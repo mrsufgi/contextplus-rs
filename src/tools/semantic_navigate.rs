@@ -324,11 +324,18 @@ async fn label_sibling_clusters(
         }];
     }
 
+    const MAX_FILES_PER_LABEL: usize = 15;
+
     let descriptions: Vec<String> = clusters
         .iter()
         .enumerate()
         .map(|(i, (files, pattern))| {
-            let file_list = files
+            let sample_files = if files.len() > MAX_FILES_PER_LABEL {
+                &files[..MAX_FILES_PER_LABEL]
+            } else {
+                files
+            };
+            let file_list = sample_files
                 .iter()
                 .map(|f| {
                     let desc = if f.header.is_empty() {
@@ -344,7 +351,12 @@ async fn label_sibling_clusters(
                 .as_ref()
                 .map(|p| format!(" (pattern: {})", p))
                 .unwrap_or_default();
-            format!("Cluster {}{}:\n  {}", i + 1, pp, file_list)
+            let count_note = if files.len() > MAX_FILES_PER_LABEL {
+                format!(" ({} files total, showing {})", files.len(), MAX_FILES_PER_LABEL)
+            } else {
+                format!(" ({} files)", files.len())
+            };
+            format!("Cluster {}{}{}:\n  {}", i + 1, pp, count_note, file_list)
         })
         .collect();
 

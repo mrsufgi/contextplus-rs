@@ -84,13 +84,13 @@ impl OllamaClient {
             "stream": false,
         });
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ContextPlusError::Ollama(format!("Chat request failed: {}", e)))?;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.client.post(&url).json(&body).send(),
+        )
+        .await
+        .map_err(|_| ContextPlusError::Ollama("Chat request timed out after 30s".to_string()))?
+        .map_err(|e| ContextPlusError::Ollama(format!("Chat request failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();

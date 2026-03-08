@@ -30,6 +30,18 @@ pub struct ProjectCache {
     pub last_refresh: Instant,
 }
 
+/// Cached identifier index: parsed symbols + their embedding vectors.
+/// Rebuilt when file count changes or TTL (300s) expires.
+pub struct IdentifierIndex {
+    pub docs: Vec<crate::tools::semantic_identifiers::IdentifierDoc>,
+    pub vector_buffer: Vec<f32>,
+    pub dims: usize,
+    pub file_count: usize,
+    pub built_at: Instant,
+}
+
+const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
+
 /// Shared state accessible by all tool handlers.
 pub struct SharedState {
     pub config: Config,
@@ -41,6 +53,8 @@ pub struct SharedState {
     /// Uses CacheEntry (hash + vector) for content-hash invalidation.
     /// Persisted to disk via rkyv_store for cross-restart survival.
     pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
+    /// Cached identifier index — avoids re-embedding all symbols on each call.
+    pub identifier_index: RwLock<Option<IdentifierIndex>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -81,6 +95,7 @@ impl ContextPlusServer {
             memory_graph,
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
+            identifier_index: RwLock::new(None),
         });
         Self { state }
     }
@@ -188,9 +203,206 @@ impl ContextPlusServer {
     /// Invalidate the project cache. Called by the file watcher when files change.
     /// Note: embedding_cache is NOT cleared — content hashes in CacheEntry
     /// handle staleness detection. Only clears the project file/line cache.
+    /// Also invalidates the identifier index so it rebuilds with fresh data.
     pub async fn invalidate_project_cache(&self) {
         let mut guard = self.state.project_cache.write().await;
         *guard = None;
+        drop(guard);
+        let mut idx_guard = self.state.identifier_index.write().await;
+        *idx_guard = None;
+    }
+
+    /// Ensure the identifier index is built and cached.
+    /// Returns cached index if TTL hasn't expired and file count is unchanged.
+    /// Otherwise rebuilds: parses all symbols, embeds them, caches the result.
+    async fn ensure_identifier_index(
+        &self,
+        cache: &Arc<ProjectCache>,
+    ) -> Result<Arc<IdentifierIndex>> {
+        let file_count = cache.file_entries.iter().filter(|e| !e.is_directory).count();
+
+        // Fast path: index exists, TTL valid, file count unchanged
+        {
+            let guard = self.state.identifier_index.read().await;
+            if let Some(ref idx) = *guard {
+                if idx.file_count == file_count
+                    && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
+                {
+                    return Ok(Arc::new(IdentifierIndex {
+                        docs: idx.docs.clone(),
+                        vector_buffer: idx.vector_buffer.clone(),
+                        dims: idx.dims,
+                        file_count: idx.file_count,
+                        built_at: idx.built_at,
+                    }));
+                }
+            }
+        }
+
+        // Slow path: rebuild identifier index
+        tracing::info!(file_count, "Building identifier index (parsing + embedding)");
+        let cache_clone = cache.clone();
+
+        // Step 1: Parse symbols (CPU-bound)
+        let identifier_docs = tokio::task::spawn_blocking(move || {
+            let mut docs = Vec::new();
+            for entry in &cache_clone.file_entries {
+                if entry.is_directory {
+                    continue;
+                }
+                if let Some(lines) = cache_clone.file_lines.get(&entry.relative_path) {
+                    let content = lines.join("\n");
+                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
+                        let line_refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                        let header = crate::core::parser::extract_header(&line_refs);
+                        for sym in crate::core::parser::flatten_symbols(&symbols, None) {
+                            let sig = sym.signature.clone().unwrap_or_default();
+                            let text = format!(
+                                "{} {} {} {}",
+                                sym.name, sym.kind, entry.relative_path, sig
+                            );
+                            docs.push(crate::tools::semantic_identifiers::IdentifierDoc {
+                                id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
+                                path: entry.relative_path.clone(),
+                                header: header.clone(),
+                                name: sym.name.clone(),
+                                kind: sym.kind.clone(),
+                                line: sym.line,
+                                end_line: sym.end_line,
+                                signature: sig,
+                                parent_name: sym.parent_name.clone(),
+                                text,
+                            });
+                        }
+                    }
+                }
+            }
+            docs
+        })
+        .await
+        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
+
+        if identifier_docs.is_empty() {
+            let idx = IdentifierIndex {
+                docs: Vec::new(),
+                vector_buffer: Vec::new(),
+                dims: 0,
+                file_count,
+                built_at: Instant::now(),
+            };
+            let mut guard = self.state.identifier_index.write().await;
+            *guard = Some(IdentifierIndex {
+                docs: idx.docs.clone(),
+                vector_buffer: idx.vector_buffer.clone(),
+                dims: idx.dims,
+                file_count: idx.file_count,
+                built_at: idx.built_at,
+            });
+            return Ok(Arc::new(idx));
+        }
+
+        // Step 2: Check identifier embedding cache on disk, embed only missing
+        let texts: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
+        tracing::info!(
+            identifiers = texts.len(),
+            "Embedding identifiers (using disk cache for warm hits)"
+        );
+
+        // Load identifier-specific embedding cache
+        let id_cache = match rkyv_store::load_cache(&self.state.root_dir, "identifier-embeddings") {
+            Ok(Some(data)) => {
+                let store = data.to_store();
+                tracing::info!(cached = store.count(), "Loaded identifier embedding cache");
+                Some(store)
+            }
+            _ => None,
+        };
+
+        // Partition: cached vs uncached identifiers
+        let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+        let mut uncached_indices: Vec<usize> = Vec::new();
+        let mut uncached_texts: Vec<String> = Vec::new();
+
+        for (i, text) in texts.iter().enumerate() {
+            if let Some(ref store) = id_cache {
+                if let Some(vec) = store.get_vector(text) {
+                    result_vectors.push(Some(vec.to_vec()));
+                    continue;
+                }
+            }
+            result_vectors.push(None);
+            uncached_indices.push(i);
+            uncached_texts.push(text.clone());
+        }
+
+        tracing::info!(
+            cached = texts.len() - uncached_indices.len(),
+            uncached = uncached_indices.len(),
+            "Identifier embedding cache hit/miss"
+        );
+
+        // Embed only uncached identifiers
+        if !uncached_texts.is_empty() {
+            let new_vectors = self.state.ollama.embed(&uncached_texts).await?;
+            for (j, &idx) in uncached_indices.iter().enumerate() {
+                if j < new_vectors.len() {
+                    result_vectors[idx] = Some(new_vectors[j].clone());
+                }
+            }
+
+            // Persist updated identifier embedding cache to disk
+            let all_texts: Vec<String> = texts.clone();
+            let all_vecs: Vec<Vec<f32>> = result_vectors
+                .iter()
+                .filter_map(|v| v.clone())
+                .collect();
+            if all_vecs.len() == all_texts.len() {
+                let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
+                let keys = all_texts;
+                let hashes: Vec<String> = keys.iter().map(|_| String::new()).collect();
+                let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
+                let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
+                if let Err(e) = rkyv_store::save_vector_store(
+                    &self.state.root_dir,
+                    "identifier-embeddings",
+                    &store,
+                ) {
+                    tracing::warn!("Failed to save identifier embedding cache: {e}");
+                }
+            }
+        }
+
+        let dims = result_vectors
+            .first()
+            .and_then(|v| v.as_ref())
+            .map_or(0, |v| v.len());
+        let flat_buffer: Vec<f32> = result_vectors
+            .into_iter()
+            .flat_map(|v| v.unwrap_or_else(|| vec![0.0; dims]))
+            .collect();
+
+        let idx = IdentifierIndex {
+            docs: identifier_docs,
+            vector_buffer: flat_buffer,
+            dims,
+            file_count,
+            built_at: Instant::now(),
+        };
+
+        // Store in shared state
+        {
+            let mut guard = self.state.identifier_index.write().await;
+            *guard = Some(IdentifierIndex {
+                docs: idx.docs.clone(),
+                vector_buffer: idx.vector_buffer.clone(),
+                dims: idx.dims,
+                file_count: idx.file_count,
+                built_at: idx.built_at,
+            });
+        }
+
+        Ok(Arc::new(idx))
     }
 
     /// Helper: convert cached file_lines HashMap into the Vec<(String, Vec<String>)> format
@@ -404,9 +616,10 @@ impl ContextPlusServer {
         };
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());
-        let walker = WalkerIndexer {
+        let walker = CachedWalkerIndexer {
             config: self.state.config.clone(),
             ollama: self.state.ollama.clone(),
+            state: self.state.clone(),
         };
 
         let result =
@@ -428,57 +641,14 @@ impl ContextPlusServer {
         let cache = self.ensure_project_cache().await?;
         let file_lines = Self::file_lines_as_vec(&cache);
 
-        // Build identifier docs by parsing each file (CPU-bound, use spawn_blocking)
-        let identifier_docs = tokio::task::spawn_blocking(move || {
-            let mut docs = Vec::new();
-            for entry in &cache.file_entries {
-                if entry.is_directory {
-                    continue;
-                }
-                if let Some(lines) = cache.file_lines.get(&entry.relative_path) {
-                    let content = lines.join("\n");
-                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                        let line_refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
-                        let header = crate::core::parser::extract_header(&line_refs);
-                        for sym in crate::core::parser::flatten_symbols(&symbols, None) {
-                            let sig = sym.signature.clone().unwrap_or_default();
-                            let text = format!(
-                                "{} {} {} {}",
-                                sym.name, sym.kind, entry.relative_path, sig
-                            );
-                            docs.push(IdentifierDoc {
-                                id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
-                                path: entry.relative_path.clone(),
-                                header: header.clone(),
-                                name: sym.name.clone(),
-                                kind: sym.kind.clone(),
-                                line: sym.line,
-                                end_line: sym.end_line,
-                                signature: sig,
-                                parent_name: sym.parent_name.clone(),
-                                text,
-                            });
-                        }
-                    }
-                }
-            }
-            docs
-        })
-        .await
-        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
+        // Use cached identifier index (TTL=300s, rebuilds if file count changes)
+        let idx = self.ensure_identifier_index(&cache).await?;
 
-        if identifier_docs.is_empty() {
+        if idx.docs.is_empty() {
             return Ok(Self::ok_text(
                 "No supported identifiers found for semantic identifier search.".to_string(),
             ));
         }
-
-        // Embed identifier docs
-        let texts: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
-        let vectors = self.state.ollama.embed(&texts).await?;
-        let dims = vectors.first().map_or(0, |v| v.len());
-        let flat_buffer: Vec<f32> = vectors.into_iter().flatten().collect();
 
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
@@ -505,9 +675,9 @@ impl ContextPlusServer {
         let result = semantic_identifier_search(
             options,
             &OllamaEmbedder(self.state.ollama.clone()),
-            &identifier_docs,
-            &flat_buffer,
-            dims,
+            &idx.docs,
+            &idx.vector_buffer,
+            idx.dims,
             &file_lines,
         )
         .await?;
@@ -907,16 +1077,18 @@ impl EmbedFn for OllamaEmbedder {
     }
 }
 
-// --- WalkAndIndexFn adapter ---
+// --- WalkAndIndexFn adapter (uses embedding cache for warm hits) ---
 
+use crate::core::embeddings::content_hash;
 use crate::tools::semantic_search::{SearchDocument, SymbolSearchEntry, WalkAndIndexFn};
 
-struct WalkerIndexer {
+struct CachedWalkerIndexer {
     config: Config,
     ollama: OllamaClient,
+    state: Arc<SharedState>,
 }
 
-impl WalkAndIndexFn for WalkerIndexer {
+impl WalkAndIndexFn for CachedWalkerIndexer {
     fn walk_and_index(
         &self,
         root_dir: &Path,
@@ -930,9 +1102,13 @@ impl WalkAndIndexFn for WalkerIndexer {
         let root = root_dir.to_path_buf();
         let config = self.config.clone();
         let ollama = self.ollama.clone();
+        let state = self.state.clone();
         Box::pin(async move {
+            let embedding_cache = &state.embedding_cache;
+            let store_root = &state.root_dir;
             let entries = walk_with_config(&root, &config);
             let mut docs = Vec::new();
+            let mut content_hashes = Vec::new();
 
             for entry in &entries {
                 let full_path = root.join(&entry.relative_path);
@@ -957,40 +1133,88 @@ impl WalkAndIndexFn for WalkerIndexer {
                     })
                     .collect();
 
+                let doc_content = format!(
+                    "{} {}",
+                    detect_language(&entry.relative_path).unwrap_or("unknown"),
+                    content.chars().take(500).collect::<String>()
+                );
+                content_hashes.push((entry.relative_path.clone(), content_hash(&doc_content)));
+
                 docs.push(SearchDocument {
                     path: entry.relative_path.clone(),
                     header,
                     symbols: symbol_names,
                     symbol_entries,
-                    content: format!(
-                        "{} {}",
-                        detect_language(&entry.relative_path).unwrap_or("unknown"),
-                        content.chars().take(500).collect::<String>()
-                    ),
+                    content: doc_content,
                 });
             }
 
-            // Embed all document content via Ollama
-            let texts: Vec<String> = docs.iter().map(|d| d.content.clone()).collect();
-            let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
-
-            if texts.is_empty() {
-                return Ok((docs, vectors));
+            if docs.is_empty() {
+                return Ok((docs, Vec::new()));
             }
 
-            // Embed in batches
-            let batch_size = config.embed_batch_size.max(1);
-            for chunk in texts.chunks(batch_size) {
-                match ollama.embed(chunk).await {
-                    Ok(embeddings) => {
-                        for emb in embeddings {
-                            vectors.push(Some(emb));
+            // Resolve vectors from cache, embed only uncached/stale files
+            let cache_read = embedding_cache.read().await;
+            let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
+            let mut uncached_indices: Vec<usize> = Vec::new();
+            let mut uncached_texts: Vec<String> = Vec::new();
+
+            for (i, (rel_path, hash)) in content_hashes.iter().enumerate() {
+                if let Some(entry) = cache_read.get(rel_path) {
+                    if entry.hash == *hash {
+                        vectors.push(Some(entry.vector.clone()));
+                        continue;
+                    }
+                }
+                vectors.push(None);
+                uncached_indices.push(i);
+                uncached_texts.push(docs[i].content.clone());
+            }
+            drop(cache_read);
+
+            tracing::info!(
+                cached = docs.len() - uncached_indices.len(),
+                uncached = uncached_indices.len(),
+                "semantic_code_search embedding cache hit/miss"
+            );
+
+            // Embed only uncached files
+            if !uncached_texts.is_empty() {
+                let batch_size = config.embed_batch_size.max(1);
+                let mut new_vectors = Vec::with_capacity(uncached_texts.len());
+                for chunk in uncached_texts.chunks(batch_size) {
+                    match ollama.embed(chunk).await {
+                        Ok(embeddings) => new_vectors.extend(embeddings),
+                        Err(e) => {
+                            tracing::warn!("Embedding batch failed: {e}, filling with None");
+                            for _ in chunk {
+                                new_vectors.push(Vec::new());
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Embedding batch failed: {e}, filling with None");
-                        for _ in chunk {
-                            vectors.push(None);
+                }
+
+                // Store new vectors in cache and fill result
+                {
+                    let mut cache_write = embedding_cache.write().await;
+                    for (j, &idx) in uncached_indices.iter().enumerate() {
+                        if j < new_vectors.len() && !new_vectors[j].is_empty() {
+                            let (rel_path, hash) = &content_hashes[idx];
+                            cache_write.insert(
+                                rel_path.clone(),
+                                CacheEntry {
+                                    hash: hash.clone(),
+                                    vector: new_vectors[j].clone(),
+                                },
+                            );
+                            vectors[idx] = Some(new_vectors[j].clone());
+                        }
+                    }
+
+                    // Persist to disk
+                    if let Some(store) = crate::core::embeddings::VectorStore::from_cache(&cache_write) {
+                        if let Err(e) = rkyv_store::save_vector_store(&store_root, "embeddings", &store) {
+                            tracing::warn!("Failed to save embedding cache: {e}");
                         }
                     }
                 }
