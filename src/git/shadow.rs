@@ -5,7 +5,11 @@ use crate::error::{ContextPlusError, Result};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use tokio::fs;
+
+static RESTORE_POINT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^rp-\d+-[a-z0-9]{6}$").expect("valid regex"));
 
 const MAX_RESTORE_POINTS: usize = 100;
 const BACKUP_DIR: &str = "backups";
@@ -28,8 +32,7 @@ pub struct FileBackup {
 
 /// Validates restore point ID format: `rp-{digits}-{6 alphanumeric chars}`
 pub fn validate_restore_point_id(id: &str) -> bool {
-    let re = regex::Regex::new(r"^rp-\d+-[a-z0-9]{6}$").expect("valid regex");
-    re.is_match(id)
+    RESTORE_POINT_RE.is_match(id)
 }
 
 /// Generates a unique restore point ID: `rp-{timestamp_ms}-{random_6}`

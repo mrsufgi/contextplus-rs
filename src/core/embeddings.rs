@@ -176,9 +176,9 @@ fn shrink_input(input: &str) -> String {
     let next_len = (input.len() as f64 * SINGLE_INPUT_SHRINK_FACTOR) as usize;
     let next_len = next_len.max(MIN_EMBED_INPUT_CHARS);
     if next_len >= input.len() {
-        return input[..input.len() - 1].to_string();
+        return crate::core::parser::truncate_to_char_boundary(input, input.len() - 1).to_string();
     }
-    input[..next_len].to_string()
+    crate::core::parser::truncate_to_char_boundary(input, next_len).to_string()
 }
 
 // ---------------------------------------------------------------------------

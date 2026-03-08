@@ -2,6 +2,7 @@
 // Browse codebase by meaning: embeds files, clusters vectors, generates labels.
 
 use crate::core::clustering::{find_path_pattern, spectral_cluster};
+use crate::core::embeddings::OllamaClient;
 use crate::error::{ContextPlusError, Result};
 use reqwest::Client;
 use serde::Deserialize;
@@ -38,7 +39,7 @@ struct ClusterNode {
 }
 
 /// Perform semantic navigation: embed files, cluster, label, return tree.
-pub async fn semantic_navigate(options: SemanticNavigateOptions) -> Result<String> {
+pub async fn semantic_navigate(options: SemanticNavigateOptions, ollama: &OllamaClient) -> Result<String> {
     let max_clusters = options.max_clusters.unwrap_or(20);
     let max_depth = options.max_depth.unwrap_or(3);
     let root = PathBuf::from(&options.root_dir);
@@ -55,8 +56,8 @@ pub async fn semantic_navigate(options: SemanticNavigateOptions) -> Result<Strin
         .map(|f| format!("{} {} {}", f.header, f.relative_path, f.content))
         .collect();
 
-    // Fetch embeddings via Ollama
-    let vectors = match fetch_embeddings(&embed_texts).await {
+    // Fetch embeddings via OllamaClient
+    let vectors = match ollama.embed(&embed_texts).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(format!(
@@ -165,7 +166,7 @@ async fn collect_source_files(root: &Path) -> Result<Vec<FileInfo>> {
 
                     let header = extract_header(&content);
                     let truncated_content = if content.len() > 500 {
-                        content[..500].to_string()
+                        crate::core::parser::truncate_to_char_boundary(&content, 500).to_string()
                     } else {
                         content
                     };
@@ -202,59 +203,10 @@ fn extract_header(content: &str) -> String {
     }
     let joined = header_lines.join(" ");
     if joined.len() > 200 {
-        joined[..200].to_string()
+        crate::core::parser::truncate_to_char_boundary(&joined, 200).to_string()
     } else {
         joined
     }
-}
-
-/// Fetch embeddings from Ollama API.
-async fn fetch_embeddings(inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-    let ollama_host =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let embed_model =
-        std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
-
-    let client = Client::new();
-    let mut all_embeddings = Vec::with_capacity(inputs.len());
-
-    // Batch in groups of 32
-    for chunk in inputs.chunks(32) {
-        let body = serde_json::json!({
-            "model": embed_model,
-            "input": chunk,
-        });
-
-        let resp = client
-            .post(format!("{}/api/embed", ollama_host))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ContextPlusError::Ollama(format!("Embedding request failed: {}", e)))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ContextPlusError::Ollama(format!(
-                "Ollama returned {}: {}",
-                status, text
-            )));
-        }
-
-        #[derive(Deserialize)]
-        struct EmbedResponse {
-            embeddings: Vec<Vec<f32>>,
-        }
-
-        let embed_resp: EmbedResponse = resp
-            .json()
-            .await
-            .map_err(|e| ContextPlusError::Ollama(format!("Failed to parse embedding response: {}", e)))?;
-
-        all_embeddings.extend(embed_resp.embeddings);
-    }
-
-    Ok(all_embeddings)
 }
 
 /// Label files using Ollama chat for small sets.
@@ -300,7 +252,7 @@ async fn label_sibling_clusters(
             .collect();
         let joined = names.join(", ");
         return vec![if joined.len() > 40 {
-            joined[..40].to_string()
+            crate::core::parser::truncate_to_char_boundary(&joined, 40).to_string()
         } else {
             joined
         }];

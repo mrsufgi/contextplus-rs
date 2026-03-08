@@ -33,6 +33,19 @@ fn radix36(mut n: u32) -> String {
     String::from_utf8(buf).unwrap()
 }
 
+/// Truncate a string to at most `max_bytes` bytes, but never split a UTF-8 codepoint.
+pub fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    // Find the last char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[derive(Debug, Clone)]
 pub struct CodeSymbol {
     pub name: String,

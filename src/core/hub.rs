@@ -4,6 +4,23 @@
 use regex::Regex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+static CROSS_LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@linked-to\s+\[\[[^\]]+\]\]").expect("valid regex"));
+
+static WIKILINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]*))?\]\]").expect("valid regex"));
+
+static CROSS_LINK_CAPTURE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@linked-to\s+\[\[([^\]]+)\]\]").expect("valid regex"));
+
+static FEATURE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?://|#|--)\s*FEATURE:\s*(.+)$").expect("valid regex")
+});
+
+static HEADING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^#\s+(.+)$").expect("valid regex"));
 
 /// A parsed wikilink target with optional description alias.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,14 +49,12 @@ pub struct HubInfo {
 /// Parse wikilinks from markdown content: `[[target]]` or `[[target|description]]`
 /// Excludes cross-link references (`@linked-to [[...]]`).
 pub fn parse_wiki_links(content: &str) -> Vec<HubLink> {
-    let cross_link_re = Regex::new(r"@linked-to\s+\[\[[^\]]+\]\]").expect("valid regex");
-    let cleaned = cross_link_re.replace_all(content, "");
+    let cleaned = CROSS_LINK_RE.replace_all(content, "");
 
-    let wikilink_re = Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]*))?\]\]").expect("valid regex");
     let mut links = Vec::new();
     let mut seen = HashSet::new();
 
-    for cap in wikilink_re.captures_iter(&cleaned) {
+    for cap in WIKILINK_RE.captures_iter(&cleaned) {
         let target = cap[1].trim().to_string();
         if seen.insert(target.clone()) {
             let description = cap.get(2).map(|m| m.as_str().trim().to_string());
@@ -54,8 +69,7 @@ pub fn parse_wiki_links(content: &str) -> Vec<HubLink> {
 
 /// Parse `@linked-to [[hubName]]` cross-link references.
 pub fn parse_cross_links(content: &str, source_file: &str) -> Vec<CrossLink> {
-    let re = Regex::new(r"@linked-to\s+\[\[([^\]]+)\]\]").expect("valid regex");
-    re.captures_iter(content)
+    CROSS_LINK_CAPTURE_RE.captures_iter(content)
         .map(|cap| CrossLink {
             hub_name: cap[1].trim().to_string(),
             source_file: source_file.to_string(),
@@ -65,8 +79,7 @@ pub fn parse_cross_links(content: &str, source_file: &str) -> Vec<CrossLink> {
 
 /// Extract a `// FEATURE: ...` or `# FEATURE: ...` or `-- FEATURE: ...` tag from file header.
 pub fn extract_feature_tag(content: &str) -> Option<String> {
-    let re = Regex::new(r"(?m)^(?://|#|--)\s*FEATURE:\s*(.+)$").expect("valid regex");
-    re.captures(content).map(|cap| cap[1].trim().to_string())
+    FEATURE_TAG_RE.captures(content).map(|cap| cap[1].trim().to_string())
 }
 
 /// Parse a hub markdown file into structured information.
@@ -79,8 +92,7 @@ pub fn parse_hub_file(hub_path: &str, content: &str) -> HubInfo {
         .to_string();
 
     // Extract first heading as title
-    let heading_re = Regex::new(r"(?m)^#\s+(.+)$").expect("valid regex");
-    if let Some(cap) = heading_re.captures(content) {
+    if let Some(cap) = HEADING_RE.captures(content) {
         title = cap[1].trim().to_string();
     }
 
@@ -95,8 +107,7 @@ pub fn parse_hub_file(hub_path: &str, content: &str) -> HubInfo {
 
 /// Check if a markdown file contains wikilinks (is a hub).
 pub fn has_wikilinks(content: &str) -> bool {
-    let re = Regex::new(r"\[\[([^\]|]+)(?:\|([^\]]*))?\]\]").expect("valid regex");
-    re.is_match(content)
+    WIKILINK_RE.is_match(content)
 }
 
 /// Walk a directory tree and discover hub files (markdown files with wikilinks).

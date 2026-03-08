@@ -1,12 +1,11 @@
 // MCP tool wrappers for memory graph operations and interlinked RAG.
 // 6 tools: upsert, relate, search, prune, interlink, traverse.
 
+use crate::core::embeddings::OllamaClient;
 use crate::core::memory_graph::{
     GraphStore, NodeType, RelationType, TraversalResult,
 };
 use crate::error::{ContextPlusError, Result};
-use reqwest::Client;
-use serde::Deserialize;
 use std::collections::HashMap;
 
 // --- Options structs ---
@@ -123,46 +122,10 @@ fn parse_edge_filter(filter: &Option<Vec<String>>) -> Result<Option<Vec<Relation
     }
 }
 
-/// Fetch embedding for a text string from Ollama.
-async fn fetch_embedding(text: &str) -> Result<Vec<f32>> {
-    let ollama_host =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let embed_model =
-        std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
-
-    let client = Client::new();
-    let body = serde_json::json!({
-        "model": embed_model,
-        "input": [text],
-    });
-
-    let resp = client
-        .post(format!("{}/api/embed", ollama_host))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ContextPlusError::Ollama(format!("Embedding request failed: {}", e)))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ContextPlusError::Ollama(format!(
-            "Ollama returned {}: {}",
-            status, text
-        )));
-    }
-
-    #[derive(Deserialize)]
-    struct EmbedResponse {
-        embeddings: Vec<Vec<f32>>,
-    }
-
-    let embed_resp: EmbedResponse = resp.json().await.map_err(|e| {
-        ContextPlusError::Ollama(format!("Failed to parse embedding response: {}", e))
-    })?;
-
-    embed_resp
-        .embeddings
+/// Fetch a single embedding via OllamaClient.
+async fn fetch_embedding(ollama: &OllamaClient, text: &str) -> Result<Vec<f32>> {
+    let results = ollama.embed(&[text.to_string()]).await?;
+    results
         .into_iter()
         .next()
         .ok_or_else(|| ContextPlusError::Ollama("No embedding returned".to_string()))
@@ -173,11 +136,12 @@ async fn fetch_embedding(text: &str) -> Result<Vec<f32>> {
 /// Tool 1: Upsert a memory node. Creates or updates by (label, type).
 pub async fn tool_upsert_memory_node(
     store: &GraphStore,
+    ollama: &OllamaClient,
     options: UpsertMemoryNodeOptions,
 ) -> Result<String> {
     let node_type = parse_node_type(&options.node_type)?;
     let embed_text = format!("{} {}", options.label, options.content);
-    let embedding = fetch_embedding(&embed_text).await?;
+    let embedding = fetch_embedding(ollama, &embed_text).await?;
 
     let node = store
         .get_graph(&options.root_dir, |graph| {
@@ -277,13 +241,14 @@ pub async fn tool_create_relation(
 /// Tool 3: Search memory graph semantically + BFS traversal.
 pub async fn tool_search_memory_graph(
     store: &GraphStore,
+    ollama: &OllamaClient,
     options: SearchMemoryGraphOptions,
 ) -> Result<String> {
     let max_depth = options.max_depth.unwrap_or(1);
     let top_k = options.top_k.unwrap_or(5);
     let edge_filter = parse_edge_filter(&options.edge_filter)?;
 
-    let query_embedding = fetch_embedding(&options.query).await?;
+    let query_embedding = fetch_embedding(ollama, &options.query).await?;
 
     let result = store
         .get_graph(&options.root_dir, |graph| {
@@ -350,6 +315,7 @@ pub async fn tool_prune_stale_links(
 /// Tool 5: Add interlinked context (batch upsert + auto-similarity linking).
 pub async fn tool_add_interlinked_context(
     store: &GraphStore,
+    ollama: &OllamaClient,
     options: AddInterlinkedContextOptions,
 ) -> Result<String> {
     let auto_link = options.auto_link.unwrap_or(true);
@@ -359,7 +325,7 @@ pub async fn tool_add_interlinked_context(
     for item in &options.items {
         let node_type = parse_node_type(&item.node_type)?;
         let embed_text = format!("{} {}", item.label, item.content);
-        let embedding = fetch_embedding(&embed_text).await?;
+        let embedding = fetch_embedding(ollama, &embed_text).await?;
         prepared_items.push((
             node_type,
             item.label.clone(),

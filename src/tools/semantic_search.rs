@@ -91,36 +91,6 @@ pub struct ResolvedSearchOptions {
 // Pure helper functions
 // ---------------------------------------------------------------------------
 
-/// Java-style hashCode (wrapping i32 arithmetic), then base-36 encode.
-/// Matches the TS `hashContent` which uses `charCodeAt` (UTF-16 code units).
-pub fn hash_content(text: &str) -> String {
-    let mut h: i32 = 0;
-    for ch in text.encode_utf16() {
-        h = h.wrapping_mul(31).wrapping_add(ch as i32);
-    }
-    format_radix_i32(h, 36)
-}
-
-/// Format an i32 in the given radix (2..=36), matching JS `Number.toString(radix)`.
-fn format_radix_i32(value: i32, radix: u32) -> String {
-    if value == 0 {
-        return "0".to_string();
-    }
-    let negative = value < 0;
-    let mut abs_val = (value as i64).unsigned_abs();
-    let mut digits = Vec::new();
-    while abs_val > 0 {
-        let d = (abs_val % radix as u64) as u32;
-        digits.push(std::char::from_digit(d, radix).unwrap_or('?'));
-        abs_val /= radix as u64;
-    }
-    if negative {
-        digits.push('-');
-    }
-    digits.reverse();
-    digits.into_iter().collect()
-}
-
 /// Split camelCase, snake_case, kebab-case text into lowercase tokens.
 /// Filters tokens with length > 1.
 /// "getUserById" -> ["get", "user", "by", "id"]
@@ -591,6 +561,7 @@ pub trait WalkAndIndexFn: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::parser::hash_content;
 
     // -- hash_content tests --
 
@@ -946,23 +917,6 @@ mod tests {
         let long = "a".repeat(3000);
         let result = sanitize_query(&long);
         assert_eq!(result.len(), MAX_QUERY_LEN);
-    }
-
-    // -- format_radix_i32 tests --
-
-    #[test]
-    fn test_format_radix_zero() {
-        assert_eq!(format_radix_i32(0, 36), "0");
-    }
-
-    #[test]
-    fn test_format_radix_positive() {
-        assert_eq!(format_radix_i32(255, 16), "ff");
-    }
-
-    #[test]
-    fn test_format_radix_negative() {
-        assert_eq!(format_radix_i32(-1, 36), "-1");
     }
 
     #[test]

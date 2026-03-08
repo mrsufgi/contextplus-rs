@@ -383,7 +383,7 @@ impl ContextPlusServer {
             max_clusters: Self::get_usize(&args, "maxClusters"),
         };
 
-        let result = crate::tools::semantic_navigate::semantic_navigate(options).await?;
+        let result = crate::tools::semantic_navigate::semantic_navigate(options, &self.state.ollama).await?;
         Ok(Self::ok_text(result))
     }
 
@@ -500,7 +500,7 @@ impl ContextPlusServer {
         };
 
         let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_upsert_memory_node(store, options).await?;
+        let result = crate::tools::memory_tools::tool_upsert_memory_node(store, &self.state.ollama, options).await?;
 
         Ok(Self::ok_text(result))
     }
@@ -545,7 +545,7 @@ impl ContextPlusServer {
         };
 
         let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_search_memory_graph(store, options).await?;
+        let result = crate::tools::memory_tools::tool_search_memory_graph(store, &self.state.ollama, options).await?;
         Ok(Self::ok_text(result))
     }
 
@@ -594,7 +594,7 @@ impl ContextPlusServer {
 
         let store = &self.state.memory_graph;
         let result =
-            crate::tools::memory_tools::tool_add_interlinked_context(store, options).await?;
+            crate::tools::memory_tools::tool_add_interlinked_context(store, &self.state.ollama, options).await?;
 
         Ok(Self::ok_text(result))
     }
@@ -623,9 +623,23 @@ impl ContextPlusServer {
     // --- Helpers ---
 
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
-        Self::get_str(args, "rootDir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.state.root_dir.clone())
+        if let Some(requested) = Self::get_str(args, "rootDir") {
+            let requested_path = PathBuf::from(&requested);
+            // Normalize both paths to handle `.`, `..`, symlinks, etc.
+            let canonical_root = self.state.root_dir.canonicalize()
+                .unwrap_or_else(|_| self.state.root_dir.clone());
+            if let Ok(canonical_requested) = requested_path.canonicalize() {
+                if canonical_requested.starts_with(&canonical_root) {
+                    return canonical_requested;
+                }
+            }
+            tracing::warn!(
+                requested = %requested,
+                root = %self.state.root_dir.display(),
+                "Caller-provided rootDir is outside the server root; ignoring"
+            );
+        }
+        self.state.root_dir.clone()
     }
 
 }
@@ -1012,4 +1026,220 @@ fn make_tool(
         Some(description.to_string().into()),
         Arc::new(schema),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::RawContent;
+    use serde_json::json;
+
+    fn test_server() -> ContextPlusServer {
+        let config = Config::from_env();
+        let root = std::env::temp_dir().join("contextplus-test");
+        let _ = std::fs::create_dir_all(&root);
+        ContextPlusServer::new(root, config)
+    }
+
+    #[test]
+    fn tool_definitions_returns_all_17_tools() {
+        let defs = tool_definitions();
+        assert_eq!(defs.len(), 17, "expected 17 tools, got {}", defs.len());
+        for tool in &defs {
+            assert!(!tool.name.is_empty(), "tool name must not be empty");
+            assert!(tool.description.is_some(), "tool '{}' must have a description", tool.name);
+        }
+    }
+
+    #[test]
+    fn tool_definitions_contain_expected_names() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|t| t.name.as_ref()).collect();
+        let expected = [
+            "get_context_tree",
+            "get_file_skeleton",
+            "get_blast_radius",
+            "semantic_code_search",
+            "semantic_identifier_search",
+            "semantic_navigate",
+            "get_feature_hub",
+            "run_static_analysis",
+            "propose_commit",
+            "list_restore_points",
+            "undo_change",
+            "upsert_memory_node",
+            "create_relation",
+            "search_memory_graph",
+            "prune_stale_links",
+            "add_interlinked_context",
+            "retrieve_with_traversal",
+        ];
+        for name in expected {
+            assert!(names.contains(&name), "missing tool: {}", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_tool_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("nonexistent_tool", args).await;
+        assert_eq!(result.is_error, Some(true), "unknown tool should return is_error=true");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| match &c.raw {
+                RawContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        assert!(
+            text.contains("Unknown tool"),
+            "expected 'Unknown tool' in error text, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_restore_points_succeeds_with_empty_state() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("list_restore_points", args).await;
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "list_restore_points should not error on empty state"
+        );
+    }
+
+    #[test]
+    fn get_str_extracts_string() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!("value"));
+        assert_eq!(ContextPlusServer::get_str(&args, "key"), Some("value".to_string()));
+        assert_eq!(ContextPlusServer::get_str(&args, "missing"), None);
+    }
+
+    #[test]
+    fn get_str_returns_none_for_non_string() {
+        let mut args = serde_json::Map::new();
+        args.insert("num".to_string(), json!(42));
+        assert_eq!(ContextPlusServer::get_str(&args, "num"), None);
+    }
+
+    #[test]
+    fn get_str_or_returns_default_when_missing() {
+        let args = serde_json::Map::new();
+        assert_eq!(
+            ContextPlusServer::get_str_or(&args, "missing", "fallback"),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn get_str_or_returns_value_when_present() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!("actual"));
+        assert_eq!(
+            ContextPlusServer::get_str_or(&args, "key", "fallback"),
+            "actual"
+        );
+    }
+
+    #[test]
+    fn get_usize_extracts_number() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!(42));
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), Some(42));
+        assert_eq!(ContextPlusServer::get_usize(&args, "missing"), None);
+    }
+
+    #[test]
+    fn get_f64_extracts_float() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), json!(3.14));
+        let val = ContextPlusServer::get_f64(&args, "f").unwrap();
+        assert!((val - 3.14).abs() < f64::EPSILON);
+        assert_eq!(ContextPlusServer::get_f64(&args, "missing"), None);
+    }
+
+    #[test]
+    fn get_bool_extracts_boolean() {
+        let mut args = serde_json::Map::new();
+        args.insert("b".to_string(), json!(true));
+        assert_eq!(ContextPlusServer::get_bool(&args, "b"), Some(true));
+        args.insert("b".to_string(), json!(false));
+        assert_eq!(ContextPlusServer::get_bool(&args, "b"), Some(false));
+        assert_eq!(ContextPlusServer::get_bool(&args, "missing"), None);
+    }
+
+    #[test]
+    fn resolve_root_uses_server_root_when_no_arg() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let root = server.resolve_root(&args);
+        assert_eq!(root, server.state.root_dir);
+    }
+
+    #[test]
+    fn resolve_root_rejects_path_outside_server_root() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("rootDir".to_string(), json!("/etc/passwd"));
+        let root = server.resolve_root(&args);
+        // Should fall back to server root since /etc/passwd is outside
+        assert_eq!(root, server.state.root_dir);
+    }
+
+    #[test]
+    fn ok_text_creates_success_result() {
+        let result = ContextPlusServer::ok_text("hello".to_string());
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn err_text_creates_error_result() {
+        let result = ContextPlusServer::err_text("oops".to_string());
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn make_tool_sets_required_params() {
+        let tool = make_tool(
+            "test_tool",
+            "A test tool",
+            &[
+                ("required_param", "string", true, "A required param"),
+                ("optional_param", "integer", false, "An optional param"),
+            ],
+        );
+        assert_eq!(tool.name.as_ref(), "test_tool");
+        assert_eq!(tool.description.as_deref(), Some("A test tool"));
+
+        let schema = tool.input_schema.as_ref();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].as_str(), Some("required_param"));
+    }
+
+    #[test]
+    fn parse_metadata_extracts_map() {
+        let mut args = serde_json::Map::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert("source".to_string(), json!("test"));
+        meta.insert("priority".to_string(), json!("high"));
+        args.insert("metadata".to_string(), Value::Object(meta));
+
+        let result = parse_metadata(&args).unwrap();
+        assert_eq!(result.get("source"), Some(&"test".to_string()));
+        assert_eq!(result.get("priority"), Some(&"high".to_string()));
+    }
+
+    #[test]
+    fn parse_metadata_returns_none_when_missing() {
+        let args = serde_json::Map::new();
+        assert!(parse_metadata(&args).is_none());
+    }
 }
