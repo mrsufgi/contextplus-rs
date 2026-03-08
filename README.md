@@ -74,7 +74,7 @@ The binary is at `target/release/contextplus-rs`.
 
 ```bash
 ollama pull snowflake-arctic-embed2   # embeddings
-ollama pull llama3.2                  # chat (for cluster labeling)
+ollama pull qwen3.5:9b                # chat (for cluster labeling)
 ```
 
 ## Configuration
@@ -85,7 +85,7 @@ Same environment variables as the TypeScript version:
 |----------|---------|-------------|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_EMBED_MODEL` | `snowflake-arctic-embed2` | Embedding model |
-| `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model (for cluster labels) |
+| `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model for cluster labels (recommended: `qwen3.5:9b`) |
 | `OLLAMA_API_KEY` | _(none)_ | Optional API key |
 | `CONTEXTPLUS_EMBED_BATCH_SIZE` | `32` | Embedding batch size |
 | `CONTEXTPLUS_EMBED_TRACKER` | `true` | Enable file watcher |
@@ -112,13 +112,18 @@ Add to your MCP config (`~/.claude/mcp.json` or project `.mcp.json`):
       "command": "/path/to/contextplus-rs",
       "args": ["--root-dir", "/path/to/project"],
       "env": {
+        "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+        "OLLAMA_CHAT_MODEL": "qwen3.5:9b",
         "OLLAMA_HOST": "http://127.0.0.1:11434",
-        "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2"
+        "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+        "CONTEXTPLUS_EMBED_TRACKER": "true"
       }
     }
   }
 }
 ```
+
+> **Note:** `think: false` is sent automatically to the chat model to avoid slow thinking-mode responses. Models like `qwen3.5:9b` produce cluster labels in <1s with thinking disabled vs 45s+ with thinking enabled.
 
 ### CLI subcommands
 
