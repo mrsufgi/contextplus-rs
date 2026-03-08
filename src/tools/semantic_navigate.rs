@@ -1,15 +1,25 @@
 // Semantic project navigator using spectral clustering and Ollama labeling.
 // Browse codebase by meaning: embeds files, clusters vectors, generates labels.
 
+use crate::config::Config;
 use crate::core::clustering::{find_path_pattern, spectral_cluster};
 use crate::core::embeddings::OllamaClient;
-use crate::error::{ContextPlusError, Result};
-use reqwest::Client;
+use crate::core::walker;
+use crate::error::Result;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const MAX_FILES_PER_LEAF: usize = 20;
+
+/// Extensions accepted for semantic navigation (without leading dot).
+/// Superset of tree_sitter::get_supported_extensions — includes data formats
+/// (sql, graphql, proto, yaml, yml, toml, json) that tree-sitter doesn't parse
+/// but are useful for clustering.
+const NAVIGATE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "cpp", "h", "hpp", "cc",
+    "rb", "sh", "bash", "zsh", "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
+];
 
 /// Options for the semantic navigation tool.
 #[derive(Debug, Clone)]
@@ -42,13 +52,14 @@ struct ClusterNode {
 pub async fn semantic_navigate(
     options: SemanticNavigateOptions,
     ollama: &OllamaClient,
+    config: &Config,
 ) -> Result<String> {
     let max_clusters = options.max_clusters.unwrap_or(20);
     let max_depth = options.max_depth.unwrap_or(3);
     let root = PathBuf::from(&options.root_dir);
 
-    // Walk directory for source files
-    let files = collect_source_files(&root).await?;
+    // Walk directory for source files using shared walker infrastructure
+    let files = collect_source_files_via_walker(&root, config).await?;
     if files.is_empty() {
         return Ok("No supported source files found in the project.".to_string());
     }
@@ -72,7 +83,7 @@ pub async fn semantic_navigate(
 
     if files.len() <= MAX_FILES_PER_LEAF {
         // Small project: just list files with labels
-        let file_labels = label_files(&files).await;
+        let file_labels = label_files(&files, ollama).await;
         let mut lines = vec![format!("Semantic Navigator: {} files\n", files.len())];
         for (i, file) in files.iter().enumerate() {
             let symbols = if file.symbol_preview.is_empty() {
@@ -90,7 +101,7 @@ pub async fn semantic_navigate(
     }
 
     // Build hierarchical cluster tree
-    let tree = build_hierarchy(&files, &vectors, max_clusters, 0, max_depth).await;
+    let tree = build_hierarchy(&files, &vectors, max_clusters, 0, max_depth, ollama).await;
     let mut root_node = tree;
     root_node.label = "Project".to_string();
 
@@ -101,84 +112,48 @@ pub async fn semantic_navigate(
     ))
 }
 
-/// Walk the directory and collect source file information.
-async fn collect_source_files(root: &Path) -> Result<Vec<FileInfo>> {
-    let skip_dirs: HashSet<&str> = [
-        "node_modules",
-        ".git",
-        "build",
-        "dist",
-        ".mcp_data",
-        "target",
-        ".next",
-        "coverage",
-        "__pycache__",
-        ".turbo",
-    ]
-    .into_iter()
-    .collect();
+/// Walk the directory using shared walker infrastructure and collect source file information.
+async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result<Vec<FileInfo>> {
+    let allowed_extensions: HashSet<&str> = NAVIGATE_EXTENSIONS.iter().copied().collect();
 
-    let supported_extensions: HashSet<&str> = [
-        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh",
-        "bash", "zsh", "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
-    ]
-    .into_iter()
-    .collect();
+    // walk_with_config is synchronous (uses the `ignore` crate), run on blocking thread
+    let root_clone = root.to_path_buf();
+    let config_clone = config.clone();
+    let entries =
+        tokio::task::spawn_blocking(move || walker::walk_with_config(&root_clone, &config_clone))
+            .await
+            .unwrap_or_default();
 
+    // Filter to supported extensions and non-directories, then read content
     let mut files = Vec::new();
-    let mut dirs = vec![root.to_path_buf()];
+    for entry in entries {
+        if entry.is_directory {
+            continue;
+        }
 
-    while let Some(dir) = dirs.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let ext = entry
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !allowed_extensions.contains(ext) {
+            continue;
+        }
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if skip_dirs.contains(name_str.as_ref()) {
-                continue;
-            }
-
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
+        if let Ok(content) = tokio::fs::read_to_string(&entry.path).await {
+            let header = extract_header(&content);
+            let truncated_content = if content.len() > 500 {
+                crate::core::parser::truncate_to_char_boundary(&content, 500).to_string()
+            } else {
+                content
             };
 
-            let full_path = entry.path();
-
-            if file_type.is_dir() {
-                dirs.push(full_path);
-            } else if file_type.is_file() {
-                let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !supported_extensions.contains(ext) {
-                    continue;
-                }
-
-                if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
-                    let relative_path = full_path
-                        .strip_prefix(root)
-                        .unwrap_or(&full_path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-
-                    let header = extract_header(&content);
-                    let truncated_content = if content.len() > 500 {
-                        crate::core::parser::truncate_to_char_boundary(&content, 500).to_string()
-                    } else {
-                        content
-                    };
-
-                    files.push(FileInfo {
-                        relative_path,
-                        header,
-                        content: truncated_content,
-                        symbol_preview: Vec::new(), // Skipped for now; parser not yet available
-                    });
-                }
-            }
+            files.push(FileInfo {
+                relative_path: entry.relative_path,
+                header,
+                content: truncated_content,
+                symbol_preview: Vec::new(),
+            });
         }
     }
 
@@ -210,7 +185,7 @@ fn extract_header(content: &str) -> String {
 }
 
 /// Label files using Ollama chat for small sets.
-async fn label_files(files: &[FileInfo]) -> Vec<String> {
+async fn label_files(files: &[FileInfo], ollama: &OllamaClient) -> Vec<String> {
     let file_list = files
         .iter()
         .map(|f| format!("{}: {}", f.relative_path, f.header))
@@ -222,7 +197,7 @@ async fn label_files(files: &[FileInfo]) -> Vec<String> {
         file_list
     );
 
-    match chat_completion(&prompt).await {
+    match ollama.chat(&prompt).await {
         Ok(response) => {
             if let Some(json_match) = extract_json_array(&response)
                 && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_match)
@@ -236,7 +211,10 @@ async fn label_files(files: &[FileInfo]) -> Vec<String> {
 }
 
 /// Label sibling clusters using Ollama chat.
-async fn label_sibling_clusters(clusters: &[(Vec<&FileInfo>, Option<String>)]) -> Vec<String> {
+async fn label_sibling_clusters(
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    ollama: &OllamaClient,
+) -> Vec<String> {
     if clusters.is_empty() {
         return Vec::new();
     }
@@ -294,7 +272,7 @@ Respond with ONLY a JSON array of {} objects. No other text."#,
         clusters.len()
     );
 
-    match chat_completion(&prompt).await {
+    match ollama.chat(&prompt).await {
         Ok(response) => {
             if let Some(json_str) = extract_json_array(&response) {
                 #[derive(Deserialize)]
@@ -330,52 +308,6 @@ Respond with ONLY a JSON array of {} objects. No other text."#,
     }
 }
 
-/// Chat with Ollama to get a response.
-async fn chat_completion(prompt: &str) -> Result<String> {
-    let ollama_host =
-        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let chat_model = std::env::var("OLLAMA_CHAT_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
-
-    let client = Client::new();
-    let body = serde_json::json!({
-        "model": chat_model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": false,
-    });
-
-    let resp = client
-        .post(format!("{}/api/chat", ollama_host))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ContextPlusError::Ollama(format!("Chat request failed: {}", e)))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ContextPlusError::Ollama(format!(
-            "Ollama chat returned {}: {}",
-            status, text
-        )));
-    }
-
-    #[derive(Deserialize)]
-    struct ChatMessage {
-        content: String,
-    }
-    #[derive(Deserialize)]
-    struct ChatResponse {
-        message: ChatMessage,
-    }
-
-    let chat_resp: ChatResponse = resp
-        .json()
-        .await
-        .map_err(|e| ContextPlusError::Ollama(format!("Failed to parse chat response: {}", e)))?;
-
-    Ok(chat_resp.message.content)
-}
-
 /// Extract a JSON array string from LLM response text.
 fn extract_json_array(text: &str) -> Option<String> {
     let start = text.find('[')?;
@@ -394,6 +326,7 @@ async fn build_hierarchy(
     max_clusters: usize,
     depth: usize,
     max_depth: usize,
+    ollama: &OllamaClient,
 ) -> ClusterNode {
     if files.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
         return ClusterNode {
@@ -451,7 +384,7 @@ async fn build_hierarchy(
         .iter()
         .map(|(files, _, pattern)| (files.clone(), pattern.clone()))
         .collect();
-    let labels = label_sibling_clusters(&label_input).await;
+    let labels = label_sibling_clusters(&label_input, ollama).await;
 
     // Recurse into children
     let mut children = Vec::new();
@@ -463,6 +396,7 @@ async fn build_hierarchy(
             max_clusters,
             depth + 1,
             max_depth,
+            ollama,
         ))
         .await;
         child.label = labels
@@ -610,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn collect_source_files_from_temp() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
+        let root = dir.path().to_path_buf();
 
         // Create some source files
         let src = root.join("src");
@@ -628,7 +562,10 @@ mod tests {
             .await
             .expect("write");
 
-        let files = collect_source_files(root).await.expect("collect");
+        let config = Config::from_env();
+        let files = collect_source_files_via_walker(&root, &config)
+            .await
+            .expect("collect");
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|f| f.relative_path.contains("main.rs")));
         assert!(files.iter().any(|f| f.relative_path.contains("lib.rs")));

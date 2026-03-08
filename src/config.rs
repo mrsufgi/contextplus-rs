@@ -12,6 +12,7 @@ pub struct Config {
     pub embed_tracker_debounce_ms: u64,
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
+    pub cache_ttl_secs: u64,
 }
 
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
@@ -20,6 +21,7 @@ const DEFAULT_CHAT_MODEL: &str = "llama3.2";
 const DEFAULT_EMBED_BATCH_SIZE: usize = 50;
 const DEFAULT_EMBED_TRACKER_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_EMBED_TRACKER_MAX_FILES: usize = 8;
+const DEFAULT_CACHE_TTL_SECS: u64 = 300;
 const MIN_EMBED_BATCH_SIZE: usize = 5;
 const MAX_EMBED_BATCH_SIZE: usize = 512;
 
@@ -96,6 +98,7 @@ impl Config {
                 DEFAULT_EMBED_TRACKER_MAX_FILES,
             ),
             ignore_dirs: build_ignore_dirs(),
+            cache_ttl_secs: env_parse("CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
         }
     }
 }
@@ -157,6 +160,7 @@ mod tests {
                 "CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS",
                 "CONTEXTPLUS_EMBED_TRACKER_MAX_FILES",
                 "CONTEXTPLUS_IGNORE_DIRS",
+                "CONTEXTPLUS_CACHE_TTL_SECS",
             ],
             || {
                 let cfg = Config::from_env();
@@ -171,6 +175,7 @@ mod tests {
                 assert!(cfg.ignore_dirs.contains("node_modules"));
                 assert!(cfg.ignore_dirs.contains(".git"));
                 assert!(cfg.ignore_dirs.contains("target"));
+                assert_eq!(cfg.cache_ttl_secs, 300);
             },
         );
     }

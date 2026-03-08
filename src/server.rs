@@ -1,14 +1,16 @@
 // MCP server wiring — dispatches tool calls to underlying implementations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::RoleServer;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use serde_json::Value;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::core::embeddings::OllamaClient;
@@ -19,12 +21,21 @@ use crate::core::walker::walk_with_config;
 use crate::error::{ContextPlusError, Result};
 use crate::tools::semantic_search::EmbedFn;
 
+/// Cached project state: walked file entries and their line contents.
+/// Built lazily on first tool call, invalidated by file watcher or TTL expiry.
+pub struct ProjectCache {
+    pub file_entries: Vec<crate::core::walker::FileEntry>,
+    pub file_lines: HashMap<String, Vec<String>>,
+    pub last_refresh: Instant,
+}
+
 /// Shared state accessible by all tool handlers.
 pub struct SharedState {
     pub config: Config,
     pub root_dir: PathBuf,
     pub ollama: OllamaClient,
     pub memory_graph: GraphStore,
+    pub project_cache: RwLock<Option<ProjectCache>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -42,6 +53,7 @@ impl ContextPlusServer {
             root_dir,
             ollama,
             memory_graph,
+            project_cache: RwLock::new(None),
         });
         Self { state }
     }
@@ -82,17 +94,83 @@ impl ContextPlusServer {
 
     // --- Walk + analyze helpers ---
 
-    fn read_file_lines(root: &Path, config: &Config) -> Vec<(String, Vec<String>)> {
-        let entries = walk_with_config(root, config);
-        let mut result = Vec::new();
-        for entry in &entries {
-            let full_path = root.join(&entry.relative_path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-                result.push((entry.relative_path.clone(), lines));
+    /// Returns a snapshot of the project cache, lazily initializing or refreshing
+    /// when the TTL has expired. All filesystem I/O runs inside `spawn_blocking`.
+    async fn ensure_project_cache(&self) -> Result<Arc<ProjectCache>> {
+        let ttl_secs = self.state.config.cache_ttl_secs;
+
+        // Fast path: cache exists and is fresh
+        {
+            let guard = self.state.project_cache.read().await;
+            if let Some(ref cache) = *guard
+                && cache.last_refresh.elapsed().as_secs() < ttl_secs
+            {
+                let file_entries = cache.file_entries.clone();
+                let file_lines = cache.file_lines.clone();
+                let last_refresh = cache.last_refresh;
+                return Ok(Arc::new(ProjectCache {
+                    file_entries,
+                    file_lines,
+                    last_refresh,
+                }));
             }
         }
-        result
+
+        // Slow path: rebuild cache
+        let root = self.state.root_dir.clone();
+        let config = self.state.config.clone();
+
+        let new_cache = tokio::task::spawn_blocking(move || {
+            let entries = walk_with_config(&root, &config);
+            let mut file_lines = HashMap::new();
+            for entry in &entries {
+                if entry.is_directory {
+                    continue;
+                }
+                let full_path = root.join(&entry.relative_path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                    file_lines.insert(entry.relative_path.clone(), lines);
+                }
+            }
+            ProjectCache {
+                file_entries: entries,
+                file_lines,
+                last_refresh: Instant::now(),
+            }
+        })
+        .await
+        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
+
+        let arc_cache = Arc::new(new_cache);
+
+        // Store a clone in the shared state
+        {
+            let mut guard = self.state.project_cache.write().await;
+            *guard = Some(ProjectCache {
+                file_entries: arc_cache.file_entries.clone(),
+                file_lines: arc_cache.file_lines.clone(),
+                last_refresh: arc_cache.last_refresh,
+            });
+        }
+
+        Ok(arc_cache)
+    }
+
+    /// Invalidate the project cache. Called by the file watcher when files change.
+    pub async fn invalidate_project_cache(&self) {
+        let mut guard = self.state.project_cache.write().await;
+        *guard = None;
+    }
+
+    /// Helper: convert cached file_lines HashMap into the Vec<(String, Vec<String>)> format
+    /// expected by blast_radius and semantic_identifier_search.
+    fn file_lines_as_vec(cache: &ProjectCache) -> Vec<(String, Vec<String>)> {
+        cache
+            .file_lines
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     // --- Tool dispatch ---
@@ -140,46 +218,53 @@ impl ContextPlusServer {
         use crate::tools::context_tree as ct;
 
         let root = self.resolve_root(&args);
-        let walker_entries = walk_with_config(&root, &self.state.config);
+        let cache = self.ensure_project_cache().await?;
 
-        // Convert walker entries to context_tree entries
-        let ct_entries: Vec<ct::FileEntry> = walker_entries
-            .iter()
-            .map(|e| ct::FileEntry {
-                relative_path: e.relative_path.clone(),
-                is_directory: e.is_directory,
-                depth: e.depth,
-            })
-            .collect();
+        // Build entries and analyses in spawn_blocking (tree-sitter parsing is CPU-bound)
+        let root_clone = root.clone();
+        let (ct_entries, ct_analyses) = tokio::task::spawn_blocking(move || {
+            let ct_entries: Vec<ct::FileEntry> = cache
+                .file_entries
+                .iter()
+                .map(|e| ct::FileEntry {
+                    relative_path: e.relative_path.clone(),
+                    is_directory: e.is_directory,
+                    depth: e.depth,
+                })
+                .collect();
 
-        // Build analyses using context_tree types
-        let mut ct_analyses = BTreeMap::new();
-        for entry in &walker_entries {
-            if entry.is_directory {
-                continue;
-            }
-            let full_path = root.join(&entry.relative_path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                    let header =
-                        crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
-                    let tree_symbols: Vec<ct::TreeSymbol> =
-                        symbols.iter().map(code_sym_to_tree_sym).collect();
-                    ct_analyses.insert(
-                        entry.relative_path.clone(),
-                        ct::FileAnalysis {
-                            header: if header.is_empty() {
-                                None
-                            } else {
-                                Some(header)
+            let mut ct_analyses = BTreeMap::new();
+            for entry in &cache.file_entries {
+                if entry.is_directory {
+                    continue;
+                }
+                if let Some(lines) = cache.file_lines.get(&entry.relative_path) {
+                    let content = lines.join("\n");
+                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
+                        let line_refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                        let header = crate::core::parser::extract_header(&line_refs);
+                        let tree_symbols: Vec<ct::TreeSymbol> =
+                            symbols.iter().map(code_sym_to_tree_sym).collect();
+                        ct_analyses.insert(
+                            entry.relative_path.clone(),
+                            ct::FileAnalysis {
+                                header: if header.is_empty() {
+                                    None
+                                } else {
+                                    Some(header)
+                                },
+                                symbols: tree_symbols,
                             },
-                            symbols: tree_symbols,
-                        },
-                    );
+                        );
+                    }
                 }
             }
-        }
+            let _ = &root_clone; // ensure root_clone lives through the closure
+            (ct_entries, ct_analyses)
+        })
+        .await
+        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
 
         let options = ct::ContextTreeOptions {
             root_dir: root,
@@ -242,9 +327,9 @@ impl ContextPlusServer {
         let symbol_name = Self::get_str(&args, "symbolName")
             .ok_or_else(|| ContextPlusError::Other("symbolName is required".into()))?;
         let file_context = Self::get_str(&args, "fileContext");
-        let root = self.resolve_root(&args);
 
-        let file_lines = Self::read_file_lines(&root, &self.state.config);
+        let cache = self.ensure_project_cache().await?;
+        let file_lines = Self::file_lines_as_vec(&cache);
 
         let result = crate::tools::blast_radius::find_symbol_usages(
             &symbol_name,
@@ -298,41 +383,48 @@ impl ContextPlusServer {
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         let root = self.resolve_root(&args);
 
-        let file_lines = Self::read_file_lines(&root, &self.state.config);
-        let entries = walk_with_config(&root, &self.state.config);
+        let cache = self.ensure_project_cache().await?;
+        let file_lines = Self::file_lines_as_vec(&cache);
 
-        // Build identifier docs by parsing each file
-        let mut identifier_docs = Vec::new();
-        for entry in &entries {
-            if entry.is_directory {
-                continue;
-            }
-            let full_path = root.join(&entry.relative_path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                    let header =
-                        crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
-                    for sym in crate::core::parser::flatten_symbols(&symbols, None) {
-                        let sig = sym.signature.clone().unwrap_or_default();
-                        let text =
-                            format!("{} {} {} {}", sym.name, sym.kind, entry.relative_path, sig);
-                        identifier_docs.push(IdentifierDoc {
-                            id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
-                            path: entry.relative_path.clone(),
-                            header: header.clone(),
-                            name: sym.name.clone(),
-                            kind: sym.kind.clone(),
-                            line: sym.line,
-                            end_line: sym.end_line,
-                            signature: sig,
-                            parent_name: sym.parent_name.clone(),
-                            text,
-                        });
+        // Build identifier docs by parsing each file (CPU-bound, use spawn_blocking)
+        let identifier_docs = tokio::task::spawn_blocking(move || {
+            let mut docs = Vec::new();
+            for entry in &cache.file_entries {
+                if entry.is_directory {
+                    continue;
+                }
+                if let Some(lines) = cache.file_lines.get(&entry.relative_path) {
+                    let content = lines.join("\n");
+                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
+                        let line_refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                        let header = crate::core::parser::extract_header(&line_refs);
+                        for sym in crate::core::parser::flatten_symbols(&symbols, None) {
+                            let sig = sym.signature.clone().unwrap_or_default();
+                            let text = format!(
+                                "{} {} {} {}",
+                                sym.name, sym.kind, entry.relative_path, sig
+                            );
+                            docs.push(IdentifierDoc {
+                                id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
+                                path: entry.relative_path.clone(),
+                                header: header.clone(),
+                                name: sym.name.clone(),
+                                kind: sym.kind.clone(),
+                                line: sym.line,
+                                end_line: sym.end_line,
+                                signature: sig,
+                                parent_name: sym.parent_name.clone(),
+                                text,
+                            });
+                        }
                     }
                 }
             }
-        }
+            docs
+        })
+        .await
+        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
 
         if identifier_docs.is_empty() {
             return Ok(Self::ok_text(
@@ -389,8 +481,12 @@ impl ContextPlusServer {
             max_clusters: Self::get_usize(&args, "maxClusters"),
         };
 
-        let result =
-            crate::tools::semantic_navigate::semantic_navigate(options, &self.state.ollama).await?;
+        let result = crate::tools::semantic_navigate::semantic_navigate(
+            options,
+            &self.state.ollama,
+            &self.state.config,
+        )
+        .await?;
         Ok(Self::ok_text(result))
     }
 

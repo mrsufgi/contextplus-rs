@@ -19,12 +19,13 @@ const MAX_SINGLE_INPUT_RETRIES: usize = 8;
 // OllamaClient
 // ---------------------------------------------------------------------------
 
-/// HTTP client for Ollama embedding API with adaptive batch/retry.
+/// HTTP client for Ollama embedding and chat APIs with adaptive batch/retry.
 #[derive(Clone)]
 pub struct OllamaClient {
     client: reqwest::Client,
     host: String,
     model: String,
+    chat_model: String,
     batch_size: usize,
 }
 
@@ -49,6 +50,7 @@ impl OllamaClient {
             client,
             host: config.ollama_host.clone(),
             model: config.ollama_embed_model.clone(),
+            chat_model: config.ollama_chat_model.clone(),
             batch_size: config.embed_batch_size,
         }
     }
@@ -71,6 +73,48 @@ impl OllamaClient {
     /// Get the configured batch size.
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Send a chat completion request to Ollama and return the response content.
+    pub async fn chat(&self, prompt: &str) -> Result<String> {
+        let url = format!("{}/api/chat", self.host);
+        let body = serde_json::json!({
+            "model": self.chat_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ContextPlusError::Ollama(format!("Chat request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ContextPlusError::Ollama(format!(
+                "Ollama chat returned {}: {}",
+                status, text
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ChatMessage {
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct ChatResponse {
+            message: ChatMessage,
+        }
+
+        let chat_resp: ChatResponse = resp.json().await.map_err(|e| {
+            ContextPlusError::Ollama(format!("Failed to parse chat response: {}", e))
+        })?;
+
+        Ok(chat_resp.message.content)
     }
 
     fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String]) -> EmbedFuture<'a> {
@@ -617,11 +661,13 @@ mod tests {
         let mut config = Config::from_env();
         config.ollama_host = "http://test:1234".to_string();
         config.ollama_embed_model = "test-model".to_string();
+        config.ollama_chat_model = "test-chat".to_string();
         config.embed_batch_size = 25;
 
         let client = OllamaClient::new(&config);
         assert_eq!(client.host, "http://test:1234");
         assert_eq!(client.model, "test-model");
+        assert_eq!(client.chat_model, "test-chat");
         assert_eq!(client.batch_size, 25);
     }
 }

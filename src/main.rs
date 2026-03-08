@@ -190,7 +190,43 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         config.ollama_embed_model
     );
 
-    let server = ContextPlusServer::new(root_dir, config);
+    let server = ContextPlusServer::new(root_dir.clone(), config.clone());
+
+    // Start the file watcher to invalidate project cache on source changes
+    let _tracker_handle = if config.embed_tracker_enabled {
+        let server_state = server.state.clone();
+        let tracker_config = contextplus_rs::core::embedding_tracker::EmbeddingTrackerConfig {
+            debounce_ms: config.embed_tracker_debounce_ms,
+            max_files_per_tick: config.embed_tracker_max_files,
+            ignore_dirs: config.ignore_dirs.clone(),
+        };
+        let callback: contextplus_rs::core::embedding_tracker::RefreshCallback =
+            std::sync::Arc::new(move |_root, _files| {
+                let state = server_state.clone();
+                tokio::spawn(async move {
+                    let mut guard = state.project_cache.write().await;
+                    *guard = None;
+                    tracing::debug!("Project cache invalidated due to file changes");
+                    (0, 0)
+                })
+            });
+        match contextplus_rs::core::embedding_tracker::start_tracker(
+            root_dir,
+            tracker_config,
+            callback,
+        ) {
+            Ok(handle) => {
+                tracing::info!("File watcher started for project cache invalidation");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start file watcher: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
