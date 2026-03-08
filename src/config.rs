@@ -239,6 +239,38 @@ mod tests {
     }
 
     #[test]
+    fn cache_ttl_secs_default() {
+        with_cleared_env(&["CONTEXTPLUS_CACHE_TTL_SECS"], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.cache_ttl_secs, 300);
+        });
+    }
+
+    #[test]
+    fn cache_ttl_secs_custom() {
+        with_env(&[("CONTEXTPLUS_CACHE_TTL_SECS", "600")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.cache_ttl_secs, 600);
+        });
+    }
+
+    #[test]
+    fn ollama_chat_model_default() {
+        with_cleared_env(&["OLLAMA_CHAT_MODEL"], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.ollama_chat_model, "llama3.2");
+        });
+    }
+
+    #[test]
+    fn ollama_chat_model_custom() {
+        with_env(&[("OLLAMA_CHAT_MODEL", "qwen3:8b")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.ollama_chat_model, "qwen3:8b");
+        });
+    }
+
+    #[test]
     fn tracker_bool_variants() {
         with_env(&[("CONTEXTPLUS_EMBED_TRACKER", "1")], || {
             assert!(Config::from_env().embed_tracker_enabled);

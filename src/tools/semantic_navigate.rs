@@ -541,6 +541,89 @@ mod tests {
         assert!(rendered.contains("    a.rs"));
     }
 
+    #[test]
+    fn extract_header_sql_dash_comments() {
+        let content = "-- Migration script\n-- Adds users table\nCREATE TABLE users();";
+        let header = extract_header(content);
+        assert_eq!(header, "Migration script Adds users table");
+    }
+
+    #[test]
+    fn extract_header_empty_leading_lines() {
+        let content = "\n\n// After blanks\nfn main() {}";
+        let header = extract_header(content);
+        assert_eq!(header, "After blanks");
+    }
+
+    #[test]
+    fn extract_header_empty_content() {
+        let header = extract_header("");
+        assert_eq!(header, "");
+    }
+
+    #[test]
+    fn extract_json_array_nested_brackets() {
+        let text = r#"Sure: [["a", "b"], ["c"]] done"#;
+        let arr = extract_json_array(text);
+        assert_eq!(arr, Some(r#"[["a", "b"], ["c"]]"#.to_string()));
+    }
+
+    #[test]
+    fn extract_json_array_garbage_text() {
+        assert_eq!(extract_json_array("just some random text"), None);
+        assert_eq!(extract_json_array("has ] but no ["), None);
+    }
+
+    #[test]
+    fn extract_json_array_only_brackets() {
+        let arr = extract_json_array("[]");
+        assert_eq!(arr, Some("[]".to_string()));
+    }
+
+    #[test]
+    fn navigate_extensions_contains_expected() {
+        assert!(NAVIGATE_EXTENSIONS.contains(&"rs"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"ts"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"tsx"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"py"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"go"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"sql"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"proto"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"json"));
+        assert!(NAVIGATE_EXTENSIONS.contains(&"yaml"));
+    }
+
+    #[test]
+    fn navigate_extensions_excludes_binary_formats() {
+        assert!(!NAVIGATE_EXTENSIONS.contains(&"png"));
+        assert!(!NAVIGATE_EXTENSIONS.contains(&"jpg"));
+        assert!(!NAVIGATE_EXTENSIONS.contains(&"exe"));
+        assert!(!NAVIGATE_EXTENSIONS.contains(&"wasm"));
+    }
+
+    #[tokio::test]
+    async fn collect_source_files_filters_by_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        tokio::fs::write(root.join("code.rs"), "fn main() {}")
+            .await
+            .expect("write");
+        tokio::fs::write(root.join("image.png"), "fake png")
+            .await
+            .expect("write");
+        tokio::fs::write(root.join("readme.md"), "# Hello")
+            .await
+            .expect("write");
+
+        let config = Config::from_env();
+        let files = collect_source_files_via_walker(&root, &config)
+            .await
+            .expect("collect");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].relative_path.contains("code.rs"));
+    }
+
     #[tokio::test]
     async fn collect_source_files_from_temp() {
         let dir = tempfile::tempdir().expect("tempdir");

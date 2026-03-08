@@ -1436,4 +1436,191 @@ mod tests {
         let args = serde_json::Map::new();
         assert!(parse_metadata(&args).is_none());
     }
+
+    // --- ProjectCache tests ---
+
+    /// Build a ContextPlusServer rooted at the given directory with a custom TTL.
+    fn server_with_root_and_ttl(root: PathBuf, cache_ttl_secs: u64) -> ContextPlusServer {
+        let mut config = Config::from_env();
+        config.cache_ttl_secs = cache_ttl_secs;
+        ContextPlusServer::new(root, config)
+    }
+
+    /// Create a temp dir with a few known files and return (TempDir, server).
+    fn setup_cache_test(ttl_secs: u64) -> (tempfile::TempDir, ContextPlusServer) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(tmp.path().join("hello.txt"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(tmp.path().join("world.rs"), "fn main() {}\n").unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("nested.txt"), "nested content\n").unwrap();
+        let server = server_with_root_and_ttl(tmp.path().to_path_buf(), ttl_secs);
+        (tmp, server)
+    }
+
+    #[tokio::test]
+    async fn ensure_project_cache_creates_cache_on_first_call() {
+        let (_tmp, server) = setup_cache_test(300);
+
+        // Cache starts as None
+        {
+            let guard = server.state.project_cache.read().await;
+            assert!(guard.is_none(), "cache should be None before first call");
+        }
+
+        let cache = server.ensure_project_cache().await.unwrap();
+
+        // Should have found our test files
+        assert!(
+            !cache.file_entries.is_empty(),
+            "file_entries should not be empty"
+        );
+        assert!(
+            !cache.file_lines.is_empty(),
+            "file_lines should not be empty"
+        );
+
+        // Verify specific files are in file_lines
+        let has_hello = cache.file_lines.contains_key("hello.txt");
+        let has_world = cache.file_lines.contains_key("world.rs");
+        assert!(has_hello, "cache should contain hello.txt");
+        assert!(has_world, "cache should contain world.rs");
+
+        // Verify content
+        let hello_lines = &cache.file_lines["hello.txt"];
+        assert_eq!(hello_lines, &["line1", "line2", "line3"]);
+
+        // Cache should now be populated in shared state
+        {
+            let guard = server.state.project_cache.read().await;
+            assert!(
+                guard.is_some(),
+                "cache should be populated after first call"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_project_cache_returns_cached_data_on_second_call() {
+        let (_tmp, server) = setup_cache_test(300);
+
+        let cache1 = server.ensure_project_cache().await.unwrap();
+        let refresh1 = cache1.last_refresh;
+
+        let cache2 = server.ensure_project_cache().await.unwrap();
+        let refresh2 = cache2.last_refresh;
+
+        // Second call should return the same cached data (same refresh timestamp)
+        assert_eq!(
+            refresh1, refresh2,
+            "second call should return cached data with same last_refresh"
+        );
+        assert_eq!(
+            cache1.file_entries.len(),
+            cache2.file_entries.len(),
+            "cached file_entries count should be identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_project_cache_respects_ttl_expiry() {
+        // Use a TTL of 0 so the cache is always expired
+        let (_tmp, server) = setup_cache_test(0);
+
+        let cache1 = server.ensure_project_cache().await.unwrap();
+        let refresh1 = cache1.last_refresh;
+
+        // With TTL=0, the next call should rebuild (new Instant)
+        // Small sleep to ensure Instant::now() differs
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let cache2 = server.ensure_project_cache().await.unwrap();
+        let refresh2 = cache2.last_refresh;
+
+        assert_ne!(
+            refresh1, refresh2,
+            "expired cache should be rebuilt with a new last_refresh"
+        );
+    }
+
+    #[test]
+    fn file_lines_as_vec_converts_hashmap_correctly() {
+        let mut file_lines = HashMap::new();
+        file_lines.insert(
+            "a.txt".to_string(),
+            vec!["alpha".to_string(), "beta".to_string()],
+        );
+        file_lines.insert("b.txt".to_string(), vec!["gamma".to_string()]);
+
+        let cache = ProjectCache {
+            file_entries: vec![],
+            file_lines,
+            last_refresh: Instant::now(),
+        };
+
+        let vec_result = ContextPlusServer::file_lines_as_vec(&cache);
+        assert_eq!(vec_result.len(), 2, "should have 2 entries");
+
+        // Collect into a map for order-independent comparison
+        let result_map: HashMap<String, Vec<String>> = vec_result.into_iter().collect();
+        assert_eq!(
+            result_map["a.txt"],
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(result_map["b.txt"], vec!["gamma".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn invalidate_project_cache_sets_cache_to_none() {
+        let (_tmp, server) = setup_cache_test(300);
+
+        // Populate the cache
+        server.ensure_project_cache().await.unwrap();
+        {
+            let guard = server.state.project_cache.read().await;
+            assert!(
+                guard.is_some(),
+                "cache should be populated before invalidation"
+            );
+        }
+
+        // Invalidate
+        server.invalidate_project_cache().await;
+        {
+            let guard = server.state.project_cache.read().await;
+            assert!(guard.is_none(), "cache should be None after invalidation");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_project_cache_rebuilds_after_invalidation() {
+        let (_tmp, server) = setup_cache_test(300);
+
+        // Populate, invalidate, then rebuild
+        let cache1 = server.ensure_project_cache().await.unwrap();
+        let refresh1 = cache1.last_refresh;
+
+        server.invalidate_project_cache().await;
+
+        // Small sleep to ensure different Instant
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let cache2 = server.ensure_project_cache().await.unwrap();
+        let refresh2 = cache2.last_refresh;
+
+        assert_ne!(
+            refresh1, refresh2,
+            "cache should be rebuilt with new last_refresh after invalidation"
+        );
+
+        // Rebuilt cache should still find the same files
+        assert!(
+            cache2.file_lines.contains_key("hello.txt"),
+            "rebuilt cache should contain hello.txt"
+        );
+        assert!(
+            cache2.file_lines.contains_key("world.rs"),
+            "rebuilt cache should contain world.rs"
+        );
+    }
 }

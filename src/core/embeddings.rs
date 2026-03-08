@@ -670,4 +670,220 @@ mod tests {
         assert_eq!(client.chat_model, "test-chat");
         assert_eq!(client.batch_size, 25);
     }
+
+    // -- OllamaClient::chat tests (wiremock) --
+
+    fn config_with_host(host: &str) -> Config {
+        let mut config = Config::from_env();
+        config.ollama_host = host.to_string();
+        config.ollama_chat_model = "test-chat-model".to_string();
+        config
+    }
+
+    #[tokio::test]
+    async fn chat_success_extracts_content() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": "Hello from LLM" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        let result = client.chat("test prompt").await;
+        assert_eq!(result.unwrap(), "Hello from LLM");
+    }
+
+    #[tokio::test]
+    async fn chat_error_on_non_200() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        let result = client.chat("test prompt").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("500"),
+            "error should mention status code, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sends_configured_model() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": "ok" }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = config_with_host(&server.uri());
+        config.ollama_chat_model = "my-specific-model".to_string();
+        let client = OllamaClient::new(&config);
+        let _ = client.chat("hello").await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "my-specific-model");
+    }
+
+    // -- OllamaClient::embed tests --
+
+    #[tokio::test]
+    async fn embed_empty_input_returns_empty() {
+        // No HTTP call should be made for empty input
+        let mut config = Config::from_env();
+        config.ollama_host = "http://localhost:0".to_string(); // unreachable port
+        let client = OllamaClient::new(&config);
+        let result = client.embed(&[]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    // -- shrink_input UTF-8 safety --
+
+    #[test]
+    fn shrink_input_utf8_multibyte_safety() {
+        // Build a string with multi-byte UTF-8 characters exceeding MIN_EMBED_INPUT_CHARS
+        // Each emoji is 4 bytes; we need enough to exceed the minimum
+        let emoji = "\u{1F600}"; // grinning face, 4 bytes
+        let count = (MIN_EMBED_INPUT_CHARS / emoji.len()) + 50;
+        let input: String = emoji.repeat(count);
+        assert!(input.len() > MIN_EMBED_INPUT_CHARS);
+
+        let shrunk = shrink_input(&input);
+        assert!(shrunk.len() < input.len());
+        // Must be valid UTF-8 (would panic on invalid)
+        assert!(std::str::from_utf8(shrunk.as_bytes()).is_ok());
+        // Must not split a multi-byte char: length should be multiple of 4
+        assert_eq!(
+            shrunk.len() % 4,
+            0,
+            "shrunk length {} should be a multiple of 4 (emoji bytes)",
+            shrunk.len()
+        );
+    }
+
+    #[test]
+    fn shrink_input_mixed_utf8() {
+        // Mix of ASCII and multi-byte: "a" (1 byte) + "\u{00E9}" (2 bytes) + "\u{1F600}" (4 bytes)
+        let base = "a\u{00E9}\u{1F600}"; // 7 bytes per unit
+        let count = (MIN_EMBED_INPUT_CHARS / base.len()) + 20;
+        let input: String = base.repeat(count);
+        assert!(input.len() > MIN_EMBED_INPUT_CHARS);
+
+        let shrunk = shrink_input(&input);
+        assert!(shrunk.len() < input.len());
+        // Validate it's still valid UTF-8
+        assert!(std::str::from_utf8(shrunk.as_bytes()).is_ok());
+    }
+
+    // -- is_context_length_error tests --
+
+    #[test]
+    fn detects_context_length_error_exact() {
+        let err = ContextPlusError::Ollama("input length exceeds context length".into());
+        assert!(is_context_length_error(&err));
+    }
+
+    #[test]
+    fn detects_context_length_error_variant() {
+        let err = ContextPlusError::Ollama("context window exceeded for model".into());
+        assert!(is_context_length_error(&err));
+    }
+
+    #[test]
+    fn non_context_error_not_detected() {
+        let err = ContextPlusError::Ollama("connection refused".into());
+        assert!(!is_context_length_error(&err));
+    }
+
+    #[test]
+    fn io_error_not_context_length() {
+        let err = ContextPlusError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "context exceeded",
+        ));
+        // The error message contains "context" and "exceed" but check it via to_string
+        // IO error wraps differently: "IO error: context exceeded"
+        // is_context_length_error checks to_string().to_lowercase()
+        // This should still match because the string contains both words
+        let result = is_context_length_error(&err);
+        // The Display impl prepends "IO error: " so the lowercase string is
+        // "io error: context exceeded" which contains "context" and "exceed"
+        assert!(result);
+    }
+
+    // -- cosine_similarity_naive additional tests --
+
+    #[test]
+    fn naive_cosine_orthogonal() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let sim = cosine_similarity_naive(&a, &b);
+        assert!(
+            sim.abs() < 1e-6,
+            "orthogonal vectors should have similarity ~0.0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn naive_cosine_parallel() {
+        let a = vec![3.0, 4.0];
+        let b = vec![6.0, 8.0]; // same direction, different magnitude
+        let sim = cosine_similarity_naive(&a, &b);
+        assert!(
+            (sim - 1.0).abs() < 1e-6,
+            "parallel vectors should have similarity ~1.0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn naive_cosine_anti_parallel() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![-1.0, -2.0, -3.0];
+        let sim = cosine_similarity_naive(&a, &b);
+        assert!(
+            (sim - (-1.0)).abs() < 1e-6,
+            "anti-parallel vectors should have similarity ~-1.0, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn naive_cosine_empty_vectors() {
+        let a: Vec<f32> = vec![];
+        let b: Vec<f32> = vec![];
+        let sim = cosine_similarity_naive(&a, &b);
+        assert_eq!(sim, 0.0, "empty vectors should return 0.0");
+    }
+
+    #[test]
+    fn naive_cosine_zero_vector() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 2.0, 3.0];
+        let sim = cosine_similarity_naive(&a, &b);
+        assert_eq!(sim, 0.0, "zero vector should return 0.0");
+    }
 }

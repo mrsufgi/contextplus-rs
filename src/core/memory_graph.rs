@@ -1009,6 +1009,67 @@ mod tests {
     }
 
     #[test]
+    fn temporal_decay_formula_verification() {
+        // decay_weight computes: weight * exp(-DECAY_LAMBDA * days)
+        // For 10 days with weight 1.0: exp(-0.05 * 10) = exp(-0.5) ~ 0.6065
+        let ten_days_ago = now_millis() - (10 * 86_400_000);
+        let edge = MemoryEdge {
+            id: "test".to_string(),
+            relation: RelationType::RelatesTo,
+            weight: 1.0,
+            created_at: ten_days_ago,
+            metadata: HashMap::new(),
+        };
+        let decayed = MemoryGraph::decay_weight(&edge);
+        let expected = (-0.05_f64 * 10.0).exp(); // ~0.6065
+        assert!(
+            (decayed - expected).abs() < 0.02,
+            "expected ~{:.4}, got {:.4}",
+            expected,
+            decayed
+        );
+    }
+
+    #[test]
+    fn temporal_decay_scales_with_weight() {
+        let one_day_ago = now_millis() - 86_400_000;
+        let edge = MemoryEdge {
+            id: "test".to_string(),
+            relation: RelationType::RelatesTo,
+            weight: 2.0,
+            created_at: one_day_ago,
+            metadata: HashMap::new(),
+        };
+        let decayed = MemoryGraph::decay_weight(&edge);
+        let expected = 2.0 * (-0.05_f64).exp(); // ~1.9025
+        assert!(
+            (decayed - expected).abs() < 0.02,
+            "expected ~{:.4}, got {:.4}",
+            expected,
+            decayed
+        );
+    }
+
+    #[test]
+    fn memory_graph_new_is_empty() {
+        let graph = MemoryGraph::new();
+        assert_eq!(graph.graph.node_count(), 0);
+        assert_eq!(graph.graph.edge_count(), 0);
+        assert!(graph.node_index.is_empty());
+        assert!(graph.id_index.is_empty());
+        assert!(!graph.is_dirty());
+    }
+
+    #[test]
+    fn memory_graph_default_equals_new() {
+        let from_new = MemoryGraph::new();
+        let from_default = MemoryGraph::default();
+        assert_eq!(from_new.graph.node_count(), from_default.graph.node_count());
+        assert_eq!(from_new.graph.edge_count(), from_default.graph.edge_count());
+        assert_eq!(from_new.is_dirty(), from_default.is_dirty());
+    }
+
+    #[test]
     fn node_type_roundtrip() {
         for nt in [
             NodeType::Concept,

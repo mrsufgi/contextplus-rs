@@ -299,6 +299,18 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_tokens_char_div_4_rounding() {
+        // 12 chars / 4 = 3 tokens exactly
+        assert_eq!(estimate_tokens("abcdefghijkl"), 3);
+        // 13 chars / 4 = 3.25 -> ceil = 4
+        assert_eq!(estimate_tokens("abcdefghijklm"), 4);
+        // 16 chars / 4 = 4 exactly
+        assert_eq!(estimate_tokens("abcdefghijklmnop"), 4);
+        // 17 chars / 4 = 4.25 -> ceil = 5
+        assert_eq!(estimate_tokens("abcdefghijklmnopq"), 5);
+    }
+
+    #[test]
     fn test_format_symbol() {
         let sym = TreeSymbol {
             name: "getUser".to_string(),

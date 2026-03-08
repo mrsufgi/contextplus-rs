@@ -288,6 +288,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_affinity_known_vectors() {
+        // Two identical vectors -> cosine similarity 1.0, one orthogonal -> 0.0
+        let vectors = vec![
+            vec![1.0_f32, 0.0, 0.0],
+            vec![1.0_f32, 0.0, 0.0],
+            vec![0.0_f32, 1.0, 0.0],
+        ];
+        let aff = build_affinity_matrix(&vectors);
+        // (0,1) should be 1.0 (identical)
+        assert!((aff[(0, 1)] - 1.0).abs() < 1e-6);
+        // (0,2) should be 0.0 (orthogonal)
+        assert!(aff[(0, 2)].abs() < 1e-6);
+        // Diagonal should be 0.0
+        assert_eq!(aff[(0, 0)], 0.0);
+        assert_eq!(aff[(1, 1)], 0.0);
+    }
+
+    #[test]
+    fn build_affinity_clamps_negative() {
+        // Opposite vectors have cosine -1.0, should be clamped to 0.0
+        let vectors = vec![vec![1.0_f32, 0.0], vec![-1.0_f32, 0.0]];
+        let aff = build_affinity_matrix(&vectors);
+        assert_eq!(aff[(0, 1)], 0.0);
+    }
+
+    #[test]
+    fn eigengap_heuristic_clear_gap() {
+        // Gap at position 2->3 is largest
+        let eigenvalues = vec![0.0, 0.01, 0.5, 0.51, 0.52];
+        let k = find_optimal_k(&eigenvalues, 4);
+        assert_eq!(k, 2);
+    }
+
+    #[test]
+    fn eigengap_heuristic_respects_max_k() {
+        // Large gap at position 5, but max_k=3 should cap the search
+        let eigenvalues = vec![0.0, 0.01, 0.02, 0.03, 0.04, 0.9];
+        let k = find_optimal_k(&eigenvalues, 3);
+        assert!(k <= 3, "k={} should be <= max_k=3", k);
+    }
+
+    #[test]
+    fn kmeans_obvious_two_clusters() {
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![0.05, 0.05],
+            vec![-0.05, 0.05],
+            vec![100.0, 100.0],
+            vec![100.05, 99.95],
+            vec![99.95, 100.05],
+        ];
+        let assignments = kmeans(&data, 2);
+        // First 3 should be in same cluster
+        assert_eq!(assignments[0], assignments[1]);
+        assert_eq!(assignments[0], assignments[2]);
+        // Last 3 should be in same cluster
+        assert_eq!(assignments[3], assignments[4]);
+        assert_eq!(assignments[3], assignments[5]);
+        // Two clusters should differ
+        assert_ne!(assignments[0], assignments[3]);
+    }
+
+    #[test]
+    fn kmeans_empty_data() {
+        let data: Vec<Vec<f64>> = vec![];
+        let assignments = kmeans(&data, 3);
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn kmeans_single_point() {
+        let data = vec![vec![1.0, 2.0]];
+        let assignments = kmeans(&data, 1);
+        assert_eq!(assignments, vec![0]);
+    }
+
+    #[test]
     fn cosine_sim_identical_vectors() {
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![1.0_f32, 0.0, 0.0];

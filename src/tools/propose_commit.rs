@@ -255,6 +255,77 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn validate_header_valid_two_lines() {
+        let lines = vec!["// First line", "// Second line", "code here"];
+        let errors = validate_header(&lines, "ts");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn validate_header_missing_returns_error() {
+        let lines = vec!["let x = 1;", "let y = 2;"];
+        let errors = validate_header(&lines, "ts");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].rule, "header");
+        assert!(errors[0].message.contains("Missing 2-line"));
+    }
+
+    #[test]
+    fn validate_header_one_comment_line_insufficient() {
+        let lines = vec!["// Only one", "code here"];
+        let errors = validate_header(&lines, "rs");
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn validate_no_inline_comments_clean_code() {
+        let lines = vec!["// header 1", "// header 2", "fn main() {}", "let x = 1;"];
+        let errors = validate_no_inline_comments(&lines, "rs");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn validate_no_inline_comments_flags_comment_after_header() {
+        let lines = vec![
+            "// header 1",
+            "// header 2",
+            "fn main() {}",
+            "  // rogue comment",
+            "let x = 1;",
+        ];
+        let errors = validate_no_inline_comments(&lines, "rs");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].rule, "no-comments");
+        assert!(errors[0].message.contains("line 4"));
+    }
+
+    #[test]
+    fn nesting_depth_flat_code() {
+        let lines = vec!["let a = 1;", "let b = 2;", "let c = 3;"];
+        let errors = validate_abstraction(&lines);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn nesting_depth_deeply_nested() {
+        let lines = vec![
+            "{", "{", "{", "{", "{", "{", "{", "}", "}", "}", "}", "}", "}", "}",
+        ];
+        let errors = validate_abstraction(&lines);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].rule, "nesting");
+        assert!(errors[0].message.contains("7"));
+    }
+
+    #[test]
+    fn nesting_depth_exactly_at_limit() {
+        // Depth of exactly 6 should pass (MAX_NESTING_DEPTH = 6)
+        let lines = vec!["{", "{", "{", "{", "{", "{", "}", "}", "}", "}", "}", "}"];
+        let errors = validate_abstraction(&lines);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn header_valid_when_two_comment_lines() {
         let lines = vec!["// Line one", "// Line two", "fn main() {}"];
         let errors = validate_header(&lines, "rs");
