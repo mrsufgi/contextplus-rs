@@ -122,7 +122,7 @@ fn validate_no_inline_comments(lines: &[&str], ext: &str) -> Vec<ValidationError
                 message: format!(
                     "Unauthorized comment found on line {}: {}",
                     i + 1,
-                    &trimmed[..trimmed.len().min(80)]
+                    crate::core::parser::truncate_to_char_boundary(trimmed, 80)
                 ),
             });
         }

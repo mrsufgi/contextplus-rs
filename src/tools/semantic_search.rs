@@ -304,7 +304,7 @@ fn compute_combined_score(
 pub fn sanitize_query(query: &str) -> String {
     let q = query.trim();
     if q.len() > MAX_QUERY_LEN {
-        q[..MAX_QUERY_LEN].to_string()
+        crate::core::parser::truncate_to_char_boundary(q, MAX_QUERY_LEN).to_string()
     } else {
         q.to_string()
     }

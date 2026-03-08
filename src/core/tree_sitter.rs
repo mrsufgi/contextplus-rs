@@ -133,7 +133,7 @@ fn extract_signature<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
     let text = node.utf8_text(source).unwrap_or("");
     let first_line = text.lines().next().unwrap_or("").trim();
     if first_line.len() > 150 {
-        format!("{}...", &first_line[..150])
+        format!("{}...", crate::core::parser::truncate_to_char_boundary(first_line, 150))
     } else {
         first_line.to_string()
     }
@@ -199,6 +199,7 @@ pub fn parse_with_tree_sitter(content: &str, ext: &str) -> Result<Vec<CodeSymbol
 
     PARSER.with(|parser_cell| {
         let mut parser = parser_cell.borrow_mut();
+        parser.reset();
         parser
             .set_language(&language)
             .map_err(|e| ContextPlusError::TreeSitter(format!("set_language failed: {}", e)))?;
