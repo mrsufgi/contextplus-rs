@@ -36,6 +36,9 @@ pub struct SharedState {
     pub ollama: OllamaClient,
     pub memory_graph: GraphStore,
     pub project_cache: RwLock<Option<ProjectCache>>,
+    /// Cached embedding vectors keyed by relative file path.
+    /// Shared across semantic_navigate and other embedding-based tools.
+    pub embedding_cache: RwLock<HashMap<String, Vec<f32>>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -54,6 +57,7 @@ impl ContextPlusServer {
             ollama,
             memory_graph,
             project_cache: RwLock::new(None),
+            embedding_cache: RwLock::new(HashMap::new()),
         });
         Self { state }
     }
@@ -161,6 +165,9 @@ impl ContextPlusServer {
     pub async fn invalidate_project_cache(&self) {
         let mut guard = self.state.project_cache.write().await;
         *guard = None;
+        // Also clear embedding cache so stale vectors aren't used after file changes
+        let mut embed_guard = self.state.embedding_cache.write().await;
+        embed_guard.clear();
     }
 
     /// Helper: convert cached file_lines HashMap into the Vec<(String, Vec<String>)> format
@@ -485,6 +492,7 @@ impl ContextPlusServer {
             options,
             &self.state.ollama,
             &self.state.config,
+            &self.state.embedding_cache,
         )
         .await?;
         Ok(Self::ok_text(result))

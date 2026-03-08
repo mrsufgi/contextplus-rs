@@ -7,8 +7,9 @@ use crate::core::embeddings::OllamaClient;
 use crate::core::walker;
 use crate::error::Result;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tokio::sync::RwLock;
 
 const MAX_FILES_PER_LEAF: usize = 20;
 
@@ -49,10 +50,14 @@ struct ClusterNode {
 }
 
 /// Perform semantic navigation: embed files, cluster, label, return tree.
+///
+/// Uses `embedding_cache` to avoid re-embedding files that haven't changed.
+/// On warm runs (cache populated), this skips all Ollama embed calls entirely.
 pub async fn semantic_navigate(
     options: SemanticNavigateOptions,
     ollama: &OllamaClient,
     config: &Config,
+    embedding_cache: &RwLock<HashMap<String, Vec<f32>>>,
 ) -> Result<String> {
     let max_clusters = options.max_clusters.unwrap_or(20);
     let max_depth = options.max_depth.unwrap_or(3);
@@ -64,14 +69,8 @@ pub async fn semantic_navigate(
         return Ok("No supported source files found in the project.".to_string());
     }
 
-    // Build embedding texts
-    let embed_texts: Vec<String> = files
-        .iter()
-        .map(|f| format!("{} {} {}", f.header, f.relative_path, f.content))
-        .collect();
-
-    // Fetch embeddings via OllamaClient
-    let vectors = match ollama.embed(&embed_texts).await {
+    // Resolve vectors: check cache first, embed only uncached files
+    let vectors = match resolve_embeddings(&files, ollama, embedding_cache).await {
         Ok(v) => v,
         Err(e) => {
             return Ok(format!(
@@ -158,6 +157,65 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
     }
 
     Ok(files)
+}
+
+/// Resolve embedding vectors for files, using cache where possible.
+///
+/// Returns one Vec<f32> per file (same order as `files`).
+/// Reads from `embedding_cache` first; only calls Ollama for files not in cache.
+/// Stores newly embedded vectors back into the cache for future calls.
+async fn resolve_embeddings(
+    files: &[FileInfo],
+    ollama: &OllamaClient,
+    embedding_cache: &RwLock<HashMap<String, Vec<f32>>>,
+) -> std::result::Result<Vec<Vec<f32>>, crate::error::ContextPlusError> {
+    let cache_read = embedding_cache.read().await;
+
+    // Partition: which files have cached vectors, which need embedding
+    let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(files.len());
+    let mut uncached_indices: Vec<usize> = Vec::new();
+    let mut uncached_texts: Vec<String> = Vec::new();
+
+    for (i, file) in files.iter().enumerate() {
+        if let Some(vec) = cache_read.get(&file.relative_path) {
+            result_vectors.push(Some(vec.clone()));
+        } else {
+            result_vectors.push(None);
+            uncached_indices.push(i);
+            uncached_texts.push(format!(
+                "{} {} {}",
+                file.header, file.relative_path, file.content
+            ));
+        }
+    }
+    drop(cache_read);
+
+    // If everything was cached, skip Ollama entirely
+    if uncached_indices.is_empty() {
+        return Ok(result_vectors.into_iter().map(|v| v.unwrap()).collect());
+    }
+
+    // Embed only the uncached files
+    let new_vectors = ollama.embed(&uncached_texts).await?;
+
+    // Store new vectors in cache and fill result
+    {
+        let mut cache_write = embedding_cache.write().await;
+        for (j, &file_idx) in uncached_indices.iter().enumerate() {
+            if j < new_vectors.len() {
+                cache_write.insert(
+                    files[file_idx].relative_path.clone(),
+                    new_vectors[j].clone(),
+                );
+                result_vectors[file_idx] = Some(new_vectors[j].clone());
+            }
+        }
+    }
+
+    Ok(result_vectors
+        .into_iter()
+        .map(|v| v.unwrap_or_default())
+        .collect())
 }
 
 /// Extract a header comment from the first few lines of a file.
@@ -1324,5 +1382,130 @@ mod tests {
     fn extract_json_array_only_close_bracket() {
         // Has ']' but no '['
         assert_eq!(extract_json_array("]"), None);
+    }
+
+    // ── resolve_embeddings cache tests ────────────────────────────────
+
+    fn make_test_file(path: &str) -> FileInfo {
+        FileInfo {
+            relative_path: path.to_string(),
+            header: format!("header for {path}"),
+            content: format!("content of {path}"),
+            symbol_preview: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_embeddings_all_cached_skips_ollama() {
+        // Pre-populate cache with known vectors
+        let cache: RwLock<HashMap<String, Vec<f32>>> = RwLock::new(HashMap::new());
+        {
+            let mut w = cache.write().await;
+            w.insert("src/a.rs".to_string(), vec![1.0, 2.0, 3.0]);
+            w.insert("src/b.rs".to_string(), vec![4.0, 5.0, 6.0]);
+        }
+
+        let files = vec![make_test_file("src/a.rs"), make_test_file("src/b.rs")];
+
+        // OllamaClient pointing to a non-existent server — if it tries to call
+        // Ollama it will fail. Success proves cache was used.
+        let config = crate::config::Config::from_env();
+        let mut bad_config = config.clone();
+        bad_config.ollama_host = "http://127.0.0.1:1".to_string(); // unreachable
+        let ollama = OllamaClient::new(&bad_config);
+
+        let result = resolve_embeddings(&files, &ollama, &cache).await;
+        assert!(result.is_ok(), "should succeed from cache without Ollama");
+        let vecs = result.unwrap();
+        assert_eq!(vecs.len(), 2);
+        assert_eq!(vecs[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(vecs[1], vec![4.0, 5.0, 6.0]);
+    }
+
+    #[tokio::test]
+    async fn resolve_embeddings_partial_cache_only_embeds_missing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Return a single 3-dim vector for each embed call
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embeddings": [[7.0, 8.0, 9.0]]
+            })))
+            .expect(1) // Should only be called ONCE (for the uncached file)
+            .mount(&mock_server)
+            .await;
+
+        let cache: RwLock<HashMap<String, Vec<f32>>> = RwLock::new(HashMap::new());
+        {
+            let mut w = cache.write().await;
+            w.insert("src/cached.rs".to_string(), vec![1.0, 2.0, 3.0]);
+        }
+
+        let files = vec![
+            make_test_file("src/cached.rs"),
+            make_test_file("src/uncached.rs"),
+        ];
+
+        let mut config = crate::config::Config::from_env();
+        config.ollama_host = mock_server.uri();
+        let ollama = OllamaClient::new(&config);
+
+        let result = resolve_embeddings(&files, &ollama, &cache).await;
+        assert!(result.is_ok());
+        let vecs = result.unwrap();
+        assert_eq!(vecs[0], vec![1.0, 2.0, 3.0]); // from cache
+        assert_eq!(vecs[1], vec![7.0, 8.0, 9.0]); // from Ollama
+
+        // Verify the newly embedded vector was stored in cache
+        let r = cache.read().await;
+        assert_eq!(r.get("src/uncached.rs").unwrap(), &vec![7.0, 8.0, 9.0]);
+    }
+
+    #[tokio::test]
+    async fn resolve_embeddings_stores_all_new_vectors_in_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "embeddings": [[1.0, 0.0], [0.0, 1.0]]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let cache: RwLock<HashMap<String, Vec<f32>>> = RwLock::new(HashMap::new());
+        let files = vec![make_test_file("a.ts"), make_test_file("b.ts")];
+
+        let mut config = crate::config::Config::from_env();
+        config.ollama_host = mock_server.uri();
+        let ollama = OllamaClient::new(&config);
+
+        let result = resolve_embeddings(&files, &ollama, &cache).await.unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Both should now be in cache
+        let r = cache.read().await;
+        assert_eq!(r.len(), 2);
+        assert!(r.contains_key("a.ts"));
+        assert!(r.contains_key("b.ts"));
+    }
+
+    #[tokio::test]
+    async fn resolve_embeddings_empty_files_returns_empty() {
+        let cache: RwLock<HashMap<String, Vec<f32>>> = RwLock::new(HashMap::new());
+        let files: Vec<FileInfo> = vec![];
+
+        let config = crate::config::Config::from_env();
+        let ollama = OllamaClient::new(&config);
+
+        let result = resolve_embeddings(&files, &ollama, &cache).await.unwrap();
+        assert!(result.is_empty());
     }
 }
