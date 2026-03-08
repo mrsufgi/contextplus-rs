@@ -4,7 +4,42 @@ High-performance [MCP](https://modelcontextprotocol.io/) server for semantic cod
 
 ## Why Rust?
 
-The original TypeScript Context+ server has measured bottlenecks:
+### Cold Start Benchmark (fresh process per call)
+
+Measured against the workspace (~2800 source files), each call spawns a fresh process:
+
+| Tool | Rust | TypeScript | Grep | Rust vs TS |
+|------|------|-----------|------|------------|
+| `get_file_skeleton` | **1,712 ms** | 4,030 ms | 1,315 ms* | **2.4x faster** |
+| `get_context_tree` | **1,857 ms** | 4,002 ms | 1,382 ms* | **2.2x faster** |
+| `get_blast_radius` | **1,881 ms** | 4,148 ms | 1,323 ms* | **2.2x faster** |
+| `semantic_code_search` | **1,684 ms** | 4,081 ms | 2,448 ms* | **2.4x faster** |
+| `semantic_identifier_search` | **1,854 ms** | 4,128 ms | 1,296 ms* | **2.2x faster** |
+| **Average** | **1,798 ms** | **4,078 ms** | **1,553 ms** | **2.3x faster** |
+
+\* Grep is fast but returns raw matches — see token comparison below.
+
+### Token Efficiency (MCP vs Grep)
+
+MCP tools return ranked, structured results. Grep returns raw lines.
+
+| Query | MCP Output | Grep Output | Reduction |
+|-------|-----------|-------------|-----------|
+| File skeleton (profile.ts) | ~400 tokens | ~1,678 tokens | **4x fewer** |
+| Context tree (scheduling) | ~1,250 tokens | ~707K tokens | **566x fewer** |
+| Blast radius (createProfileService) | ~300 tokens | ~1,419 tokens | **5x fewer** |
+| Semantic search ("form validation") | ~500 tokens | ~42.7M tokens | **85,000x fewer** |
+| Identifier search ("membership") | ~625 tokens | ~23.9M tokens | **38,000x fewer** |
+
+### 20-Search Session Cost
+
+| Engine | Wall Time | Tokens Consumed |
+|--------|-----------|-----------------|
+| **Rust MCP** | **~28s** | **~10K tokens** |
+| TS MCP | ~73s | ~10K tokens |
+| Grep | ~96s | **~268M tokens** |
+
+### Internal Bottleneck Comparison
 
 | Bottleneck | TypeScript | Rust | Improvement |
 |------------|-----------|------|-------------|
@@ -19,6 +54,7 @@ Rust eliminates all overhead via:
 - **SIMD cosine similarity** via `simsimd` (AVX-512/AVX2 auto-dispatch)
 - **Native tree-sitter** (compiled in, no WASM VM)
 - **Binary serialization** (rkyv replaces JSON for memory graph)
+- **Disk-persistent embedding cache** with content-hash staleness detection
 
 ## Install
 
@@ -87,14 +123,15 @@ Add to your MCP config (`~/.claude/mcp.json` or project `.mcp.json`):
 ### CLI subcommands
 
 ```bash
-# Initialize .mcp_data directory
-contextplus-rs --root-dir . init
+# Generate MCP config for your editor (claude, cursor, vscode, windsurf, opencode)
+contextplus-rs init claude
+contextplus-rs init cursor
 
 # Print file skeleton
-contextplus-rs --root-dir . skeleton src/main.rs
+contextplus-rs skeleton src/main.rs
 
 # Print context tree
-contextplus-rs --root-dir . tree --max-tokens 5000
+contextplus-rs tree --max-tokens 5000
 ```
 
 ## Tools (17)
@@ -178,10 +215,9 @@ TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Bash
 ## Development
 
 ```bash
-cargo test                  # Run all tests
-cargo clippy                # Lint
+cargo test                  # 571 tests
+cargo clippy --all-targets  # Lint
 cargo fmt --check           # Format check
-cargo bench                 # Run benchmarks
 ```
 
 ## Credits
