@@ -6,6 +6,10 @@ description = "High-performance MCP server for semantic code analysis via Ollama
 license = "MIT"
 repository = "https://github.com/mrsufgi/contextplus-rs"
 
+[lib]
+name = "contextplus_rs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "contextplus-rs"
 path = "src/main.rs"

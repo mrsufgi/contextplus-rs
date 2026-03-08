@@ -1,1 +1,377 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::core::embeddings::{CacheEntry, VectorStore};
+use crate::error::{ContextPlusError, Result};
+
+// ---------------------------------------------------------------------------
+// Cache directory
+// ---------------------------------------------------------------------------
+
+const CACHE_DIR: &str = ".mcp_data";
+const CACHE_VERSION: u8 = 1;
+/// Header size padded to 16-byte alignment so rkyv data starts aligned.
+const HEADER_SIZE: usize = 16;
+
+fn cache_dir(root_dir: &Path) -> PathBuf {
+    root_dir.join(CACHE_DIR)
+}
+
+fn cache_path(root_dir: &Path, name: &str) -> PathBuf {
+    cache_dir(root_dir).join(format!("{}.rkyv", name))
+}
+
+pub fn ensure_cache_dir(root_dir: &Path) -> Result<()> {
+    fs::create_dir_all(cache_dir(root_dir))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Serializable cache format
+// ---------------------------------------------------------------------------
+
+#[derive(Archive, Serialize, Deserialize, Debug)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub struct CacheData {
+    pub dims: u32,
+    pub keys: Vec<String>,
+    pub hashes: Vec<String>,
+    pub vectors: Vec<f32>,
+}
+
+impl CacheData {
+    /// Build from a VectorStore.
+    pub fn from_store(store: &VectorStore) -> Self {
+        Self {
+            dims: store.dims() as u32,
+            keys: store.keys().to_vec(),
+            hashes: store.hashes().to_vec(),
+            vectors: store.vectors_data().to_vec(),
+        }
+    }
+
+    /// Convert to a VectorStore.
+    pub fn to_store(&self) -> VectorStore {
+        VectorStore::new(
+            self.dims,
+            self.keys.clone(),
+            self.hashes.clone(),
+            self.vectors.clone(),
+        )
+    }
+
+    /// Build from a cache map.
+    pub fn from_cache_map(cache: &HashMap<String, CacheEntry>) -> Option<Self> {
+        if cache.is_empty() {
+            return None;
+        }
+        let keys: Vec<String> = cache.keys().cloned().collect();
+        let dims = cache[&keys[0]].vector.len() as u32;
+        let hashes: Vec<String> = keys.iter().map(|k| cache[k].hash.clone()).collect();
+        let mut vectors = Vec::with_capacity(keys.len() * dims as usize);
+        for key in &keys {
+            vectors.extend_from_slice(&cache[key].vector);
+        }
+        Some(Self {
+            dims,
+            keys,
+            hashes,
+            vectors,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Save / Load with rkyv
+// ---------------------------------------------------------------------------
+
+/// Save a CacheData to disk using rkyv serialization.
+/// Uses atomic write: write to temp file then rename.
+pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
+    ensure_cache_dir(root_dir)?;
+
+    let bytes =
+        rkyv::to_bytes::<rkyv::rancor::Error>(data)
+            .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
+
+    let path = cache_path(root_dir, name);
+    let tmp_path = path.with_extension("rkyv.tmp");
+
+    // Write: 16-byte aligned header (version + padding) + rkyv data
+    let mut buf = Vec::with_capacity(HEADER_SIZE + bytes.len());
+    buf.resize(HEADER_SIZE, 0);
+    buf[0] = CACHE_VERSION;
+    buf.extend_from_slice(&bytes);
+
+    fs::write(&tmp_path, &buf)?;
+    fs::rename(&tmp_path, &path)?;
+
+    Ok(())
+}
+
+/// Load a CacheData from disk.
+/// Validates version byte and uses rkyv bytecheck for safe deserialization.
+pub fn load_cache(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
+    let path = cache_path(root_dir, name);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)?;
+    if bytes.len() < HEADER_SIZE {
+        return Ok(None);
+    }
+
+    // Check version
+    if bytes[0] != CACHE_VERSION {
+        return Err(ContextPlusError::Cache(format!(
+            "unsupported cache version: {} (expected {})",
+            bytes[0], CACHE_VERSION
+        )));
+    }
+
+    let data_bytes = &bytes[HEADER_SIZE..];
+
+    let data = rkyv::from_bytes::<CacheData, rkyv::rancor::Error>(data_bytes)
+        .map_err(|e| ContextPlusError::Cache(format!("rkyv deserialize: {}", e)))?;
+
+    Ok(Some(data))
+}
+
+/// Load directly into a VectorStore.
+pub fn load_vector_store(root_dir: &Path, name: &str) -> Result<Option<VectorStore>> {
+    match load_cache(root_dir, name)? {
+        Some(data) => Ok(Some(data.to_store())),
+        None => Ok(None),
+    }
+}
+
+/// Save a VectorStore to disk.
+pub fn save_vector_store(root_dir: &Path, name: &str, store: &VectorStore) -> Result<()> {
+    let data = CacheData::from_store(store);
+    save_cache(root_dir, name, &data)
+}
+
+/// Load cache with mmap for zero-copy read (uses memmap2).
+/// Falls back to regular load on mmap failure.
+pub fn load_cache_mmap(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
+    let path = cache_path(root_dir, name);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = fs::File::open(&path)?;
+    let metadata = file.metadata()?;
+    if (metadata.len() as usize) < HEADER_SIZE + 1 {
+        return Ok(None);
+    }
+
+    // Try mmap
+    let mmap = unsafe { memmap2::Mmap::map(&file) };
+    match mmap {
+        Ok(mmap) => {
+            if mmap[0] != CACHE_VERSION {
+                return Err(ContextPlusError::Cache(format!(
+                    "unsupported cache version: {} (expected {})",
+                    mmap[0], CACHE_VERSION
+                )));
+            }
+            let data_bytes = &mmap[HEADER_SIZE..];
+            let data =
+                rkyv::from_bytes::<CacheData, rkyv::rancor::Error>(data_bytes)
+                    .map_err(|e| ContextPlusError::Cache(format!("rkyv mmap deserialize: {}", e)))?;
+            Ok(Some(data))
+        }
+        Err(_) => {
+            // Fallback to regular load
+            load_cache(root_dir, name)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_test_data() -> CacheData {
+        CacheData {
+            dims: 3,
+            keys: vec![
+                "src/auth.ts".to_string(),
+                "src/db.ts".to_string(),
+            ],
+            hashes: vec!["hash_a".to_string(), "hash_b".to_string()],
+            vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        }
+    }
+
+    #[test]
+    fn rkyv_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let data = make_test_data();
+
+        save_cache(dir.path(), "test-cache", &data).unwrap();
+        let loaded = load_cache(dir.path(), "test-cache").unwrap().unwrap();
+
+        assert_eq!(loaded.dims, data.dims);
+        assert_eq!(loaded.keys, data.keys);
+        assert_eq!(loaded.hashes, data.hashes);
+        assert_eq!(loaded.vectors.len(), data.vectors.len());
+        for (a, b) in loaded.vectors.iter().zip(data.vectors.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn load_nonexistent_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let result = load_cache(dir.path(), "nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn save_creates_cache_dir() {
+        let dir = TempDir::new().unwrap();
+        let data = make_test_data();
+
+        // .mcp_data should not exist yet
+        assert!(!cache_dir(dir.path()).exists());
+
+        save_cache(dir.path(), "test", &data).unwrap();
+
+        assert!(cache_dir(dir.path()).exists());
+        assert!(cache_path(dir.path(), "test").exists());
+    }
+
+    #[test]
+    fn wrong_version_returns_error() {
+        let dir = TempDir::new().unwrap();
+        ensure_cache_dir(dir.path()).unwrap();
+
+        // Write a file with wrong version (must be >= HEADER_SIZE + 1 to not be treated as empty)
+        let path = cache_path(dir.path(), "bad");
+        let mut bad_data = vec![99u8; HEADER_SIZE + 4];
+        bad_data[0] = 99; // wrong version
+        fs::write(&path, &bad_data).unwrap();
+
+        let result = load_cache(dir.path(), "bad");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("unsupported cache version"));
+    }
+
+    #[test]
+    fn empty_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        ensure_cache_dir(dir.path()).unwrap();
+
+        let path = cache_path(dir.path(), "empty");
+        fs::write(&path, &[]).unwrap();
+
+        let result = load_cache(dir.path(), "empty").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn vector_store_round_trip() {
+        let dir = TempDir::new().unwrap();
+
+        let store = VectorStore::new(
+            3,
+            vec!["a.ts".to_string(), "b.ts".to_string()],
+            vec!["h1".to_string(), "h2".to_string()],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+
+        save_vector_store(dir.path(), "vectors", &store).unwrap();
+        let loaded = load_vector_store(dir.path(), "vectors").unwrap().unwrap();
+
+        assert_eq!(loaded.count(), 2);
+        assert_eq!(loaded.dims(), 3);
+        assert!(loaded.has_key("a.ts"));
+        assert!(loaded.has_key("b.ts"));
+
+        let vec_a = loaded.get_vector("a.ts").unwrap();
+        assert!((vec_a[0] - 1.0).abs() < 1e-6);
+        assert!((vec_a[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cache_data_from_store() {
+        let store = VectorStore::new(
+            2,
+            vec!["x".to_string()],
+            vec!["hx".to_string()],
+            vec![0.5, 0.5],
+        );
+        let data = CacheData::from_store(&store);
+        assert_eq!(data.dims, 2);
+        assert_eq!(data.keys.len(), 1);
+        assert_eq!(data.vectors.len(), 2);
+    }
+
+    #[test]
+    fn cache_data_from_cache_map() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "file.rs".to_string(),
+            CacheEntry {
+                hash: "abc".to_string(),
+                vector: vec![1.0, 2.0],
+            },
+        );
+        let data = CacheData::from_cache_map(&cache).unwrap();
+        assert_eq!(data.dims, 2);
+        assert_eq!(data.keys.len(), 1);
+    }
+
+    #[test]
+    fn cache_data_from_empty_map() {
+        let cache = HashMap::new();
+        assert!(CacheData::from_cache_map(&cache).is_none());
+    }
+
+    #[test]
+    fn mmap_load_works() {
+        let dir = TempDir::new().unwrap();
+        let data = make_test_data();
+
+        save_cache(dir.path(), "mmap-test", &data).unwrap();
+        let loaded = load_cache_mmap(dir.path(), "mmap-test").unwrap().unwrap();
+
+        assert_eq!(loaded.dims, data.dims);
+        assert_eq!(loaded.keys, data.keys);
+    }
+
+    #[test]
+    fn mmap_nonexistent_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let result = load_cache_mmap(dir.path(), "no-such").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn atomic_write_survives() {
+        let dir = TempDir::new().unwrap();
+        let data = make_test_data();
+
+        // Save twice — second should overwrite cleanly
+        save_cache(dir.path(), "atomic", &data).unwrap();
+        save_cache(dir.path(), "atomic", &data).unwrap();
+
+        let loaded = load_cache(dir.path(), "atomic").unwrap().unwrap();
+        assert_eq!(loaded.keys, data.keys);
+
+        // Temp file should not linger
+        let tmp_path = cache_path(dir.path(), "atomic").with_extension("rkyv.tmp");
+        assert!(!tmp_path.exists());
+    }
+}
