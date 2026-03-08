@@ -1623,4 +1623,1028 @@ mod tests {
             "rebuilt cache should contain world.rs"
         );
     }
+
+    // ---------------------------------------------------------------
+    // get_str edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_str_returns_empty_string_for_empty_string_value() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!(""));
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "key"),
+            Some("".to_string())
+        );
+    }
+
+    #[test]
+    fn get_str_returns_none_for_null_value() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), Value::Null);
+        assert_eq!(ContextPlusServer::get_str(&args, "key"), None);
+    }
+
+    #[test]
+    fn get_str_returns_none_for_array_value() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!(["a", "b"]));
+        assert_eq!(ContextPlusServer::get_str(&args, "key"), None);
+    }
+
+    #[test]
+    fn get_str_returns_none_for_boolean_value() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!(true));
+        assert_eq!(ContextPlusServer::get_str(&args, "key"), None);
+    }
+
+    #[test]
+    fn get_str_returns_none_for_object_value() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!({"nested": "obj"}));
+        assert_eq!(ContextPlusServer::get_str(&args, "key"), None);
+    }
+
+    #[test]
+    fn get_str_preserves_whitespace() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!("  hello  world  "));
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "key"),
+            Some("  hello  world  ".to_string())
+        );
+    }
+
+    #[test]
+    fn get_str_handles_unicode() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!("日本語テスト"));
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "key"),
+            Some("日本語テスト".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // get_str_or edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_str_or_returns_default_when_wrong_type() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!(42));
+        assert_eq!(
+            ContextPlusServer::get_str_or(&args, "key", "default"),
+            "default"
+        );
+    }
+
+    #[test]
+    fn get_str_or_returns_empty_string_value_not_default() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), json!(""));
+        // Empty string IS a valid string, should return it, not the default
+        assert_eq!(ContextPlusServer::get_str_or(&args, "key", "default"), "");
+    }
+
+    #[test]
+    fn get_str_or_returns_default_for_null() {
+        let mut args = serde_json::Map::new();
+        args.insert("key".to_string(), Value::Null);
+        assert_eq!(
+            ContextPlusServer::get_str_or(&args, "key", "fallback"),
+            "fallback"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // get_usize edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_usize_returns_none_for_string() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!("42"));
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), None);
+    }
+
+    #[test]
+    fn get_usize_returns_none_for_negative_number() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!(-5));
+        // as_u64() returns None for negative numbers
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), None);
+    }
+
+    #[test]
+    fn get_usize_handles_zero() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!(0));
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), Some(0));
+    }
+
+    #[test]
+    fn get_usize_returns_none_for_float() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!(3.75));
+        // as_u64() returns None for non-integer values
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), None);
+    }
+
+    #[test]
+    fn get_usize_returns_none_for_bool() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!(true));
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), None);
+    }
+
+    #[test]
+    fn get_usize_returns_none_for_null() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), Value::Null);
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), None);
+    }
+
+    #[test]
+    fn get_usize_handles_large_number() {
+        let mut args = serde_json::Map::new();
+        args.insert("n".to_string(), json!(1_000_000u64));
+        assert_eq!(ContextPlusServer::get_usize(&args, "n"), Some(1_000_000));
+    }
+
+    // ---------------------------------------------------------------
+    // get_f64 edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_f64_returns_none_for_string() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), json!("3.14"));
+        assert_eq!(ContextPlusServer::get_f64(&args, "f"), None);
+    }
+
+    #[test]
+    fn get_f64_handles_integer_as_float() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), json!(42));
+        // as_f64() should coerce integer to f64
+        assert_eq!(ContextPlusServer::get_f64(&args, "f"), Some(42.0));
+    }
+
+    #[test]
+    fn get_f64_handles_zero() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), json!(0.0));
+        assert_eq!(ContextPlusServer::get_f64(&args, "f"), Some(0.0));
+    }
+
+    #[test]
+    fn get_f64_handles_negative() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), json!(-1.5));
+        let val = ContextPlusServer::get_f64(&args, "f").unwrap();
+        assert!((val - (-1.5)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn get_f64_returns_none_for_bool() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), json!(true));
+        assert_eq!(ContextPlusServer::get_f64(&args, "f"), None);
+    }
+
+    #[test]
+    fn get_f64_returns_none_for_null() {
+        let mut args = serde_json::Map::new();
+        args.insert("f".to_string(), Value::Null);
+        assert_eq!(ContextPlusServer::get_f64(&args, "f"), None);
+    }
+
+    // ---------------------------------------------------------------
+    // get_bool edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_bool_returns_none_for_string_true() {
+        let mut args = serde_json::Map::new();
+        args.insert("b".to_string(), json!("true"));
+        // "true" as a string is NOT a boolean
+        assert_eq!(ContextPlusServer::get_bool(&args, "b"), None);
+    }
+
+    #[test]
+    fn get_bool_returns_none_for_number_one() {
+        let mut args = serde_json::Map::new();
+        args.insert("b".to_string(), json!(1));
+        // Number 1 is NOT a boolean
+        assert_eq!(ContextPlusServer::get_bool(&args, "b"), None);
+    }
+
+    #[test]
+    fn get_bool_returns_none_for_number_zero() {
+        let mut args = serde_json::Map::new();
+        args.insert("b".to_string(), json!(0));
+        assert_eq!(ContextPlusServer::get_bool(&args, "b"), None);
+    }
+
+    #[test]
+    fn get_bool_returns_none_for_null() {
+        let mut args = serde_json::Map::new();
+        args.insert("b".to_string(), Value::Null);
+        assert_eq!(ContextPlusServer::get_bool(&args, "b"), None);
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_root edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolve_root_accepts_subdirectory_inside_root() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let server = server_with_root_and_ttl(tmp.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "rootDir".to_string(),
+            json!(sub.to_string_lossy().to_string()),
+        );
+
+        let root = server.resolve_root(&args);
+        // Should accept the subdirectory since it's inside the server root
+        let canonical_sub = sub.canonicalize().unwrap();
+        assert_eq!(root, canonical_sub);
+    }
+
+    #[test]
+    fn resolve_root_rejects_nonexistent_path() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("rootDir".to_string(), json!("/nonexistent/path/xyz123"));
+        let root = server.resolve_root(&args);
+        // Should fall back to server root since path doesn't exist (canonicalize fails)
+        assert_eq!(root, server.state.root_dir);
+    }
+
+    #[test]
+    fn resolve_root_rejects_empty_string() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("rootDir".to_string(), json!(""));
+        let root = server.resolve_root(&args);
+        // Empty string can't be canonicalized to a path inside root
+        assert_eq!(root, server.state.root_dir);
+    }
+
+    #[test]
+    fn resolve_root_rejects_relative_path_outside_root() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("rootDir".to_string(), json!("../../etc"));
+        let root = server.resolve_root(&args);
+        assert_eq!(root, server.state.root_dir);
+    }
+
+    // ---------------------------------------------------------------
+    // ok_text / err_text content verification
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn ok_text_contains_correct_text() {
+        let result = ContextPlusServer::ok_text("test message".to_string());
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(text, "test message");
+    }
+
+    #[test]
+    fn err_text_contains_correct_text() {
+        let result = ContextPlusServer::err_text("error message".to_string());
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(text, "error message");
+    }
+
+    #[test]
+    fn ok_text_handles_empty_string() {
+        let result = ContextPlusServer::ok_text(String::new());
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn err_text_handles_empty_string() {
+        let result = ContextPlusServer::err_text(String::new());
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn ok_text_handles_multiline_text() {
+        let result = ContextPlusServer::ok_text("line1\nline2\nline3".to_string());
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(text, "line1\nline2\nline3");
+    }
+
+    // ---------------------------------------------------------------
+    // make_tool edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn make_tool_with_no_params() {
+        let tool = make_tool("empty_tool", "No params", &[]);
+        assert_eq!(tool.name.as_ref(), "empty_tool");
+        let schema = tool.input_schema.as_ref();
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(props.is_empty(), "should have no properties");
+        // required key should not be present
+        assert!(
+            schema.get("required").is_none(),
+            "should not have required key when no required params"
+        );
+    }
+
+    #[test]
+    fn make_tool_with_all_required_params() {
+        let tool = make_tool(
+            "all_required",
+            "All required",
+            &[
+                ("a", "string", true, "Param a"),
+                ("b", "integer", true, "Param b"),
+            ],
+        );
+        let schema = tool.input_schema.as_ref();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(required.len(), 2);
+        let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(req_strs.contains(&"a"));
+        assert!(req_strs.contains(&"b"));
+    }
+
+    #[test]
+    fn make_tool_with_all_optional_params() {
+        let tool = make_tool(
+            "all_optional",
+            "All optional",
+            &[
+                ("x", "string", false, "Param x"),
+                ("y", "integer", false, "Param y"),
+            ],
+        );
+        let schema = tool.input_schema.as_ref();
+        // No required array since all are optional
+        assert!(
+            schema.get("required").is_none(),
+            "should not have required key when all params are optional"
+        );
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(props.len(), 2);
+    }
+
+    #[test]
+    fn make_tool_schema_has_correct_type_field() {
+        let tool = make_tool(
+            "typed",
+            "Typed params",
+            &[("n", "integer", true, "A number")],
+        );
+        let schema = tool.input_schema.as_ref();
+        assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("object"));
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        let n_prop = props.get("n").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(n_prop.get("type").and_then(|v| v.as_str()), Some("integer"));
+        assert_eq!(
+            n_prop.get("description").and_then(|v| v.as_str()),
+            Some("A number")
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // parse_metadata edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_metadata_returns_none_for_non_object_metadata() {
+        let mut args = serde_json::Map::new();
+        args.insert("metadata".to_string(), json!("not-an-object"));
+        assert!(parse_metadata(&args).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_returns_none_for_array_metadata() {
+        let mut args = serde_json::Map::new();
+        args.insert("metadata".to_string(), json!(["a", "b"]));
+        assert!(parse_metadata(&args).is_none());
+    }
+
+    #[test]
+    fn parse_metadata_converts_non_string_values_to_empty_string() {
+        let mut args = serde_json::Map::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert("count".to_string(), json!(42));
+        meta.insert("flag".to_string(), json!(true));
+        meta.insert("valid".to_string(), json!("ok"));
+        args.insert("metadata".to_string(), Value::Object(meta));
+
+        let result = parse_metadata(&args).unwrap();
+        // Non-string values get as_str() => None => unwrap_or("") => ""
+        assert_eq!(result.get("count"), Some(&"".to_string()));
+        assert_eq!(result.get("flag"), Some(&"".to_string()));
+        assert_eq!(result.get("valid"), Some(&"ok".to_string()));
+    }
+
+    #[test]
+    fn parse_metadata_handles_empty_object() {
+        let mut args = serde_json::Map::new();
+        args.insert("metadata".to_string(), json!({}));
+        let result = parse_metadata(&args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // code_sym_to_tree_sym / code_sym_to_skel_sym
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn code_sym_to_tree_sym_converts_basic_symbol() {
+        let sym = crate::core::parser::CodeSymbol {
+            name: "my_func".to_string(),
+            kind: "function".to_string(),
+            line: 10,
+            end_line: 20,
+            signature: Some("fn my_func(x: i32) -> bool".to_string()),
+            children: vec![],
+        };
+        let tree_sym = code_sym_to_tree_sym(&sym);
+        assert_eq!(tree_sym.name, "my_func");
+        assert_eq!(tree_sym.kind, "function");
+        assert_eq!(tree_sym.line, 10);
+        assert_eq!(tree_sym.end_line, 20);
+        assert_eq!(tree_sym.signature, "fn my_func(x: i32) -> bool");
+        assert!(tree_sym.children.is_empty());
+    }
+
+    #[test]
+    fn code_sym_to_tree_sym_converts_symbol_without_signature() {
+        let sym = crate::core::parser::CodeSymbol {
+            name: "MY_CONST".to_string(),
+            kind: "constant".to_string(),
+            line: 5,
+            end_line: 5,
+            signature: None,
+            children: vec![],
+        };
+        let tree_sym = code_sym_to_tree_sym(&sym);
+        assert_eq!(tree_sym.signature, ""); // None becomes empty string
+    }
+
+    #[test]
+    fn code_sym_to_tree_sym_converts_nested_children() {
+        let child = crate::core::parser::CodeSymbol {
+            name: "inner".to_string(),
+            kind: "method".to_string(),
+            line: 15,
+            end_line: 18,
+            signature: Some("fn inner()".to_string()),
+            children: vec![],
+        };
+        let parent = crate::core::parser::CodeSymbol {
+            name: "MyClass".to_string(),
+            kind: "class".to_string(),
+            line: 10,
+            end_line: 25,
+            signature: Some("class MyClass".to_string()),
+            children: vec![child],
+        };
+        let tree_sym = code_sym_to_tree_sym(&parent);
+        assert_eq!(tree_sym.children.len(), 1);
+        assert_eq!(tree_sym.children[0].name, "inner");
+        assert_eq!(tree_sym.children[0].kind, "method");
+    }
+
+    #[test]
+    fn code_sym_to_skel_sym_converts_basic_symbol() {
+        let sym = crate::core::parser::CodeSymbol {
+            name: "handler".to_string(),
+            kind: "function".to_string(),
+            line: 1,
+            end_line: 50,
+            signature: Some("async fn handler(req: Request) -> Response".to_string()),
+            children: vec![],
+        };
+        let skel_sym = code_sym_to_skel_sym(&sym);
+        assert_eq!(skel_sym.name, "handler");
+        assert_eq!(skel_sym.kind, "function");
+        assert_eq!(skel_sym.line, 1);
+        assert_eq!(skel_sym.end_line, 50);
+        assert_eq!(
+            skel_sym.signature,
+            "async fn handler(req: Request) -> Response"
+        );
+        assert!(skel_sym.children.is_empty());
+    }
+
+    #[test]
+    fn code_sym_to_skel_sym_converts_symbol_without_signature() {
+        let sym = crate::core::parser::CodeSymbol {
+            name: "FOO".to_string(),
+            kind: "variable".to_string(),
+            line: 3,
+            end_line: 3,
+            signature: None,
+            children: vec![],
+        };
+        let skel_sym = code_sym_to_skel_sym(&sym);
+        assert_eq!(skel_sym.signature, "");
+    }
+
+    #[test]
+    fn code_sym_to_skel_sym_converts_nested_children() {
+        let child = crate::core::parser::CodeSymbol {
+            name: "method_a".to_string(),
+            kind: "method".to_string(),
+            line: 12,
+            end_line: 14,
+            signature: None,
+            children: vec![],
+        };
+        let parent = crate::core::parser::CodeSymbol {
+            name: "Struct".to_string(),
+            kind: "struct".to_string(),
+            line: 10,
+            end_line: 20,
+            signature: Some("pub struct Struct".to_string()),
+            children: vec![child],
+        };
+        let skel_sym = code_sym_to_skel_sym(&parent);
+        assert_eq!(skel_sym.children.len(), 1);
+        assert_eq!(skel_sym.children[0].name, "method_a");
+    }
+
+    // ---------------------------------------------------------------
+    // file_lines_as_vec edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn file_lines_as_vec_handles_empty_cache() {
+        let cache = ProjectCache {
+            file_entries: vec![],
+            file_lines: HashMap::new(),
+            last_refresh: Instant::now(),
+        };
+        let result = ContextPlusServer::file_lines_as_vec(&cache);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn file_lines_as_vec_preserves_empty_line_vectors() {
+        let mut file_lines = HashMap::new();
+        file_lines.insert("empty.txt".to_string(), vec![]);
+        let cache = ProjectCache {
+            file_entries: vec![],
+            file_lines,
+            last_refresh: Instant::now(),
+        };
+        let result = ContextPlusServer::file_lines_as_vec(&cache);
+        assert_eq!(result.len(), 1);
+        let result_map: HashMap<String, Vec<String>> = result.into_iter().collect();
+        assert!(result_map["empty.txt"].is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // dispatch with missing required arguments
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_blast_radius_missing_symbol_name_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("get_blast_radius", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("symbolName is required"),
+            "expected symbolName error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_file_skeleton_missing_file_path_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("get_file_skeleton", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("filePath is required"),
+            "expected filePath error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_commit_missing_file_path_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("propose_commit", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("filePath is required"),
+            "expected filePath error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_propose_commit_missing_content_returns_error() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("filePath".to_string(), json!("test.txt"));
+        let result = server.dispatch("propose_commit", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("content is required"),
+            "expected content error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_undo_change_missing_restore_point_id_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("undo_change", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("restorePointId is required"),
+            "expected restorePointId error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_upsert_memory_node_missing_label_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("upsert_memory_node", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("label is required"),
+            "expected label error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_create_relation_missing_source_label_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("create_relation", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("sourceLabel is required"),
+            "expected sourceLabel error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_search_memory_graph_missing_query_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("search_memory_graph", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("query is required"),
+            "expected query error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_retrieve_with_traversal_missing_node_id_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("retrieve_with_traversal", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("nodeId is required"),
+            "expected nodeId error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_semantic_code_search_missing_query_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("semantic_code_search", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("query is required"),
+            "expected query error, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_semantic_navigate_missing_query_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("semantic_navigate", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("query is required"),
+            "expected query error, got: {}",
+            text
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // tool_definitions schema validation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tool_definitions_blast_radius_requires_symbol_name() {
+        let defs = tool_definitions();
+        let tool = defs
+            .iter()
+            .find(|t| t.name.as_ref() == "get_blast_radius")
+            .unwrap();
+        let schema = tool.input_schema.as_ref();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(req_strs.contains(&"symbolName"));
+    }
+
+    #[test]
+    fn tool_definitions_propose_commit_requires_file_path_and_content() {
+        let defs = tool_definitions();
+        let tool = defs
+            .iter()
+            .find(|t| t.name.as_ref() == "propose_commit")
+            .unwrap();
+        let schema = tool.input_schema.as_ref();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
+        let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(req_strs.contains(&"filePath"));
+        assert!(req_strs.contains(&"content"));
+    }
+
+    #[test]
+    fn tool_definitions_context_tree_has_no_required_params() {
+        let defs = tool_definitions();
+        let tool = defs
+            .iter()
+            .find(|t| t.name.as_ref() == "get_context_tree")
+            .unwrap();
+        let schema = tool.input_schema.as_ref();
+        // get_context_tree has no required params
+        assert!(
+            schema.get("required").is_none(),
+            "get_context_tree should have no required params"
+        );
+    }
+
+    #[test]
+    fn tool_definitions_all_tools_have_object_type_schema() {
+        let defs = tool_definitions();
+        for tool in &defs {
+            let schema = tool.input_schema.as_ref();
+            assert_eq!(
+                schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "tool '{}' should have type: object in schema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_definitions_all_tools_have_properties() {
+        let defs = tool_definitions();
+        for tool in &defs {
+            let schema = tool.input_schema.as_ref();
+            assert!(
+                schema.get("properties").is_some(),
+                "tool '{}' should have properties in schema",
+                tool.name
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ContextPlusServer::new
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn server_new_initializes_with_correct_root() {
+        let root = PathBuf::from("/tmp/test-root");
+        let config = Config::from_env();
+        let server = ContextPlusServer::new(root.clone(), config);
+        assert_eq!(server.root_dir(), Path::new("/tmp/test-root"));
+        assert_eq!(server.state.root_dir, root);
+    }
+
+    // ---------------------------------------------------------------
+    // Multiple args extraction patterns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_str_handles_multiple_keys_independently() {
+        let mut args = serde_json::Map::new();
+        args.insert("a".to_string(), json!("alpha"));
+        args.insert("b".to_string(), json!("beta"));
+        args.insert("c".to_string(), json!(42));
+
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "a"),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "b"),
+            Some("beta".to_string())
+        );
+        assert_eq!(ContextPlusServer::get_str(&args, "c"), None);
+        assert_eq!(ContextPlusServer::get_str(&args, "d"), None);
+    }
+
+    #[test]
+    fn mixed_arg_extraction_from_same_map() {
+        let mut args = serde_json::Map::new();
+        args.insert("name".to_string(), json!("test"));
+        args.insert("count".to_string(), json!(5));
+        args.insert("weight".to_string(), json!(0.75));
+        args.insert("enabled".to_string(), json!(true));
+
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "name"),
+            Some("test".to_string())
+        );
+        assert_eq!(ContextPlusServer::get_usize(&args, "count"), Some(5));
+        let w = ContextPlusServer::get_f64(&args, "weight").unwrap();
+        assert!((w - 0.75).abs() < f64::EPSILON);
+        assert_eq!(ContextPlusServer::get_bool(&args, "enabled"), Some(true));
+    }
+
+    // ---------------------------------------------------------------
+    // String array extraction (used in dispatch handlers)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn string_array_extraction_pattern() {
+        // This mirrors the pattern used for includeKinds and edgeFilter
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "includeKinds".to_string(),
+            json!(["function", "class", "method"]),
+        );
+
+        let result: Option<Vec<String>> =
+            args.get("includeKinds")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
+
+        let kinds = result.unwrap();
+        assert_eq!(kinds, vec!["function", "class", "method"]);
+    }
+
+    #[test]
+    fn string_array_extraction_returns_none_when_missing() {
+        let args = serde_json::Map::new();
+        let result: Option<Vec<String>> =
+            args.get("includeKinds")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn string_array_extraction_filters_non_string_elements() {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "kinds".to_string(),
+            json!(["function", 42, "class", true, "method"]),
+        );
+
+        let result: Option<Vec<String>> = args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+        let kinds = result.unwrap();
+        // Non-string elements are filtered out
+        assert_eq!(kinds, vec!["function", "class", "method"]);
+    }
+
+    #[test]
+    fn string_array_extraction_handles_empty_array() {
+        let mut args = serde_json::Map::new();
+        args.insert("kinds".to_string(), json!([]));
+
+        let result: Option<Vec<String>> = args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+        let kinds = result.unwrap();
+        assert!(kinds.is_empty());
+    }
+
+    #[test]
+    fn string_array_extraction_returns_none_for_non_array() {
+        let mut args = serde_json::Map::new();
+        args.insert("kinds".to_string(), json!("not-an-array"));
+
+        let result: Option<Vec<String>> = args.get("kinds").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+        assert!(result.is_none());
+    }
 }

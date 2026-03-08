@@ -418,6 +418,39 @@ mod tests {
         vec![seed, seed * 0.5, 1.0 - seed, seed * 0.3]
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn make_traversal(
+        id: &str,
+        node_type: NodeType,
+        label: &str,
+        content: &str,
+        depth: usize,
+        path: Vec<String>,
+        score: f64,
+        access_count: u32,
+    ) -> TraversalResult {
+        TraversalResult {
+            node: MemoryNode {
+                id: id.to_string(),
+                node_type,
+                label: label.to_string(),
+                content: content.to_string(),
+                embedding: vec![],
+                created_at: 0,
+                last_accessed: 0,
+                access_count,
+                metadata: HashMap::new(),
+            },
+            depth,
+            path_relations: path,
+            relevance_score: score,
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // parse_node_type
+    // ---------------------------------------------------------------
+
     #[test]
     fn parse_node_type_valid() {
         assert!(parse_node_type("concept").is_ok());
@@ -427,9 +460,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_node_type_returns_correct_variant() {
+        assert_eq!(parse_node_type("concept").unwrap(), NodeType::Concept);
+        assert_eq!(parse_node_type("file").unwrap(), NodeType::File);
+        assert_eq!(parse_node_type("symbol").unwrap(), NodeType::Symbol);
+        assert_eq!(parse_node_type("note").unwrap(), NodeType::Note);
+    }
+
+    #[test]
     fn parse_node_type_invalid() {
         assert!(parse_node_type("invalid").is_err());
     }
+
+    #[test]
+    fn parse_node_type_invalid_error_message() {
+        let err = parse_node_type("bogus").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid node type: 'bogus'"), "got: {msg}");
+        assert!(msg.contains("concept, file, symbol, note"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_node_type_case_sensitive() {
+        assert!(parse_node_type("Concept").is_err());
+        assert!(parse_node_type("FILE").is_err());
+        assert!(parse_node_type("Symbol").is_err());
+        assert!(parse_node_type("NOTE").is_err());
+    }
+
+    #[test]
+    fn parse_node_type_empty_string() {
+        assert!(parse_node_type("").is_err());
+    }
+
+    #[test]
+    fn parse_node_type_whitespace() {
+        assert!(parse_node_type(" concept").is_err());
+        assert!(parse_node_type("concept ").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // parse_relation_type
+    // ---------------------------------------------------------------
 
     #[test]
     fn parse_relation_type_valid() {
@@ -442,9 +514,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_relation_type_returns_correct_variant() {
+        assert_eq!(
+            parse_relation_type("relates_to").unwrap(),
+            RelationType::RelatesTo
+        );
+        assert_eq!(
+            parse_relation_type("depends_on").unwrap(),
+            RelationType::DependsOn
+        );
+        assert_eq!(
+            parse_relation_type("implements").unwrap(),
+            RelationType::Implements
+        );
+        assert_eq!(
+            parse_relation_type("references").unwrap(),
+            RelationType::References
+        );
+        assert_eq!(
+            parse_relation_type("similar_to").unwrap(),
+            RelationType::SimilarTo
+        );
+        assert_eq!(
+            parse_relation_type("contains").unwrap(),
+            RelationType::Contains
+        );
+    }
+
+    #[test]
     fn parse_relation_type_invalid() {
         assert!(parse_relation_type("invalid").is_err());
     }
+
+    #[test]
+    fn parse_relation_type_invalid_error_message() {
+        let err = parse_relation_type("foo_bar").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid relation: 'foo_bar'"), "got: {msg}");
+        assert!(msg.contains("relates_to"), "got: {msg}");
+        assert!(msg.contains("depends_on"), "got: {msg}");
+        assert!(msg.contains("implements"), "got: {msg}");
+        assert!(msg.contains("references"), "got: {msg}");
+        assert!(msg.contains("similar_to"), "got: {msg}");
+        assert!(msg.contains("contains"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_relation_type_case_sensitive() {
+        assert!(parse_relation_type("RelatesTo").is_err());
+        assert!(parse_relation_type("DEPENDS_ON").is_err());
+    }
+
+    #[test]
+    fn parse_relation_type_empty_string() {
+        assert!(parse_relation_type("").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // parse_edge_filter
+    // ---------------------------------------------------------------
 
     #[test]
     fn parse_edge_filter_none() {
@@ -461,10 +589,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_edge_filter_valid_preserves_order() {
+        let filter = Some(vec![
+            "contains".to_string(),
+            "relates_to".to_string(),
+            "similar_to".to_string(),
+        ]);
+        let types = parse_edge_filter(&filter).unwrap().unwrap();
+        assert_eq!(types[0], RelationType::Contains);
+        assert_eq!(types[1], RelationType::RelatesTo);
+        assert_eq!(types[2], RelationType::SimilarTo);
+    }
+
+    #[test]
+    fn parse_edge_filter_single_element() {
+        let filter = Some(vec!["references".to_string()]);
+        let types = parse_edge_filter(&filter).unwrap().unwrap();
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0], RelationType::References);
+    }
+
+    #[test]
+    fn parse_edge_filter_all_six_types() {
+        let filter = Some(vec![
+            "relates_to".to_string(),
+            "depends_on".to_string(),
+            "implements".to_string(),
+            "references".to_string(),
+            "similar_to".to_string(),
+            "contains".to_string(),
+        ]);
+        let types = parse_edge_filter(&filter).unwrap().unwrap();
+        assert_eq!(types.len(), 6);
+    }
+
+    #[test]
     fn parse_edge_filter_invalid() {
         let filter = Some(vec!["invalid".to_string()]);
         assert!(parse_edge_filter(&filter).is_err());
     }
+
+    #[test]
+    fn parse_edge_filter_mixed_valid_invalid_fails() {
+        let filter = Some(vec!["depends_on".to_string(), "nope".to_string()]);
+        assert!(parse_edge_filter(&filter).is_err());
+    }
+
+    #[test]
+    fn parse_edge_filter_empty_vec() {
+        let filter = Some(vec![]);
+        let result = parse_edge_filter(&filter).unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // format_traversal_result
+    // ---------------------------------------------------------------
 
     #[test]
     fn format_traversal_result_basic() {
@@ -539,6 +720,1379 @@ mod tests {
         let formatted = format_traversal_result(&result);
         assert!(formatted.contains("..."));
     }
+
+    #[test]
+    fn format_traversal_result_no_path_when_single_element() {
+        let result = make_traversal(
+            "mn-1",
+            NodeType::Concept,
+            "root",
+            "content",
+            0,
+            vec!["root".to_string()],
+            100.0,
+            1,
+        );
+        let formatted = format_traversal_result(&result);
+        // path_relations.len() == 1, so "Path:" should NOT appear
+        assert!(!formatted.contains("Path:"), "got: {formatted}");
+    }
+
+    #[test]
+    fn format_traversal_result_no_path_when_empty() {
+        let result = make_traversal(
+            "mn-1",
+            NodeType::Concept,
+            "root",
+            "content",
+            0,
+            vec![],
+            100.0,
+            1,
+        );
+        let formatted = format_traversal_result(&result);
+        assert!(!formatted.contains("Path:"), "got: {formatted}");
+    }
+
+    #[test]
+    fn format_traversal_result_exact_120_chars_no_truncation() {
+        let content = "b".repeat(120);
+        let result = make_traversal(
+            "mn-boundary",
+            NodeType::Note,
+            "boundary",
+            &content,
+            0,
+            vec![],
+            50.0,
+            1,
+        );
+        let formatted = format_traversal_result(&result);
+        // Exactly 120 chars is NOT > 120, so no truncation
+        assert!(!formatted.contains("..."), "got: {formatted}");
+        assert!(formatted.contains(&content), "got: {formatted}");
+    }
+
+    #[test]
+    fn format_traversal_result_121_chars_truncates() {
+        let content = "c".repeat(121);
+        let result = make_traversal(
+            "mn-over",
+            NodeType::Note,
+            "over",
+            &content,
+            0,
+            vec![],
+            50.0,
+            1,
+        );
+        let formatted = format_traversal_result(&result);
+        assert!(formatted.contains("..."), "got: {formatted}");
+        // Should not contain the full 121-char string
+        assert!(!formatted.contains(&content), "got: {formatted}");
+    }
+
+    #[test]
+    fn format_traversal_result_contains_id() {
+        let result = make_traversal(
+            "mn-unique-id-42",
+            NodeType::Symbol,
+            "my_fn",
+            "a function",
+            2,
+            vec![],
+            33.3,
+            7,
+        );
+        let formatted = format_traversal_result(&result);
+        assert!(
+            formatted.contains("ID: mn-unique-id-42"),
+            "got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn format_traversal_result_all_node_types() {
+        for (nt, expected) in [
+            (NodeType::Concept, "[concept]"),
+            (NodeType::File, "[file]"),
+            (NodeType::Symbol, "[symbol]"),
+            (NodeType::Note, "[note]"),
+        ] {
+            let result = make_traversal("mn-1", nt, "x", "x", 0, vec![], 0.0, 1);
+            let formatted = format_traversal_result(&result);
+            assert!(formatted.contains(expected), "got: {formatted}");
+        }
+    }
+
+    #[test]
+    fn format_traversal_result_short_content_not_truncated() {
+        let result = make_traversal(
+            "mn-short",
+            NodeType::Note,
+            "short",
+            "hello world",
+            0,
+            vec![],
+            80.0,
+            2,
+        );
+        let formatted = format_traversal_result(&result);
+        assert!(
+            formatted.contains("Content: hello world"),
+            "got: {formatted}"
+        );
+        assert!(!formatted.contains("..."), "got: {formatted}");
+    }
+
+    #[test]
+    fn format_traversal_result_depth_and_score() {
+        let result = make_traversal("mn-1", NodeType::Concept, "deep", "c", 5, vec![], 12.34, 1);
+        let formatted = format_traversal_result(&result);
+        assert!(formatted.contains("depth: 5"), "got: {formatted}");
+        assert!(formatted.contains("score: 12.34"), "got: {formatted}");
+    }
+
+    // ---------------------------------------------------------------
+    // tool_create_relation
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_create_relation_source_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Create only the target node
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "target",
+                    "target node",
+                    make_embedding(0.5),
+                    None,
+                );
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "nonexistent".to_string(),
+                source_type: "concept".to_string(),
+                target_label: "target".to_string(),
+                target_type: "concept".to_string(),
+                relation: "depends_on".to_string(),
+                weight: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("source node not found"), "got: {result}");
+        assert!(result.contains("nonexistent"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_create_relation_target_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Create only the source node
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "source",
+                    "source node",
+                    make_embedding(0.5),
+                    None,
+                );
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "source".to_string(),
+                source_type: "concept".to_string(),
+                target_label: "missing".to_string(),
+                target_type: "concept".to_string(),
+                relation: "depends_on".to_string(),
+                weight: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("target node not found"), "got: {result}");
+        assert!(result.contains("missing"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_create_relation_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "auth",
+                    "auth module",
+                    make_embedding(0.3),
+                    None,
+                );
+                graph.upsert_node(
+                    NodeType::File,
+                    "auth.rs",
+                    "auth file",
+                    make_embedding(0.7),
+                    None,
+                );
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "auth".to_string(),
+                source_type: "concept".to_string(),
+                target_label: "auth.rs".to_string(),
+                target_type: "file".to_string(),
+                relation: "implements".to_string(),
+                weight: Some(0.9),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("Relation created"), "got: {result}");
+        assert!(result.contains("implements"), "got: {result}");
+        assert!(
+            result.contains("1 nodes, 1 edges") || result.contains("2 nodes, 1 edges"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_create_relation_invalid_relation_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "a".to_string(),
+                source_type: "concept".to_string(),
+                target_label: "b".to_string(),
+                target_type: "concept".to_string(),
+                relation: "invalid_relation".to_string(),
+                weight: None,
+                metadata: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid relation"),);
+    }
+
+    #[tokio::test]
+    async fn tool_create_relation_invalid_source_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "a".to_string(),
+                source_type: "bad_type".to_string(),
+                target_label: "b".to_string(),
+                target_type: "concept".to_string(),
+                relation: "depends_on".to_string(),
+                weight: None,
+                metadata: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_create_relation_invalid_target_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "a".to_string(),
+                source_type: "concept".to_string(),
+                target_label: "b".to_string(),
+                target_type: "bad_type".to_string(),
+                relation: "depends_on".to_string(),
+                weight: None,
+                metadata: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_create_relation_with_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(NodeType::Concept, "A", "node A", make_embedding(0.2), None);
+                graph.upsert_node(NodeType::Concept, "B", "node B", make_embedding(0.8), None);
+            })
+            .await
+            .expect("ok");
+
+        let mut meta = HashMap::new();
+        meta.insert("reason".to_string(), "test".to_string());
+
+        let result = tool_create_relation(
+            &store,
+            CreateRelationOptions {
+                root_dir: root,
+                source_label: "A".to_string(),
+                source_type: "concept".to_string(),
+                target_label: "B".to_string(),
+                target_type: "concept".to_string(),
+                relation: "relates_to".to_string(),
+                weight: Some(0.75),
+                metadata: Some(meta),
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("Relation created"), "got: {result}");
+        assert!(result.contains("Weight: 0.75"), "got: {result}");
+    }
+
+    // ---------------------------------------------------------------
+    // tool_prune_stale_links
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_prune_stale_links_empty_graph() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_prune_stale_links(
+            &store,
+            PruneStaleLinksOptions {
+                root_dir: root,
+                threshold: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("Pruning complete"), "got: {result}");
+        assert!(result.contains("Removed: 0"), "got: {result}");
+        assert!(result.contains("Remaining edges: 0"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_prune_stale_links_with_threshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Add nodes and a fresh edge
+        store
+            .get_graph(&root, |graph| {
+                let a = graph.upsert_node(NodeType::Concept, "A", "a", make_embedding(0.1), None);
+                let b = graph.upsert_node(NodeType::Concept, "B", "b", make_embedding(0.9), None);
+                graph.create_relation(&a.id, &b.id, RelationType::DependsOn, None, None);
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_prune_stale_links(
+            &store,
+            PruneStaleLinksOptions {
+                root_dir: root,
+                threshold: Some(0.1),
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("Pruning complete"), "got: {result}");
+        // Fresh edge should not be pruned (decay ~ 1.0, well above 0.1)
+        assert!(result.contains("Remaining edges: 1"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_prune_stale_links_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_prune_stale_links(
+            &store,
+            PruneStaleLinksOptions {
+                root_dir: root,
+                threshold: Some(0.5),
+            },
+        )
+        .await
+        .expect("ok");
+
+        // Verify output format structure
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines[0], "Pruning complete");
+        assert!(lines[1].contains("Removed:"), "got: {}", lines[1]);
+        assert!(
+            lines[1].contains("stale links/orphan nodes"),
+            "got: {}",
+            lines[1]
+        );
+        assert!(lines[2].contains("Remaining edges:"), "got: {}", lines[2]);
+    }
+
+    // ---------------------------------------------------------------
+    // tool_retrieve_with_traversal
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_retrieve_with_traversal_node_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_retrieve_with_traversal(
+            &store,
+            RetrieveWithTraversalOptions {
+                root_dir: root,
+                node_id: "nonexistent-id".to_string(),
+                max_depth: None,
+                edge_filter: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(result, "Node not found: nonexistent-id");
+    }
+
+    #[tokio::test]
+    async fn tool_retrieve_with_traversal_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let node_id = store
+            .get_graph(&root, |graph| {
+                let a = graph.upsert_node(
+                    NodeType::Concept,
+                    "root_node",
+                    "the root",
+                    make_embedding(0.5),
+                    None,
+                );
+                let b = graph.upsert_node(
+                    NodeType::File,
+                    "child.rs",
+                    "child file",
+                    make_embedding(0.6),
+                    None,
+                );
+                graph.create_relation(&a.id, &b.id, RelationType::Contains, None, None);
+                a.id
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_retrieve_with_traversal(
+            &store,
+            RetrieveWithTraversalOptions {
+                root_dir: root,
+                node_id,
+                max_depth: Some(2),
+                edge_filter: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(
+            result.contains("Traversal from: root_node"),
+            "got: {result}"
+        );
+        assert!(result.contains("depth limit: 2"), "got: {result}");
+        assert!(result.contains("[concept] root_node"), "got: {result}");
+        assert!(result.contains("[file] child.rs"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_retrieve_with_traversal_default_max_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let node_id = store
+            .get_graph(&root, |graph| {
+                let a = graph.upsert_node(
+                    NodeType::Concept,
+                    "solo",
+                    "standalone node",
+                    make_embedding(0.5),
+                    None,
+                );
+                a.id
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_retrieve_with_traversal(
+            &store,
+            RetrieveWithTraversalOptions {
+                root_dir: root,
+                node_id,
+                max_depth: None, // defaults to 2
+                edge_filter: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        // Default max_depth is 2
+        assert!(result.contains("depth limit: 2"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_retrieve_with_traversal_with_edge_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let node_id = store
+            .get_graph(&root, |graph| {
+                let a = graph.upsert_node(NodeType::Concept, "A", "a", make_embedding(0.1), None);
+                let b = graph.upsert_node(NodeType::Concept, "B", "b", make_embedding(0.5), None);
+                let c = graph.upsert_node(NodeType::File, "C", "c", make_embedding(0.9), None);
+                graph.create_relation(&a.id, &b.id, RelationType::DependsOn, None, None);
+                graph.create_relation(&a.id, &c.id, RelationType::Contains, None, None);
+                a.id
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_retrieve_with_traversal(
+            &store,
+            RetrieveWithTraversalOptions {
+                root_dir: root,
+                node_id,
+                max_depth: Some(1),
+                edge_filter: Some(vec!["depends_on".to_string()]),
+            },
+        )
+        .await
+        .expect("ok");
+
+        // Should contain A and B (depends_on) but not C (contains)
+        assert!(result.contains("[concept] A"), "got: {result}");
+        assert!(result.contains("[concept] B"), "got: {result}");
+        assert!(!result.contains("[file] C"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_retrieve_with_traversal_invalid_edge_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_retrieve_with_traversal(
+            &store,
+            RetrieveWithTraversalOptions {
+                root_dir: root,
+                node_id: "any-id".to_string(),
+                max_depth: None,
+                edge_filter: Some(vec!["not_a_valid_type".to_string()]),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // tool_upsert_memory_node (requires mock Ollama)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_upsert_memory_node_with_mock_ollama() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock the /api/embed endpoint
+        let embed_response = serde_json::json!({
+            "embeddings": [[0.1, 0.2, 0.3, 0.4]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_upsert_memory_node(
+            &store,
+            &ollama,
+            UpsertMemoryNodeOptions {
+                root_dir: root,
+                node_type: "concept".to_string(),
+                label: "authentication".to_string(),
+                content: "handles user login and token verification".to_string(),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(
+            result.contains("Memory node upserted: authentication"),
+            "got: {result}"
+        );
+        assert!(result.contains("Type: concept"), "got: {result}");
+        assert!(result.contains("1 nodes, 0 edges"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_upsert_memory_node_invalid_type() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_upsert_memory_node(
+            &store,
+            &ollama,
+            UpsertMemoryNodeOptions {
+                root_dir: root,
+                node_type: "invalid_type".to_string(),
+                label: "test".to_string(),
+                content: "test".to_string(),
+                metadata: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid node type"),
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_upsert_memory_node_with_metadata() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let embed_response = serde_json::json!({
+            "embeddings": [[0.5, 0.5, 0.5, 0.5]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let mut meta = HashMap::new();
+        meta.insert("source".to_string(), "test".to_string());
+
+        let result = tool_upsert_memory_node(
+            &store,
+            &ollama,
+            UpsertMemoryNodeOptions {
+                root_dir: root,
+                node_type: "note".to_string(),
+                label: "my-note".to_string(),
+                content: "some important note".to_string(),
+                metadata: Some(meta),
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(
+            result.contains("Memory node upserted: my-note"),
+            "got: {result}"
+        );
+        assert!(result.contains("Access count: 1"), "got: {result}");
+    }
+
+    // ---------------------------------------------------------------
+    // tool_search_memory_graph (requires mock Ollama)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_search_memory_graph_empty_graph() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let embed_response = serde_json::json!({
+            "embeddings": [[0.5, 0.5, 0.5]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_search_memory_graph(
+            &store,
+            &ollama,
+            SearchMemoryGraphOptions {
+                root_dir: root,
+                query: "test query".to_string(),
+                max_depth: None,
+                top_k: None,
+                edge_filter: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("No memory nodes found"), "got: {result}");
+        assert!(result.contains("test query"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_search_memory_graph_with_results() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let embed_response = serde_json::json!({
+            "embeddings": [[1.0, 0.0, 0.0]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Pre-populate graph
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "auth",
+                    "authentication logic",
+                    vec![1.0, 0.0, 0.0],
+                    None,
+                );
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "db",
+                    "database layer",
+                    vec![0.0, 1.0, 0.0],
+                    None,
+                );
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_search_memory_graph(
+            &store,
+            &ollama,
+            SearchMemoryGraphOptions {
+                root_dir: root,
+                query: "authentication".to_string(),
+                max_depth: Some(0),
+                top_k: Some(5),
+                edge_filter: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(
+            result.contains("Memory Graph Search: \"authentication\""),
+            "got: {result}"
+        );
+        assert!(result.contains("Direct Matches:"), "got: {result}");
+        assert!(result.contains("[concept] auth"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_search_memory_graph_with_neighbors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let embed_response = serde_json::json!({
+            "embeddings": [[1.0, 0.0, 0.0]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Pre-populate with linked nodes
+        store
+            .get_graph(&root, |graph| {
+                let a = graph.upsert_node(
+                    NodeType::Concept,
+                    "auth",
+                    "authentication",
+                    vec![1.0, 0.0, 0.0],
+                    None,
+                );
+                let b = graph.upsert_node(
+                    NodeType::Concept,
+                    "tokens",
+                    "JWT tokens",
+                    vec![0.5, 0.5, 0.0],
+                    None,
+                );
+                graph.create_relation(&a.id, &b.id, RelationType::DependsOn, None, None);
+            })
+            .await
+            .expect("ok");
+
+        let result = tool_search_memory_graph(
+            &store,
+            &ollama,
+            SearchMemoryGraphOptions {
+                root_dir: root,
+                query: "auth".to_string(),
+                max_depth: Some(1),
+                top_k: Some(1),
+                edge_filter: None,
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(result.contains("Direct Matches:"), "got: {result}");
+        assert!(result.contains("Linked Neighbors:"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_search_memory_graph_invalid_edge_filter() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_search_memory_graph(
+            &store,
+            &ollama,
+            SearchMemoryGraphOptions {
+                root_dir: root,
+                query: "test".to_string(),
+                max_depth: None,
+                top_k: None,
+                edge_filter: Some(vec!["bad_filter".to_string()]),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // tool_add_interlinked_context (requires mock Ollama)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_add_interlinked_context_single_item() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let embed_response = serde_json::json!({
+            "embeddings": [[0.5, 0.5, 0.5]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_add_interlinked_context(
+            &store,
+            &ollama,
+            AddInterlinkedContextOptions {
+                root_dir: root,
+                items: vec![InterlinkedItem {
+                    node_type: "concept".to_string(),
+                    label: "solo-node".to_string(),
+                    content: "just one node".to_string(),
+                    metadata: None,
+                }],
+                auto_link: Some(true),
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(
+            result.contains("Added 1 interlinked nodes"),
+            "got: {result}"
+        );
+        assert!(result.contains("[concept] solo-node"), "got: {result}");
+        assert!(result.contains("Graph total:"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn tool_add_interlinked_context_no_auto_link() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let embed_response = serde_json::json!({
+            "embeddings": [[0.5, 0.5, 0.5]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_add_interlinked_context(
+            &store,
+            &ollama,
+            AddInterlinkedContextOptions {
+                root_dir: root,
+                items: vec![
+                    InterlinkedItem {
+                        node_type: "concept".to_string(),
+                        label: "A".to_string(),
+                        content: "node a".to_string(),
+                        metadata: None,
+                    },
+                    InterlinkedItem {
+                        node_type: "concept".to_string(),
+                        label: "B".to_string(),
+                        content: "node b".to_string(),
+                        metadata: None,
+                    },
+                ],
+                auto_link: Some(false),
+            },
+        )
+        .await
+        .expect("ok");
+
+        assert!(
+            result.contains("Added 2 interlinked nodes"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("No auto-links above threshold"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_add_interlinked_context_invalid_node_type() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_add_interlinked_context(
+            &store,
+            &ollama,
+            AddInterlinkedContextOptions {
+                root_dir: root,
+                items: vec![InterlinkedItem {
+                    node_type: "invalid_type".to_string(),
+                    label: "test".to_string(),
+                    content: "test".to_string(),
+                    metadata: None,
+                }],
+                auto_link: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_add_interlinked_context_default_auto_link_is_true() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Return identical embeddings so auto-linking triggers
+        let embed_response = serde_json::json!({
+            "embeddings": [[1.0, 0.0, 0.0]]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&embed_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::Config {
+            ollama_host: mock_server.uri(),
+            ollama_embed_model: "test-model".to_string(),
+            ollama_chat_model: "test-chat".to_string(),
+            ollama_api_key: None,
+            embed_batch_size: 32,
+            embed_tracker_enabled: false,
+            embed_tracker_debounce_ms: 0,
+            embed_tracker_max_files: 0,
+            ignore_dirs: std::collections::HashSet::new(),
+            cache_ttl_secs: 300,
+        };
+        let ollama = OllamaClient::new(&config);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        let result = tool_add_interlinked_context(
+            &store,
+            &ollama,
+            AddInterlinkedContextOptions {
+                root_dir: root,
+                items: vec![
+                    InterlinkedItem {
+                        node_type: "concept".to_string(),
+                        label: "X".to_string(),
+                        content: "x content".to_string(),
+                        metadata: None,
+                    },
+                    InterlinkedItem {
+                        node_type: "concept".to_string(),
+                        label: "Y".to_string(),
+                        content: "y content".to_string(),
+                        metadata: None,
+                    },
+                ],
+                auto_link: None, // defaults to true
+            },
+        )
+        .await
+        .expect("ok");
+
+        // With identical embeddings (cosine similarity = 1.0), auto-link should fire
+        assert!(result.contains("Auto-linked:"), "got: {result}");
+        assert!(result.contains("similarity edges"), "got: {result}");
+    }
+
+    // ---------------------------------------------------------------
+    // Options structs construction
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn upsert_memory_node_options_construction() {
+        let opts = UpsertMemoryNodeOptions {
+            root_dir: "/tmp/test".to_string(),
+            node_type: "concept".to_string(),
+            label: "test".to_string(),
+            content: "test content".to_string(),
+            metadata: None,
+        };
+        assert_eq!(opts.root_dir, "/tmp/test");
+        assert_eq!(opts.node_type, "concept");
+        assert_eq!(opts.label, "test");
+        assert_eq!(opts.content, "test content");
+        assert!(opts.metadata.is_none());
+    }
+
+    #[test]
+    fn create_relation_options_construction() {
+        let opts = CreateRelationOptions {
+            root_dir: "/tmp/test".to_string(),
+            source_label: "src".to_string(),
+            source_type: "concept".to_string(),
+            target_label: "tgt".to_string(),
+            target_type: "file".to_string(),
+            relation: "depends_on".to_string(),
+            weight: Some(0.5),
+            metadata: None,
+        };
+        assert_eq!(opts.source_label, "src");
+        assert_eq!(opts.target_label, "tgt");
+        assert_eq!(opts.weight, Some(0.5));
+    }
+
+    #[test]
+    fn search_memory_graph_options_construction() {
+        let opts = SearchMemoryGraphOptions {
+            root_dir: "/tmp/test".to_string(),
+            query: "find auth".to_string(),
+            max_depth: Some(3),
+            top_k: Some(10),
+            edge_filter: Some(vec!["depends_on".to_string()]),
+        };
+        assert_eq!(opts.query, "find auth");
+        assert_eq!(opts.max_depth, Some(3));
+        assert_eq!(opts.top_k, Some(10));
+    }
+
+    #[test]
+    fn prune_stale_links_options_construction() {
+        let opts = PruneStaleLinksOptions {
+            root_dir: "/tmp/test".to_string(),
+            threshold: Some(0.25),
+        };
+        assert_eq!(opts.threshold, Some(0.25));
+    }
+
+    #[test]
+    fn add_interlinked_context_options_construction() {
+        let item = InterlinkedItem {
+            node_type: "file".to_string(),
+            label: "main.rs".to_string(),
+            content: "entry point".to_string(),
+            metadata: Some(HashMap::from([("lang".to_string(), "rust".to_string())])),
+        };
+        assert_eq!(item.node_type, "file");
+        assert_eq!(item.label, "main.rs");
+        assert!(item.metadata.is_some());
+
+        let opts = AddInterlinkedContextOptions {
+            root_dir: "/tmp/test".to_string(),
+            items: vec![item],
+            auto_link: Some(false),
+        };
+        assert_eq!(opts.items.len(), 1);
+        assert_eq!(opts.auto_link, Some(false));
+    }
+
+    #[test]
+    fn retrieve_with_traversal_options_construction() {
+        let opts = RetrieveWithTraversalOptions {
+            root_dir: "/tmp/test".to_string(),
+            node_id: "mn-12345".to_string(),
+            max_depth: Some(4),
+            edge_filter: None,
+        };
+        assert_eq!(opts.node_id, "mn-12345");
+        assert_eq!(opts.max_depth, Some(4));
+        assert!(opts.edge_filter.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Existing integration tests
+    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn graph_store_search_without_ollama() {
