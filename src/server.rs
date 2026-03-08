@@ -219,28 +219,34 @@ impl ContextPlusServer {
         &self,
         cache: &Arc<ProjectCache>,
     ) -> Result<Arc<IdentifierIndex>> {
-        let file_count = cache.file_entries.iter().filter(|e| !e.is_directory).count();
+        let file_count = cache
+            .file_entries
+            .iter()
+            .filter(|e| !e.is_directory)
+            .count();
 
         // Fast path: index exists, TTL valid, file count unchanged
         {
             let guard = self.state.identifier_index.read().await;
-            if let Some(ref idx) = *guard {
-                if idx.file_count == file_count
-                    && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
-                {
-                    return Ok(Arc::new(IdentifierIndex {
-                        docs: idx.docs.clone(),
-                        vector_buffer: idx.vector_buffer.clone(),
-                        dims: idx.dims,
-                        file_count: idx.file_count,
-                        built_at: idx.built_at,
-                    }));
-                }
+            if let Some(ref idx) = *guard
+                && idx.file_count == file_count
+                && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
+            {
+                return Ok(Arc::new(IdentifierIndex {
+                    docs: idx.docs.clone(),
+                    vector_buffer: idx.vector_buffer.clone(),
+                    dims: idx.dims,
+                    file_count: idx.file_count,
+                    built_at: idx.built_at,
+                }));
             }
         }
 
         // Slow path: rebuild identifier index
-        tracing::info!(file_count, "Building identifier index (parsing + embedding)");
+        tracing::info!(
+            file_count,
+            "Building identifier index (parsing + embedding)"
+        );
         let cache_clone = cache.clone();
 
         // Step 1: Parse symbols (CPU-bound)
@@ -325,11 +331,11 @@ impl ContextPlusServer {
         let mut uncached_texts: Vec<String> = Vec::new();
 
         for (i, text) in texts.iter().enumerate() {
-            if let Some(ref store) = id_cache {
-                if let Some(vec) = store.get_vector(text) {
-                    result_vectors.push(Some(vec.to_vec()));
-                    continue;
-                }
+            if let Some(ref store) = id_cache
+                && let Some(vec) = store.get_vector(text)
+            {
+                result_vectors.push(Some(vec.to_vec()));
+                continue;
             }
             result_vectors.push(None);
             uncached_indices.push(i);
@@ -353,10 +359,7 @@ impl ContextPlusServer {
 
             // Persist updated identifier embedding cache to disk
             let all_texts: Vec<String> = texts.clone();
-            let all_vecs: Vec<Vec<f32>> = result_vectors
-                .iter()
-                .filter_map(|v| v.clone())
-                .collect();
+            let all_vecs: Vec<Vec<f32>> = result_vectors.iter().filter_map(|v| v.clone()).collect();
             if all_vecs.len() == all_texts.len() {
                 let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
                 let keys = all_texts;
@@ -571,8 +574,8 @@ impl ContextPlusServer {
         let symbol_name = Self::get_str(&args, "symbol_name")
             .or_else(|| Self::get_str(&args, "symbolName"))
             .ok_or_else(|| ContextPlusError::Other("symbol_name is required".into()))?;
-        let file_context = Self::get_str(&args, "file_context")
-            .or_else(|| Self::get_str(&args, "fileContext"));
+        let file_context =
+            Self::get_str(&args, "file_context").or_else(|| Self::get_str(&args, "fileContext"));
 
         let cache = self.ensure_project_cache().await?;
         let file_lines = Self::file_lines_as_vec(&cache);
@@ -597,8 +600,7 @@ impl ContextPlusServer {
         let options = crate::tools::semantic_search::SemanticSearchOptions {
             root_dir: root.clone(),
             query,
-            top_k: Self::get_usize(&args, "top_k")
-                .or_else(|| Self::get_usize(&args, "topK")),
+            top_k: Self::get_usize(&args, "top_k").or_else(|| Self::get_usize(&args, "topK")),
             semantic_weight: Self::get_f64(&args, "semantic_weight")
                 .or_else(|| Self::get_f64(&args, "semanticWeight")),
             keyword_weight: Self::get_f64(&args, "keyword_weight")
@@ -653,8 +655,7 @@ impl ContextPlusServer {
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
             query,
-            top_k: Self::get_usize(&args, "top_k")
-                .or_else(|| Self::get_usize(&args, "topK")),
+            top_k: Self::get_usize(&args, "top_k").or_else(|| Self::get_usize(&args, "topK")),
             top_calls_per_identifier: Self::get_usize(&args, "top_calls_per_identifier")
                 .or_else(|| Self::get_usize(&args, "topCallsPerIdentifier")),
             semantic_weight: Self::get_f64(&args, "semantic_weight")
@@ -865,8 +866,7 @@ impl ContextPlusServer {
             target_type: Self::get_str(&args, "target_type")
                 .or_else(|| Self::get_str(&args, "targetType"))
                 .unwrap_or_else(|| "concept".to_string()),
-            relation: Self::get_str(&args, "relation")
-                .unwrap_or_else(|| "relates_to".to_string()),
+            relation: Self::get_str(&args, "relation").unwrap_or_else(|| "relates_to".to_string()),
             weight: Self::get_f64(&args, "weight").map(|w| w as f32),
             metadata: parse_metadata(&args),
         };
@@ -887,8 +887,7 @@ impl ContextPlusServer {
                 .ok_or_else(|| ContextPlusError::Other("query is required".into()))?,
             max_depth: Self::get_usize(&args, "max_depth")
                 .or_else(|| Self::get_usize(&args, "maxDepth")),
-            top_k: Self::get_usize(&args, "top_k")
-                .or_else(|| Self::get_usize(&args, "topK")),
+            top_k: Self::get_usize(&args, "top_k").or_else(|| Self::get_usize(&args, "topK")),
             edge_filter: args
                 .get("edge_filter")
                 .or_else(|| args.get("edgeFilter"))
@@ -1160,11 +1159,11 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
             let mut uncached_texts: Vec<String> = Vec::new();
 
             for (i, (rel_path, hash)) in content_hashes.iter().enumerate() {
-                if let Some(entry) = cache_read.get(rel_path) {
-                    if entry.hash == *hash {
-                        vectors.push(Some(entry.vector.clone()));
-                        continue;
-                    }
+                if let Some(entry) = cache_read.get(rel_path)
+                    && entry.hash == *hash
+                {
+                    vectors.push(Some(entry.vector.clone()));
+                    continue;
                 }
                 vectors.push(None);
                 uncached_indices.push(i);
@@ -1212,10 +1211,12 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     }
 
                     // Persist to disk
-                    if let Some(store) = crate::core::embeddings::VectorStore::from_cache(&cache_write) {
-                        if let Err(e) = rkyv_store::save_vector_store(&store_root, "embeddings", &store) {
-                            tracing::warn!("Failed to save embedding cache: {e}");
-                        }
+                    if let Some(store) =
+                        crate::core::embeddings::VectorStore::from_cache(&cache_write)
+                        && let Err(e) =
+                            rkyv_store::save_vector_store(store_root, "embeddings", &store)
+                    {
+                        tracing::warn!("Failed to save embedding cache: {e}");
                     }
                 }
             }
@@ -1273,84 +1274,230 @@ fn tool_definitions() -> Vec<Tool> {
             "get_context_tree",
             "Build a token-aware context tree showing file structure and symbols. Prunes detail levels based on max_tokens budget.",
             &[
-                ("target_path", "string", false, "Specific directory or file to analyze (relative to project root)"),
-                ("depth_limit", "integer", false, "How many folder levels deep to scan. Use 1-2 for large projects."),
-                ("include_symbols", "boolean", false, "Include function/class/enum names in the tree (default true)"),
-                ("max_tokens", "integer", false, "Maximum tokens for output. Auto-prunes if exceeded (default 20000)"),
+                (
+                    "target_path",
+                    "string",
+                    false,
+                    "Specific directory or file to analyze (relative to project root)",
+                ),
+                (
+                    "depth_limit",
+                    "integer",
+                    false,
+                    "How many folder levels deep to scan. Use 1-2 for large projects.",
+                ),
+                (
+                    "include_symbols",
+                    "boolean",
+                    false,
+                    "Include function/class/enum names in the tree (default true)",
+                ),
+                (
+                    "max_tokens",
+                    "integer",
+                    false,
+                    "Maximum tokens for output. Auto-prunes if exceeded (default 20000)",
+                ),
             ],
         ),
         make_tool(
             "get_file_skeleton",
             "Get function signatures, class definitions, and line ranges for a file without reading full content.",
-            &[
-                ("file_path", "string", true, "Path to the file to inspect (relative to project root)"),
-            ],
+            &[(
+                "file_path",
+                "string",
+                true,
+                "Path to the file to inspect (relative to project root)",
+            )],
         ),
         make_tool(
             "get_blast_radius",
             "Find every file that imports or references a symbol. Maps the full impact of changing it.",
             &[
-                ("symbol_name", "string", true, "The function, class, or variable name to trace across the codebase"),
-                ("file_context", "string", false, "The file where the symbol is defined. Excludes the definition line from results."),
+                (
+                    "symbol_name",
+                    "string",
+                    true,
+                    "The function, class, or variable name to trace across the codebase",
+                ),
+                (
+                    "file_context",
+                    "string",
+                    false,
+                    "The file where the symbol is defined. Excludes the definition line from results.",
+                ),
             ],
         ),
         make_tool(
             "semantic_code_search",
             "Search code files semantically using natural language queries. Combines embedding similarity with keyword matching for hybrid ranking.",
             &[
-                ("query", "string", true, "Natural language description of what you're looking for"),
-                ("top_k", "integer", false, "Number of matches to return (default 5, max 50)"),
-                ("semantic_weight", "number", false, "Weight for embedding similarity in hybrid ranking (default 0.72)"),
-                ("keyword_weight", "number", false, "Weight for keyword overlap in hybrid ranking (default 0.28)"),
-                ("min_semantic_score", "number", false, "Minimum semantic score filter (0-1 or 0-100)"),
-                ("min_keyword_score", "number", false, "Minimum keyword score filter (0-1 or 0-100)"),
-                ("min_combined_score", "number", false, "Minimum final score filter (0-1 or 0-100)"),
-                ("require_keyword_match", "boolean", false, "When true, only return files with keyword overlap"),
-                ("require_semantic_match", "boolean", false, "When true, only return files with positive semantic similarity"),
+                (
+                    "query",
+                    "string",
+                    true,
+                    "Natural language description of what you're looking for",
+                ),
+                (
+                    "top_k",
+                    "integer",
+                    false,
+                    "Number of matches to return (default 5, max 50)",
+                ),
+                (
+                    "semantic_weight",
+                    "number",
+                    false,
+                    "Weight for embedding similarity in hybrid ranking (default 0.72)",
+                ),
+                (
+                    "keyword_weight",
+                    "number",
+                    false,
+                    "Weight for keyword overlap in hybrid ranking (default 0.28)",
+                ),
+                (
+                    "min_semantic_score",
+                    "number",
+                    false,
+                    "Minimum semantic score filter (0-1 or 0-100)",
+                ),
+                (
+                    "min_keyword_score",
+                    "number",
+                    false,
+                    "Minimum keyword score filter (0-1 or 0-100)",
+                ),
+                (
+                    "min_combined_score",
+                    "number",
+                    false,
+                    "Minimum final score filter (0-1 or 0-100)",
+                ),
+                (
+                    "require_keyword_match",
+                    "boolean",
+                    false,
+                    "When true, only return files with keyword overlap",
+                ),
+                (
+                    "require_semantic_match",
+                    "boolean",
+                    false,
+                    "When true, only return files with positive semantic similarity",
+                ),
             ],
         ),
         make_tool(
             "semantic_identifier_search",
             "Search for functions, classes, and variables by semantic meaning. Returns identifiers with call-site rankings.",
             &[
-                ("query", "string", true, "Natural language intent to match identifiers and usages"),
-                ("top_k", "integer", false, "How many identifiers to return (default 5)"),
-                ("top_calls_per_identifier", "integer", false, "How many ranked call sites per identifier (default 10)"),
-                ("include_kinds", "array", false, "Optional kinds filter, e.g. [\"function\", \"method\", \"variable\"]"),
-                ("semantic_weight", "number", false, "Weight for semantic similarity score (default 0.78)"),
-                ("keyword_weight", "number", false, "Weight for keyword overlap score (default 0.22)"),
+                (
+                    "query",
+                    "string",
+                    true,
+                    "Natural language intent to match identifiers and usages",
+                ),
+                (
+                    "top_k",
+                    "integer",
+                    false,
+                    "How many identifiers to return (default 5)",
+                ),
+                (
+                    "top_calls_per_identifier",
+                    "integer",
+                    false,
+                    "How many ranked call sites per identifier (default 10)",
+                ),
+                (
+                    "include_kinds",
+                    "array",
+                    false,
+                    "Optional kinds filter, e.g. [\"function\", \"method\", \"variable\"]",
+                ),
+                (
+                    "semantic_weight",
+                    "number",
+                    false,
+                    "Weight for semantic similarity score (default 0.78)",
+                ),
+                (
+                    "keyword_weight",
+                    "number",
+                    false,
+                    "Weight for keyword overlap score (default 0.22)",
+                ),
             ],
         ),
         make_tool(
             "semantic_navigate",
             "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation.",
             &[
-                ("max_depth", "integer", false, "Maximum nesting depth of clusters (default 3)"),
-                ("max_clusters", "integer", false, "Maximum sub-clusters per level (default 20)"),
+                (
+                    "max_depth",
+                    "integer",
+                    false,
+                    "Maximum nesting depth of clusters (default 3)",
+                ),
+                (
+                    "max_clusters",
+                    "integer",
+                    false,
+                    "Maximum sub-clusters per level (default 20)",
+                ),
             ],
         ),
         make_tool(
             "get_feature_hub",
             "Navigate Obsidian-style wikilinks to discover feature hubs and their connections.",
             &[
-                ("hub_path", "string", false, "Path to a specific hub .md file (relative to root)"),
-                ("feature_name", "string", false, "Feature name to search for. Finds matching hub file automatically."),
-                ("show_orphans", "boolean", false, "If true, lists all source files not linked to any hub."),
+                (
+                    "hub_path",
+                    "string",
+                    false,
+                    "Path to a specific hub .md file (relative to root)",
+                ),
+                (
+                    "feature_name",
+                    "string",
+                    false,
+                    "Feature name to search for. Finds matching hub file automatically.",
+                ),
+                (
+                    "show_orphans",
+                    "boolean",
+                    false,
+                    "If true, lists all source files not linked to any hub.",
+                ),
             ],
         ),
         make_tool(
             "run_static_analysis",
             "Run available linters (tsc, eslint, cargo check, ruff) on the project or a specific file.",
-            &[
-                ("target_path", "string", false, "Specific file or folder to lint (relative to root). Omit for full project."),
-            ],
+            &[(
+                "target_path",
+                "string",
+                false,
+                "Specific file or folder to lint (relative to root). Omit for full project.",
+            )],
         ),
         make_tool(
             "propose_commit",
             "Write a file with validation (header, comments, nesting, line count) and create a shadow restore point for undo.",
             &[
-                ("file_path", "string", true, "Where to save the file (relative to project root)"),
-                ("new_content", "string", true, "The complete file content to save"),
+                (
+                    "file_path",
+                    "string",
+                    true,
+                    "Where to save the file (relative to project root)",
+                ),
+                (
+                    "new_content",
+                    "string",
+                    true,
+                    "The complete file content to save",
+                ),
                 ("description", "string", false, "Description of the change"),
             ],
         ),
@@ -1362,18 +1509,41 @@ fn tool_definitions() -> Vec<Tool> {
         make_tool(
             "undo_change",
             "Restore files from a shadow restore point created by propose_commit.",
-            &[
-                ("point_id", "string", true, "The restore point ID (format: rp-timestamp-hash). Get from list_restore_points."),
-            ],
+            &[(
+                "point_id",
+                "string",
+                true,
+                "The restore point ID (format: rp-timestamp-hash). Get from list_restore_points.",
+            )],
         ),
         make_tool(
             "upsert_memory_node",
             "Create or update a memory graph node. Nodes are uniquely identified by (label, type).",
             &[
-                ("type", "string", true, "Node type: concept, file, symbol, note"),
-                ("label", "string", true, "Short identifier for the node. Used for deduplication with type."),
-                ("content", "string", true, "Detailed content for the node. Used for embedding generation."),
-                ("metadata", "object", false, "Optional key-value metadata pairs"),
+                (
+                    "type",
+                    "string",
+                    true,
+                    "Node type: concept, file, symbol, note",
+                ),
+                (
+                    "label",
+                    "string",
+                    true,
+                    "Short identifier for the node. Used for deduplication with type.",
+                ),
+                (
+                    "content",
+                    "string",
+                    true,
+                    "Detailed content for the node. Used for embedding generation.",
+                ),
+                (
+                    "metadata",
+                    "object",
+                    false,
+                    "Optional key-value metadata pairs",
+                ),
             ],
         ),
         make_tool(
@@ -1382,43 +1552,106 @@ fn tool_definitions() -> Vec<Tool> {
             &[
                 ("source_id", "string", true, "ID of the source memory node"),
                 ("target_id", "string", true, "ID of the target memory node"),
-                ("relation", "string", true, "Relationship type: relates_to, depends_on, implements, references, similar_to, contains"),
-                ("weight", "number", false, "Edge weight 0-1. Higher = stronger relationship (default 1.0)"),
-                ("metadata", "object", false, "Optional key-value metadata for the edge"),
+                (
+                    "relation",
+                    "string",
+                    true,
+                    "Relationship type: relates_to, depends_on, implements, references, similar_to, contains",
+                ),
+                (
+                    "weight",
+                    "number",
+                    false,
+                    "Edge weight 0-1. Higher = stronger relationship (default 1.0)",
+                ),
+                (
+                    "metadata",
+                    "object",
+                    false,
+                    "Optional key-value metadata for the edge",
+                ),
             ],
         ),
         make_tool(
             "search_memory_graph",
             "Search the memory graph by semantic similarity and BFS traversal.",
             &[
-                ("query", "string", true, "Natural language query to search the memory graph"),
-                ("max_depth", "integer", false, "How many hops to traverse from direct matches (default 1)"),
-                ("top_k", "integer", false, "Number of direct matches to return (default 5)"),
-                ("edge_filter", "array", false, "Only traverse edges of these types. Omit for all types."),
+                (
+                    "query",
+                    "string",
+                    true,
+                    "Natural language query to search the memory graph",
+                ),
+                (
+                    "max_depth",
+                    "integer",
+                    false,
+                    "How many hops to traverse from direct matches (default 1)",
+                ),
+                (
+                    "top_k",
+                    "integer",
+                    false,
+                    "Number of direct matches to return (default 5)",
+                ),
+                (
+                    "edge_filter",
+                    "array",
+                    false,
+                    "Only traverse edges of these types. Omit for all types.",
+                ),
             ],
         ),
         make_tool(
             "prune_stale_links",
             "Remove memory graph edges with decayed weight below threshold, and orphan nodes.",
-            &[
-                ("threshold", "number", false, "Minimum decayed weight to keep an edge (default 0.15). Lower = keep more edges."),
-            ],
+            &[(
+                "threshold",
+                "number",
+                false,
+                "Minimum decayed weight to keep an edge (default 0.15). Lower = keep more edges.",
+            )],
         ),
         make_tool(
             "add_interlinked_context",
             "Add multiple memory nodes at once with optional auto-linking by semantic similarity.",
             &[
-                ("items", "array", true, "Array of nodes to add. Each needs type, label, and content."),
-                ("auto_link", "boolean", false, "Whether to auto-create similarity edges (default true)"),
+                (
+                    "items",
+                    "array",
+                    true,
+                    "Array of nodes to add. Each needs type, label, and content.",
+                ),
+                (
+                    "auto_link",
+                    "boolean",
+                    false,
+                    "Whether to auto-create similarity edges (default true)",
+                ),
             ],
         ),
         make_tool(
             "retrieve_with_traversal",
             "Retrieve a memory node and its neighborhood via BFS traversal with depth penalty.",
             &[
-                ("start_node_id", "string", true, "ID of the memory node to start traversal from"),
-                ("max_depth", "integer", false, "Maximum traversal depth from start node (default 2)"),
-                ("edge_filter", "array", false, "Only traverse edges of these types. Omit for all."),
+                (
+                    "start_node_id",
+                    "string",
+                    true,
+                    "ID of the memory node to start traversal from",
+                ),
+                (
+                    "max_depth",
+                    "integer",
+                    false,
+                    "Maximum traversal depth from start node (default 2)",
+                ),
+                (
+                    "edge_filter",
+                    "array",
+                    false,
+                    "Only traverse edges of these types. Omit for all.",
+                ),
             ],
         ),
     ]

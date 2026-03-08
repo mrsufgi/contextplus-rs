@@ -22,7 +22,9 @@ fn generate_vectors(n: usize, dims: usize) -> Vec<f32> {
 }
 
 fn generate_query(dims: usize) -> Vec<f32> {
-    (0..dims).map(|d| ((d * 31 + 17) % 1000) as f32 / 1000.0).collect()
+    (0..dims)
+        .map(|d| ((d * 31 + 17) % 1000) as f32 / 1000.0)
+        .collect()
 }
 
 fn bench_cosine_single_pair(c: &mut Criterion) {
@@ -32,21 +34,13 @@ fn bench_cosine_single_pair(c: &mut Criterion) {
         let a: Vec<f32> = (0..dims).map(|d| (d as f32 * 0.001).sin()).collect();
         let b: Vec<f32> = (0..dims).map(|d| (d as f32 * 0.002).cos()).collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("simsimd", dims),
-            &dims,
-            |bench, _| {
-                bench.iter(|| cosine_similarity_simsimd(&a, &b));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("simsimd", dims), &dims, |bench, _| {
+            bench.iter(|| cosine_similarity_simsimd(&a, &b));
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("naive", dims),
-            &dims,
-            |bench, _| {
-                bench.iter(|| cosine_similarity_naive(&a, &b));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("naive", dims), &dims, |bench, _| {
+            bench.iter(|| cosine_similarity_naive(&a, &b));
+        });
     }
 
     group.finish();

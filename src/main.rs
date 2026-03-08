@@ -92,42 +92,38 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| PathBuf::from("contextplus-rs"));
 
             let content = match target {
-                AgentTarget::Opencode => {
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "$schema": "https://opencode.ai/config.json",
-                        "mcp": {
-                            "contextplus": {
-                                "type": "local",
-                                "command": [binary_path.to_string_lossy()],
-                                "enabled": true,
-                                "environment": {
-                                    "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
-                                    "OLLAMA_CHAT_MODEL": "llama3.2",
-                                    "OLLAMA_HOST": "http://localhost:11434",
-                                    "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
-                                    "CONTEXTPLUS_EMBED_TRACKER": "true"
-                                }
+                AgentTarget::Opencode => serde_json::to_string_pretty(&serde_json::json!({
+                    "$schema": "https://opencode.ai/config.json",
+                    "mcp": {
+                        "contextplus": {
+                            "type": "local",
+                            "command": [binary_path.to_string_lossy()],
+                            "enabled": true,
+                            "environment": {
+                                "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+                                "OLLAMA_CHAT_MODEL": "llama3.2",
+                                "OLLAMA_HOST": "http://localhost:11434",
+                                "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+                                "CONTEXTPLUS_EMBED_TRACKER": "true"
                             }
                         }
-                    }))?
-                }
-                _ => {
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "mcpServers": {
-                            "contextplus": {
-                                "command": binary_path.to_string_lossy(),
-                                "args": [],
-                                "env": {
-                                    "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
-                                    "OLLAMA_CHAT_MODEL": "llama3.2",
-                                    "OLLAMA_HOST": "http://localhost:11434",
-                                    "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
-                                    "CONTEXTPLUS_EMBED_TRACKER": "true"
-                                }
+                    }
+                }))?,
+                _ => serde_json::to_string_pretty(&serde_json::json!({
+                    "mcpServers": {
+                        "contextplus": {
+                            "command": binary_path.to_string_lossy(),
+                            "args": [],
+                            "env": {
+                                "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+                                "OLLAMA_CHAT_MODEL": "llama3.2",
+                                "OLLAMA_HOST": "http://localhost:11434",
+                                "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+                                "CONTEXTPLUS_EMBED_TRACKER": "true"
                             }
                         }
-                    }))?
-                }
+                    }
+                }))?,
             };
 
             let output_path = root_dir.join(target.config_path());

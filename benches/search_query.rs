@@ -10,14 +10,18 @@ use std::collections::HashMap;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-use contextplus_rs::cache::rkyv_store::{load_cache_mmap, save_cache, CacheData};
+use contextplus_rs::cache::rkyv_store::{CacheData, load_cache_mmap, save_cache};
 use contextplus_rs::core::embeddings::{CacheEntry, VectorStore};
 
 /// Generate a realistic embedding cache with `n` file entries.
 fn generate_cache(n: usize, dims: usize) -> HashMap<String, CacheEntry> {
     let mut cache = HashMap::with_capacity(n);
     for i in 0..n {
-        let key = format!("packages/domains/feature_{}/service/handler_{}.ts", i / 50, i);
+        let key = format!(
+            "packages/domains/feature_{}/service/handler_{}.ts",
+            i / 50,
+            i
+        );
         let hash = format!("hash_{}", i);
         let vector: Vec<f32> = (0..dims)
             .map(|d| ((i * 7 + d * 13 + 42) % 1000) as f32 / 1000.0)

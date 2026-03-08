@@ -484,7 +484,10 @@ fn bench_parse_all_languages(c: &mut Criterion) {
                 let symbols = parse_with_tree_sitter(code, ext).unwrap();
                 total_symbols += symbols.len();
             }
-            assert!(total_symbols > 20, "expected >20 symbols across 10 languages");
+            assert!(
+                total_symbols > 20,
+                "expected >20 symbols across 10 languages"
+            );
             total_symbols
         });
     });

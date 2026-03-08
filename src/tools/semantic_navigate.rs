@@ -4,8 +4,8 @@
 use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::core::clustering::{find_path_pattern, spectral_cluster};
-use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
 use crate::core::embeddings::VectorStore;
+use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
 use crate::core::walker;
 use crate::error::Result;
 use serde::Deserialize;
@@ -238,9 +238,10 @@ async fn resolve_embeddings(
 
         // Persist full cache to disk
         if let Some(store) = VectorStore::from_cache(&cache_write)
-            && let Err(e) = rkyv_store::save_vector_store(root_dir, "embeddings", &store) {
-                tracing::warn!("Failed to save embedding cache to disk: {e}");
-            }
+            && let Err(e) = rkyv_store::save_vector_store(root_dir, "embeddings", &store)
+        {
+            tracing::warn!("Failed to save embedding cache to disk: {e}");
+        }
     }
 
     Ok(result_vectors
@@ -352,7 +353,11 @@ async fn label_sibling_clusters(
                 .map(|p| format!(" (pattern: {})", p))
                 .unwrap_or_default();
             let count_note = if files.len() > MAX_FILES_PER_LABEL {
-                format!(" ({} files total, showing {})", files.len(), MAX_FILES_PER_LABEL)
+                format!(
+                    " ({} files total, showing {})",
+                    files.len(),
+                    MAX_FILES_PER_LABEL
+                )
             } else {
                 format!(" ({} files)", files.len())
             };
@@ -1454,8 +1459,14 @@ mod tests {
         let cache: RwLock<HashMap<String, CacheEntry>> = RwLock::new(HashMap::new());
         {
             let mut w = cache.write().await;
-            w.insert("src/a.rs".to_string(), make_cache_entry("src/a.rs", vec![1.0, 2.0, 3.0]));
-            w.insert("src/b.rs".to_string(), make_cache_entry("src/b.rs", vec![4.0, 5.0, 6.0]));
+            w.insert(
+                "src/a.rs".to_string(),
+                make_cache_entry("src/a.rs", vec![1.0, 2.0, 3.0]),
+            );
+            w.insert(
+                "src/b.rs".to_string(),
+                make_cache_entry("src/b.rs", vec![4.0, 5.0, 6.0]),
+            );
         }
 
         let files = vec![make_test_file("src/a.rs"), make_test_file("src/b.rs")];
@@ -1496,7 +1507,10 @@ mod tests {
         let cache: RwLock<HashMap<String, CacheEntry>> = RwLock::new(HashMap::new());
         {
             let mut w = cache.write().await;
-            w.insert("src/cached.rs".to_string(), make_cache_entry("src/cached.rs", vec![1.0, 2.0, 3.0]));
+            w.insert(
+                "src/cached.rs".to_string(),
+                make_cache_entry("src/cached.rs", vec![1.0, 2.0, 3.0]),
+            );
         }
 
         let files = vec![
@@ -1544,7 +1558,9 @@ mod tests {
         config.ollama_host = mock_server.uri();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path()).await.unwrap();
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path())
+            .await
+            .unwrap();
         assert_eq!(result.len(), 2);
 
         // Both should now be in cache
@@ -1563,7 +1579,9 @@ mod tests {
         let config = crate::config::Config::from_env();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path()).await.unwrap();
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path())
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1588,10 +1606,13 @@ mod tests {
         let cache: RwLock<HashMap<String, CacheEntry>> = RwLock::new(HashMap::new());
         {
             let mut w = cache.write().await;
-            w.insert("src/changed.rs".to_string(), CacheEntry {
-                hash: "stale_hash_that_wont_match".to_string(),
-                vector: vec![1.0, 1.0, 1.0],
-            });
+            w.insert(
+                "src/changed.rs".to_string(),
+                CacheEntry {
+                    hash: "stale_hash_that_wont_match".to_string(),
+                    vector: vec![1.0, 1.0, 1.0],
+                },
+            );
         }
 
         let files = vec![make_test_file("src/changed.rs")];
@@ -1600,7 +1621,9 @@ mod tests {
         config.ollama_host = mock_server.uri();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path()).await.unwrap();
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path())
+            .await
+            .unwrap();
         // Should have re-embedded with new vector from Ollama
         assert_eq!(result[0], vec![9.0, 9.0, 9.0]);
 

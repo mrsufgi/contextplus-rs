@@ -377,7 +377,11 @@ mod tests {
 
     #[test]
     fn feature_tag_present_case_insensitive() {
-        let lines = vec!["// Description line", "// feature: My Thing", "fn main() {}"];
+        let lines = vec![
+            "// Description line",
+            "// feature: My Thing",
+            "fn main() {}",
+        ];
         let errors = validate_header(&lines, "rs");
         assert!(errors.is_empty(), "feature: (lowercase) should be accepted");
     }
@@ -387,7 +391,10 @@ mod tests {
         let lines = vec!["fn main() {}", "let x = 1;"];
         let errors = validate_header(&lines, "rs");
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].rule, "header", "Only header error, no feature-tag when < 2 comment lines");
+        assert_eq!(
+            errors[0].rule, "header",
+            "Only header error, no feature-tag when < 2 comment lines"
+        );
     }
 
     #[test]

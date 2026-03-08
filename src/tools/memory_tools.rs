@@ -912,9 +912,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("nonexistent".to_string()),
+                source_id: None,
+                source_label: Some("nonexistent".to_string()),
                 source_type: "concept".to_string(),
-                target_id: None, target_label: Some("target".to_string()),
+                target_id: None,
+                target_label: Some("target".to_string()),
                 target_type: "concept".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -952,9 +954,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("source".to_string()),
+                source_id: None,
+                source_label: Some("source".to_string()),
                 source_type: "concept".to_string(),
-                target_id: None, target_label: Some("missing".to_string()),
+                target_id: None,
+                target_label: Some("missing".to_string()),
                 target_type: "concept".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -998,9 +1002,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("auth".to_string()),
+                source_id: None,
+                source_label: Some("auth".to_string()),
                 source_type: "concept".to_string(),
-                target_id: None, target_label: Some("auth.rs".to_string()),
+                target_id: None,
+                target_label: Some("auth.rs".to_string()),
                 target_type: "file".to_string(),
                 relation: "implements".to_string(),
                 weight: Some(0.9),
@@ -1028,9 +1034,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("a".to_string()),
+                source_id: None,
+                source_label: Some("a".to_string()),
                 source_type: "concept".to_string(),
-                target_id: None, target_label: Some("b".to_string()),
+                target_id: None,
+                target_label: Some("b".to_string()),
                 target_type: "concept".to_string(),
                 relation: "invalid_relation".to_string(),
                 weight: None,
@@ -1053,9 +1061,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("a".to_string()),
+                source_id: None,
+                source_label: Some("a".to_string()),
                 source_type: "bad_type".to_string(),
-                target_id: None, target_label: Some("b".to_string()),
+                target_id: None,
+                target_label: Some("b".to_string()),
                 target_type: "concept".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -1076,13 +1086,7 @@ mod tests {
         // Create a source node so source lookup succeeds
         store
             .get_graph(&root, |graph| {
-                graph.upsert_node(
-                    NodeType::Concept,
-                    "a",
-                    "test",
-                    vec![0.1, 0.2],
-                    None,
-                )
+                graph.upsert_node(NodeType::Concept, "a", "test", vec![0.1, 0.2], None)
             })
             .await
             .unwrap();
@@ -1091,9 +1095,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("a".to_string()),
+                source_id: None,
+                source_label: Some("a".to_string()),
                 source_type: "concept".to_string(),
-                target_id: None, target_label: Some("b".to_string()),
+                target_id: None,
+                target_label: Some("b".to_string()),
                 target_type: "bad_type".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -1126,9 +1132,11 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_id: None, source_label: Some("A".to_string()),
+                source_id: None,
+                source_label: Some("A".to_string()),
                 source_type: "concept".to_string(),
-                target_id: None, target_label: Some("B".to_string()),
+                target_id: None,
+                target_label: Some("B".to_string()),
                 target_type: "concept".to_string(),
                 relation: "relates_to".to_string(),
                 weight: Some(0.75),
@@ -2065,9 +2073,11 @@ mod tests {
     fn create_relation_options_construction() {
         let opts = CreateRelationOptions {
             root_dir: "/tmp/test".to_string(),
-            source_id: None, source_label: Some("src".to_string()),
+            source_id: None,
+            source_label: Some("src".to_string()),
             source_type: "concept".to_string(),
-            target_id: None, target_label: Some("tgt".to_string()),
+            target_id: None,
+            target_label: Some("tgt".to_string()),
             target_type: "file".to_string(),
             relation: "depends_on".to_string(),
             weight: Some(0.5),
