@@ -98,26 +98,17 @@ pub fn render_skeleton(
         None => {
             // Unsupported file type
             let preview = file_content
-                .map(|content| {
-                    content
-                        .lines()
-                        .take(20)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
+                .map(|content| content.lines().take(20).collect::<Vec<_>>().join("\n"))
                 .unwrap_or_default();
-            format!("[Unsupported language, showing first 20 lines]\n\n{}", preview)
+            format!(
+                "[Unsupported language, showing first 20 lines]\n\n{}",
+                preview
+            )
         }
         Some(analysis) if analysis.symbols.is_empty() => {
             // No symbols detected
             let preview = file_content
-                .map(|content| {
-                    content
-                        .lines()
-                        .take(30)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
+                .map(|content| content.lines().take(30).collect::<Vec<_>>().join("\n"))
                 .unwrap_or_default();
             format!(
                 "[No symbols detected, showing first 30 lines]\n\n{}",
@@ -125,13 +116,12 @@ pub fn render_skeleton(
             )
         }
         Some(analysis) => {
-            let parts = [format!("File: {} ({} lines)", file_path, analysis.line_count),
-                format!(
-                    "Symbols: {} top-level definitions",
-                    analysis.symbols.len()
-                ),
+            let parts = [
+                format!("File: {} ({} lines)", file_path, analysis.line_count),
+                format!("Symbols: {} top-level definitions", analysis.symbols.len()),
                 String::new(),
-                format_signature_block(analysis)];
+                format_signature_block(analysis),
+            ];
             parts.join("\n")
         }
     }

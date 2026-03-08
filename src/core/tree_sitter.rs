@@ -8,7 +8,10 @@ use crate::error::{ContextPlusError, Result};
 /// Extension-to-grammar mapping for the 10 supported native grammars.
 fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
     match ext {
-        ".ts" => Some(("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())),
+        ".ts" => Some((
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        )),
         ".tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
         ".js" | ".jsx" | ".mjs" | ".cjs" => {
             Some(("javascript", tree_sitter_javascript::LANGUAGE.into()))
@@ -92,9 +95,9 @@ fn extract_name<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
             && let Some(inner) = name_node
                 .child_by_field_name("declarator")
                 .or_else(|| name_node.named_child(0))
-            {
-                return inner.utf8_text(source).unwrap_or("anonymous").to_string();
-            }
+        {
+            return inner.utf8_text(source).unwrap_or("anonymous").to_string();
+        }
         return name_node
             .utf8_text(source)
             .unwrap_or("anonymous")
@@ -114,9 +117,10 @@ fn extract_name<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
             }
             // Handle variable_declarator / const_declaration
             if (kind == "variable_declarator" || kind == "const_declaration")
-                && let Some(inner) = child.child_by_field_name("name") {
-                    return inner.utf8_text(source).unwrap_or("anonymous").to_string();
-                }
+                && let Some(inner) = child.child_by_field_name("name")
+            {
+                return inner.utf8_text(source).unwrap_or("anonymous").to_string();
+            }
         }
     }
 
@@ -133,7 +137,10 @@ fn extract_signature<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
     let text = node.utf8_text(source).unwrap_or("");
     let first_line = text.lines().next().unwrap_or("").trim();
     if first_line.len() > 150 {
-        format!("{}...", crate::core::parser::truncate_to_char_boundary(first_line, 150))
+        format!(
+            "{}...",
+            crate::core::parser::truncate_to_char_boundary(first_line, 150)
+        )
     } else {
         first_line.to_string()
     }
@@ -158,7 +165,13 @@ fn collect_symbols(
         let mut children = Vec::new();
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
-                children.extend(collect_symbols(&child, source, def_types, depth + 1, max_depth));
+                children.extend(collect_symbols(
+                    &child,
+                    source,
+                    def_types,
+                    depth + 1,
+                    max_depth,
+                ));
             }
         }
 

@@ -2,9 +2,7 @@
 // 6 tools: upsert, relate, search, prune, interlink, traverse.
 
 use crate::core::embeddings::OllamaClient;
-use crate::core::memory_graph::{
-    GraphStore, NodeType, RelationType, TraversalResult,
-};
+use crate::core::memory_graph::{GraphStore, NodeType, RelationType, TraversalResult};
 use crate::error::{ContextPlusError, Result};
 use std::collections::HashMap;
 
@@ -66,7 +64,10 @@ pub struct RetrieveWithTraversalOptions {
 
 fn format_traversal_result(result: &TraversalResult) -> String {
     let content_preview = if result.node.content.len() > 120 {
-        format!("{}...", &result.node.content[..120])
+        format!(
+            "{}...",
+            crate::core::parser::truncate_to_char_boundary(&result.node.content, 120)
+        )
     } else {
         result.node.content.clone()
     };
@@ -92,7 +93,7 @@ fn format_traversal_result(result: &TraversalResult) -> String {
 }
 
 fn parse_node_type(s: &str) -> Result<NodeType> {
-    NodeType::from_str(s).ok_or_else(|| {
+    NodeType::parse_str(s).ok_or_else(|| {
         ContextPlusError::Other(format!(
             "Invalid node type: '{}'. Valid types: concept, file, symbol, note",
             s
@@ -101,7 +102,7 @@ fn parse_node_type(s: &str) -> Result<NodeType> {
 }
 
 fn parse_relation_type(s: &str) -> Result<RelationType> {
-    RelationType::from_str(s).ok_or_else(|| {
+    RelationType::parse_str(s).ok_or_else(|| {
         ContextPlusError::Other(format!(
             "Invalid relation: '{}'. Valid: relates_to, depends_on, implements, references, similar_to, contains",
             s
@@ -252,12 +253,7 @@ pub async fn tool_search_memory_graph(
 
     let result = store
         .get_graph(&options.root_dir, |graph| {
-            graph.search(
-                &query_embedding,
-                max_depth,
-                top_k,
-                edge_filter.as_deref(),
-            )
+            graph.search(&query_embedding, max_depth, top_k, edge_filter.as_deref())
         })
         .await?;
 
@@ -369,10 +365,7 @@ pub async fn tool_add_interlinked_context(
     if !result.edges.is_empty() {
         sections.push("\nEdges:".to_string());
         for edge in &result.edges {
-            sections.push(format!(
-                "  --[{} w:{:.2}]-->",
-                edge.relation, edge.weight
-            ));
+            sections.push(format!("  --[{} w:{:.2}]-->", edge.relation, edge.weight));
         }
     }
 

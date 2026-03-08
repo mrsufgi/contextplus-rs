@@ -15,9 +15,8 @@ static WIKILINK_RE: LazyLock<Regex> =
 static CROSS_LINK_CAPTURE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"@linked-to\s+\[\[([^\]]+)\]\]").expect("valid regex"));
 
-static FEATURE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^(?://|#|--)\s*FEATURE:\s*(.+)$").expect("valid regex")
-});
+static FEATURE_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(?://|#|--)\s*FEATURE:\s*(.+)$").expect("valid regex"));
 
 static HEADING_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^#\s+(.+)$").expect("valid regex"));
@@ -69,7 +68,8 @@ pub fn parse_wiki_links(content: &str) -> Vec<HubLink> {
 
 /// Parse `@linked-to [[hubName]]` cross-link references.
 pub fn parse_cross_links(content: &str, source_file: &str) -> Vec<CrossLink> {
-    CROSS_LINK_CAPTURE_RE.captures_iter(content)
+    CROSS_LINK_CAPTURE_RE
+        .captures_iter(content)
         .map(|cap| CrossLink {
             hub_name: cap[1].trim().to_string(),
             source_file: source_file.to_string(),
@@ -79,7 +79,9 @@ pub fn parse_cross_links(content: &str, source_file: &str) -> Vec<CrossLink> {
 
 /// Extract a `// FEATURE: ...` or `# FEATURE: ...` or `-- FEATURE: ...` tag from file header.
 pub fn extract_feature_tag(content: &str) -> Option<String> {
-    FEATURE_TAG_RE.captures(content).map(|cap| cap[1].trim().to_string())
+    FEATURE_TAG_RE
+        .captures(content)
+        .map(|cap| cap[1].trim().to_string())
 }
 
 /// Parse a hub markdown file into structured information.
@@ -146,11 +148,12 @@ pub async fn discover_hubs(root_dir: &Path) -> crate::error::Result<Vec<String>>
                 dirs.push(full_path);
             } else if name_str.ends_with(".md")
                 && let Ok(content) = tokio::fs::read_to_string(&full_path).await
-                    && has_wikilinks(&content)
-                        && let Ok(rel) = full_path.strip_prefix(root_dir) {
-                            let rel_str = rel.to_string_lossy().replace('\\', "/");
-                            hubs.push(rel_str);
-                        }
+                && has_wikilinks(&content)
+                && let Ok(rel) = full_path.strip_prefix(root_dir)
+            {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                hubs.push(rel_str);
+            }
         }
     }
 
@@ -357,7 +360,9 @@ mod tests {
             "hub.md".to_string(),
         ];
 
-        let orphans = find_orphaned_files(root, &all_files).await.expect("orphans");
+        let orphans = find_orphaned_files(root, &all_files)
+            .await
+            .expect("orphans");
         assert_eq!(orphans, vec!["orphan.rs"]);
     }
 

@@ -146,21 +146,19 @@ fn build_tree(
         };
 
         if !entry.is_directory
-            && let Some(analysis) = analyses.get(&entry.relative_path) {
-                node.header = analysis.header.clone();
-                if include_symbols && !analysis.symbols.is_empty() {
-                    node.symbols = Some(format_symbols(&analysis.symbols));
-                }
+            && let Some(analysis) = analyses.get(&entry.relative_path)
+        {
+            node.header = analysis.header.clone();
+            if include_symbols && !analysis.symbols.is_empty() {
+                node.symbols = Some(format_symbols(&analysis.symbols));
             }
+        }
 
         if entry.is_directory {
             dir_map.entry(entry.relative_path.clone()).or_default();
         }
 
-        dir_map
-            .entry(parent_path)
-            .or_default()
-            .push(node);
+        dir_map.entry(parent_path).or_default().push(node);
     }
 
     // Reconstruct tree bottom-up
@@ -181,10 +179,7 @@ fn build_tree(
     }
 
     let children = collect_children(".", &mut dir_map);
-    TreeNode {
-        children,
-        ..root
-    }
+    TreeNode { children, ..root }
 }
 
 fn render_tree(node: &TreeNode, indent: usize) -> String {

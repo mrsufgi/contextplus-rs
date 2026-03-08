@@ -77,10 +77,7 @@ fn get_linter_config(ext: &str) -> Option<LinterConfig> {
         }),
         ".rs" => Some(LinterConfig {
             cmd: "cargo",
-            args: vec![
-                "check".to_string(),
-                "--message-format=short".to_string(),
-            ],
+            args: vec!["check".to_string(), "--message-format=short".to_string()],
             config_file: Some("Cargo.toml"),
         }),
         ".go" => Some(LinterConfig {
@@ -148,9 +145,10 @@ async fn config_exists(root_dir: &Path, config_file: &str) -> bool {
 async fn detect_available_linter(root_dir: &Path, ext: &str) -> Option<LinterConfig> {
     let config = get_linter_config(ext)?;
     if let Some(required_file) = config.config_file
-        && !config_exists(root_dir, required_file).await {
-            return None;
-        }
+        && !config_exists(root_dir, required_file).await
+    {
+        return None;
+    }
     Some(config)
 }
 
@@ -191,7 +189,7 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
         }
 
         let truncated = if result.output.len() > MAX_OUTPUT_LEN_SINGLE {
-            &result.output[..MAX_OUTPUT_LEN_SINGLE]
+            crate::core::parser::truncate_to_char_boundary(&result.output, MAX_OUTPUT_LEN_SINGLE)
         } else {
             &result.output
         };
@@ -213,7 +211,7 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
         let result = run_command(linter.cmd, &linter.args, &options.root_dir).await;
         if !result.output.is_empty() {
             let truncated = if result.output.len() > MAX_OUTPUT_LEN_MULTI {
-                &result.output[..MAX_OUTPUT_LEN_MULTI]
+                crate::core::parser::truncate_to_char_boundary(&result.output, MAX_OUTPUT_LEN_MULTI)
             } else {
                 &result.output
             };
@@ -345,12 +343,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_command_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_command(
-            "nonexistent_command_xyz_12345",
-            &[],
-            dir.path(),
-        )
-        .await;
+        let result = run_command("nonexistent_command_xyz_12345", &[], dir.path()).await;
         assert_ne!(result.exit_code, 0);
     }
 

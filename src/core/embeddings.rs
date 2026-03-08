@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
 
+/// Type alias for the boxed future returned by embedding functions.
+type EmbedFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -69,36 +73,33 @@ impl OllamaClient {
         self.batch_size
     }
 
-    fn embed_batch_adaptive<'a>(
-        &'a self,
-        batch: &'a [String],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>> {
+    fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String]) -> EmbedFuture<'a> {
         Box::pin(async move {
-        match self.call_embed_api(batch).await {
-            Ok(embeddings) => {
-                if embeddings.len() != batch.len() {
-                    return Err(ContextPlusError::Ollama(format!(
-                        "embedding response size mismatch: expected {}, got {}",
-                        batch.len(),
-                        embeddings.len()
-                    )));
+            match self.call_embed_api(batch).await {
+                Ok(embeddings) => {
+                    if embeddings.len() != batch.len() {
+                        return Err(ContextPlusError::Ollama(format!(
+                            "embedding response size mismatch: expected {}, got {}",
+                            batch.len(),
+                            embeddings.len()
+                        )));
+                    }
+                    Ok(embeddings)
                 }
-                Ok(embeddings)
-            }
-            Err(e) if is_context_length_error(&e) => {
-                if batch.len() == 1 {
-                    let vec = self.embed_single_adaptive(&batch[0]).await?;
-                    Ok(vec![vec])
-                } else {
-                    // Binary split
-                    let mid = batch.len().div_ceil(2);
-                    let left = self.embed_batch_adaptive(&batch[..mid]).await?;
-                    let right = self.embed_batch_adaptive(&batch[mid..]).await?;
-                    Ok([left, right].concat())
+                Err(e) if is_context_length_error(&e) => {
+                    if batch.len() == 1 {
+                        let vec = self.embed_single_adaptive(&batch[0]).await?;
+                        Ok(vec![vec])
+                    } else {
+                        // Binary split
+                        let mid = batch.len().div_ceil(2);
+                        let left = self.embed_batch_adaptive(&batch[..mid]).await?;
+                        let right = self.embed_batch_adaptive(&batch[mid..]).await?;
+                        Ok([left, right].concat())
+                    }
                 }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        }
         })
     }
 
@@ -108,9 +109,9 @@ impl OllamaClient {
         for _attempt in 0..=MAX_SINGLE_INPUT_RETRIES {
             match self.call_embed_api(&[candidate.clone()]).await {
                 Ok(mut vecs) => {
-                    return vecs
-                        .pop()
-                        .ok_or_else(|| ContextPlusError::Ollama("empty embedding response".into()));
+                    return vecs.pop().ok_or_else(|| {
+                        ContextPlusError::Ollama("empty embedding response".into())
+                    });
                 }
                 Err(e) if is_context_length_error(&e) => {
                     let next = shrink_input(&candidate);

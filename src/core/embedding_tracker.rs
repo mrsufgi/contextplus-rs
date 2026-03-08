@@ -2,7 +2,7 @@
 // Watches for file modifications and triggers debounced embedding refreshes
 
 use notify_debouncer_full::notify::RecursiveMode;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,9 +51,10 @@ impl EmbeddingTrackerConfig {
 pub fn should_track(path: &Path, ignore_dirs: &HashSet<String>) -> bool {
     for component in path.components() {
         if let Some(segment) = component.as_os_str().to_str()
-            && ignore_dirs.contains(segment) {
-                return false;
-            }
+            && ignore_dirs.contains(segment)
+        {
+            return false;
+        }
     }
     true
 }
@@ -61,9 +62,7 @@ pub fn should_track(path: &Path, ignore_dirs: &HashSet<String>) -> bool {
 /// Normalizes a path to use forward slashes and strips leading slashes.
 fn normalize_relative_path(path: &Path) -> String {
     let s = path.to_string_lossy();
-    s.replace('\\', "/")
-        .trim_start_matches('/')
-        .to_string()
+    s.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
 /// Handle for controlling a running embedding tracker.
@@ -117,45 +116,38 @@ pub fn start_tracker(
     // Set up notify debouncer with an event handler that filters and collects paths
     let handler_root = root_dir.clone();
 
-    let event_handler = move |result: DebounceEventResult| {
-        match result {
-            Ok(events) => {
-                let mut new_files = Vec::new();
-                for event in &events {
-                    for path in &event.paths {
-                        let relative = match path.strip_prefix(&handler_root) {
-                            Ok(r) => r.to_path_buf(),
-                            Err(_) => continue,
-                        };
-                        if !should_track(&relative, &ignore_dirs) {
-                            continue;
-                        }
-                        let normalized = normalize_relative_path(&relative);
-                        if !normalized.is_empty() {
-                            new_files.push(normalized);
-                        }
+    let event_handler = move |result: DebounceEventResult| match result {
+        Ok(events) => {
+            let mut new_files = Vec::new();
+            for event in &events {
+                for path in &event.paths {
+                    let relative = match path.strip_prefix(&handler_root) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    if !should_track(&relative, &ignore_dirs) {
+                        continue;
+                    }
+                    let normalized = normalize_relative_path(&relative);
+                    if !normalized.is_empty() {
+                        new_files.push(normalized);
                     }
                 }
-                if !new_files.is_empty() {
-                    let _ = event_tx.try_send(new_files);
-                }
             }
-            Err(errors) => {
-                for e in errors {
-                    error!("Embedding tracker watcher error: {}", e);
-                }
+            if !new_files.is_empty() {
+                let _ = event_tx.try_send(new_files);
+            }
+        }
+        Err(errors) => {
+            for e in errors {
+                error!("Embedding tracker watcher error: {}", e);
             }
         }
     };
 
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(debounce_ms),
-        None,
-        event_handler,
-    )?;
+    let mut debouncer = new_debouncer(Duration::from_millis(debounce_ms), None, event_handler)?;
 
-    debouncer
-        .watch(&root_dir, RecursiveMode::Recursive)?;
+    debouncer.watch(&root_dir, RecursiveMode::Recursive)?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -260,10 +252,7 @@ mod tests {
     #[test]
     fn should_track_ignores_node_modules() {
         let ignore = default_ignore_dirs();
-        assert!(!should_track(
-            Path::new("node_modules/foo/bar.js"),
-            &ignore
-        ));
+        assert!(!should_track(Path::new("node_modules/foo/bar.js"), &ignore));
         assert!(!should_track(
             Path::new("packages/web/node_modules/react/index.js"),
             &ignore
@@ -366,9 +355,7 @@ mod tests {
     #[tokio::test]
     async fn tracker_starts_and_stops() {
         let dir = tempfile::TempDir::new().unwrap();
-        let callback: RefreshCallback = Arc::new(|_root, _files| {
-            tokio::spawn(async { (0, 0) })
-        });
+        let callback: RefreshCallback = Arc::new(|_root, _files| tokio::spawn(async { (0, 0) }));
 
         let handle = start_tracker(
             dir.path().to_path_buf(),
@@ -400,8 +387,7 @@ mod tests {
             ignore_dirs: default_ignore_dirs(),
         };
 
-        let handle = start_tracker(root.clone(), config, callback)
-            .expect("tracker should start");
+        let handle = start_tracker(root.clone(), config, callback).expect("tracker should start");
 
         // Create source files (not in ignored dirs)
         let src_dir = root.join("src");
@@ -418,7 +404,9 @@ mod tests {
             Ok(Some(files)) => {
                 // notify may report the file itself or parent dir depending on OS
                 assert!(
-                    files.iter().any(|f| f.contains("test.rs") || f.contains("src")),
+                    files
+                        .iter()
+                        .any(|f| f.contains("test.rs") || f.contains("src")),
                     "expected test.rs or src in batch, got: {:?}",
                     files
                 );
@@ -453,8 +441,7 @@ mod tests {
             ignore_dirs: default_ignore_dirs(),
         };
 
-        let handle = start_tracker(root.clone(), config, callback)
-            .expect("tracker should start");
+        let handle = start_tracker(root.clone(), config, callback).expect("tracker should start");
 
         // Write to ignored directory
         let nm_dir = root.join("node_modules").join("pkg");

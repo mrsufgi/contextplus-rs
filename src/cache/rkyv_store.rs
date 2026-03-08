@@ -93,9 +93,8 @@ impl CacheData {
 pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     ensure_cache_dir(root_dir)?;
 
-    let bytes =
-        rkyv::to_bytes::<rkyv::rancor::Error>(data)
-            .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(data)
+        .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
 
     let path = cache_path(root_dir, name);
     let tmp_path = path.with_extension("rkyv.tmp");
@@ -180,9 +179,8 @@ pub fn load_cache_mmap(root_dir: &Path, name: &str) -> Result<Option<CacheData>>
                 )));
             }
             let data_bytes = &mmap[HEADER_SIZE..];
-            let data =
-                rkyv::from_bytes::<CacheData, rkyv::rancor::Error>(data_bytes)
-                    .map_err(|e| ContextPlusError::Cache(format!("rkyv mmap deserialize: {}", e)))?;
+            let data = rkyv::from_bytes::<CacheData, rkyv::rancor::Error>(data_bytes)
+                .map_err(|e| ContextPlusError::Cache(format!("rkyv mmap deserialize: {}", e)))?;
             Ok(Some(data))
         }
         Err(_) => {
@@ -204,10 +202,7 @@ mod tests {
     fn make_test_data() -> CacheData {
         CacheData {
             dims: 3,
-            keys: vec![
-                "src/auth.ts".to_string(),
-                "src/db.ts".to_string(),
-            ],
+            keys: vec!["src/auth.ts".to_string(), "src/db.ts".to_string()],
             hashes: vec!["hash_a".to_string(), "hash_b".to_string()],
             vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
         }

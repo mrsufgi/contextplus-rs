@@ -6,7 +6,11 @@ use contextplus_rs::server::ContextPlusServer;
 use rmcp::ServiceExt;
 
 #[derive(Parser)]
-#[command(name = "contextplus-rs", version, about = "Context+ MCP server for semantic code analysis")]
+#[command(
+    name = "contextplus-rs",
+    version,
+    about = "Context+ MCP server for semantic code analysis"
+)]
 struct Cli {
     /// Root directory to analyze (defaults to current directory)
     #[arg(long, global = true)]
@@ -65,7 +69,9 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Initialized .mcp_data/ in {}", root_dir.display());
         }
         Some(Commands::Skeleton { file }) => {
-            use contextplus_rs::tools::file_skeleton::{SkeletonAnalysis, SkeletonOptions, SkeletonSymbol};
+            use contextplus_rs::tools::file_skeleton::{
+                SkeletonAnalysis, SkeletonOptions, SkeletonSymbol,
+            };
 
             let full_path = root_dir.join(&file);
             let content = tokio::fs::read_to_string(&full_path).await?;
@@ -85,11 +91,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let header = contextplus_rs::core::parser::extract_header(
-                &content.lines().collect::<Vec<_>>(),
-            );
+            let header =
+                contextplus_rs::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
             let analysis = SkeletonAnalysis {
-                header: if header.is_empty() { None } else { Some(header) },
+                header: if header.is_empty() {
+                    None
+                } else {
+                    Some(header)
+                },
                 symbols: code_symbols.iter().map(code_to_skel).collect(),
                 line_count: content.lines().count(),
             };
@@ -108,8 +117,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Tree { max_tokens }) => {
             use contextplus_rs::tools::context_tree;
 
-            let walker_entries =
-                contextplus_rs::core::walker::walk_with_config(&root_dir, &config);
+            let walker_entries = contextplus_rs::core::walker::walk_with_config(&root_dir, &config);
 
             // Convert walker entries to context_tree entries
             let entries: Vec<context_tree::FileEntry> = walker_entries
@@ -121,7 +129,9 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
 
-            fn code_to_tree(s: &contextplus_rs::core::parser::CodeSymbol) -> context_tree::TreeSymbol {
+            fn code_to_tree(
+                s: &contextplus_rs::core::parser::CodeSymbol,
+            ) -> context_tree::TreeSymbol {
                 context_tree::TreeSymbol {
                     name: s.name.clone(),
                     kind: s.kind.clone(),
@@ -146,7 +156,11 @@ async fn main() -> anyhow::Result<()> {
                         analyses.insert(
                             entry.relative_path.clone(),
                             context_tree::FileAnalysis {
-                                header: if header.is_empty() { None } else { Some(header) },
+                                header: if header.is_empty() {
+                                    None
+                                } else {
+                                    Some(header)
+                                },
                                 symbols: symbols.iter().map(code_to_tree).collect(),
                             },
                         );

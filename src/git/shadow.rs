@@ -179,10 +179,7 @@ pub async fn restore_from_point(root_dir: &Path, restore_point_id: &str) -> Resu
         .iter()
         .find(|p| p.id == restore_point_id)
         .ok_or_else(|| {
-            ContextPlusError::Other(format!(
-                "restore point {} not found",
-                restore_point_id
-            ))
+            ContextPlusError::Other(format!("restore point {} not found", restore_point_id))
         })?;
 
     let rp_backup_dir = backup_dir(root_dir).join(restore_point_id);
@@ -260,10 +257,7 @@ mod tests {
     #[test]
     fn encode_backup_filename_works() {
         assert_eq!(encode_backup_filename("src/main.rs"), "src__main.rs");
-        assert_eq!(
-            encode_backup_filename("a/b/c/d.ts"),
-            "a__b__c__d.ts"
-        );
+        assert_eq!(encode_backup_filename("a/b/c/d.ts"), "a__b__c__d.ts");
         assert_eq!(
             encode_backup_filename("path\\to\\file.js"),
             "path__to__file.js"

@@ -10,6 +10,19 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{ContextPlusError, Result};
 
+/// Type alias for the boxed future returned by embedding functions.
+type EmbedFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
+
+/// Type alias for the boxed future returned by walk-and-index functions.
+type WalkAndIndexFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>>
+            + Send
+            + 'a,
+    >,
+>;
+
 // ---------------------------------------------------------------------------
 // Constants (matching TS reference)
 // ---------------------------------------------------------------------------
@@ -186,11 +199,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
         norm_a += ai * ai;
     }
     let denom = norm_a.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
 /// Get term coverage: fraction of query terms that appear in doc terms.
@@ -265,12 +274,12 @@ fn compute_keyword_score(
     );
     let doc_terms: HashSet<String> = split_camel_case(&doc_text).into_iter().collect();
     let query_lower = query.trim().to_lowercase();
-    let phrase_boost =
-        if !query_lower.is_empty() && doc_text.to_lowercase().contains(&query_lower) {
-            PHRASE_BOOST
-        } else {
-            0.0
-        };
+    let phrase_boost = if !query_lower.is_empty() && doc_text.to_lowercase().contains(&query_lower)
+    {
+        PHRASE_BOOST
+    } else {
+        0.0
+    };
     let symbol_terms: HashSet<String> = split_camel_case(&matched_symbols.join(" "))
         .into_iter()
         .collect();
@@ -355,6 +364,7 @@ impl SearchIndex {
     ) -> Vec<SearchResult> {
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
 
+        #[allow(clippy::type_complexity)]
         let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = Vec::new();
 
         for (i, doc) in self.documents.iter().enumerate() {
@@ -406,14 +416,8 @@ impl SearchIndex {
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    b.3.partial_cmp(&a.3)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| {
-                    b.2.partial_cmp(&a.2)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
         });
 
         scored
@@ -511,7 +515,7 @@ pub async fn semantic_code_search(
     let resolved = resolve_search_options(&options);
 
     // Get query embedding
-    let query_vecs = embed_fn.embed(&[query.clone()]).await?;
+    let query_vecs = embed_fn.embed(std::slice::from_ref(&query)).await?;
     let query_vec = query_vecs
         .into_iter()
         .next()
@@ -533,25 +537,12 @@ pub async fn semantic_code_search(
 
 /// Trait for embedding text into vectors.
 pub trait EmbedFn: Send + Sync {
-    fn embed(
-        &self,
-        texts: &[String],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>>;
+    fn embed(&self, texts: &[String]) -> EmbedFuture<'_>;
 }
 
 /// Trait for walking files and producing indexed documents with vectors.
 pub trait WalkAndIndexFn: Send + Sync {
-    fn walk_and_index(
-        &self,
-        root_dir: &Path,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
-                > + Send
-                + '_,
-        >,
-    >;
+    fn walk_and_index(&self, root_dir: &Path) -> WalkAndIndexFuture<'_>;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,9 +828,11 @@ mod tests {
 
         let results = index.search("getUserById", &query_vec, &opts);
         assert_eq!(results.len(), 1);
-        assert!(results[0]
-            .matched_symbol_locations
-            .contains(&"getUserById@L10-L25".to_string()));
+        assert!(
+            results[0]
+                .matched_symbol_locations
+                .contains(&"getUserById@L10-L25".to_string())
+        );
     }
 
     #[test]

@@ -15,9 +15,9 @@ fn validate_path(root: &Path, user_path: &str) -> Result<std::path::PathBuf> {
         match component {
             std::path::Component::ParentDir => {
                 if !normalized.pop() {
-                    return Err(ContextPlusError::Other(
-                        format!("Path traversal detected: {user_path}"),
-                    ));
+                    return Err(ContextPlusError::Other(format!(
+                        "Path traversal detected: {user_path}"
+                    )));
                 }
             }
             std::path::Component::Normal(c) => normalized.push(c),
@@ -33,9 +33,9 @@ fn validate_path(root: &Path, user_path: &str) -> Result<std::path::PathBuf> {
         std::env::current_dir().unwrap_or_default().join(root)
     };
     if !normalized.starts_with(&root_canonical) {
-        return Err(ContextPlusError::Other(
-            format!("Path traversal detected: {user_path}"),
-        ));
+        return Err(ContextPlusError::Other(format!(
+            "Path traversal detected: {user_path}"
+        )));
     }
     Ok(normalized)
 }
@@ -116,7 +116,10 @@ fn validate_no_inline_comments(lines: &[&str], ext: &str) -> Vec<ValidationError
     let mut errors = Vec::new();
     for (i, line) in lines.iter().enumerate().skip(2) {
         let trimmed = line.trim();
-        if trimmed.starts_with(prefix) && !trimmed.starts_with("#!") && !trimmed.starts_with("#include") {
+        if trimmed.starts_with(prefix)
+            && !trimmed.starts_with("#!")
+            && !trimmed.starts_with("#include")
+        {
             errors.push(ValidationError {
                 rule: "no-comments".to_string(),
                 message: format!(
@@ -193,7 +196,10 @@ pub async fn propose_commit(
         .collect();
 
     if comment_errors.len() > 5 {
-        let mut result = vec![format!("REJECTED: {} violations found.\n", all_errors.len())];
+        let mut result = vec![format!(
+            "REJECTED: {} violations found.\n",
+            all_errors.len()
+        )];
         for e in all_errors.iter().take(10) {
             result.push(format!("  [{}] {}", e.rule, e.message));
         }
@@ -279,7 +285,12 @@ mod tests {
 
     #[test]
     fn inline_comments_detected() {
-        let lines = vec!["// header 1", "// header 2", "  // this is bad", "code here"];
+        let lines = vec![
+            "// header 1",
+            "// header 2",
+            "  // this is bad",
+            "code here",
+        ];
         let errors = validate_no_inline_comments(&lines, "rs");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].rule, "no-comments");
@@ -319,13 +330,7 @@ mod tests {
             "{", // 5
             "{", // 6
             "{", // 7
-            "}",
-            "}",
-            "}",
-            "}",
-            "}",
-            "}",
-            "}",
+            "}", "}", "}", "}", "}", "}", "}",
         ];
         let errors = validate_abstraction(&lines);
         assert_eq!(errors.len(), 1);
@@ -440,9 +445,7 @@ mod tests {
         assert_eq!(content, new_content);
 
         // Restore point should exist
-        let points = crate::git::shadow::list_restore_points(root)
-            .await
-            .unwrap();
+        let points = crate::git::shadow::list_restore_points(root).await.unwrap();
         assert_eq!(points.len(), 1);
     }
 

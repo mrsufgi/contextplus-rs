@@ -1,9 +1,9 @@
 // In-memory property graph backed by petgraph with rkyv binary persistence.
 // Supports temporal decay, auto-similarity linking, BFS traversal, and pruning.
 
+use petgraph::Direction;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -43,7 +43,7 @@ impl NodeType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<NodeType> {
+    pub fn parse_str(s: &str) -> Option<NodeType> {
         match s {
             "concept" => Some(NodeType::Concept),
             "file" => Some(NodeType::File),
@@ -84,7 +84,7 @@ impl RelationType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<RelationType> {
+    pub fn parse_str(s: &str) -> Option<RelationType> {
         match s {
             "relates_to" => Some(RelationType::RelatesTo),
             "depends_on" => Some(RelationType::DependsOn),
@@ -181,6 +181,12 @@ pub struct MemoryGraph {
     dirty: bool,
 }
 
+impl Default for MemoryGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryGraph {
     /// Create an empty graph.
     pub fn new() -> Self {
@@ -234,17 +240,18 @@ impl MemoryGraph {
         let key = (label.to_string(), node_type.as_str().to_string());
 
         if let Some(&idx) = self.node_index.get(&key)
-            && let Some(node) = self.graph.node_weight_mut(idx) {
-                node.content = content.to_string();
-                node.last_accessed = now_millis();
-                node.access_count += 1;
-                node.embedding = embedding;
-                if let Some(meta) = metadata {
-                    node.metadata.extend(meta);
-                }
-                self.dirty = true;
-                return node.clone();
+            && let Some(node) = self.graph.node_weight_mut(idx)
+        {
+            node.content = content.to_string();
+            node.last_accessed = now_millis();
+            node.access_count += 1;
+            node.embedding = embedding;
+            if let Some(meta) = metadata {
+                node.metadata.extend(meta);
             }
+            self.dirty = true;
+            return node.clone();
+        }
 
         let now = now_millis();
         let node = MemoryNode {
@@ -363,11 +370,7 @@ impl MemoryGraph {
             norm_b += bi * bi;
         }
         let denom = norm_a.sqrt() * norm_b.sqrt();
-        if denom < 1e-15 {
-            0.0
-        } else {
-            dot / denom
-        }
+        if denom < 1e-15 { 0.0 } else { dot / denom }
     }
 
     /// Compute temporal decay weight: weight * exp(-lambda * days_since_creation)
@@ -437,7 +440,7 @@ impl MemoryGraph {
                 query_vec,
                 1,
                 max_depth,
-                &[hit.node.label.clone()],
+                std::slice::from_ref(&hit.node.label),
                 &mut visited,
                 &mut neighbor_results,
                 edge_filter,
@@ -466,6 +469,7 @@ impl MemoryGraph {
     }
 
     /// BFS traversal collecting neighbor nodes with relevance scoring.
+    #[allow(clippy::too_many_arguments)]
     fn traverse_neighbors(
         &mut self,
         node_id: &str,
@@ -485,12 +489,12 @@ impl MemoryGraph {
 
         for (edge, source_id, target_id) in edges {
             if let Some(filter) = edge_filter
-                && !filter.contains(&edge.relation) {
-                    continue;
-                }
+                && !filter.contains(&edge.relation)
+            {
+                continue;
+            }
 
-            let neighbor_id =
-                Self::get_neighbor_id(&source_id, &target_id, node_id).to_string();
+            let neighbor_id = Self::get_neighbor_id(&source_id, &target_id, node_id).to_string();
             if visited.contains(&neighbor_id) {
                 continue;
             }
@@ -504,8 +508,7 @@ impl MemoryGraph {
 
             let similarity = Self::cosine(query_vec, &neighbor.embedding);
             let edge_decay = Self::decay_weight(&edge);
-            let relevance =
-                similarity * 0.6 + (edge_decay / (edge.weight as f64).max(0.01)) * 0.4;
+            let relevance = similarity * 0.6 + (edge_decay / (edge.weight as f64).max(0.01)) * 0.4;
 
             let mut new_path = path_labels.to_vec();
             new_path.push(format!("--[{}]-->", edge.relation));
@@ -544,9 +547,10 @@ impl MemoryGraph {
         // Find stale edges
         for edge_idx in self.graph.edge_indices() {
             if let Some(edge) = self.graph.edge_weight(edge_idx)
-                && Self::decay_weight(edge) < cutoff {
-                    edges_to_remove.push(edge_idx);
-                }
+                && Self::decay_weight(edge) < cutoff
+            {
+                edges_to_remove.push(edge_idx);
+            }
         }
 
         for idx in &edges_to_remove {
@@ -572,11 +576,16 @@ impl MemoryGraph {
 
             if !has_edges
                 && let Some(node) = self.graph.node_weight(node_idx)
-                    && node.access_count <= 1
-                        && now.saturating_sub(node.last_accessed) > age_threshold
-                    {
-                        nodes_to_remove.push((node_idx, node.id.clone(), node.label.clone(), node.node_type.clone()));
-                    }
+                && node.access_count <= 1
+                && now.saturating_sub(node.last_accessed) > age_threshold
+            {
+                nodes_to_remove.push((
+                    node_idx,
+                    node.id.clone(),
+                    node.label.clone(),
+                    node.node_type.clone(),
+                ));
+            }
         }
 
         for (idx, id, label, node_type) in &nodes_to_remove {
@@ -596,9 +605,16 @@ impl MemoryGraph {
     }
 
     /// Add multiple interlinked context nodes, optionally auto-linking by similarity.
+    #[allow(clippy::type_complexity)]
     pub fn add_interlinked_context(
         &mut self,
-        items: Vec<(NodeType, String, String, Vec<f32>, Option<HashMap<String, String>>)>,
+        items: Vec<(
+            NodeType,
+            String,
+            String,
+            Vec<f32>,
+            Option<HashMap<String, String>>,
+        )>,
         auto_link: bool,
     ) -> InterlinkResult {
         let mut created_nodes: Vec<MemoryNode> = Vec::new();
@@ -623,9 +639,10 @@ impl MemoryGraph {
                             RelationType::SimilarTo,
                             Some(similarity as f32),
                             None,
-                        ) {
-                            created_edges.push(edge);
-                        }
+                        )
+                    {
+                        created_edges.push(edge);
+                    }
                 }
             }
 
@@ -642,8 +659,7 @@ impl MemoryGraph {
 
             for new_node in &created_nodes {
                 for existing in &existing_nodes {
-                    let similarity =
-                        Self::cosine(&new_node.embedding, &existing.embedding);
+                    let similarity = Self::cosine(&new_node.embedding, &existing.embedding);
                     if similarity >= SIMILARITY_THRESHOLD
                         && let Some(edge) = self.create_relation(
                             &new_node.id,
@@ -651,9 +667,10 @@ impl MemoryGraph {
                             RelationType::SimilarTo,
                             Some(similarity as f32),
                             None,
-                        ) {
-                            created_edges.push(edge);
-                        }
+                        )
+                    {
+                        created_edges.push(edge);
+                    }
                 }
             }
         }
@@ -696,7 +713,7 @@ impl MemoryGraph {
             start_node_id,
             1,
             max_depth,
-            &[start_node.label.clone()],
+            std::slice::from_ref(&start_node.label),
             &mut visited,
             &mut results,
             edge_filter,
@@ -707,6 +724,7 @@ impl MemoryGraph {
     }
 
     /// BFS traversal collecting nodes with depth-penalized scoring.
+    #[allow(clippy::too_many_arguments)]
     fn collect_traversal(
         &mut self,
         node_id: &str,
@@ -725,12 +743,12 @@ impl MemoryGraph {
 
         for (edge, source_id, target_id) in edges {
             if let Some(filter) = edge_filter
-                && !filter.contains(&edge.relation) {
-                    continue;
-                }
+                && !filter.contains(&edge.relation)
+            {
+                continue;
+            }
 
-            let neighbor_id =
-                Self::get_neighbor_id(&source_id, &target_id, node_id).to_string();
+            let neighbor_id = Self::get_neighbor_id(&source_id, &target_id, node_id).to_string();
             if visited.contains(&neighbor_id) {
                 continue;
             }
@@ -781,7 +799,9 @@ impl MemoryGraph {
 
         for idx in self.graph.node_indices() {
             if let Some(node) = self.graph.node_weight(idx) {
-                *types.entry(node.node_type.as_str().to_string()).or_insert(0) += 1;
+                *types
+                    .entry(node.node_type.as_str().to_string())
+                    .or_insert(0) += 1;
             }
         }
         for idx in self.graph.edge_indices() {
@@ -859,10 +879,11 @@ impl GraphStore {
     pub async fn persist(&self, root_dir: &str) -> Result<()> {
         let mut graphs = self.graphs.lock().await;
         if let Some(graph) = graphs.get_mut(root_dir)
-            && graph.is_dirty() {
-                persist_graph_to_disk(root_dir, graph).await?;
-                graph.mark_clean();
-            }
+            && graph.is_dirty()
+        {
+            persist_graph_to_disk(root_dir, graph).await?;
+            graph.mark_clean();
+        }
         Ok(())
     }
 }
@@ -908,9 +929,10 @@ async fn load_graph_from_disk(root_dir: &str) -> Result<MemoryGraph> {
 
             if let (Some(&source_idx), Some(&target_idx)) =
                 (graph.id_index.get(source), graph.id_index.get(target))
-                && let Ok(edge) = serde_json::from_value::<MemoryEdge>(edge_val.clone()) {
-                    graph.graph.add_edge(source_idx, target_idx, edge);
-                }
+                && let Ok(edge) = serde_json::from_value::<MemoryEdge>(edge_val.clone())
+            {
+                graph.graph.add_edge(source_idx, target_idx, edge);
+            }
         }
     }
 
@@ -940,20 +962,21 @@ async fn persist_graph_to_disk(root_dir: &str, graph: &MemoryGraph) -> Result<()
                 graph.graph.edge_weight(edge_idx),
                 graph.graph.node_weight(source_idx),
                 graph.graph.node_weight(target_idx),
-            ) {
-                let mut edge_json = serde_json::to_value(edge).unwrap_or_default();
-                if let Some(obj) = edge_json.as_object_mut() {
-                    obj.insert(
-                        "source".to_string(),
-                        serde_json::Value::String(source_node.id.clone()),
-                    );
-                    obj.insert(
-                        "target".to_string(),
-                        serde_json::Value::String(target_node.id.clone()),
-                    );
-                }
-                edges.insert(edge.id.clone(), edge_json);
+            )
+        {
+            let mut edge_json = serde_json::to_value(edge).unwrap_or_default();
+            if let Some(obj) = edge_json.as_object_mut() {
+                obj.insert(
+                    "source".to_string(),
+                    serde_json::Value::String(source_node.id.clone()),
+                );
+                obj.insert(
+                    "target".to_string(),
+                    serde_json::Value::String(target_node.id.clone()),
+                );
             }
+            edges.insert(edge.id.clone(), edge_json);
+        }
     }
 
     let store = serde_json::json!({
@@ -987,9 +1010,14 @@ mod tests {
 
     #[test]
     fn node_type_roundtrip() {
-        for nt in [NodeType::Concept, NodeType::File, NodeType::Symbol, NodeType::Note] {
+        for nt in [
+            NodeType::Concept,
+            NodeType::File,
+            NodeType::Symbol,
+            NodeType::Note,
+        ] {
             let s = nt.as_str();
-            let parsed = NodeType::from_str(s);
+            let parsed = NodeType::parse_str(s);
             assert_eq!(parsed, Some(nt));
         }
     }
@@ -1005,7 +1033,7 @@ mod tests {
             RelationType::Contains,
         ] {
             let s = rt.as_str();
-            let parsed = RelationType::from_str(s);
+            let parsed = RelationType::parse_str(s);
             assert_eq!(parsed, Some(rt));
         }
     }
@@ -1028,20 +1056,8 @@ mod tests {
     #[test]
     fn upsert_updates_existing_node() {
         let mut graph = MemoryGraph::new();
-        let first = graph.upsert_node(
-            NodeType::Concept,
-            "auth",
-            "v1",
-            make_embedding(0.5),
-            None,
-        );
-        let second = graph.upsert_node(
-            NodeType::Concept,
-            "auth",
-            "v2",
-            make_embedding(0.6),
-            None,
-        );
+        let first = graph.upsert_node(NodeType::Concept, "auth", "v1", make_embedding(0.5), None);
+        let second = graph.upsert_node(NodeType::Concept, "auth", "v2", make_embedding(0.6), None);
         assert_eq!(first.id, second.id);
         assert_eq!(second.content, "v2");
         assert_eq!(second.access_count, 2);
@@ -1057,13 +1073,7 @@ mod tests {
             make_embedding(0.5),
             None,
         );
-        let file = graph.upsert_node(
-            NodeType::File,
-            "auth",
-            "file",
-            make_embedding(0.6),
-            None,
-        );
+        let file = graph.upsert_node(NodeType::File, "auth", "file", make_embedding(0.6), None);
         assert_ne!(concept.id, file.id);
     }
 
@@ -1107,7 +1117,13 @@ mod tests {
     #[test]
     fn get_node_by_id() {
         let mut graph = MemoryGraph::new();
-        let node = graph.upsert_node(NodeType::File, "main.rs", "entry", make_embedding(0.5), None);
+        let node = graph.upsert_node(
+            NodeType::File,
+            "main.rs",
+            "entry",
+            make_embedding(0.5),
+            None,
+        );
         let found = graph.get_node(&node.id);
         assert!(found.is_some());
         assert_eq!(found.expect("node").label, "main.rs");
@@ -1116,7 +1132,13 @@ mod tests {
     #[test]
     fn find_node_by_label_and_type() {
         let mut graph = MemoryGraph::new();
-        graph.upsert_node(NodeType::Symbol, "MyStruct", "a struct", make_embedding(0.5), None);
+        graph.upsert_node(
+            NodeType::Symbol,
+            "MyStruct",
+            "a struct",
+            make_embedding(0.5),
+            None,
+        );
         let found = graph.find_node("MyStruct", &NodeType::Symbol);
         assert!(found.is_some());
         let not_found = graph.find_node("MyStruct", &NodeType::File);
@@ -1179,8 +1201,20 @@ mod tests {
     #[test]
     fn search_finds_similar_nodes() {
         let mut graph = MemoryGraph::new();
-        graph.upsert_node(NodeType::Concept, "auth", "authentication", vec![1.0, 0.0, 0.0], None);
-        graph.upsert_node(NodeType::Concept, "db", "database", vec![0.0, 1.0, 0.0], None);
+        graph.upsert_node(
+            NodeType::Concept,
+            "auth",
+            "authentication",
+            vec![1.0, 0.0, 0.0],
+            None,
+        );
+        graph.upsert_node(
+            NodeType::Concept,
+            "db",
+            "database",
+            vec![0.0, 1.0, 0.0],
+            None,
+        );
 
         let result = graph.search(&[0.9, 0.1, 0.0], 0, 5, None);
         assert!(!result.direct.is_empty());
@@ -1191,8 +1225,20 @@ mod tests {
     #[test]
     fn search_with_neighbors() {
         let mut graph = MemoryGraph::new();
-        let a = graph.upsert_node(NodeType::Concept, "auth", "authentication", vec![1.0, 0.0, 0.0], None);
-        let b = graph.upsert_node(NodeType::Concept, "tokens", "JWT tokens", vec![0.5, 0.5, 0.0], None);
+        let a = graph.upsert_node(
+            NodeType::Concept,
+            "auth",
+            "authentication",
+            vec![1.0, 0.0, 0.0],
+            None,
+        );
+        let b = graph.upsert_node(
+            NodeType::Concept,
+            "tokens",
+            "JWT tokens",
+            vec![0.5, 0.5, 0.0],
+            None,
+        );
         graph.create_relation(&a.id, &b.id, RelationType::DependsOn, None, None);
 
         let result = graph.search(&[0.9, 0.1, 0.0], 1, 1, None);
@@ -1239,8 +1285,20 @@ mod tests {
     #[test]
     fn retrieve_with_traversal_basic() {
         let mut graph = MemoryGraph::new();
-        let a = graph.upsert_node(NodeType::Concept, "root", "root node", make_embedding(0.5), None);
-        let b = graph.upsert_node(NodeType::Concept, "child", "child node", make_embedding(0.6), None);
+        let a = graph.upsert_node(
+            NodeType::Concept,
+            "root",
+            "root node",
+            make_embedding(0.5),
+            None,
+        );
+        let b = graph.upsert_node(
+            NodeType::Concept,
+            "child",
+            "child node",
+            make_embedding(0.6),
+            None,
+        );
         graph.create_relation(&a.id, &b.id, RelationType::Contains, None, None);
 
         let results = graph.retrieve_with_traversal(&a.id, 2, None);
@@ -1267,11 +1325,7 @@ mod tests {
         graph.create_relation(&a.id, &b.id, RelationType::DependsOn, None, None);
         graph.create_relation(&a.id, &c.id, RelationType::Contains, None, None);
 
-        let results = graph.retrieve_with_traversal(
-            &a.id,
-            2,
-            Some(&[RelationType::DependsOn]),
-        );
+        let results = graph.retrieve_with_traversal(&a.id, 2, Some(&[RelationType::DependsOn]));
         // Should only find A -> B (depends_on), not A -> C (contains)
         assert_eq!(results.len(), 2);
         assert_eq!(results[1].node.label, "B");
@@ -1282,9 +1336,27 @@ mod tests {
         let mut graph = MemoryGraph::new();
         // Two very similar embeddings should auto-link
         let items = vec![
-            (NodeType::Concept, "A".to_string(), "a".to_string(), vec![1.0_f32, 0.0, 0.0], None),
-            (NodeType::Concept, "B".to_string(), "b".to_string(), vec![0.99_f32, 0.01, 0.0], None),
-            (NodeType::Concept, "C".to_string(), "c".to_string(), vec![0.0_f32, 1.0, 0.0], None),
+            (
+                NodeType::Concept,
+                "A".to_string(),
+                "a".to_string(),
+                vec![1.0_f32, 0.0, 0.0],
+                None,
+            ),
+            (
+                NodeType::Concept,
+                "B".to_string(),
+                "b".to_string(),
+                vec![0.99_f32, 0.01, 0.0],
+                None,
+            ),
+            (
+                NodeType::Concept,
+                "C".to_string(),
+                "c".to_string(),
+                vec![0.0_f32, 1.0, 0.0],
+                None,
+            ),
         ];
 
         let result = graph.add_interlinked_context(items, true);
@@ -1298,8 +1370,20 @@ mod tests {
     fn add_interlinked_context_no_auto_link() {
         let mut graph = MemoryGraph::new();
         let items = vec![
-            (NodeType::Concept, "A".to_string(), "a".to_string(), vec![1.0_f32, 0.0], None),
-            (NodeType::Concept, "B".to_string(), "b".to_string(), vec![0.99_f32, 0.01], None),
+            (
+                NodeType::Concept,
+                "A".to_string(),
+                "a".to_string(),
+                vec![1.0_f32, 0.0],
+                None,
+            ),
+            (
+                NodeType::Concept,
+                "B".to_string(),
+                "b".to_string(),
+                vec![0.99_f32, 0.01],
+                None,
+            ),
         ];
 
         let result = graph.add_interlinked_context(items, false);
@@ -1312,7 +1396,11 @@ mod tests {
         let mut graph = MemoryGraph::new();
         graph.upsert_node(NodeType::Concept, "A", "a", make_embedding(0.1), None);
         graph.upsert_node(NodeType::File, "B", "b", make_embedding(0.5), None);
-        let a = graph.find_node("A", &NodeType::Concept).expect("A").id.clone();
+        let a = graph
+            .find_node("A", &NodeType::Concept)
+            .expect("A")
+            .id
+            .clone();
         let b = graph.find_node("B", &NodeType::File).expect("B").id.clone();
         graph.create_relation(&a, &b, RelationType::References, None, None);
 
@@ -1351,13 +1439,8 @@ mod tests {
                     vec![1.0, 0.0],
                     None,
                 );
-                let b = graph.upsert_node(
-                    NodeType::File,
-                    "auth.rs",
-                    "auth file",
-                    vec![0.0, 1.0],
-                    None,
-                );
+                let b =
+                    graph.upsert_node(NodeType::File, "auth.rs", "auth file", vec![0.0, 1.0], None);
                 graph.create_relation(&a.id, &b.id, RelationType::Implements, None, None);
                 (a.id, b.id)
             })

@@ -135,10 +135,7 @@ pub fn is_supported_file(file_path: &str) -> bool {
 }
 
 /// Flatten nested symbols into a flat list with parent info.
-pub fn flatten_symbols(
-    symbols: &[CodeSymbol],
-    parent_name: Option<&str>,
-) -> Vec<SymbolLocation> {
+pub fn flatten_symbols(symbols: &[CodeSymbol], parent_name: Option<&str>) -> Vec<SymbolLocation> {
     let mut result = Vec::new();
     for sym in symbols {
         result.push(SymbolLocation {

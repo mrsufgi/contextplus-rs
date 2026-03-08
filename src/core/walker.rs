@@ -58,9 +58,10 @@ pub fn walk_directory(opts: &WalkOptions) -> Vec<FileEntry> {
     builder.git_exclude(true);
 
     if let Some(limit) = opts.depth_limit
-        && limit > 0 {
-            builder.max_depth(Some(limit));
-        }
+        && limit > 0
+    {
+        builder.max_depth(Some(limit));
+    }
 
     let mut results = Vec::new();
 
@@ -107,8 +108,11 @@ pub fn walk_with_config(root_dir: &Path, config: &Config) -> Vec<FileEntry> {
 }
 
 /// Group file entries by their parent directory.
-pub fn group_by_directory(entries: &[FileEntry]) -> std::collections::HashMap<String, Vec<&FileEntry>> {
-    let mut groups: std::collections::HashMap<String, Vec<&FileEntry>> = std::collections::HashMap::new();
+pub fn group_by_directory(
+    entries: &[FileEntry],
+) -> std::collections::HashMap<String, Vec<&FileEntry>> {
+    let mut groups: std::collections::HashMap<String, Vec<&FileEntry>> =
+        std::collections::HashMap::new();
     for entry in entries {
         let dir = if entry.relative_path.contains('/') {
             entry.relative_path.rsplit_once('/').unwrap().0.to_string()
@@ -143,7 +147,10 @@ mod tests {
     fn should_track_segment_based() {
         let ignore = make_ignore_set(&["gen", "generated"]);
         // "gen" as a segment should be blocked
-        assert!(!should_track("packages/contracts/gen/typescript/index.ts", &ignore));
+        assert!(!should_track(
+            "packages/contracts/gen/typescript/index.ts",
+            &ignore
+        ));
         // "generated" as a segment should be blocked
         assert!(!should_track("some/generated/file.ts", &ignore));
         // but "generic" should NOT be blocked (not a full segment match)
@@ -189,7 +196,11 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
-        fs::write(root.join("node_modules/pkg/index.js"), "module.exports = {}").unwrap();
+        fs::write(
+            root.join("node_modules/pkg/index.js"),
+            "module.exports = {}",
+        )
+        .unwrap();
 
         let ignore = make_ignore_set(&["node_modules"]);
         let entries = walk_directory(&WalkOptions {

@@ -92,16 +92,15 @@ pub fn is_definition_line(line: &str, symbol_name: &str) -> bool {
     if let Some(rest) = strip_definition_keyword_1(trimmed) {
         // The symbol name should appear as the next identifier
         let rest = rest.trim_start();
-        if let Some(after) = rest.strip_prefix(symbol_name) {
-            if after.is_empty()
+        if let Some(after) = rest.strip_prefix(symbol_name)
+            && (after.is_empty()
                 || after.starts_with('(')
                 || after.starts_with('<')
                 || after.starts_with(' ')
                 || after.starts_with(':')
-                || after.starts_with('{')
-            {
-                return true;
-            }
+                || after.starts_with('{'))
+        {
+            return true;
         }
     }
 
@@ -110,9 +109,7 @@ pub fn is_definition_line(line: &str, symbol_name: &str) -> bool {
     if let Some(rest) = strip_definition_keyword_2(trimmed) {
         let rest = rest.trim_start();
         // Skip optional `async function` after export
-        let rest = rest
-            .strip_prefix("async ")
-            .unwrap_or(rest);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
         let rest = rest
             .strip_prefix("function ")
             .or_else(|| rest.strip_prefix("fn "))
@@ -122,17 +119,16 @@ pub fn is_definition_line(line: &str, symbol_name: &str) -> bool {
             .or_else(|| rest.strip_prefix("type "))
             .unwrap_or(rest)
             .trim_start();
-        if let Some(after) = rest.strip_prefix(symbol_name) {
-            if after.is_empty()
+        if let Some(after) = rest.strip_prefix(symbol_name)
+            && (after.is_empty()
                 || after.starts_with('(')
                 || after.starts_with('<')
                 || after.starts_with(' ')
                 || after.starts_with(':')
                 || after.starts_with('{')
-                || after.starts_with('=')
-            {
-                return true;
-            }
+                || after.starts_with('='))
+        {
+            return true;
         }
     }
 
@@ -141,7 +137,15 @@ pub fn is_definition_line(line: &str, symbol_name: &str) -> bool {
 
 fn strip_definition_keyword_1(line: &str) -> Option<&str> {
     let keywords = [
-        "function ", "class ", "enum ", "interface ", "struct ", "type ", "trait ", "fn ", "def ",
+        "function ",
+        "class ",
+        "enum ",
+        "interface ",
+        "struct ",
+        "type ",
+        "trait ",
+        "fn ",
+        "def ",
         "func ",
     ];
     for kw in &keywords {
@@ -160,9 +164,10 @@ fn strip_definition_keyword_1(line: &str) -> Option<&str> {
             }
             // Handle `export async function`
             if let Some(rest2) = rest.strip_prefix("async ")
-                && let Some(rest3) = rest2.strip_prefix(kw) {
-                    return Some(rest3);
-                }
+                && let Some(rest3) = rest2.strip_prefix(kw)
+            {
+                return Some(rest3);
+            }
         }
     }
     None
@@ -178,9 +183,10 @@ fn strip_definition_keyword_2(line: &str) -> Option<&str> {
         if let Some(rest) = line
             .strip_prefix("export ")
             .or_else(|| line.strip_prefix("pub "))
-            && let Some(rest2) = rest.strip_prefix(kw) {
-                return Some(rest2);
-            }
+            && let Some(rest2) = rest.strip_prefix(kw)
+        {
+            return Some(rest2);
+        }
     }
     None
 }
@@ -190,8 +196,7 @@ pub fn escape_regex(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
-            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']'
-            | '\\' => {
+            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\' => {
                 escaped.push('\\');
                 escaped.push(c);
             }
@@ -284,7 +289,12 @@ pub fn rank_call_sites(
     };
     let call_pattern = match Regex::new(&pattern_str) {
         Ok(re) => re,
-        Err(_) => return CallSiteResult { sites: vec![], total: 0 },
+        Err(_) => {
+            return CallSiteResult {
+                sites: vec![],
+                total: 0,
+            };
+        }
     };
 
     let mut candidates: Vec<(String, usize, String, f64)> = Vec::new();
@@ -308,24 +318,23 @@ pub fn rank_call_sites(
             } else {
                 context
             };
-            let keyword_score =
-                get_keyword_coverage(query_terms, &format!("{} {}", file, context));
+            let keyword_score = get_keyword_coverage(query_terms, &format!("{} {}", file, context));
             candidates.push((file.clone(), i + 1, context.to_string(), keyword_score));
         }
     }
 
     if candidates.is_empty() {
-        return CallSiteResult { sites: vec![], total: 0 };
+        return CallSiteResult {
+            sites: vec![],
+            total: 0,
+        };
     }
 
     let total = candidates.len();
 
     // Sample top candidates by keyword score for embedding
     let embed_budget = (limit * 4).max(30);
-    candidates.sort_by(|a, b| {
-        b.3.partial_cmp(&a.3)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(embed_budget);
 
     let mut ranked: Vec<CallSite> = candidates
@@ -342,8 +351,7 @@ pub fn rank_call_sites(
                 .unwrap_or(0.0);
 
             let score = clamp01(
-                semantic_score * CALLSITE_SEMANTIC_WEIGHT
-                    + keyword_score * CALLSITE_KEYWORD_WEIGHT,
+                semantic_score * CALLSITE_SEMANTIC_WEIGHT + keyword_score * CALLSITE_KEYWORD_WEIGHT,
             );
             CallSite {
                 file: file.clone(),
@@ -379,6 +387,7 @@ pub trait CallSiteVectorProvider {
 // ---------------------------------------------------------------------------
 
 /// Score identifiers against a query using hybrid semantic + keyword ranking.
+#[allow(clippy::too_many_arguments)]
 pub fn score_identifiers(
     docs: &[IdentifierDoc],
     query_vec: &[f32],
@@ -395,9 +404,10 @@ pub fn score_identifiers(
 
     for (i, doc) in docs.iter().enumerate() {
         if let Some(kinds) = include_kinds
-            && !kinds.contains(&doc.kind.to_lowercase()) {
-                continue;
-            }
+            && !kinds.contains(&doc.kind.to_lowercase())
+        {
+            continue;
+        }
 
         // Compute cosine similarity from flat buffer
         let offset = i * vector_dims;
@@ -490,11 +500,7 @@ pub fn format_identifier_results(
             if calls.sites.is_empty() {
                 lines.push("   Calls: none found".to_string());
             } else {
-                lines.push(format!(
-                    "   Calls ({}/{}):",
-                    calls.sites.len(),
-                    calls.total
-                ));
+                lines.push(format!("   Calls ({}/{}):", calls.sites.len(), calls.total));
                 for (j, site) in calls.sites.iter().enumerate() {
                     lines.push(format!(
                         "     {}. {}:L{} ({}%) {}",
@@ -534,7 +540,7 @@ pub async fn semantic_identifier_search(
         return Ok("No supported identifiers found for semantic identifier search.".to_string());
     }
 
-    let top_k = options.top_k.unwrap_or(DEFAULT_TOP_K).max(1).min(MAX_TOP_K);
+    let top_k = options.top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, MAX_TOP_K);
     let top_calls = options
         .top_calls_per_identifier
         .unwrap_or(DEFAULT_TOP_CALLS)
@@ -548,7 +554,7 @@ pub async fn semantic_identifier_search(
     }
 
     // Get query embedding
-    let query_vecs = embed_fn.embed(&[query.clone()]).await?;
+    let query_vecs = embed_fn.embed(std::slice::from_ref(&query)).await?;
     let query_vec = query_vecs
         .into_iter()
         .next()
@@ -864,8 +870,7 @@ mod tests {
         let query_terms: HashSet<String> = ["user", "get"].iter().map(|s| s.to_string()).collect();
         let query_vec = vec![1.0, 0.0, 0.0];
 
-        let result =
-            rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
+        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
 
         // Should find the call in handler.ts (not the definition in user.ts)
         assert!(result.total > 0);
@@ -900,8 +905,7 @@ mod tests {
         let query_terms = HashSet::new();
         let query_vec = vec![1.0];
 
-        let result =
-            rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
+        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
         assert_eq!(result.total, 0);
     }
 
@@ -919,10 +923,7 @@ mod tests {
             parent_name: None,
             text: "noMatch".to_string(),
         };
-        let file_lines = vec![(
-            "other.ts".to_string(),
-            vec!["const x = 42;".to_string()],
-        )];
+        let file_lines = vec![("other.ts".to_string(), vec!["const x = 42;".to_string()])];
         let query_terms = HashSet::new();
         let query_vec = vec![1.0];
 

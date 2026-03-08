@@ -14,6 +14,11 @@ use regex::Regex;
 use crate::error::Result;
 use crate::tools::semantic_identifiers::{escape_regex, is_definition_line};
 
+/// Type alias for the boxed future returned by file-line providers.
+type FileLinesFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<(String, Vec<String>)>>> + Send + 'a>,
+>;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -70,7 +75,7 @@ pub fn find_symbol_usages(
             return BlastRadiusResult {
                 usages: vec![],
                 by_file: BTreeMap::new(),
-            }
+            };
         }
     };
 
@@ -84,13 +89,15 @@ pub fn find_symbol_usages(
 
             // Skip definition line if this file matches fileContext
             if let Some(ctx) = file_context
-                && relative_path == ctx && is_definition_line(line, symbol_name) {
-                    continue;
-                }
+                && relative_path == ctx
+                && is_definition_line(line, symbol_name)
+            {
+                continue;
+            }
 
             let context = line.trim();
             let context = if context.len() > MAX_CONTEXT_LEN {
-                &context[..MAX_CONTEXT_LEN]
+                crate::core::parser::truncate_to_char_boundary(context, MAX_CONTEXT_LEN)
             } else {
                 context
             };
@@ -104,10 +111,7 @@ pub fn find_symbol_usages(
 
     let mut by_file: BTreeMap<String, Vec<SymbolUsage>> = BTreeMap::new();
     for u in &usages {
-        by_file
-            .entry(u.file.clone())
-            .or_default()
-            .push(u.clone());
+        by_file.entry(u.file.clone()).or_default().push(u.clone());
     }
 
     BlastRadiusResult { usages, by_file }
@@ -154,12 +158,7 @@ pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> Str
 /// Trait for providing file lines. Implementations can use cached file lines
 /// from the identifier index or read files from disk.
 pub trait FileLineProvider: Send + Sync {
-    fn get_file_lines(
-        &self,
-        root_dir: &Path,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<(String, Vec<String>)>>> + Send + '_>,
-    >;
+    fn get_file_lines(&self, root_dir: &Path) -> FileLinesFuture<'_>;
 }
 
 /// Run blast radius analysis.
@@ -172,15 +171,9 @@ pub async fn get_blast_radius(
         return Ok("Symbol name is empty.".to_string());
     }
 
-    let file_lines = file_line_provider
-        .get_file_lines(&options.root_dir)
-        .await?;
+    let file_lines = file_line_provider.get_file_lines(&options.root_dir).await?;
 
-    let result = find_symbol_usages(
-        symbol_name,
-        options.file_context.as_deref(),
-        &file_lines,
-    );
+    let result = find_symbol_usages(symbol_name, options.file_context.as_deref(), &file_lines);
 
     Ok(format_blast_radius(symbol_name, &result))
 }

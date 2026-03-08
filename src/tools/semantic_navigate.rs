@@ -39,7 +39,10 @@ struct ClusterNode {
 }
 
 /// Perform semantic navigation: embed files, cluster, label, return tree.
-pub async fn semantic_navigate(options: SemanticNavigateOptions, ollama: &OllamaClient) -> Result<String> {
+pub async fn semantic_navigate(
+    options: SemanticNavigateOptions,
+    ollama: &OllamaClient,
+) -> Result<String> {
     let max_clusters = options.max_clusters.unwrap_or(20);
     let max_depth = options.max_depth.unwrap_or(3);
     let root = PathBuf::from(&options.root_dir);
@@ -149,10 +152,7 @@ async fn collect_source_files(root: &Path) -> Result<Vec<FileInfo>> {
             if file_type.is_dir() {
                 dirs.push(full_path);
             } else if file_type.is_file() {
-                let ext = full_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !supported_extensions.contains(ext) {
                     continue;
                 }
@@ -225,9 +225,10 @@ async fn label_files(files: &[FileInfo]) -> Vec<String> {
     match chat_completion(&prompt).await {
         Ok(response) => {
             if let Some(json_match) = extract_json_array(&response)
-                && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_match) {
-                    return labels;
-                }
+                && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_match)
+            {
+                return labels;
+            }
             files.iter().map(|f| f.header.clone()).collect()
         }
         Err(_) => files.iter().map(|f| f.header.clone()).collect(),
@@ -235,9 +236,7 @@ async fn label_files(files: &[FileInfo]) -> Vec<String> {
 }
 
 /// Label sibling clusters using Ollama chat.
-async fn label_sibling_clusters(
-    clusters: &[(Vec<&FileInfo>, Option<String>)],
-) -> Vec<String> {
+async fn label_sibling_clusters(clusters: &[(Vec<&FileInfo>, Option<String>)]) -> Vec<String> {
     if clusters.is_empty() {
         return Vec::new();
     }
@@ -307,8 +306,7 @@ Respond with ONLY a JSON array of {} objects. No other text."#,
                         .into_iter()
                         .enumerate()
                         .map(|(i, l)| {
-                            let base =
-                                l.label.unwrap_or_else(|| format!("Cluster {}", i + 1));
+                            let base = l.label.unwrap_or_else(|| format!("Cluster {}", i + 1));
                             if let Some(ref pp) = clusters[i].1 {
                                 format!("{} ({})", base, pp)
                             } else {
@@ -321,17 +319,13 @@ Respond with ONLY a JSON array of {} objects. No other text."#,
             clusters
                 .iter()
                 .enumerate()
-                .map(|(i, (_, pp))| {
-                    pp.clone().unwrap_or_else(|| format!("Cluster {}", i + 1))
-                })
+                .map(|(i, (_, pp))| pp.clone().unwrap_or_else(|| format!("Cluster {}", i + 1)))
                 .collect()
         }
         Err(_) => clusters
             .iter()
             .enumerate()
-            .map(|(i, (_, pp))| {
-                pp.clone().unwrap_or_else(|| format!("Cluster {}", i + 1))
-            })
+            .map(|(i, (_, pp))| pp.clone().unwrap_or_else(|| format!("Cluster {}", i + 1)))
             .collect(),
     }
 }
@@ -340,8 +334,7 @@ Respond with ONLY a JSON array of {} objects. No other text."#,
 async fn chat_completion(prompt: &str) -> Result<String> {
     let ollama_host =
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let chat_model =
-        std::env::var("OLLAMA_CHAT_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+    let chat_model = std::env::var("OLLAMA_CHAT_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
 
     let client = Client::new();
     let body = serde_json::json!({
@@ -406,7 +399,10 @@ async fn build_hierarchy(
         return ClusterNode {
             label: String::new(),
             path_pattern: find_path_pattern(
-                &files.iter().map(|f| f.relative_path.clone()).collect::<Vec<_>>(),
+                &files
+                    .iter()
+                    .map(|f| f.relative_path.clone())
+                    .collect::<Vec<_>>(),
             ),
             files: files.to_vec(),
             children: Vec::new(),
@@ -419,7 +415,10 @@ async fn build_hierarchy(
         return ClusterNode {
             label: String::new(),
             path_pattern: find_path_pattern(
-                &files.iter().map(|f| f.relative_path.clone()).collect::<Vec<_>>(),
+                &files
+                    .iter()
+                    .map(|f| f.relative_path.clone())
+                    .collect::<Vec<_>>(),
             ),
             files: files.to_vec(),
             children: Vec::new(),
@@ -427,14 +426,21 @@ async fn build_hierarchy(
     }
 
     // Build child metadata
+    #[allow(clippy::type_complexity)]
     let child_metas: Vec<(Vec<&FileInfo>, Vec<Vec<f32>>, Option<String>)> = cluster_results
         .iter()
         .map(|cluster| {
             let cluster_files: Vec<&FileInfo> =
                 cluster.indices.iter().map(|&i| &files[i]).collect();
-            let cluster_vectors: Vec<Vec<f32>> =
-                cluster.indices.iter().map(|&i| vectors[i].clone()).collect();
-            let paths: Vec<String> = cluster_files.iter().map(|f| f.relative_path.clone()).collect();
+            let cluster_vectors: Vec<Vec<f32>> = cluster
+                .indices
+                .iter()
+                .map(|&i| vectors[i].clone())
+                .collect();
+            let paths: Vec<String> = cluster_files
+                .iter()
+                .map(|f| f.relative_path.clone())
+                .collect();
             let pattern = find_path_pattern(&paths);
             (cluster_files, cluster_vectors, pattern)
         })
@@ -451,17 +457,28 @@ async fn build_hierarchy(
     let mut children = Vec::new();
     for (i, (cluster_files, cluster_vectors, _pattern)) in child_metas.into_iter().enumerate() {
         let owned_files: Vec<FileInfo> = cluster_files.iter().map(|f| (*f).clone()).collect();
-        let mut child =
-            Box::pin(build_hierarchy(&owned_files, &cluster_vectors, max_clusters, depth + 1, max_depth))
-                .await;
-        child.label = labels.get(i).cloned().unwrap_or_else(|| format!("Cluster {}", i + 1));
+        let mut child = Box::pin(build_hierarchy(
+            &owned_files,
+            &cluster_vectors,
+            max_clusters,
+            depth + 1,
+            max_depth,
+        ))
+        .await;
+        child.label = labels
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Cluster {}", i + 1));
         children.push(child);
     }
 
     ClusterNode {
         label: String::new(),
         path_pattern: find_path_pattern(
-            &files.iter().map(|f| f.relative_path.clone()).collect::<Vec<_>>(),
+            &files
+                .iter()
+                .map(|f| f.relative_path.clone())
+                .collect::<Vec<_>>(),
         ),
         files: Vec::new(),
         children,

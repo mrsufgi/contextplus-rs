@@ -49,10 +49,7 @@ mod tests {
     #[test]
     fn path_traversal_error_displays() {
         let err = ContextPlusError::PathTraversal("../etc/passwd".into());
-        assert_eq!(
-            err.to_string(),
-            "Path traversal detected: ../etc/passwd"
-        );
+        assert_eq!(err.to_string(), "Path traversal detected: ../etc/passwd");
     }
 
     #[test]

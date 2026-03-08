@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rmcp::RoleServer;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
-use rmcp::RoleServer;
 use serde_json::Value;
 
 use crate::config::Config;
@@ -51,7 +51,9 @@ impl ContextPlusServer {
     }
 
     fn get_str(args: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-        args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     fn get_str_or(args: &serde_json::Map<String, Value>, key: &str, default: &str) -> String {
@@ -95,11 +97,7 @@ impl ContextPlusServer {
 
     // --- Tool dispatch ---
 
-    async fn dispatch(
-        &self,
-        name: &str,
-        args: serde_json::Map<String, Value>,
-    ) -> CallToolResult {
+    async fn dispatch(&self, name: &str, args: serde_json::Map<String, Value>) -> CallToolResult {
         match self.dispatch_inner(name, args).await {
             Ok(result) => result,
             Err(e) => Self::err_text(format!("Error: {}", e)),
@@ -164,15 +162,18 @@ impl ContextPlusServer {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                 if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                    let header = crate::core::parser::extract_header(
-                        &content.lines().collect::<Vec<_>>(),
-                    );
+                    let header =
+                        crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
                     let tree_symbols: Vec<ct::TreeSymbol> =
                         symbols.iter().map(code_sym_to_tree_sym).collect();
                     ct_analyses.insert(
                         entry.relative_path.clone(),
                         ct::FileAnalysis {
-                            header: if header.is_empty() { None } else { Some(header) },
+                            header: if header.is_empty() {
+                                None
+                            } else {
+                                Some(header)
+                            },
                             symbols: tree_symbols,
                         },
                     );
@@ -211,13 +212,15 @@ impl ContextPlusServer {
         let analysis = content_ref.and_then(|c| {
             let ext = file_path.rsplit('.').next().unwrap_or("");
             let symbols = parse_with_tree_sitter(c, ext).ok()?;
-            let header = crate::core::parser::extract_header(
-                &c.lines().collect::<Vec<_>>(),
-            );
+            let header = crate::core::parser::extract_header(&c.lines().collect::<Vec<_>>());
             let skel_symbols: Vec<fs::SkeletonSymbol> =
                 symbols.iter().map(code_sym_to_skel_sym).collect();
             Some(fs::SkeletonAnalysis {
-                header: if header.is_empty() { None } else { Some(header) },
+                header: if header.is_empty() {
+                    None
+                } else {
+                    Some(header)
+                },
                 symbols: skel_symbols,
                 line_count: c.lines().count(),
             })
@@ -279,10 +282,9 @@ impl ContextPlusServer {
             ollama: self.state.ollama.clone(),
         };
 
-        let result = crate::tools::semantic_search::semantic_code_search(
-            options, &embedder, &walker,
-        )
-        .await?;
+        let result =
+            crate::tools::semantic_search::semantic_code_search(options, &embedder, &walker)
+                .await?;
         Ok(Self::ok_text(result))
     }
 
@@ -309,12 +311,12 @@ impl ContextPlusServer {
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                 if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                    let header = crate::core::parser::extract_header(
-                        &content.lines().collect::<Vec<_>>(),
-                    );
+                    let header =
+                        crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
                     for sym in crate::core::parser::flatten_symbols(&symbols, None) {
                         let sig = sym.signature.clone().unwrap_or_default();
-                        let text = format!("{} {} {} {}", sym.name, sym.kind, entry.relative_path, sig);
+                        let text =
+                            format!("{} {} {} {}", sym.name, sym.kind, entry.relative_path, sig);
                         identifier_docs.push(IdentifierDoc {
                             id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
                             path: entry.relative_path.clone(),
@@ -354,7 +356,11 @@ impl ContextPlusServer {
             include_kinds: args
                 .get("includeKinds")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                }),
         };
 
         let result = semantic_identifier_search(
@@ -383,7 +389,8 @@ impl ContextPlusServer {
             max_clusters: Self::get_usize(&args, "maxClusters"),
         };
 
-        let result = crate::tools::semantic_navigate::semantic_navigate(options, &self.state.ollama).await?;
+        let result =
+            crate::tools::semantic_navigate::semantic_navigate(options, &self.state.ollama).await?;
         Ok(Self::ok_text(result))
     }
 
@@ -500,7 +507,9 @@ impl ContextPlusServer {
         };
 
         let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_upsert_memory_node(store, &self.state.ollama, options).await?;
+        let result =
+            crate::tools::memory_tools::tool_upsert_memory_node(store, &self.state.ollama, options)
+                .await?;
 
         Ok(Self::ok_text(result))
     }
@@ -541,11 +550,20 @@ impl ContextPlusServer {
             edge_filter: args
                 .get("edgeFilter")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                }),
         };
 
         let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_search_memory_graph(store, &self.state.ollama, options).await?;
+        let result = crate::tools::memory_tools::tool_search_memory_graph(
+            store,
+            &self.state.ollama,
+            options,
+        )
+        .await?;
         Ok(Self::ok_text(result))
     }
 
@@ -576,7 +594,8 @@ impl ContextPlusServer {
                     .filter_map(|item| {
                         let obj = item.as_object()?;
                         Some(crate::tools::memory_tools::InterlinkedItem {
-                            node_type: Self::get_str(obj, "nodeType").unwrap_or_else(|| "concept".to_string()),
+                            node_type: Self::get_str(obj, "nodeType")
+                                .unwrap_or_else(|| "concept".to_string()),
                             label: Self::get_str(obj, "label")?,
                             content: Self::get_str(obj, "content")?,
                             metadata: parse_metadata(obj),
@@ -593,8 +612,12 @@ impl ContextPlusServer {
         };
 
         let store = &self.state.memory_graph;
-        let result =
-            crate::tools::memory_tools::tool_add_interlinked_context(store, &self.state.ollama, options).await?;
+        let result = crate::tools::memory_tools::tool_add_interlinked_context(
+            store,
+            &self.state.ollama,
+            options,
+        )
+        .await?;
 
         Ok(Self::ok_text(result))
     }
@@ -611,7 +634,11 @@ impl ContextPlusServer {
             edge_filter: args
                 .get("edgeFilter")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                }),
         };
 
         let store = &self.state.memory_graph;
@@ -626,12 +653,15 @@ impl ContextPlusServer {
         if let Some(requested) = Self::get_str(args, "rootDir") {
             let requested_path = PathBuf::from(&requested);
             // Normalize both paths to handle `.`, `..`, symlinks, etc.
-            let canonical_root = self.state.root_dir.canonicalize()
+            let canonical_root = self
+                .state
+                .root_dir
+                .canonicalize()
                 .unwrap_or_else(|_| self.state.root_dir.clone());
-            if let Ok(canonical_requested) = requested_path.canonicalize() {
-                if canonical_requested.starts_with(&canonical_root) {
-                    return canonical_requested;
-                }
+            if let Ok(canonical_requested) = requested_path.canonicalize()
+                && canonical_requested.starts_with(&canonical_root)
+            {
+                return canonical_requested;
             }
             tracing::warn!(
                 requested = %requested,
@@ -641,27 +671,22 @@ impl ContextPlusServer {
         }
         self.state.root_dir.clone()
     }
-
 }
 
 // --- ServerHandler implementation ---
 
 impl ServerHandler for ContextPlusServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
-        .with_server_info(Implementation::new(
-            "contextplus",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions(
-            "Context+ semantic code analysis server. Provides semantic search, \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "contextplus",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Context+ semantic code analysis server. Provides semantic search, \
              blast radius analysis, context trees, file skeletons, navigation, \
              memory graph, and more.",
-        )
+            )
     }
 
     fn list_tools(
@@ -669,8 +694,8 @@ impl ServerHandler for ContextPlusServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = std::result::Result<ListToolsResult, rmcp::ErrorData>>
-           + Send
-           + '_ {
+    + Send
+    + '_ {
         std::future::ready(Ok(ListToolsResult {
             tools: tool_definitions(),
             meta: None,
@@ -678,18 +703,14 @@ impl ServerHandler for ContextPlusServer {
         }))
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = std::result::Result<CallToolResult, rmcp::ErrorData>>
-           + Send
-           + '_ {
-        async move {
-            let name = request.name.to_string();
-            let args = request.arguments.unwrap_or_default();
-            Ok(self.dispatch(&name, args).await)
-        }
+    ) -> std::result::Result<CallToolResult, rmcp::ErrorData> {
+        let name = request.name.to_string();
+        let args = request.arguments.unwrap_or_default();
+        Ok(self.dispatch(&name, args).await)
     }
 }
 
@@ -710,9 +731,7 @@ impl EmbedFn for OllamaEmbedder {
 
 // --- WalkAndIndexFn adapter ---
 
-use crate::tools::semantic_search::{
-    SearchDocument, SymbolSearchEntry, WalkAndIndexFn,
-};
+use crate::tools::semantic_search::{SearchDocument, SymbolSearchEntry, WalkAndIndexFn};
 
 struct WalkerIndexer {
     config: Config,
@@ -725,9 +744,8 @@ impl WalkAndIndexFn for WalkerIndexer {
         root_dir: &Path,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
-                > + Send
+            dyn std::future::Future<Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>>
+                + Send
                 + '_,
         >,
     > {
@@ -746,9 +764,8 @@ impl WalkAndIndexFn for WalkerIndexer {
                 };
                 let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                 let symbols = parse_with_tree_sitter(&content, ext).unwrap_or_default();
-                let header = crate::core::parser::extract_header(
-                    &content.lines().collect::<Vec<_>>(),
-                );
+                let header =
+                    crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
 
                 let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
                 let symbol_entries: Vec<SymbolSearchEntry> = symbols
@@ -786,7 +803,7 @@ impl WalkAndIndexFn for WalkerIndexer {
             // Embed in batches
             let batch_size = config.embed_batch_size.max(1);
             for chunk in texts.chunks(batch_size) {
-                match ollama.embed(&chunk.to_vec()).await {
+                match ollama.embed(chunk).await {
                     Ok(embeddings) => {
                         for emb in embeddings {
                             vectors.push(Some(emb));
@@ -808,7 +825,9 @@ impl WalkAndIndexFn for WalkerIndexer {
 
 // --- Type conversion helpers ---
 
-fn code_sym_to_tree_sym(sym: &crate::core::parser::CodeSymbol) -> crate::tools::context_tree::TreeSymbol {
+fn code_sym_to_tree_sym(
+    sym: &crate::core::parser::CodeSymbol,
+) -> crate::tools::context_tree::TreeSymbol {
     crate::tools::context_tree::TreeSymbol {
         name: sym.name.clone(),
         kind: sym.kind.clone(),
@@ -819,7 +838,9 @@ fn code_sym_to_tree_sym(sym: &crate::core::parser::CodeSymbol) -> crate::tools::
     }
 }
 
-fn code_sym_to_skel_sym(sym: &crate::core::parser::CodeSymbol) -> crate::tools::file_skeleton::SkeletonSymbol {
+fn code_sym_to_skel_sym(
+    sym: &crate::core::parser::CodeSymbol,
+) -> crate::tools::file_skeleton::SkeletonSymbol {
     crate::tools::file_skeleton::SkeletonSymbol {
         name: sym.name.clone(),
         kind: sym.kind.clone(),
@@ -851,7 +872,12 @@ fn tool_definitions() -> Vec<Tool> {
             "Build a token-aware context tree showing file structure and symbols. Prunes detail levels based on maxTokens budget.",
             &[
                 ("rootDir", "string", false, "Root directory to analyze"),
-                ("includeSymbols", "boolean", false, "Include symbols in output (default true)"),
+                (
+                    "includeSymbols",
+                    "boolean",
+                    false,
+                    "Include symbols in output (default true)",
+                ),
                 ("maxTokens", "integer", false, "Token budget for output"),
             ],
         ),
@@ -868,7 +894,12 @@ fn tool_definitions() -> Vec<Tool> {
             "Find every file that imports or references a symbol. Maps the full impact of changing it.",
             &[
                 ("symbolName", "string", true, "Symbol to search for"),
-                ("fileContext", "string", false, "File where symbol is defined (to exclude definition)"),
+                (
+                    "fileContext",
+                    "string",
+                    false,
+                    "File where symbol is defined (to exclude definition)",
+                ),
                 ("rootDir", "string", false, "Root directory"),
             ],
         ),
@@ -877,10 +908,25 @@ fn tool_definitions() -> Vec<Tool> {
             "Search code files semantically using natural language queries. Combines embedding similarity with keyword matching for hybrid ranking.",
             &[
                 ("query", "string", true, "Natural language search query"),
-                ("topK", "integer", false, "Number of results (default 5, max 50)"),
+                (
+                    "topK",
+                    "integer",
+                    false,
+                    "Number of results (default 5, max 50)",
+                ),
                 ("rootDir", "string", false, "Root directory"),
-                ("semanticWeight", "number", false, "Weight for semantic score (default 0.72)"),
-                ("keywordWeight", "number", false, "Weight for keyword score (default 0.28)"),
+                (
+                    "semanticWeight",
+                    "number",
+                    false,
+                    "Weight for semantic score (default 0.72)",
+                ),
+                (
+                    "keywordWeight",
+                    "number",
+                    false,
+                    "Weight for keyword score (default 0.28)",
+                ),
             ],
         ),
         make_tool(
@@ -899,7 +945,12 @@ fn tool_definitions() -> Vec<Tool> {
             &[
                 ("query", "string", true, "Navigation query"),
                 ("rootDir", "string", false, "Root directory"),
-                ("maxClusters", "integer", false, "Maximum number of clusters"),
+                (
+                    "maxClusters",
+                    "integer",
+                    false,
+                    "Maximum number of clusters",
+                ),
                 ("maxFiles", "integer", false, "Maximum files to analyze"),
             ],
         ),
@@ -938,7 +989,12 @@ fn tool_definitions() -> Vec<Tool> {
             "undo_change",
             "Restore files from a shadow restore point created by propose_commit.",
             &[
-                ("restorePointId", "string", true, "Restore point ID (format: rp-{timestamp}-{random})"),
+                (
+                    "restorePointId",
+                    "string",
+                    true,
+                    "Restore point ID (format: rp-{timestamp}-{random})",
+                ),
                 ("rootDir", "string", false, "Root directory"),
             ],
         ),
@@ -948,7 +1004,12 @@ fn tool_definitions() -> Vec<Tool> {
             &[
                 ("label", "string", true, "Node label"),
                 ("content", "string", true, "Node content"),
-                ("nodeType", "string", false, "Node type: concept, file, symbol, note (default: concept)"),
+                (
+                    "nodeType",
+                    "string",
+                    false,
+                    "Node type: concept, file, symbol, note (default: concept)",
+                ),
             ],
         ),
         make_tool(
@@ -956,10 +1017,25 @@ fn tool_definitions() -> Vec<Tool> {
             "Create or update a relation between two memory graph nodes.",
             &[
                 ("sourceLabel", "string", true, "Source node label"),
-                ("sourceType", "string", false, "Source node type (default: concept)"),
+                (
+                    "sourceType",
+                    "string",
+                    false,
+                    "Source node type (default: concept)",
+                ),
                 ("targetLabel", "string", true, "Target node label"),
-                ("targetType", "string", false, "Target node type (default: concept)"),
-                ("relation", "string", false, "Relation type: relates_to, depends_on, implements, references, similar_to, contains"),
+                (
+                    "targetType",
+                    "string",
+                    false,
+                    "Target node type (default: concept)",
+                ),
+                (
+                    "relation",
+                    "string",
+                    false,
+                    "Relation type: relates_to, depends_on, implements, references, similar_to, contains",
+                ),
                 ("weight", "number", false, "Relation weight (0.0-1.0)"),
             ],
         ),
@@ -975,14 +1051,29 @@ fn tool_definitions() -> Vec<Tool> {
         make_tool(
             "prune_stale_links",
             "Remove memory graph edges with decayed weight below threshold, and orphan nodes.",
-            &[("threshold", "number", false, "Weight threshold (default 0.1)")],
+            &[(
+                "threshold",
+                "number",
+                false,
+                "Weight threshold (default 0.1)",
+            )],
         ),
         make_tool(
             "add_interlinked_context",
             "Add multiple memory nodes at once with optional auto-linking by semantic similarity.",
             &[
-                ("items", "array", true, "Array of {nodeType, label, content} objects"),
-                ("autoLink", "boolean", false, "Auto-link similar nodes (cosine > 0.72)"),
+                (
+                    "items",
+                    "array",
+                    true,
+                    "Array of {nodeType, label, content} objects",
+                ),
+                (
+                    "autoLink",
+                    "boolean",
+                    false,
+                    "Auto-link similar nodes (cosine > 0.72)",
+                ),
             ],
         ),
         make_tool(
@@ -996,11 +1087,7 @@ fn tool_definitions() -> Vec<Tool> {
     ]
 }
 
-fn make_tool(
-    name: &str,
-    description: &str,
-    params: &[(&str, &str, bool, &str)],
-) -> Tool {
+fn make_tool(name: &str, description: &str, params: &[(&str, &str, bool, &str)]) -> Tool {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
 
@@ -1047,7 +1134,11 @@ mod tests {
         assert_eq!(defs.len(), 17, "expected 17 tools, got {}", defs.len());
         for tool in &defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
-            assert!(tool.description.is_some(), "tool '{}' must have a description", tool.name);
+            assert!(
+                tool.description.is_some(),
+                "tool '{}' must have a description",
+                tool.name
+            );
         }
     }
 
@@ -1084,7 +1175,11 @@ mod tests {
         let server = test_server();
         let args = serde_json::Map::new();
         let result = server.dispatch("nonexistent_tool", args).await;
-        assert_eq!(result.is_error, Some(true), "unknown tool should return is_error=true");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "unknown tool should return is_error=true"
+        );
         let text = result
             .content
             .first()
@@ -1116,7 +1211,10 @@ mod tests {
     fn get_str_extracts_string() {
         let mut args = serde_json::Map::new();
         args.insert("key".to_string(), json!("value"));
-        assert_eq!(ContextPlusServer::get_str(&args, "key"), Some("value".to_string()));
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "key"),
+            Some("value".to_string())
+        );
         assert_eq!(ContextPlusServer::get_str(&args, "missing"), None);
     }
 

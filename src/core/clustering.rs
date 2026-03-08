@@ -42,11 +42,7 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
         norm_b += bi * bi;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-15 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom < 1e-15 { 0.0 } else { dot / denom }
 }
 
 /// Compute normalized symmetric Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
@@ -121,17 +117,13 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     for _ in 1..k {
         let mut best_idx = 0;
         let mut best_dist = -1.0_f64;
-        for i in 0..n {
+        for (i, row) in data.iter().enumerate() {
             if used.contains(&i) {
                 continue;
             }
             let min_dist = centroids
                 .iter()
-                .map(|c| {
-                    (0..dim)
-                        .map(|d| (data[i][d] - c[d]).powi(2))
-                        .sum::<f64>()
-                })
+                .map(|c| (0..dim).map(|d| (row[d] - c[d]).powi(2)).sum::<f64>())
                 .fold(f64::INFINITY, f64::min);
             if min_dist > best_dist {
                 best_dist = min_dist;
@@ -151,9 +143,7 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
             let mut best_dist = f64::INFINITY;
             let mut best_c = 0_usize;
             for (c, centroid) in centroids.iter().enumerate() {
-                let dist: f64 = (0..dim)
-                    .map(|d| (data[i][d] - centroid[d]).powi(2))
-                    .sum();
+                let dist: f64 = (0..dim).map(|d| (data[i][d] - centroid[d]).powi(2)).sum();
                 if dist < best_dist {
                     best_dist = dist;
                     best_c = c;
@@ -222,8 +212,11 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
 
     // Sort eigenvalue indices by value (ascending) and take first k eigenvectors
     let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
-    sorted_indices
-        .sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_indices.sort_by(|&a, &b| {
+        eigenvalues[a]
+            .partial_cmp(&eigenvalues[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Build embedding: rows of first k eigenvectors, row-normalized
     let mut embedding: Vec<Vec<f64>> = Vec::with_capacity(n);
@@ -326,11 +319,7 @@ mod tests {
 
     #[test]
     fn build_affinity_symmetric() {
-        let vectors = vec![
-            vec![1.0_f32, 0.0],
-            vec![0.0_f32, 1.0],
-            vec![0.5_f32, 0.5],
-        ];
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0], vec![0.5_f32, 0.5]];
         let aff = build_affinity_matrix(&vectors);
         assert_eq!(aff.nrows(), 3);
         assert_eq!(aff.ncols(), 3);
@@ -346,11 +335,7 @@ mod tests {
 
     #[test]
     fn normalized_laplacian_diagonal_is_one() {
-        let vectors = vec![
-            vec![1.0_f32, 0.0],
-            vec![0.0_f32, 1.0],
-            vec![0.5_f32, 0.5],
-        ];
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0], vec![0.5_f32, 0.5]];
         let aff = build_affinity_matrix(&vectors);
         let lap = normalized_laplacian(&aff);
         for i in 0..3 {
@@ -398,10 +383,7 @@ mod tests {
 
     #[test]
     fn spectral_cluster_small_set_returns_singletons() {
-        let vectors = vec![
-            vec![1.0_f32, 0.0],
-            vec![0.0_f32, 1.0],
-        ];
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
         let result = spectral_cluster(&vectors, 5);
         // n <= max_clusters, so each gets its own cluster
         assert_eq!(result.len(), 2);
@@ -437,30 +419,21 @@ mod tests {
 
     #[test]
     fn find_path_pattern_common_prefix() {
-        let paths = vec![
-            "src/core/foo.rs".to_string(),
-            "src/core/bar.rs".to_string(),
-        ];
+        let paths = vec!["src/core/foo.rs".to_string(), "src/core/bar.rs".to_string()];
         let pattern = find_path_pattern(&paths);
         assert_eq!(pattern, Some("src/core/*".to_string()));
     }
 
     #[test]
     fn find_path_pattern_same_suffix() {
-        let paths = vec![
-            "src/mod.rs".to_string(),
-            "lib/mod.rs".to_string(),
-        ];
+        let paths = vec!["src/mod.rs".to_string(), "lib/mod.rs".to_string()];
         let pattern = find_path_pattern(&paths);
         assert_eq!(pattern, Some("*/mod.rs".to_string()));
     }
 
     #[test]
     fn find_path_pattern_common_both() {
-        let paths = vec![
-            "src/core/mod.rs".to_string(),
-            "src/core/mod.rs".to_string(),
-        ];
+        let paths = vec!["src/core/mod.rs".to_string(), "src/core/mod.rs".to_string()];
         let pattern = find_path_pattern(&paths);
         assert_eq!(pattern, Some("src/core/mod.rs".to_string()));
     }
@@ -473,10 +446,7 @@ mod tests {
 
     #[test]
     fn find_path_pattern_none() {
-        let paths = vec![
-            "src/foo.rs".to_string(),
-            "lib/bar.rs".to_string(),
-        ];
+        let paths = vec!["src/foo.rs".to_string(), "lib/bar.rs".to_string()];
         let pattern = find_path_pattern(&paths);
         assert_eq!(pattern, None);
     }

@@ -149,11 +149,7 @@ pub async fn get_feature_hub(options: FeatureHubOptions) -> Result<String> {
         // Show first 20 lines as preview
         let full = root.join(file_path);
         if let Ok(file_content) = tokio::fs::read_to_string(&full).await {
-            let preview: String = file_content
-                .lines()
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let preview: String = file_content.lines().take(20).collect::<Vec<_>>().join("\n");
             out.push(preview);
         }
         out.push(String::new());
@@ -259,9 +255,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
 
-        tokio::fs::write(root.join("feature.md"), "# Auth Feature\n\n- [[src/auth.rs]]")
-            .await
-            .expect("write");
+        tokio::fs::write(
+            root.join("feature.md"),
+            "# Auth Feature\n\n- [[src/auth.rs]]",
+        )
+        .await
+        .expect("write");
 
         let options = FeatureHubOptions {
             root_dir: root.to_string_lossy().to_string(),
@@ -338,9 +337,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
 
-        tokio::fs::write(root.join("auth.md"), "# Authentication\n\n- [[src/auth.rs]]")
-            .await
-            .expect("write");
+        tokio::fs::write(
+            root.join("auth.md"),
+            "# Authentication\n\n- [[src/auth.rs]]",
+        )
+        .await
+        .expect("write");
 
         let options = FeatureHubOptions {
             root_dir: root.to_string_lossy().to_string(),
