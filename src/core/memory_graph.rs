@@ -220,6 +220,11 @@ impl MemoryGraph {
             .and_then(|idx| self.graph.node_weight_mut(idx))
     }
 
+    /// Check if a node exists by ID.
+    pub fn node_exists(&self, id: &str) -> bool {
+        self.id_index.contains_key(id)
+    }
+
     /// Find a node by label and type.
     pub fn find_node(&self, label: &str, node_type: &NodeType) -> Option<&MemoryNode> {
         let key = (label.to_string(), node_type.as_str().to_string());

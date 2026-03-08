@@ -12,8 +12,9 @@ use rmcp::service::RequestContext;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use crate::cache::rkyv_store;
 use crate::config::Config;
-use crate::core::embeddings::OllamaClient;
+use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::memory_graph::GraphStore;
 use crate::core::parser::detect_language;
 use crate::core::tree_sitter::parse_with_tree_sitter;
@@ -37,8 +38,9 @@ pub struct SharedState {
     pub memory_graph: GraphStore,
     pub project_cache: RwLock<Option<ProjectCache>>,
     /// Cached embedding vectors keyed by relative file path.
-    /// Shared across semantic_navigate and other embedding-based tools.
-    pub embedding_cache: RwLock<HashMap<String, Vec<f32>>>,
+    /// Uses CacheEntry (hash + vector) for content-hash invalidation.
+    /// Persisted to disk via rkyv_store for cross-restart survival.
+    pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -51,13 +53,34 @@ impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
         let ollama = OllamaClient::new(&config);
         let memory_graph = GraphStore::new();
+
+        // Load embedding cache from disk if available (cross-restart persistence)
+        let initial_cache = match rkyv_store::load_vector_store(&root_dir, "embeddings") {
+            Ok(Some(store)) => {
+                let cache_map = store.to_cache();
+                tracing::info!(
+                    entries = cache_map.len(),
+                    "Loaded embedding cache from disk"
+                );
+                cache_map
+            }
+            Ok(None) => {
+                tracing::debug!("No embedding cache on disk, starting fresh");
+                HashMap::new()
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load embedding cache from disk: {e}");
+                HashMap::new()
+            }
+        };
+
         let state = Arc::new(SharedState {
             config,
             root_dir,
             ollama,
             memory_graph,
             project_cache: RwLock::new(None),
-            embedding_cache: RwLock::new(HashMap::new()),
+            embedding_cache: RwLock::new(initial_cache),
         });
         Self { state }
     }
@@ -72,6 +95,7 @@ impl ContextPlusServer {
             .map(|s| s.to_string())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn get_str_or(args: &serde_json::Map<String, Value>, key: &str, default: &str) -> String {
         Self::get_str(args, key).unwrap_or_else(|| default.to_string())
     }
@@ -162,12 +186,11 @@ impl ContextPlusServer {
     }
 
     /// Invalidate the project cache. Called by the file watcher when files change.
+    /// Note: embedding_cache is NOT cleared — content hashes in CacheEntry
+    /// handle staleness detection. Only clears the project file/line cache.
     pub async fn invalidate_project_cache(&self) {
         let mut guard = self.state.project_cache.write().await;
         *guard = None;
-        // Also clear embedding cache so stale vectors aren't used after file changes
-        let mut embed_guard = self.state.embedding_cache.write().await;
-        embed_guard.clear();
     }
 
     /// Helper: convert cached file_lines HashMap into the Vec<(String, Vec<String>)> format
@@ -291,9 +314,11 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         use crate::tools::file_skeleton as fs;
 
-        let file_path = Self::get_str(&args, "filePath")
+        let file_path = Self::get_str(&args, "file_path")
+            .or_else(|| Self::get_str(&args, "filePath"))
+            .or_else(|| Self::get_str(&args, "target_path"))
             .or_else(|| Self::get_str(&args, "targetPath"))
-            .ok_or_else(|| ContextPlusError::Other("filePath is required".into()))?;
+            .ok_or_else(|| ContextPlusError::Other("file_path is required".into()))?;
 
         let root = self.resolve_root(&args);
         let full_path = root.join(&file_path);
@@ -331,9 +356,11 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        let symbol_name = Self::get_str(&args, "symbolName")
-            .ok_or_else(|| ContextPlusError::Other("symbolName is required".into()))?;
-        let file_context = Self::get_str(&args, "fileContext");
+        let symbol_name = Self::get_str(&args, "symbol_name")
+            .or_else(|| Self::get_str(&args, "symbolName"))
+            .ok_or_else(|| ContextPlusError::Other("symbol_name is required".into()))?;
+        let file_context = Self::get_str(&args, "file_context")
+            .or_else(|| Self::get_str(&args, "fileContext"));
 
         let cache = self.ensure_project_cache().await?;
         let file_lines = Self::file_lines_as_vec(&cache);
@@ -358,14 +385,22 @@ impl ContextPlusServer {
         let options = crate::tools::semantic_search::SemanticSearchOptions {
             root_dir: root.clone(),
             query,
-            top_k: Self::get_usize(&args, "topK"),
-            semantic_weight: Self::get_f64(&args, "semanticWeight"),
-            keyword_weight: Self::get_f64(&args, "keywordWeight"),
-            min_semantic_score: Self::get_f64(&args, "minSemanticScore"),
-            min_keyword_score: Self::get_f64(&args, "minKeywordScore"),
-            min_combined_score: Self::get_f64(&args, "minCombinedScore"),
-            require_keyword_match: Self::get_bool(&args, "requireKeywordMatch"),
-            require_semantic_match: Self::get_bool(&args, "requireSemanticMatch"),
+            top_k: Self::get_usize(&args, "top_k")
+                .or_else(|| Self::get_usize(&args, "topK")),
+            semantic_weight: Self::get_f64(&args, "semantic_weight")
+                .or_else(|| Self::get_f64(&args, "semanticWeight")),
+            keyword_weight: Self::get_f64(&args, "keyword_weight")
+                .or_else(|| Self::get_f64(&args, "keywordWeight")),
+            min_semantic_score: Self::get_f64(&args, "min_semantic_score")
+                .or_else(|| Self::get_f64(&args, "minSemanticScore")),
+            min_keyword_score: Self::get_f64(&args, "min_keyword_score")
+                .or_else(|| Self::get_f64(&args, "minKeywordScore")),
+            min_combined_score: Self::get_f64(&args, "min_combined_score")
+                .or_else(|| Self::get_f64(&args, "minCombinedScore")),
+            require_keyword_match: Self::get_bool(&args, "require_keyword_match")
+                .or_else(|| Self::get_bool(&args, "requireKeywordMatch")),
+            require_semantic_match: Self::get_bool(&args, "require_semantic_match")
+                .or_else(|| Self::get_bool(&args, "requireSemanticMatch")),
         };
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());
@@ -448,12 +483,17 @@ impl ContextPlusServer {
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
             query,
-            top_k: Self::get_usize(&args, "topK"),
-            top_calls_per_identifier: Self::get_usize(&args, "topCallsPerIdentifier"),
-            semantic_weight: Self::get_f64(&args, "semanticWeight"),
-            keyword_weight: Self::get_f64(&args, "keywordWeight"),
+            top_k: Self::get_usize(&args, "top_k")
+                .or_else(|| Self::get_usize(&args, "topK")),
+            top_calls_per_identifier: Self::get_usize(&args, "top_calls_per_identifier")
+                .or_else(|| Self::get_usize(&args, "topCallsPerIdentifier")),
+            semantic_weight: Self::get_f64(&args, "semantic_weight")
+                .or_else(|| Self::get_f64(&args, "semanticWeight")),
+            keyword_weight: Self::get_f64(&args, "keyword_weight")
+                .or_else(|| Self::get_f64(&args, "keywordWeight")),
             include_kinds: args
-                .get("includeKinds")
+                .get("include_kinds")
+                .or_else(|| args.get("includeKinds"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -478,14 +518,16 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        let _query = Self::get_str(&args, "query")
-            .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
+        // query is optional in TS version — accepted but unused for clustering
+        let _query = Self::get_str(&args, "query");
         let root = self.resolve_root(&args);
 
         let options = crate::tools::semantic_navigate::SemanticNavigateOptions {
             root_dir: root.to_string_lossy().into(),
-            max_depth: Self::get_usize(&args, "maxDepth"),
-            max_clusters: Self::get_usize(&args, "maxClusters"),
+            max_depth: Self::get_usize(&args, "max_depth")
+                .or_else(|| Self::get_usize(&args, "maxDepth")),
+            max_clusters: Self::get_usize(&args, "max_clusters")
+                .or_else(|| Self::get_usize(&args, "maxClusters")),
         };
 
         let result = crate::tools::semantic_navigate::semantic_navigate(
@@ -493,6 +535,7 @@ impl ContextPlusServer {
             &self.state.ollama,
             &self.state.config,
             &self.state.embedding_cache,
+            &self.state.root_dir,
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -536,10 +579,12 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        let file_path = Self::get_str(&args, "filePath")
-            .ok_or_else(|| ContextPlusError::Other("filePath is required".into()))?;
-        let content = Self::get_str(&args, "content")
-            .ok_or_else(|| ContextPlusError::Other("content is required".into()))?;
+        let file_path = Self::get_str(&args, "file_path")
+            .or_else(|| Self::get_str(&args, "filePath"))
+            .ok_or_else(|| ContextPlusError::Other("file_path is required".into()))?;
+        let content = Self::get_str(&args, "new_content")
+            .or_else(|| Self::get_str(&args, "content"))
+            .ok_or_else(|| ContextPlusError::Other("new_content is required".into()))?;
         let description = Self::get_str(&args, "description");
         let root = self.resolve_root(&args);
 
@@ -550,6 +595,10 @@ impl ContextPlusServer {
             description.as_deref(),
         )
         .await?;
+
+        // Invalidate project cache after file write (matches TS invalidateSearchCache behavior)
+        self.invalidate_project_cache().await;
+
         Ok(Self::ok_text(result))
     }
 
@@ -582,11 +631,16 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        let restore_point_id = Self::get_str(&args, "restorePointId")
-            .ok_or_else(|| ContextPlusError::Other("restorePointId is required".into()))?;
+        let restore_point_id = Self::get_str(&args, "point_id")
+            .or_else(|| Self::get_str(&args, "restorePointId"))
+            .ok_or_else(|| ContextPlusError::Other("point_id is required".into()))?;
         let root = self.resolve_root(&args);
 
         let restored = crate::git::shadow::restore_from_point(&root, &restore_point_id).await?;
+
+        // Invalidate project cache after file restore (matches TS invalidateSearchCache behavior)
+        self.invalidate_project_cache().await;
+
         let msg = format!(
             "Restored {} file(s) from restore point {}:\n  {}",
             restored.len(),
@@ -602,7 +656,9 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         let options = crate::tools::memory_tools::UpsertMemoryNodeOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
-            node_type: Self::get_str_or(&args, "nodeType", "concept"),
+            node_type: Self::get_str(&args, "type")
+                .or_else(|| Self::get_str(&args, "nodeType"))
+                .unwrap_or_else(|| "concept".to_string()),
             label: Self::get_str(&args, "label")
                 .ok_or_else(|| ContextPlusError::Other("label is required".into()))?,
             content: Self::get_str(&args, "content")
@@ -624,13 +680,23 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         let options = crate::tools::memory_tools::CreateRelationOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
-            source_label: Self::get_str(&args, "sourceLabel")
-                .ok_or_else(|| ContextPlusError::Other("sourceLabel is required".into()))?,
-            source_type: Self::get_str_or(&args, "sourceType", "concept"),
-            target_label: Self::get_str(&args, "targetLabel")
-                .ok_or_else(|| ContextPlusError::Other("targetLabel is required".into()))?,
-            target_type: Self::get_str_or(&args, "targetType", "concept"),
-            relation: Self::get_str_or(&args, "relation", "relates_to"),
+            // TS API: source_id / target_id (direct node IDs)
+            source_id: Self::get_str(&args, "source_id")
+                .or_else(|| Self::get_str(&args, "sourceId")),
+            source_label: Self::get_str(&args, "source_label")
+                .or_else(|| Self::get_str(&args, "sourceLabel")),
+            source_type: Self::get_str(&args, "source_type")
+                .or_else(|| Self::get_str(&args, "sourceType"))
+                .unwrap_or_else(|| "concept".to_string()),
+            target_id: Self::get_str(&args, "target_id")
+                .or_else(|| Self::get_str(&args, "targetId")),
+            target_label: Self::get_str(&args, "target_label")
+                .or_else(|| Self::get_str(&args, "targetLabel")),
+            target_type: Self::get_str(&args, "target_type")
+                .or_else(|| Self::get_str(&args, "targetType"))
+                .unwrap_or_else(|| "concept".to_string()),
+            relation: Self::get_str(&args, "relation")
+                .unwrap_or_else(|| "relates_to".to_string()),
             weight: Self::get_f64(&args, "weight").map(|w| w as f32),
             metadata: parse_metadata(&args),
         };
@@ -649,10 +715,13 @@ impl ContextPlusServer {
             root_dir: self.root_dir().to_string_lossy().into(),
             query: Self::get_str(&args, "query")
                 .ok_or_else(|| ContextPlusError::Other("query is required".into()))?,
-            max_depth: Self::get_usize(&args, "maxDepth"),
-            top_k: Self::get_usize(&args, "topK"),
+            max_depth: Self::get_usize(&args, "max_depth")
+                .or_else(|| Self::get_usize(&args, "maxDepth")),
+            top_k: Self::get_usize(&args, "top_k")
+                .or_else(|| Self::get_usize(&args, "topK")),
             edge_filter: args
-                .get("edgeFilter")
+                .get("edge_filter")
+                .or_else(|| args.get("edgeFilter"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -698,7 +767,8 @@ impl ContextPlusServer {
                     .filter_map(|item| {
                         let obj = item.as_object()?;
                         Some(crate::tools::memory_tools::InterlinkedItem {
-                            node_type: Self::get_str(obj, "nodeType")
+                            node_type: Self::get_str(obj, "type")
+                                .or_else(|| Self::get_str(obj, "nodeType"))
                                 .unwrap_or_else(|| "concept".to_string()),
                             label: Self::get_str(obj, "label")?,
                             content: Self::get_str(obj, "content")?,
@@ -712,7 +782,8 @@ impl ContextPlusServer {
         let options = crate::tools::memory_tools::AddInterlinkedContextOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
             items,
-            auto_link: Self::get_bool(&args, "autoLink"),
+            auto_link: Self::get_bool(&args, "auto_link")
+                .or_else(|| Self::get_bool(&args, "autoLink")),
         };
 
         let store = &self.state.memory_graph;
@@ -732,11 +803,14 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         let options = crate::tools::memory_tools::RetrieveWithTraversalOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
-            node_id: Self::get_str(&args, "nodeId")
-                .ok_or_else(|| ContextPlusError::Other("nodeId is required".into()))?,
-            max_depth: Self::get_usize(&args, "maxDepth"),
+            node_id: Self::get_str(&args, "start_node_id")
+                .or_else(|| Self::get_str(&args, "nodeId"))
+                .ok_or_else(|| ContextPlusError::Other("start_node_id is required".into()))?,
+            max_depth: Self::get_usize(&args, "max_depth")
+                .or_else(|| Self::get_usize(&args, "maxDepth")),
             edge_filter: args
-                .get("edgeFilter")
+                .get("edge_filter")
+                .or_else(|| args.get("edgeFilter"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -973,219 +1047,154 @@ fn tool_definitions() -> Vec<Tool> {
     vec![
         make_tool(
             "get_context_tree",
-            "Build a token-aware context tree showing file structure and symbols. Prunes detail levels based on maxTokens budget.",
+            "Build a token-aware context tree showing file structure and symbols. Prunes detail levels based on max_tokens budget.",
             &[
-                ("rootDir", "string", false, "Root directory to analyze"),
-                (
-                    "includeSymbols",
-                    "boolean",
-                    false,
-                    "Include symbols in output (default true)",
-                ),
-                ("maxTokens", "integer", false, "Token budget for output"),
+                ("target_path", "string", false, "Specific directory or file to analyze (relative to project root)"),
+                ("depth_limit", "integer", false, "How many folder levels deep to scan. Use 1-2 for large projects."),
+                ("include_symbols", "boolean", false, "Include function/class/enum names in the tree (default true)"),
+                ("max_tokens", "integer", false, "Maximum tokens for output. Auto-prunes if exceeded (default 20000)"),
             ],
         ),
         make_tool(
             "get_file_skeleton",
             "Get function signatures, class definitions, and line ranges for a file without reading full content.",
             &[
-                ("filePath", "string", true, "Relative path to the file"),
-                ("rootDir", "string", false, "Root directory"),
+                ("file_path", "string", true, "Path to the file to inspect (relative to project root)"),
             ],
         ),
         make_tool(
             "get_blast_radius",
             "Find every file that imports or references a symbol. Maps the full impact of changing it.",
             &[
-                ("symbolName", "string", true, "Symbol to search for"),
-                (
-                    "fileContext",
-                    "string",
-                    false,
-                    "File where symbol is defined (to exclude definition)",
-                ),
-                ("rootDir", "string", false, "Root directory"),
+                ("symbol_name", "string", true, "The function, class, or variable name to trace across the codebase"),
+                ("file_context", "string", false, "The file where the symbol is defined. Excludes the definition line from results."),
             ],
         ),
         make_tool(
             "semantic_code_search",
             "Search code files semantically using natural language queries. Combines embedding similarity with keyword matching for hybrid ranking.",
             &[
-                ("query", "string", true, "Natural language search query"),
-                (
-                    "topK",
-                    "integer",
-                    false,
-                    "Number of results (default 5, max 50)",
-                ),
-                ("rootDir", "string", false, "Root directory"),
-                (
-                    "semanticWeight",
-                    "number",
-                    false,
-                    "Weight for semantic score (default 0.72)",
-                ),
-                (
-                    "keywordWeight",
-                    "number",
-                    false,
-                    "Weight for keyword score (default 0.28)",
-                ),
+                ("query", "string", true, "Natural language description of what you're looking for"),
+                ("top_k", "integer", false, "Number of matches to return (default 5, max 50)"),
+                ("semantic_weight", "number", false, "Weight for embedding similarity in hybrid ranking (default 0.72)"),
+                ("keyword_weight", "number", false, "Weight for keyword overlap in hybrid ranking (default 0.28)"),
+                ("min_semantic_score", "number", false, "Minimum semantic score filter (0-1 or 0-100)"),
+                ("min_keyword_score", "number", false, "Minimum keyword score filter (0-1 or 0-100)"),
+                ("min_combined_score", "number", false, "Minimum final score filter (0-1 or 0-100)"),
+                ("require_keyword_match", "boolean", false, "When true, only return files with keyword overlap"),
+                ("require_semantic_match", "boolean", false, "When true, only return files with positive semantic similarity"),
             ],
         ),
         make_tool(
             "semantic_identifier_search",
             "Search for functions, classes, and variables by semantic meaning. Returns identifiers with call-site rankings.",
             &[
-                ("query", "string", true, "Natural language search query"),
-                ("topK", "integer", false, "Number of results (default 5)"),
-                ("rootDir", "string", false, "Root directory"),
-                ("includeKinds", "array", false, "Filter by symbol kinds"),
+                ("query", "string", true, "Natural language intent to match identifiers and usages"),
+                ("top_k", "integer", false, "How many identifiers to return (default 5)"),
+                ("top_calls_per_identifier", "integer", false, "How many ranked call sites per identifier (default 10)"),
+                ("include_kinds", "array", false, "Optional kinds filter, e.g. [\"function\", \"method\", \"variable\"]"),
+                ("semantic_weight", "number", false, "Weight for semantic similarity score (default 0.78)"),
+                ("keyword_weight", "number", false, "Weight for keyword overlap score (default 0.22)"),
             ],
         ),
         make_tool(
             "semantic_navigate",
             "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation.",
             &[
-                ("query", "string", true, "Navigation query"),
-                ("rootDir", "string", false, "Root directory"),
-                (
-                    "maxClusters",
-                    "integer",
-                    false,
-                    "Maximum number of clusters",
-                ),
-                ("maxFiles", "integer", false, "Maximum files to analyze"),
+                ("max_depth", "integer", false, "Maximum nesting depth of clusters (default 3)"),
+                ("max_clusters", "integer", false, "Maximum sub-clusters per level (default 20)"),
             ],
         ),
         make_tool(
             "get_feature_hub",
             "Navigate Obsidian-style wikilinks to discover feature hubs and their connections.",
             &[
-                ("rootDir", "string", false, "Root directory"),
-                ("hubPath", "string", false, "Specific hub file to analyze"),
+                ("hub_path", "string", false, "Path to a specific hub .md file (relative to root)"),
+                ("feature_name", "string", false, "Feature name to search for. Finds matching hub file automatically."),
+                ("show_orphans", "boolean", false, "If true, lists all source files not linked to any hub."),
             ],
         ),
         make_tool(
             "run_static_analysis",
             "Run available linters (tsc, eslint, cargo check, ruff) on the project or a specific file.",
             &[
-                ("rootDir", "string", false, "Root directory"),
-                ("targetPath", "string", false, "Specific file to analyze"),
+                ("target_path", "string", false, "Specific file or folder to lint (relative to root). Omit for full project."),
             ],
         ),
         make_tool(
             "propose_commit",
             "Write a file with validation (header, comments, nesting, line count) and create a shadow restore point for undo.",
             &[
-                ("filePath", "string", true, "Relative path for the file"),
-                ("content", "string", true, "File content to write"),
+                ("file_path", "string", true, "Where to save the file (relative to project root)"),
+                ("new_content", "string", true, "The complete file content to save"),
                 ("description", "string", false, "Description of the change"),
-                ("rootDir", "string", false, "Root directory"),
             ],
         ),
         make_tool(
             "list_restore_points",
             "List all shadow restore points created by propose_commit.",
-            &[("rootDir", "string", false, "Root directory")],
+            &[],
         ),
         make_tool(
             "undo_change",
             "Restore files from a shadow restore point created by propose_commit.",
             &[
-                (
-                    "restorePointId",
-                    "string",
-                    true,
-                    "Restore point ID (format: rp-{timestamp}-{random})",
-                ),
-                ("rootDir", "string", false, "Root directory"),
+                ("point_id", "string", true, "The restore point ID (format: rp-timestamp-hash). Get from list_restore_points."),
             ],
         ),
         make_tool(
             "upsert_memory_node",
             "Create or update a memory graph node. Nodes are uniquely identified by (label, type).",
             &[
-                ("label", "string", true, "Node label"),
-                ("content", "string", true, "Node content"),
-                (
-                    "nodeType",
-                    "string",
-                    false,
-                    "Node type: concept, file, symbol, note (default: concept)",
-                ),
+                ("type", "string", true, "Node type: concept, file, symbol, note"),
+                ("label", "string", true, "Short identifier for the node. Used for deduplication with type."),
+                ("content", "string", true, "Detailed content for the node. Used for embedding generation."),
+                ("metadata", "object", false, "Optional key-value metadata pairs"),
             ],
         ),
         make_tool(
             "create_relation",
             "Create or update a relation between two memory graph nodes.",
             &[
-                ("sourceLabel", "string", true, "Source node label"),
-                (
-                    "sourceType",
-                    "string",
-                    false,
-                    "Source node type (default: concept)",
-                ),
-                ("targetLabel", "string", true, "Target node label"),
-                (
-                    "targetType",
-                    "string",
-                    false,
-                    "Target node type (default: concept)",
-                ),
-                (
-                    "relation",
-                    "string",
-                    false,
-                    "Relation type: relates_to, depends_on, implements, references, similar_to, contains",
-                ),
-                ("weight", "number", false, "Relation weight (0.0-1.0)"),
+                ("source_id", "string", true, "ID of the source memory node"),
+                ("target_id", "string", true, "ID of the target memory node"),
+                ("relation", "string", true, "Relationship type: relates_to, depends_on, implements, references, similar_to, contains"),
+                ("weight", "number", false, "Edge weight 0-1. Higher = stronger relationship (default 1.0)"),
+                ("metadata", "object", false, "Optional key-value metadata for the edge"),
             ],
         ),
         make_tool(
             "search_memory_graph",
             "Search the memory graph by semantic similarity and BFS traversal.",
             &[
-                ("query", "string", true, "Search query"),
-                ("topK", "integer", false, "Number of results"),
-                ("maxDepth", "integer", false, "Maximum traversal depth"),
+                ("query", "string", true, "Natural language query to search the memory graph"),
+                ("max_depth", "integer", false, "How many hops to traverse from direct matches (default 1)"),
+                ("top_k", "integer", false, "Number of direct matches to return (default 5)"),
+                ("edge_filter", "array", false, "Only traverse edges of these types. Omit for all types."),
             ],
         ),
         make_tool(
             "prune_stale_links",
             "Remove memory graph edges with decayed weight below threshold, and orphan nodes.",
-            &[(
-                "threshold",
-                "number",
-                false,
-                "Weight threshold (default 0.1)",
-            )],
+            &[
+                ("threshold", "number", false, "Minimum decayed weight to keep an edge (default 0.15). Lower = keep more edges."),
+            ],
         ),
         make_tool(
             "add_interlinked_context",
             "Add multiple memory nodes at once with optional auto-linking by semantic similarity.",
             &[
-                (
-                    "items",
-                    "array",
-                    true,
-                    "Array of {nodeType, label, content} objects",
-                ),
-                (
-                    "autoLink",
-                    "boolean",
-                    false,
-                    "Auto-link similar nodes (cosine > 0.72)",
-                ),
+                ("items", "array", true, "Array of nodes to add. Each needs type, label, and content."),
+                ("auto_link", "boolean", false, "Whether to auto-create similarity edges (default true)"),
             ],
         ),
         make_tool(
             "retrieve_with_traversal",
             "Retrieve a memory node and its neighborhood via BFS traversal with depth penalty.",
             &[
-                ("nodeId", "string", true, "Node ID to start traversal from"),
-                ("maxDepth", "integer", false, "Maximum traversal depth"),
+                ("start_node_id", "string", true, "ID of the memory node to start traversal from"),
+                ("max_depth", "integer", false, "Maximum traversal depth from start node (default 2)"),
+                ("edge_filter", "array", false, "Only traverse edges of these types. Omit for all."),
             ],
         ),
     ]
@@ -2264,8 +2273,8 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("symbolName is required"),
-            "expected symbolName error, got: {}",
+            text.contains("symbol_name is required"),
+            "expected symbol_name error, got: {}",
             text
         );
     }
@@ -2281,8 +2290,8 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("filePath is required"),
-            "expected filePath error, got: {}",
+            text.contains("file_path is required"),
+            "expected file_path error, got: {}",
             text
         );
     }
@@ -2298,8 +2307,8 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("filePath is required"),
-            "expected filePath error, got: {}",
+            text.contains("file_path is required"),
+            "expected file_path error, got: {}",
             text
         );
     }
@@ -2316,8 +2325,8 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("content is required"),
-            "expected content error, got: {}",
+            text.contains("new_content is required"),
+            "expected new_content error, got: {}",
             text
         );
     }
@@ -2333,8 +2342,8 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("restorePointId is required"),
-            "expected restorePointId error, got: {}",
+            text.contains("point_id is required"),
+            "expected point_id error, got: {}",
             text
         );
     }
@@ -2357,18 +2366,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_create_relation_missing_source_label_returns_error() {
+    async fn dispatch_create_relation_missing_source_returns_failure() {
         let server = test_server();
         let args = serde_json::Map::new();
         let result = server.dispatch("create_relation", args).await;
-        assert_eq!(result.is_error, Some(true));
         let text = match &result.content[0].raw {
             RawContent::Text(t) => t.text.as_str(),
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("sourceLabel is required"),
-            "expected sourceLabel error, got: {}",
+            text.contains("source_id or source_label is required"),
+            "expected source_id/source_label failure, got: {}",
             text
         );
     }
@@ -2401,8 +2409,8 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(
-            text.contains("nodeId is required"),
-            "expected nodeId error, got: {}",
+            text.contains("start_node_id is required"),
+            "expected start_node_id error, got: {}",
             text
         );
     }
@@ -2425,20 +2433,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_semantic_navigate_missing_query_returns_error() {
+    async fn dispatch_semantic_navigate_without_query_does_not_error() {
+        // query is optional in TS version — should not return a "query is required" error
         let server = test_server();
         let args = serde_json::Map::new();
         let result = server.dispatch("semantic_navigate", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("query is required"),
-            "expected query error, got: {}",
-            text
-        );
+        // It may still error for other reasons (e.g., no files found), but not because query is missing
+        if result.is_error == Some(true) {
+            let text = match &result.content[0].raw {
+                RawContent::Text(t) => t.text.as_str(),
+                _ => "",
+            };
+            assert!(
+                !text.contains("query is required"),
+                "query should be optional, got: {}",
+                text
+            );
+        }
     }
 
     // ---------------------------------------------------------------
@@ -2455,7 +2466,7 @@ mod tests {
         let schema = tool.input_schema.as_ref();
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(req_strs.contains(&"symbolName"));
+        assert!(req_strs.contains(&"symbol_name"));
     }
 
     #[test]
@@ -2468,8 +2479,8 @@ mod tests {
         let schema = tool.input_schema.as_ref();
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(req_strs.contains(&"filePath"));
-        assert!(req_strs.contains(&"content"));
+        assert!(req_strs.contains(&"file_path"));
+        assert!(req_strs.contains(&"new_content"));
     }
 
     #[test]

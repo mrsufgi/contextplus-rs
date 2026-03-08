@@ -104,6 +104,17 @@ fn validate_header(lines: &[&str], ext: &str) -> Vec<ValidationError> {
             ),
         });
     }
+
+    if header_lines.len() >= 2 && !header_lines[1].to_uppercase().contains("FEATURE:") {
+        errors.push(ValidationError {
+            rule: "feature-tag".to_string(),
+            message: format!(
+                "Line 2 should include a FEATURE: tag (e.g., \"{} FEATURE: Feature Name\"). Links files to feature hubs.",
+                prefix
+            ),
+        });
+    }
+
     errors
 }
 
@@ -256,7 +267,7 @@ mod tests {
 
     #[test]
     fn validate_header_valid_two_lines() {
-        let lines = vec!["// First line", "// Second line", "code here"];
+        let lines = vec!["// First line", "// FEATURE: Test Feature", "code here"];
         let errors = validate_header(&lines, "ts");
         assert!(errors.is_empty());
     }
@@ -327,7 +338,7 @@ mod tests {
 
     #[test]
     fn header_valid_when_two_comment_lines() {
-        let lines = vec!["// Line one", "// Line two", "fn main() {}"];
+        let lines = vec!["// Line one", "// FEATURE: My Feature", "fn main() {}"];
         let errors = validate_header(&lines, "rs");
         assert!(errors.is_empty());
     }
@@ -349,7 +360,39 @@ mod tests {
 
     #[test]
     fn header_python_uses_hash() {
-        let lines = vec!["# line one", "# line two", "def main():"];
+        let lines = vec!["# line one", "# FEATURE: Python Feature", "def main():"];
+        let errors = validate_header(&lines, "py");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn feature_tag_missing_produces_warning() {
+        let lines = vec!["// Description line", "// No tag here", "fn main() {}"];
+        let errors = validate_header(&lines, "rs");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].rule, "feature-tag");
+        assert!(errors[0].message.contains("FEATURE:"));
+        assert!(errors[0].message.contains("// FEATURE:"));
+    }
+
+    #[test]
+    fn feature_tag_present_case_insensitive() {
+        let lines = vec!["// Description line", "// feature: My Thing", "fn main() {}"];
+        let errors = validate_header(&lines, "rs");
+        assert!(errors.is_empty(), "feature: (lowercase) should be accepted");
+    }
+
+    #[test]
+    fn feature_tag_not_checked_when_header_missing() {
+        let lines = vec!["fn main() {}", "let x = 1;"];
+        let errors = validate_header(&lines, "rs");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].rule, "header", "Only header error, no feature-tag when < 2 comment lines");
+    }
+
+    #[test]
+    fn feature_tag_with_python_prefix() {
+        let lines = vec!["# Description", "# feature: Billing", "def main():"];
         let errors = validate_header(&lines, "py");
         assert!(errors.is_empty());
     }

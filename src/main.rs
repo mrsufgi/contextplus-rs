@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use contextplus_rs::config::Config;
 use contextplus_rs::server::ContextPlusServer;
 use rmcp::ServiceExt;
@@ -20,12 +20,37 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum AgentTarget {
+    Claude,
+    Cursor,
+    Vscode,
+    Windsurf,
+    Opencode,
+}
+
+impl AgentTarget {
+    fn config_path(self) -> &'static str {
+        match self {
+            Self::Claude => ".mcp.json",
+            Self::Cursor => ".cursor/mcp.json",
+            Self::Vscode => ".vscode/mcp.json",
+            Self::Windsurf => ".windsurf/mcp.json",
+            Self::Opencode => "opencode.json",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Start the MCP server over stdio (default behavior)
     Serve,
-    /// Initialize .mcp_data directory
-    Init,
+    /// Generate MCP config file for a coding agent
+    Init {
+        /// Target agent (claude, cursor, vscode, windsurf, opencode)
+        #[arg(value_enum, default_value = "claude")]
+        target: AgentTarget,
+    },
     /// Print file skeleton for a file
     Skeleton {
         /// Path to the file
@@ -61,12 +86,64 @@ async fn main() -> anyhow::Result<()> {
         None | Some(Commands::Serve) => {
             run_mcp_server(root_dir, config).await?;
         }
-        Some(Commands::Init) => {
-            let mcp_data = root_dir.join(".mcp_data");
-            tokio::fs::create_dir_all(&mcp_data).await?;
-            let backups = mcp_data.join("backups");
-            tokio::fs::create_dir_all(&backups).await?;
-            eprintln!("Initialized .mcp_data/ in {}", root_dir.display());
+        Some(Commands::Init { target }) => {
+            let binary_path = std::env::current_exe()
+                .and_then(|p| p.canonicalize())
+                .unwrap_or_else(|_| PathBuf::from("contextplus-rs"));
+
+            let content = match target {
+                AgentTarget::Opencode => {
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "$schema": "https://opencode.ai/config.json",
+                        "mcp": {
+                            "contextplus": {
+                                "type": "local",
+                                "command": [binary_path.to_string_lossy()],
+                                "enabled": true,
+                                "environment": {
+                                    "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+                                    "OLLAMA_CHAT_MODEL": "llama3.2",
+                                    "OLLAMA_HOST": "http://localhost:11434",
+                                    "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+                                    "CONTEXTPLUS_EMBED_TRACKER": "true"
+                                }
+                            }
+                        }
+                    }))?
+                }
+                _ => {
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "mcpServers": {
+                            "contextplus": {
+                                "command": binary_path.to_string_lossy(),
+                                "args": [],
+                                "env": {
+                                    "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+                                    "OLLAMA_CHAT_MODEL": "llama3.2",
+                                    "OLLAMA_HOST": "http://localhost:11434",
+                                    "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+                                    "CONTEXTPLUS_EMBED_TRACKER": "true"
+                                }
+                            }
+                        }
+                    }))?
+                }
+            };
+
+            let output_path = root_dir.join(target.config_path());
+            if let Some(parent) = output_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&output_path, format!("{content}\n")).await?;
+            let target_name = match target {
+                AgentTarget::Claude => "claude",
+                AgentTarget::Cursor => "cursor",
+                AgentTarget::Vscode => "vscode",
+                AgentTarget::Windsurf => "windsurf",
+                AgentTarget::Opencode => "opencode",
+            };
+            eprintln!("Context+ initialized for {target_name}.");
+            eprintln!("Wrote MCP config: {}", output_path.display());
         }
         Some(Commands::Skeleton { file }) => {
             use contextplus_rs::tools::file_skeleton::{

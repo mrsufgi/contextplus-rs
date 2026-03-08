@@ -18,9 +18,15 @@ pub struct UpsertMemoryNodeOptions {
 
 pub struct CreateRelationOptions {
     pub root_dir: String,
-    pub source_label: String,
+    /// Direct node ID (TS API: source_id). Bypasses label+type lookup.
+    pub source_id: Option<String>,
+    /// Fallback: find node by label+type if source_id is not provided.
+    pub source_label: Option<String>,
     pub source_type: String,
-    pub target_label: String,
+    /// Direct node ID (TS API: target_id). Bypasses label+type lookup.
+    pub target_id: Option<String>,
+    /// Fallback: find node by label+type if target_id is not provided.
+    pub target_label: Option<String>,
     pub target_type: String,
     pub relation: String,
     pub weight: Option<f32>,
@@ -168,45 +174,70 @@ pub async fn tool_upsert_memory_node(
     ))
 }
 
-/// Tool 2: Create a relation between two nodes found by label+type.
+/// Tool 2: Create a relation between two nodes.
+/// Supports both direct ID lookup (TS API: source_id/target_id) and label+type fallback.
 pub async fn tool_create_relation(
     store: &GraphStore,
     options: CreateRelationOptions,
 ) -> Result<String> {
     let relation = parse_relation_type(&options.relation)?;
-    let source_type = parse_node_type(&options.source_type)?;
-    let target_type = parse_node_type(&options.target_type)?;
 
-    // Look up node IDs by label+type
-    let (source_id, target_id) = store
-        .get_graph(&options.root_dir, |graph| {
-            let source = graph
-                .find_node(&options.source_label, &source_type)
-                .map(|n| n.id.clone());
-            let target = graph
-                .find_node(&options.target_label, &target_type)
-                .map(|n| n.id.clone());
-            (source, target)
-        })
-        .await?;
-
-    let source_id = match source_id {
-        Some(id) => id,
-        None => {
-            return Ok(format!(
-                "Failed: source node not found (label: '{}', type: '{}')",
-                options.source_label, options.source_type
-            ));
+    // Resolve source: prefer direct ID, fall back to label+type lookup
+    let source_id = if let Some(ref id) = options.source_id {
+        let exists = store
+            .get_graph(&options.root_dir, |graph| graph.node_exists(id))
+            .await?;
+        if !exists {
+            return Ok(format!("Failed: source node not found (id: '{}')", id));
         }
+        id.clone()
+    } else if let Some(ref label) = options.source_label {
+        let source_type = parse_node_type(&options.source_type)?;
+        let found = store
+            .get_graph(&options.root_dir, |graph| {
+                graph.find_node(label, &source_type).map(|n| n.id.clone())
+            })
+            .await?;
+        match found {
+            Some(id) => id,
+            None => {
+                return Ok(format!(
+                    "Failed: source node not found (label: '{}', type: '{}')",
+                    label, options.source_type
+                ));
+            }
+        }
+    } else {
+        return Ok("Failed: either source_id or source_label is required".to_string());
     };
-    let target_id = match target_id {
-        Some(id) => id,
-        None => {
-            return Ok(format!(
-                "Failed: target node not found (label: '{}', type: '{}')",
-                options.target_label, options.target_type
-            ));
+
+    // Resolve target: prefer direct ID, fall back to label+type lookup
+    let target_id = if let Some(ref id) = options.target_id {
+        let exists = store
+            .get_graph(&options.root_dir, |graph| graph.node_exists(id))
+            .await?;
+        if !exists {
+            return Ok(format!("Failed: target node not found (id: '{}')", id));
         }
+        id.clone()
+    } else if let Some(ref label) = options.target_label {
+        let target_type = parse_node_type(&options.target_type)?;
+        let found = store
+            .get_graph(&options.root_dir, |graph| {
+                graph.find_node(label, &target_type).map(|n| n.id.clone())
+            })
+            .await?;
+        match found {
+            Some(id) => id,
+            None => {
+                return Ok(format!(
+                    "Failed: target node not found (label: '{}', type: '{}')",
+                    label, options.target_type
+                ));
+            }
+        }
+    } else {
+        return Ok("Failed: either target_id or target_label is required".to_string());
     };
 
     let edge = store
@@ -881,9 +912,9 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "nonexistent".to_string(),
+                source_id: None, source_label: Some("nonexistent".to_string()),
                 source_type: "concept".to_string(),
-                target_label: "target".to_string(),
+                target_id: None, target_label: Some("target".to_string()),
                 target_type: "concept".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -921,9 +952,9 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "source".to_string(),
+                source_id: None, source_label: Some("source".to_string()),
                 source_type: "concept".to_string(),
-                target_label: "missing".to_string(),
+                target_id: None, target_label: Some("missing".to_string()),
                 target_type: "concept".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -967,9 +998,9 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "auth".to_string(),
+                source_id: None, source_label: Some("auth".to_string()),
                 source_type: "concept".to_string(),
-                target_label: "auth.rs".to_string(),
+                target_id: None, target_label: Some("auth.rs".to_string()),
                 target_type: "file".to_string(),
                 relation: "implements".to_string(),
                 weight: Some(0.9),
@@ -997,9 +1028,9 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "a".to_string(),
+                source_id: None, source_label: Some("a".to_string()),
                 source_type: "concept".to_string(),
-                target_label: "b".to_string(),
+                target_id: None, target_label: Some("b".to_string()),
                 target_type: "concept".to_string(),
                 relation: "invalid_relation".to_string(),
                 weight: None,
@@ -1022,9 +1053,9 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "a".to_string(),
+                source_id: None, source_label: Some("a".to_string()),
                 source_type: "bad_type".to_string(),
-                target_label: "b".to_string(),
+                target_id: None, target_label: Some("b".to_string()),
                 target_type: "concept".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -1042,13 +1073,27 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
         let store = GraphStore::new();
 
+        // Create a source node so source lookup succeeds
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "a",
+                    "test",
+                    vec![0.1, 0.2],
+                    None,
+                )
+            })
+            .await
+            .unwrap();
+
         let result = tool_create_relation(
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "a".to_string(),
+                source_id: None, source_label: Some("a".to_string()),
                 source_type: "concept".to_string(),
-                target_label: "b".to_string(),
+                target_id: None, target_label: Some("b".to_string()),
                 target_type: "bad_type".to_string(),
                 relation: "depends_on".to_string(),
                 weight: None,
@@ -1081,9 +1126,9 @@ mod tests {
             &store,
             CreateRelationOptions {
                 root_dir: root,
-                source_label: "A".to_string(),
+                source_id: None, source_label: Some("A".to_string()),
                 source_type: "concept".to_string(),
-                target_label: "B".to_string(),
+                target_id: None, target_label: Some("B".to_string()),
                 target_type: "concept".to_string(),
                 relation: "relates_to".to_string(),
                 weight: Some(0.75),
@@ -2020,16 +2065,16 @@ mod tests {
     fn create_relation_options_construction() {
         let opts = CreateRelationOptions {
             root_dir: "/tmp/test".to_string(),
-            source_label: "src".to_string(),
+            source_id: None, source_label: Some("src".to_string()),
             source_type: "concept".to_string(),
-            target_label: "tgt".to_string(),
+            target_id: None, target_label: Some("tgt".to_string()),
             target_type: "file".to_string(),
             relation: "depends_on".to_string(),
             weight: Some(0.5),
             metadata: None,
         };
-        assert_eq!(opts.source_label, "src");
-        assert_eq!(opts.target_label, "tgt");
+        assert_eq!(opts.source_label, Some("src".to_string()));
+        assert_eq!(opts.target_label, Some("tgt".to_string()));
         assert_eq!(opts.weight, Some(0.5));
     }
 

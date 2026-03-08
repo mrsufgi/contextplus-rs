@@ -64,7 +64,7 @@ fn get_linter_config(ext: &str) -> Option<LinterConfig> {
             cmd: "npx",
             args: vec![
                 "eslint".to_string(),
-                "--no-eslintrc".to_string(),
+                "--no-config-lookup".to_string(),
                 "--rule".to_string(),
                 "{\"no-unused-vars\": \"warn\"}".to_string(),
             ],
@@ -73,7 +73,7 @@ fn get_linter_config(ext: &str) -> Option<LinterConfig> {
         ".py" => Some(LinterConfig {
             cmd: "python",
             args: vec!["-m".to_string(), "py_compile".to_string()],
-            config_file: None,
+            config_file: Some("pyproject.toml"),
         }),
         ".rs" => Some(LinterConfig {
             cmd: "cargo",
@@ -278,7 +278,7 @@ mod tests {
         assert!(config.is_some());
         let config = config.unwrap();
         assert_eq!(config.cmd, "python");
-        assert!(config.config_file.is_none());
+        assert_eq!(config.config_file, Some("pyproject.toml"));
     }
 
     #[test]

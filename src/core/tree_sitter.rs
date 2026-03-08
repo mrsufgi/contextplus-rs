@@ -8,21 +8,25 @@ use crate::error::{ContextPlusError, Result};
 /// Extension-to-grammar mapping for the 10 supported native grammars.
 fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
     match ext {
-        ".ts" => Some((
+        ".ts" | "ts" => Some((
             "typescript",
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         )),
-        ".tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
-        ".js" | ".jsx" | ".mjs" | ".cjs" => {
+        ".tsx" | "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
+        ".js" | "js" | ".jsx" | "jsx" | ".mjs" | "mjs" | ".cjs" | "cjs" => {
             Some(("javascript", tree_sitter_javascript::LANGUAGE.into()))
         }
-        ".py" => Some(("python", tree_sitter_python::LANGUAGE.into())),
-        ".rs" => Some(("rust", tree_sitter_rust::LANGUAGE.into())),
-        ".go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
-        ".java" => Some(("java", tree_sitter_java::LANGUAGE.into())),
-        ".c" | ".h" => Some(("c", tree_sitter_c::LANGUAGE.into())),
-        ".cpp" | ".hpp" | ".cc" => Some(("cpp", tree_sitter_cpp::LANGUAGE.into())),
-        ".sh" | ".bash" | ".zsh" => Some(("bash", tree_sitter_bash::LANGUAGE.into())),
+        ".py" | "py" => Some(("python", tree_sitter_python::LANGUAGE.into())),
+        ".rs" | "rs" => Some(("rust", tree_sitter_rust::LANGUAGE.into())),
+        ".go" | "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
+        ".java" | "java" => Some(("java", tree_sitter_java::LANGUAGE.into())),
+        ".c" | "c" | ".h" | "h" => Some(("c", tree_sitter_c::LANGUAGE.into())),
+        ".cpp" | "cpp" | ".hpp" | "hpp" | ".cc" | "cc" => {
+            Some(("cpp", tree_sitter_cpp::LANGUAGE.into()))
+        }
+        ".sh" | "sh" | ".bash" | "bash" | ".zsh" | "zsh" => {
+            Some(("bash", tree_sitter_bash::LANGUAGE.into()))
+        }
         _ => None,
     }
 }
