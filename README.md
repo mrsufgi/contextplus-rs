@@ -212,10 +212,67 @@ TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Bash
 | `notify` | File system watching |
 | `ignore` | gitignore-aware file walking |
 
+## Benchmarks (`cargo bench`)
+
+Four criterion benchmark suites cover the critical hot paths — no Ollama dependency, fully reproducible.
+
+### Cache Load (rkyv + mmap)
+
+How fast the embedding cache loads from disk. This was the #1 bottleneck in TS (1,109ms raw, 115ms with VectorStore optimization).
+
+| Operation | 1K vectors | 5K vectors | 30K vectors |
+|-----------|-----------|-----------|------------|
+| rkyv read | 0.36 ms | 2.8 ms | 181 ms |
+| rkyv mmap | 0.63 ms | 3.1 ms | 103 ms |
+| to_store (HashMap build) | 0.16 ms | 0.97 ms | 91 ms |
+
+At 5K vectors (typical project size), total load is **~4ms**. At 30K vectors, mmap beats read by 43%.
+
+### Cosine Similarity (simsimd SIMD vs scalar)
+
+| Operation | 1K×1024 | 5K×1024 | 30K×1024 | SIMD speedup |
+|-----------|---------|---------|----------|-------------|
+| simsimd scan | 68 µs | 404 µs | **4.1 ms** | — |
+| naive scan | 663 µs | 3.4 ms | 20 ms | **~5x** |
+| Single pair (1024-dim) | 0.08 µs | — | — | **8x** vs naive |
+
+30K-vector scan in 4.1ms — well under the 20ms target.
+
+### Tree-sitter Parse (native, 10 languages)
+
+| Language | Parse time |
+|----------|-----------|
+| TypeScript | 113 µs |
+| TSX | 143 µs |
+| JavaScript | 102 µs |
+| Python | 141 µs |
+| Rust | 171 µs |
+| Go | 100 µs |
+| Java | 96 µs |
+| C | 98 µs |
+| C++ | 91 µs |
+| Bash | ~83 µs |
+| **All 10 combined** | **~1.4 ms** |
+
+All 10 languages parsed in **1.4ms total** — vs 50-200ms for WASM in TS.
+
+### Warm Search Pipeline
+
+End-to-end: disk load → VectorStore build → find_nearest(top_5) → format results.
+
+| Scenario | 1K files | 5K files | 30K files |
+|----------|---------|---------|----------|
+| Full pipeline (mmap + search) | 0.9 ms | 5.3 ms | 224 ms |
+| Warm search only (in-memory) | **78 µs** | **418 µs** | **4.3 ms** |
+| Hash-check staleness (no-op) | 23 µs | 131 µs | 975 µs |
+
+Warm search on 30K files: **4.3ms**. Hash-check (no-op refresh): **<1ms**.
+
 ## Development
 
 ```bash
 cargo test                  # 571 tests
+cargo bench                 # Criterion benchmarks (cache, cosine, tree-sitter, search)
 cargo clippy --all-targets  # Lint
 cargo fmt --check           # Format check
 ```
