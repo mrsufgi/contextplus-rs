@@ -819,10 +819,7 @@ mod tests {
 
     #[test]
     fn io_error_not_context_length() {
-        let err = ContextPlusError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "context exceeded",
-        ));
+        let err = ContextPlusError::Io(std::io::Error::other("context exceeded"));
         // The error message contains "context" and "exceed" but check it via to_string
         // IO error wraps differently: "IO error: context exceeded"
         // is_context_length_error checks to_string().to_lowercase()

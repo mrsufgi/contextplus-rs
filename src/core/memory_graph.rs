@@ -1424,7 +1424,7 @@ mod tests {
         assert_eq!(result.nodes.len(), 3);
         // A and B are very similar (cosine > 0.72), should be linked
         // A/B and C are orthogonal, should not be linked
-        assert!(result.edges.len() >= 1);
+        assert!(!result.edges.is_empty());
     }
 
     #[test]

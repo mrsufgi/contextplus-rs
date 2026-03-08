@@ -1351,9 +1351,9 @@ mod tests {
     #[test]
     fn get_f64_extracts_float() {
         let mut args = serde_json::Map::new();
-        args.insert("f".to_string(), json!(3.14));
+        args.insert("f".to_string(), json!(2.78));
         let val = ContextPlusServer::get_f64(&args, "f").unwrap();
-        assert!((val - 3.14).abs() < f64::EPSILON);
+        assert!((val - 2.78).abs() < f64::EPSILON);
         assert_eq!(ContextPlusServer::get_f64(&args, "missing"), None);
     }
 

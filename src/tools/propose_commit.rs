@@ -479,9 +479,7 @@ mod tests {
         let root = dir.path();
 
         let mut lines = vec!["// header 1", "// header 2"];
-        for _ in 0..10 {
-            lines.push("// unauthorized comment");
-        }
+        lines.extend(std::iter::repeat_n("// unauthorized comment", 10));
         lines.push("fn main() {}");
         let content = lines.join("\n");
 

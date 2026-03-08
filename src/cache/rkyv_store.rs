@@ -269,7 +269,7 @@ mod tests {
         ensure_cache_dir(dir.path()).unwrap();
 
         let path = cache_path(dir.path(), "empty");
-        fs::write(&path, &[]).unwrap();
+        fs::write(&path, []).unwrap();
 
         let result = load_cache(dir.path(), "empty").unwrap();
         assert!(result.is_none());

@@ -79,7 +79,8 @@ mod tests {
     #[test]
     fn result_type_alias_works() {
         let ok: Result<i32> = Ok(42);
-        assert_eq!(ok.unwrap(), 42);
+        assert!(ok.is_ok());
+        assert_eq!(*ok.as_ref().unwrap(), 42);
 
         let err: Result<i32> = Err(ContextPlusError::Other("test".into()));
         assert!(err.is_err());

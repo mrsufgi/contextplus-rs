@@ -331,24 +331,37 @@ mod tests {
 
     #[test]
     fn config_clamps_debounce_ms() {
-        let mut cfg = EmbeddingTrackerConfig::default();
-        cfg.debounce_ms = 10;
+        let cfg = EmbeddingTrackerConfig {
+            debounce_ms: 10,
+            ..Default::default()
+        };
         assert_eq!(cfg.clamped_debounce_ms(), MIN_DEBOUNCE_MS);
 
-        cfg.debounce_ms = 5000;
+        let cfg = EmbeddingTrackerConfig {
+            debounce_ms: 5000,
+            ..Default::default()
+        };
         assert_eq!(cfg.clamped_debounce_ms(), 5000);
     }
 
     #[test]
     fn config_clamps_max_files() {
-        let mut cfg = EmbeddingTrackerConfig::default();
-        cfg.max_files_per_tick = 1;
+        let cfg = EmbeddingTrackerConfig {
+            max_files_per_tick: 1,
+            ..Default::default()
+        };
         assert_eq!(cfg.clamped_max_files(), MIN_FILES_PER_TICK);
 
-        cfg.max_files_per_tick = 999;
+        let cfg = EmbeddingTrackerConfig {
+            max_files_per_tick: 999,
+            ..Default::default()
+        };
         assert_eq!(cfg.clamped_max_files(), MAX_FILES_PER_TICK);
 
-        cfg.max_files_per_tick = 50;
+        let cfg = EmbeddingTrackerConfig {
+            max_files_per_tick: 50,
+            ..Default::default()
+        };
         assert_eq!(cfg.clamped_max_files(), 50);
     }
 
