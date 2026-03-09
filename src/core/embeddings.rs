@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
@@ -228,6 +229,43 @@ fn shrink_input(input: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// VectorData — owned vs mmap-backed vector storage
+// ---------------------------------------------------------------------------
+
+/// Backing storage for the flat f32 vector array.
+///
+/// `Owned` holds a regular `Vec<f32>` (heap-allocated copy).
+/// `Mmap` points directly into an mmap'd rkyv cache file — true zero-copy.
+/// The `Arc<memmap2::Mmap>` keeps the mapping alive while the pointer is live.
+enum VectorData {
+    Owned(Vec<f32>),
+    Mmap {
+        _mmap: Arc<memmap2::Mmap>,
+        ptr: *const f32,
+        len: usize,
+    },
+}
+
+impl VectorData {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            VectorData::Owned(v) => v,
+            VectorData::Mmap { ptr, len, .. } => {
+                // SAFETY: ptr was derived from a valid, aligned &[f32] inside a
+                // live Mmap (kept alive by the Arc). The data is f32 on a
+                // little-endian platform where rkyv's f32_le == f32.
+                unsafe { std::slice::from_raw_parts(*ptr, *len) }
+            }
+        }
+    }
+}
+
+// SAFETY: The Mmap is immutable (read-only mapping) and the Arc keeps it alive.
+// The raw pointer is derived from the Mmap and only read through as_slice().
+unsafe impl Send for VectorData {}
+unsafe impl Sync for VectorData {}
+
+// ---------------------------------------------------------------------------
 // VectorStore
 // ---------------------------------------------------------------------------
 
@@ -235,7 +273,7 @@ fn shrink_input(input: &str) -> String {
 pub struct VectorStore {
     dims: u32,
     count: u32,
-    vectors: Vec<f32>,
+    vectors: VectorData,
     keys: Vec<String>,
     hashes: Vec<String>,
     key_index: HashMap<String, usize>,
@@ -252,7 +290,46 @@ impl VectorStore {
         Self {
             dims,
             count,
-            vectors,
+            vectors: VectorData::Owned(vectors),
+            keys,
+            hashes,
+            key_index,
+        }
+    }
+
+    /// Build a VectorStore with vector data backed by an mmap'd file (zero-copy).
+    ///
+    /// `mmap` must be kept alive for the lifetime of this VectorStore.
+    /// `vectors_ptr` must point to a valid, aligned `&[f32]` region inside `mmap`.
+    /// `vectors_len` is the number of f32 elements (not bytes).
+    ///
+    /// # Safety
+    /// The caller must ensure that:
+    /// - `vectors_ptr` points into the `mmap` region
+    /// - The pointer is aligned to `align_of::<f32>()`
+    /// - `vectors_len` f32 values are readable at that address
+    /// - The platform is little-endian (so rkyv's f32_le == native f32)
+    pub unsafe fn from_mmap(
+        dims: u32,
+        keys: Vec<String>,
+        hashes: Vec<String>,
+        vectors_ptr: *const f32,
+        vectors_len: usize,
+        mmap: Arc<memmap2::Mmap>,
+    ) -> Self {
+        let count = keys.len() as u32;
+        let mut key_index = HashMap::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            key_index.insert(key.clone(), i);
+        }
+        Self {
+            dims,
+            count,
+            vectors: VectorData::Mmap {
+                _mmap: mmap,
+                ptr: vectors_ptr,
+                len: vectors_len,
+            },
             keys,
             hashes,
             key_index,
@@ -298,9 +375,10 @@ impl VectorStore {
 
     /// Get a vector by key.
     pub fn get_vector(&self, key: &str) -> Option<&[f32]> {
+        let vectors = self.vectors.as_slice();
         self.key_index.get(key).map(|&idx| {
             let offset = idx * self.dims as usize;
-            &self.vectors[offset..offset + self.dims as usize]
+            &vectors[offset..offset + self.dims as usize]
         })
     }
 
@@ -321,7 +399,7 @@ impl VectorStore {
 
     /// Get raw vectors data.
     pub fn vectors_data(&self) -> &[f32] {
-        &self.vectors
+        self.vectors.as_slice()
     }
 
     /// Find the top-k nearest neighbors by cosine similarity using simsimd.
@@ -331,11 +409,12 @@ impl VectorStore {
             return Vec::new();
         }
 
+        let vectors = self.vectors.as_slice();
         let mut scored: Vec<(usize, f32)> = Vec::with_capacity(self.count as usize);
 
         for i in 0..self.count as usize {
             let offset = i * self.dims as usize;
-            let stored = &self.vectors[offset..offset + self.dims as usize];
+            let stored = &vectors[offset..offset + self.dims as usize];
 
             let similarity = cosine_similarity_simsimd(query, stored);
             scored.push((i, similarity));
@@ -355,8 +434,9 @@ impl VectorStore {
     pub fn cosine_by_key(&self, query: &[f32], key: &str) -> f32 {
         match self.key_index.get(key) {
             Some(&idx) => {
+                let vectors = self.vectors.as_slice();
                 let offset = idx * self.dims as usize;
-                let stored = &self.vectors[offset..offset + self.dims as usize];
+                let stored = &vectors[offset..offset + self.dims as usize];
                 cosine_similarity_simsimd(query, stored)
             }
             None => 0.0,
@@ -365,6 +445,7 @@ impl VectorStore {
 
     /// Convert to a cache map.
     pub fn to_cache(&self) -> HashMap<String, CacheEntry> {
+        let vectors = self.vectors.as_slice();
         let mut cache = HashMap::with_capacity(self.count as usize);
         for i in 0..self.count as usize {
             let offset = i * self.dims as usize;
@@ -372,7 +453,7 @@ impl VectorStore {
                 self.keys[i].clone(),
                 CacheEntry {
                     hash: self.hashes[i].clone(),
-                    vector: self.vectors[offset..offset + self.dims as usize].to_vec(),
+                    vector: vectors[offset..offset + self.dims as usize].to_vec(),
                 },
             );
         }

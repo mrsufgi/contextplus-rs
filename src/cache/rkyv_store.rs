@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -190,6 +191,72 @@ pub fn load_cache_mmap(root_dir: &Path, name: &str) -> Result<Option<CacheData>>
     }
 }
 
+/// Load a VectorStore with zero-copy mmap for the vector data.
+///
+/// Keys and hashes are copied out (they're small), but the bulk vector data
+/// (which can be 100MB+) stays in the mmap'd region — no heap allocation.
+///
+/// Uses `rkyv::access` to get a reference to the archived data without
+/// deserializing, then reinterprets the archived `Vec<f32_le>` data pointer
+/// as `*const f32` (safe on little-endian platforms where f32_le == f32).
+///
+/// Falls back to the regular (copying) `load_vector_store` on mmap failure.
+pub fn mmap_vector_store(root_dir: &Path, name: &str) -> Result<Option<VectorStore>> {
+    let path = cache_path(root_dir, name);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = fs::File::open(&path)?;
+    let metadata = file.metadata()?;
+    if (metadata.len() as usize) < HEADER_SIZE + 1 {
+        return Ok(None);
+    }
+
+    // Try mmap; fall back to regular load on failure
+    let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(m) => m,
+        Err(_) => return load_vector_store(root_dir, name),
+    };
+
+    // Validate version header
+    if mmap[0] != CACHE_VERSION {
+        return Err(ContextPlusError::Cache(format!(
+            "unsupported cache version: {} (expected {})",
+            mmap[0], CACHE_VERSION
+        )));
+    }
+
+    let data_bytes = &mmap[HEADER_SIZE..];
+
+    // Zero-copy access: returns &ArchivedCacheData pointing into the mmap
+    let archived = rkyv::access::<ArchivedCacheData, rkyv::rancor::Error>(data_bytes)
+        .map_err(|e| ContextPlusError::Cache(format!("rkyv access: {}", e)))?;
+
+    // Copy small metadata (keys + hashes are typically <1% of total size)
+    let dims = archived.dims.to_native();
+    let keys: Vec<String> = archived.keys.iter().map(|s| s.as_str().to_owned()).collect();
+    let hashes: Vec<String> = archived.hashes.iter().map(|s| s.as_str().to_owned()).collect();
+
+    // Zero-copy vector data: reinterpret &[f32_le] as *const f32.
+    // SAFETY: On little-endian platforms (x86_64, aarch64), rkyv's f32_le has
+    // identical memory layout to native f32. The archived vectors slice lives
+    // inside the mmap region which we keep alive via Arc.
+    let archived_vectors = archived.vectors.as_slice();
+    let vectors_ptr = archived_vectors.as_ptr() as *const f32;
+    let vectors_len = archived_vectors.len();
+
+    let mmap = Arc::new(mmap);
+
+    // SAFETY: vectors_ptr points into the mmap, is aligned (rkyv guarantees
+    // alignment), and the Arc<Mmap> keeps the mapping alive.
+    let store = unsafe {
+        VectorStore::from_mmap(dims, keys, hashes, vectors_ptr, vectors_len, mmap)
+    };
+
+    Ok(Some(store))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -368,5 +435,151 @@ mod tests {
         // Temp file should not linger
         let tmp_path = cache_path(dir.path(), "atomic").with_extension("rkyv.tmp");
         assert!(!tmp_path.exists());
+    }
+
+    // -- mmap_vector_store tests (zero-copy) --
+
+    #[test]
+    fn mmap_vector_store_nonexistent_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let result = mmap_vector_store(dir.path(), "no-such").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn mmap_vector_store_round_trip() {
+        let dir = TempDir::new().unwrap();
+
+        let store = VectorStore::new(
+            3,
+            vec!["a.ts".to_string(), "b.ts".to_string()],
+            vec!["h1".to_string(), "h2".to_string()],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+
+        save_vector_store(dir.path(), "zc", &store).unwrap();
+        let loaded = mmap_vector_store(dir.path(), "zc").unwrap().unwrap();
+
+        assert_eq!(loaded.count(), 2);
+        assert_eq!(loaded.dims(), 3);
+        assert!(loaded.has_key("a.ts"));
+        assert!(loaded.has_key("b.ts"));
+
+        let vec_a = loaded.get_vector("a.ts").unwrap();
+        assert!((vec_a[0] - 1.0).abs() < 1e-6);
+        assert!((vec_a[1] - 2.0).abs() < 1e-6);
+        assert!((vec_a[2] - 3.0).abs() < 1e-6);
+
+        let vec_b = loaded.get_vector("b.ts").unwrap();
+        assert!((vec_b[0] - 4.0).abs() < 1e-6);
+        assert!((vec_b[1] - 5.0).abs() < 1e-6);
+        assert!((vec_b[2] - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mmap_vector_store_matches_regular_load() {
+        let dir = TempDir::new().unwrap();
+
+        let store = VectorStore::new(
+            3,
+            vec![
+                "src/auth.ts".to_string(),
+                "src/db.ts".to_string(),
+                "src/api.ts".to_string(),
+            ],
+            vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
+            vec![
+                0.9, 0.1, 0.0,
+                0.0, 0.9, 0.1,
+                0.5, 0.5, 0.0,
+            ],
+        );
+
+        save_vector_store(dir.path(), "cmp", &store).unwrap();
+
+        let regular = load_vector_store(dir.path(), "cmp").unwrap().unwrap();
+        let mmap = mmap_vector_store(dir.path(), "cmp").unwrap().unwrap();
+
+        // Same metadata
+        assert_eq!(mmap.count(), regular.count());
+        assert_eq!(mmap.dims(), regular.dims());
+
+        // Same keys, hashes, and vectors
+        for key in regular.keys() {
+            assert!(mmap.has_key(key));
+            assert_eq!(mmap.get_hash(key), regular.get_hash(key));
+
+            let rv = regular.get_vector(key).unwrap();
+            let mv = mmap.get_vector(key).unwrap();
+            assert_eq!(rv.len(), mv.len());
+            for (a, b) in rv.iter().zip(mv.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "vector mismatch for key '{}': regular={}, mmap={}",
+                    key, a, b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mmap_vector_store_find_nearest_matches() {
+        let dir = TempDir::new().unwrap();
+
+        let store = VectorStore::new(
+            3,
+            vec![
+                "src/auth.ts".to_string(),
+                "src/db.ts".to_string(),
+                "src/api.ts".to_string(),
+            ],
+            vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
+            vec![
+                0.9, 0.1, 0.0,
+                0.0, 0.9, 0.1,
+                0.5, 0.5, 0.0,
+            ],
+        );
+
+        save_vector_store(dir.path(), "nn", &store).unwrap();
+
+        let regular = load_vector_store(dir.path(), "nn").unwrap().unwrap();
+        let mmap = mmap_vector_store(dir.path(), "nn").unwrap().unwrap();
+
+        let query = vec![1.0, 0.0, 0.0];
+        let regular_results = regular.find_nearest(&query, 3);
+        let mmap_results = mmap.find_nearest(&query, 3);
+
+        assert_eq!(regular_results.len(), mmap_results.len());
+        for (r, m) in regular_results.iter().zip(mmap_results.iter()) {
+            assert_eq!(r.0, m.0, "ordering mismatch");
+            assert!(
+                (r.1 - m.1).abs() < 1e-6,
+                "similarity mismatch: regular={}, mmap={}",
+                r.1, m.1
+            );
+        }
+    }
+
+    #[test]
+    fn mmap_vector_store_to_cache_works() {
+        let dir = TempDir::new().unwrap();
+
+        let store = VectorStore::new(
+            2,
+            vec!["x.ts".to_string()],
+            vec!["hx".to_string()],
+            vec![0.5, 0.7],
+        );
+
+        save_vector_store(dir.path(), "cache-test", &store).unwrap();
+        let loaded = mmap_vector_store(dir.path(), "cache-test").unwrap().unwrap();
+
+        let cache = loaded.to_cache();
+        assert_eq!(cache.len(), 1);
+        let entry = &cache["x.ts"];
+        assert_eq!(entry.hash, "hx");
+        assert!((entry.vector[0] - 0.5).abs() < 1e-6);
+        assert!((entry.vector[1] - 0.7).abs() < 1e-6);
     }
 }

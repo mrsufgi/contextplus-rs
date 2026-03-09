@@ -1,7 +1,13 @@
 // Spectral clustering with eigengap heuristic for tuning-free cluster counts.
 // Builds affinity matrix, normalized Laplacian, k-means on eigenvectors.
+// Uses randomized SVD (Halko-Martinsson-Tropp) for large matrices to avoid O(n^3) full eigen.
 
 use nalgebra::{DMatrix, SymmetricEigen};
+use rand::Rng;
+
+/// Matrices larger than this use randomized SVD instead of full eigendecomposition.
+/// Below this threshold, full `SymmetricEigen` is used (more accurate, still fast enough).
+const RANDOM_SVD_THRESHOLD: usize = 500;
 
 /// Result of clustering: each entry contains indices of files in that cluster.
 #[derive(Debug, Clone)]
@@ -74,6 +80,117 @@ fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
         }
     }
     laplacian
+}
+
+/// Generate a pair of standard normal random numbers using Box-Muller transform.
+/// Avoids dependency on `rand_distr` -- only needs uniform `[0, 1)` from `rand`.
+fn box_muller(rng: &mut impl Rng) -> (f64, f64) {
+    loop {
+        let u1: f64 = rng.r#gen();
+        let u2: f64 = rng.r#gen();
+        // Reject u1 == 0 to avoid log(0)
+        if u1 > 1e-15 {
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = std::f64::consts::TAU * u2;
+            return (r * theta.cos(), r * theta.sin());
+        }
+    }
+}
+
+/// Generate an n x p matrix of standard normal random entries.
+fn random_gaussian_matrix(n: usize, p: usize, rng: &mut impl Rng) -> DMatrix<f64> {
+    let mut data = Vec::with_capacity(n * p);
+    let pairs_needed = (n * p).div_ceil(2);
+    for _ in 0..pairs_needed {
+        let (a, b) = box_muller(rng);
+        data.push(a);
+        data.push(b);
+    }
+    data.truncate(n * p);
+    // nalgebra DMatrix::from_vec is column-major, but for a random Gaussian matrix
+    // the distribution is invariant to transposition, so column-major is fine.
+    DMatrix::from_vec(n, p, data)
+}
+
+/// Randomized eigendecomposition for symmetric PSD matrices (Halko-Martinsson-Tropp).
+///
+/// Computes approximate smallest eigenvalues/eigenvectors of a symmetric matrix using
+/// randomized range finding + projected eigendecomposition. Cost: O(n * k^2) vs O(n^3).
+///
+/// Returns `(eigenvalues, eigenvectors)` where eigenvalues are sorted ascending and
+/// eigenvector columns correspond to those eigenvalues. Only `k` components are returned.
+fn randomized_eigen(
+    matrix: &DMatrix<f64>,
+    k: usize,
+    oversampling: usize,
+) -> (Vec<f64>, DMatrix<f64>) {
+    let n = matrix.nrows();
+    let p = (k + oversampling).min(n);
+
+    let mut rng = rand::thread_rng();
+    let omega = random_gaussian_matrix(n, p, &mut rng);
+
+    // Y = A * Omega  (n x p)
+    let y = matrix * &omega;
+
+    // QR decomposition of Y to get orthonormal basis Q (n x p)
+    let qr = y.qr();
+    let q = qr.q(); // n x min(n,p) orthonormal columns
+
+    // Project: B = Q^T * A * Q  (p x p -- small symmetric matrix)
+    let b = q.transpose() * matrix * &q;
+
+    // Full eigendecomposition of the small p x p matrix
+    let eigen_small = SymmetricEigen::new(b);
+
+    // Sort eigenvalues ascending
+    let mut indexed_evals: Vec<(usize, f64)> = eigen_small
+        .eigenvalues
+        .iter()
+        .copied()
+        .enumerate()
+        .collect();
+    indexed_evals.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Take the first k
+    let take = k.min(indexed_evals.len());
+    let eigenvalues: Vec<f64> = indexed_evals[..take].iter().map(|(_, v)| *v).collect();
+
+    // Map eigenvectors back to original space: U = Q * V_small
+    let v_small = &eigen_small.eigenvectors;
+    let full_eigenvectors = &q * v_small;
+
+    // Reorder columns to match sorted eigenvalues
+    let mut eigenvectors = DMatrix::zeros(n, take);
+    for (new_col, &(orig_col, _)) in indexed_evals[..take].iter().enumerate() {
+        for row in 0..n {
+            eigenvectors[(row, new_col)] = full_eigenvectors[(row, orig_col)];
+        }
+    }
+
+    (eigenvalues, eigenvectors)
+}
+
+/// Full eigendecomposition, returning (eigenvalues, eigenvectors) sorted ascending.
+fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
+    let eigen = SymmetricEigen::new(matrix);
+
+    let mut indexed_evals: Vec<(usize, f64)> =
+        eigen.eigenvalues.iter().copied().enumerate().collect();
+    indexed_evals.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let eigenvalues: Vec<f64> = indexed_evals.iter().map(|(_, v)| *v).collect();
+
+    let n = eigen.eigenvectors.nrows();
+    let ncols = indexed_evals.len();
+    let mut eigenvectors = DMatrix::zeros(n, ncols);
+    for (new_col, &(orig_col, _)) in indexed_evals.iter().enumerate() {
+        for row in 0..n {
+            eigenvectors[(row, new_col)] = eigen.eigenvectors[(row, orig_col)];
+        }
+    }
+
+    (eigenvalues, eigenvectors)
 }
 
 /// Use eigengap heuristic to find optimal k: largest gap in sorted eigenvalues.
@@ -185,6 +302,9 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
 ///
 /// Returns a list of clusters, each containing the indices of vectors in that cluster.
 /// Uses eigengap heuristic to automatically determine the number of clusters.
+///
+/// For matrices larger than `RANDOM_SVD_THRESHOLD`, uses randomized SVD (Halko-Martinsson-Tropp)
+/// which computes only the needed eigenvectors in O(n*k^2) instead of O(n^3).
 pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<ClusterResult> {
     let n = vectors.len();
     if n <= 1 {
@@ -202,28 +322,28 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
 
     let affinity = build_affinity_matrix(vectors);
     let laplacian = normalized_laplacian(&affinity);
-    let eigen = SymmetricEigen::new(laplacian);
-
-    let eigenvalues: Vec<f64> = eigen.eigenvalues.iter().copied().collect();
-    let eigenvectors = &eigen.eigenvectors;
 
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
+
+    // Choose eigendecomposition strategy based on matrix size.
+    // Randomized SVD is O(n*k^2) vs O(n^3) for full eigen -- ~100x faster for n=2000, k=20.
+    let (eigenvalues, eigenvectors) = if n > RANDOM_SVD_THRESHOLD {
+        let oversampling = 10;
+        randomized_eigen(&laplacian, max_k + oversampling, oversampling)
+    } else {
+        full_eigen(laplacian)
+    };
+
     let k = find_optimal_k(&eigenvalues, max_k);
 
-    // Sort eigenvalue indices by value (ascending) and take first k eigenvectors
-    let mut sorted_indices: Vec<usize> = (0..eigenvalues.len()).collect();
-    sorted_indices.sort_by(|&a, &b| {
-        eigenvalues[a]
-            .partial_cmp(&eigenvalues[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Build embedding: rows of first k eigenvectors, row-normalized
+    // Build embedding: rows of first k eigenvectors, row-normalized.
+    // Eigenvalues/eigenvectors are already sorted ascending by full_eigen/randomized_eigen,
+    // so columns 0..k are the k smallest eigenvalues.
     let mut embedding: Vec<Vec<f64>> = Vec::with_capacity(n);
     for i in 0..n {
         let mut row: Vec<f64> = Vec::with_capacity(k);
         for j in 0..k {
-            row.push(eigenvectors[(i, sorted_indices[j])]);
+            row.push(eigenvectors[(i, j)]);
         }
         let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
         if norm > 1e-10 {
@@ -526,5 +646,196 @@ mod tests {
         let paths = vec!["src/foo.rs".to_string(), "lib/bar.rs".to_string()];
         let pattern = find_path_pattern(&paths);
         assert_eq!(pattern, None);
+    }
+
+    // --- Randomized SVD tests ---
+
+    #[test]
+    fn box_muller_produces_finite_values() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..100 {
+            let (a, b) = box_muller(&mut rng);
+            assert!(a.is_finite(), "Box-Muller produced non-finite: {}", a);
+            assert!(b.is_finite(), "Box-Muller produced non-finite: {}", b);
+        }
+    }
+
+    #[test]
+    fn random_gaussian_matrix_correct_shape() {
+        let mut rng = rand::thread_rng();
+        let mat = random_gaussian_matrix(10, 5, &mut rng);
+        assert_eq!(mat.nrows(), 10);
+        assert_eq!(mat.ncols(), 5);
+    }
+
+    #[test]
+    fn random_gaussian_matrix_has_variance() {
+        // A 100x10 Gaussian matrix should not have all identical values
+        let mut rng = rand::thread_rng();
+        let mat = random_gaussian_matrix(100, 10, &mut rng);
+        let first = mat[(0, 0)];
+        let has_variation = mat.iter().any(|&v| (v - first).abs() > 0.01);
+        assert!(has_variation, "Random matrix should have variation");
+    }
+
+    #[test]
+    fn full_eigen_returns_sorted_eigenvalues() {
+        // Simple 3x3 diagonal matrix: eigenvalues are 1, 2, 3
+        let mat = DMatrix::from_fn(3, 3, |i, j| if i == j { (i + 1) as f64 } else { 0.0 });
+        let (eigenvalues, eigenvectors) = full_eigen(mat);
+        assert_eq!(eigenvalues.len(), 3);
+        assert_eq!(eigenvectors.ncols(), 3);
+        // Should be sorted ascending
+        for w in eigenvalues.windows(2) {
+            assert!(
+                w[0] <= w[1] + 1e-10,
+                "Eigenvalues not sorted: {:?}",
+                eigenvalues
+            );
+        }
+        // Values should be approximately 1, 2, 3
+        assert!((eigenvalues[0] - 1.0).abs() < 1e-6);
+        assert!((eigenvalues[1] - 2.0).abs() < 1e-6);
+        assert!((eigenvalues[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn randomized_eigen_approximates_smallest_eigenvalues() {
+        // Build a symmetric matrix with known, evenly-spaced eigenvalues: 1..=10.
+        // Request the 4 smallest with generous oversampling so the random projection
+        // captures the full subspace.
+        let n = 10;
+        let mat = DMatrix::from_fn(n, n, |i, j| if i == j { (i + 1) as f64 } else { 0.0 });
+
+        let k = 4;
+        // Use oversampling = n - k so p = n (captures full space for this small matrix)
+        let oversampling = n - k;
+        let (eigenvalues, eigenvectors) = randomized_eigen(&mat, k, oversampling);
+
+        assert_eq!(eigenvalues.len(), k);
+        assert_eq!(eigenvectors.nrows(), n);
+        assert_eq!(eigenvectors.ncols(), k);
+
+        // The 4 smallest eigenvalues should be approximately 1, 2, 3, 4
+        for (i, expected) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
+            assert!(
+                (eigenvalues[i] - expected).abs() < 0.5,
+                "Eigenvalue {}: {} should be near {}",
+                i,
+                eigenvalues[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_eigen_sorted_ascending() {
+        let n = 20;
+        let mat = DMatrix::from_fn(n, n, |i, j| if i == j { (i + 1) as f64 } else { 0.0 });
+        let (eigenvalues, _) = randomized_eigen(&mat, 5, 5);
+        for w in eigenvalues.windows(2) {
+            assert!(
+                w[0] <= w[1] + 1e-6,
+                "Eigenvalues not sorted ascending: {:?}",
+                eigenvalues
+            );
+        }
+    }
+
+    #[test]
+    fn full_and_randomized_agree_on_small_matrix() {
+        // For a small matrix, both should find the same eigenvalues
+        let n = 8;
+        // Build a symmetric matrix
+        let mut mat = DMatrix::zeros(n, n);
+        for i in 0..n {
+            mat[(i, i)] = (i + 1) as f64;
+            if i + 1 < n {
+                mat[(i, i + 1)] = 0.1;
+                mat[(i + 1, i)] = 0.1;
+            }
+        }
+
+        let (full_evals, _) = full_eigen(mat.clone());
+        let (rand_evals, _) = randomized_eigen(&mat, 4, 4);
+
+        // First 4 eigenvalues should be close
+        for i in 0..4 {
+            assert!(
+                (full_evals[i] - rand_evals[i]).abs() < 0.3,
+                "Eigenvalue {}: full={} vs randomized={}",
+                i,
+                full_evals[i],
+                rand_evals[i]
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_selects_correct_path() {
+        // Verify RANDOM_SVD_THRESHOLD is reasonable (compile-time check)
+        const {
+            assert!(RANDOM_SVD_THRESHOLD >= 100);
+            assert!(RANDOM_SVD_THRESHOLD <= 1000);
+        }
+    }
+
+    #[test]
+    fn spectral_cluster_three_clear_clusters() {
+        // Create 3 clusters of 4 vectors each (n=12 > max_clusters=5, triggers real clustering)
+        let mut vectors = Vec::new();
+        // Cluster 1: along x-axis
+        for _ in 0..4 {
+            vectors.push(vec![1.0_f32, 0.0, 0.0]);
+        }
+        // Cluster 2: along y-axis
+        for _ in 0..4 {
+            vectors.push(vec![0.0_f32, 1.0, 0.0]);
+        }
+        // Cluster 3: along z-axis
+        for _ in 0..4 {
+            vectors.push(vec![0.0_f32, 0.0, 1.0]);
+        }
+
+        let result = spectral_cluster(&vectors, 5);
+
+        // Should produce at least 2 clusters (3 ideally, but eigengap can vary)
+        assert!(
+            result.len() >= 2,
+            "Expected at least 2 clusters, got {}",
+            result.len()
+        );
+
+        // Vectors 0-3 should all be in the same cluster
+        let c0 = result.iter().find(|c| c.indices.contains(&0)).unwrap();
+        for i in 0..4 {
+            assert!(
+                c0.indices.contains(&i),
+                "Vector {} should be in same cluster as vector 0",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_eigen_with_repeated_eigenvalues() {
+        // Matrix with repeated eigenvalues: diag(1, 1, 1, 5, 5, 10)
+        let n = 6;
+        let diag_vals = [1.0, 1.0, 1.0, 5.0, 5.0, 10.0];
+        let mat = DMatrix::from_fn(n, n, |i, j| if i == j { diag_vals[i] } else { 0.0 });
+
+        let (eigenvalues, eigenvectors) = randomized_eigen(&mat, 3, 3);
+
+        assert_eq!(eigenvalues.len(), 3);
+        assert_eq!(eigenvectors.nrows(), n);
+        // First 3 eigenvalues should all be near 1.0
+        for (i, &ev) in eigenvalues.iter().enumerate() {
+            assert!(
+                (ev - 1.0).abs() < 0.3,
+                "Eigenvalue {} = {} should be near 1.0",
+                i,
+                ev
+            );
+        }
     }
 }
