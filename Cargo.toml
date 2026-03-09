@@ -112,6 +112,22 @@ harness = false
 name = "search_query"
 harness = false
 
+[[bench]]
+name = "context_tree"
+harness = false
+
+[[bench]]
+name = "identifier_score"
+harness = false
+
+[[bench]]
+name = "blast_radius"
+harness = false
+
+[[bench]]
+name = "clustering"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1
