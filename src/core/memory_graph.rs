@@ -359,23 +359,9 @@ impl MemoryGraph {
     }
 
     /// Compute cosine similarity between two f32 vectors.
+    /// Delegates to simsimd for SIMD-accelerated computation.
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
-        let len = a.len().min(b.len());
-        if len == 0 {
-            return 0.0;
-        }
-        let mut dot: f64 = 0.0;
-        let mut norm_a: f64 = 0.0;
-        let mut norm_b: f64 = 0.0;
-        for i in 0..len {
-            let ai = a[i] as f64;
-            let bi = b[i] as f64;
-            dot += ai * bi;
-            norm_a += ai * ai;
-            norm_b += bi * bi;
-        }
-        let denom = norm_a.sqrt() * norm_b.sqrt();
-        if denom < 1e-15 { 0.0 } else { dot / denom }
+        crate::core::embeddings::cosine_similarity_simsimd(a, b) as f64
     }
 
     /// Compute temporal decay weight: weight * exp(-lambda * days_since_creation)

@@ -8,6 +8,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::error::{ContextPlusError, Result};
 
 /// Type alias for the boxed future returned by embedding functions.
@@ -73,6 +75,35 @@ pub struct SearchDocument {
     pub symbols: Vec<String>,
     pub symbol_entries: Vec<SymbolSearchEntry>,
     pub content: String,
+    /// Pre-computed lowercase searchable text for keyword scoring.
+    /// Built once at index time to avoid `format!()` + `to_lowercase()` per query.
+    pub search_text: String,
+    /// Pre-computed lowercase terms from all fields for term coverage.
+    pub search_terms: HashSet<String>,
+}
+
+impl SearchDocument {
+    /// Create a SearchDocument with pre-computed search fields.
+    pub fn new(
+        path: String,
+        header: String,
+        symbols: Vec<String>,
+        symbol_entries: Vec<SymbolSearchEntry>,
+        content: String,
+    ) -> Self {
+        let raw_text = format!("{} {} {} {}", path, header, symbols.join(" "), content);
+        let search_text = raw_text.to_lowercase();
+        let search_terms = split_camel_case(&raw_text).into_iter().collect();
+        Self {
+            path,
+            header,
+            symbols,
+            symbol_entries,
+            content,
+            search_text,
+            search_terms,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,14 +121,14 @@ pub struct SymbolSearchEntry {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedSearchOptions {
-    top_k: usize,
-    semantic_weight: f64,
-    keyword_weight: f64,
-    min_semantic_score: f64,
-    min_keyword_score: f64,
-    min_combined_score: f64,
-    require_keyword_match: bool,
-    require_semantic_match: bool,
+    pub top_k: usize,
+    pub semantic_weight: f64,
+    pub keyword_weight: f64,
+    pub min_semantic_score: f64,
+    pub min_keyword_score: f64,
+    pub min_combined_score: f64,
+    pub require_keyword_match: bool,
+    pub require_semantic_match: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,26 +140,25 @@ pub struct ResolvedSearchOptions {
 /// "getUserById" -> ["get", "user", "by", "id"]
 pub fn split_camel_case(text: &str) -> Vec<String> {
     let mut result = String::with_capacity(text.len() + 16);
-    let chars: Vec<char> = text.chars().collect();
+    let mut prev: Option<char> = None;
+    let mut chars = text.chars().peekable();
 
-    for i in 0..chars.len() {
-        let c = chars[i];
-        if i > 0 {
-            let prev = chars[i - 1];
+    while let Some(c) = chars.next() {
+        if let Some(p) = prev {
             // camelCase boundary: lowercase followed by uppercase
-            if prev.is_ascii_lowercase() && c.is_ascii_uppercase() {
+            if p.is_ascii_lowercase() && c.is_ascii_uppercase() {
                 result.push(' ');
             }
             // ACRONYMWord boundary: uppercase followed by uppercase+lowercase
-            if prev.is_ascii_uppercase()
+            if p.is_ascii_uppercase()
                 && c.is_ascii_uppercase()
-                && i + 1 < chars.len()
-                && chars[i + 1].is_ascii_lowercase()
+                && chars.peek().is_some_and(|next| next.is_ascii_lowercase())
             {
                 result.push(' ');
             }
         }
         result.push(c);
+        prev = Some(c);
     }
 
     result
@@ -186,20 +216,14 @@ fn resolve_search_options(opts: &SemanticSearchOptions) -> ResolvedSearchOptions
     }
 }
 
-/// Cosine similarity where vectors b are assumed pre-normalized (unit vectors from Ollama).
-/// Only normalizes the query vector a.
+/// Cosine similarity between two f32 vectors.
+/// Delegates to simsimd for SIMD-accelerated computation.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
-    let mut dot: f64 = 0.0;
-    let mut norm_a: f64 = 0.0;
-    for i in 0..a.len() {
-        let ai = a[i] as f64;
-        let bi = b[i] as f64;
-        dot += ai * bi;
-        norm_a += ai * ai;
+    if a.iter().all(|&v| v == 0.0) {
+        return 0.0;
     }
-    let denom = norm_a.sqrt();
-    if denom == 0.0 { 0.0 } else { dot / denom }
+    crate::core::embeddings::cosine_similarity_simsimd(a, b) as f64
 }
 
 /// Get term coverage: fraction of query terms that appear in doc terms.
@@ -256,6 +280,7 @@ fn format_line_range(line: usize, end_line: Option<usize>) -> String {
 }
 
 /// Compute keyword score from term coverage, symbol coverage, and phrase boost.
+/// Uses pre-computed `doc.search_text` and `doc.search_terms` to avoid per-query allocations.
 fn compute_keyword_score(
     query: &str,
     query_terms: &HashSet<String>,
@@ -265,17 +290,8 @@ fn compute_keyword_score(
     if query_terms.is_empty() {
         return 0.0;
     }
-    let doc_text = format!(
-        "{} {} {} {}",
-        doc.path,
-        doc.header,
-        doc.symbols.join(" "),
-        doc.content
-    );
-    let doc_terms: HashSet<String> = split_camel_case(&doc_text).into_iter().collect();
     let query_lower = query.trim().to_lowercase();
-    let phrase_boost = if !query_lower.is_empty() && doc_text.to_lowercase().contains(&query_lower)
-    {
+    let phrase_boost = if !query_lower.is_empty() && doc.search_text.contains(&query_lower) {
         PHRASE_BOOST
     } else {
         0.0
@@ -283,7 +299,7 @@ fn compute_keyword_score(
     let symbol_terms: HashSet<String> = split_camel_case(&matched_symbols.join(" "))
         .into_iter()
         .collect();
-    let term_coverage = get_term_coverage(query_terms, &doc_terms);
+    let term_coverage = get_term_coverage(query_terms, &doc.search_terms);
     let symbol_coverage = get_term_coverage(query_terms, &symbol_terms);
     clamp01(
         term_coverage * TERM_COVERAGE_WEIGHT
@@ -324,9 +340,16 @@ pub fn sanitize_query(query: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// In-memory search index holding documents and their embedding vectors.
+/// Vectors are stored in a flat contiguous buffer for cache-friendly SIMD access.
 pub struct SearchIndex {
     documents: Vec<SearchDocument>,
-    vectors: Vec<Option<Vec<f32>>>,
+    /// Flat buffer: `vector_buffer[i * dims .. (i+1) * dims]` is the vector for doc `i`.
+    /// Docs without vectors have `has_vector[i] == false` and zeros in the buffer.
+    vector_buffer: Vec<f32>,
+    /// Which docs have valid embedding vectors.
+    has_vector: Vec<bool>,
+    /// Dimensions per vector (0 if no vectors indexed yet).
+    dims: usize,
 }
 
 impl Default for SearchIndex {
@@ -339,7 +362,9 @@ impl SearchIndex {
     pub fn new() -> Self {
         Self {
             documents: Vec::new(),
-            vectors: Vec::new(),
+            vector_buffer: Vec::new(),
+            has_vector: Vec::new(),
+            dims: 0,
         }
     }
 
@@ -351,8 +376,27 @@ impl SearchIndex {
         vectors: Vec<Option<Vec<f32>>>,
     ) {
         debug_assert_eq!(docs.len(), vectors.len());
+        // Determine dims from first non-None vector
+        let dims = vectors
+            .iter()
+            .find_map(|v| v.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        let n = docs.len();
+        let mut buffer = vec![0.0f32; n * dims];
+        let mut has_vec = Vec::with_capacity(n);
+        for (i, v) in vectors.iter().enumerate() {
+            if let Some(vec) = v {
+                let offset = i * dims;
+                buffer[offset..offset + dims].copy_from_slice(vec);
+                has_vec.push(true);
+            } else {
+                has_vec.push(false);
+            }
+        }
         self.documents = docs;
-        self.vectors = vectors;
+        self.vector_buffer = buffer;
+        self.has_vector = has_vec;
+        self.dims = dims;
     }
 
     /// Perform hybrid search against the indexed documents.
@@ -365,53 +409,59 @@ impl SearchIndex {
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
 
         #[allow(clippy::type_complexity)]
-        let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = Vec::new();
+        let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = self
+            .documents
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, doc)| {
+                if !self.has_vector[i] {
+                    return None;
+                }
+                let offset = i * self.dims;
+                let vec_slice = &self.vector_buffer[offset..offset + self.dims];
+                let semantic_score = cosine(query_vec, vec_slice);
 
-        for (i, doc) in self.documents.iter().enumerate() {
-            let semantic_score = match &self.vectors[i] {
-                Some(v) => cosine(query_vec, v),
-                None => continue,
-            };
+                let matched_entries = get_matched_symbol_entries(&doc.symbol_entries, &query_terms);
+                let matched_symbols = if !matched_entries.is_empty() {
+                    matched_entries.iter().map(|e| e.name.clone()).collect()
+                } else {
+                    get_matched_symbols(&doc.symbols, &query_terms)
+                };
+                let matched_symbol_locations: Vec<String> = matched_entries
+                    .iter()
+                    .map(|e| format!("{}@{}", e.name, format_line_range(e.line, e.end_line)))
+                    .collect();
 
-            let matched_entries = get_matched_symbol_entries(&doc.symbol_entries, &query_terms);
-            let matched_symbols = if !matched_entries.is_empty() {
-                matched_entries.iter().map(|e| e.name.clone()).collect()
-            } else {
-                get_matched_symbols(&doc.symbols, &query_terms)
-            };
-            let matched_symbol_locations: Vec<String> = matched_entries
-                .iter()
-                .map(|e| format!("{}@{}", e.name, format_line_range(e.line, e.end_line)))
-                .collect();
+                let keyword_score =
+                    compute_keyword_score(query, &query_terms, doc, &matched_symbols);
+                let combined_score = compute_combined_score(semantic_score, keyword_score, opts);
 
-            let keyword_score = compute_keyword_score(query, &query_terms, doc, &matched_symbols);
-            let combined_score = compute_combined_score(semantic_score, keyword_score, opts);
+                if opts.require_semantic_match && semantic_score <= 0.0 {
+                    return None;
+                }
+                if opts.require_keyword_match && keyword_score <= 0.0 {
+                    return None;
+                }
+                if semantic_score.max(0.0) < opts.min_semantic_score {
+                    return None;
+                }
+                if keyword_score < opts.min_keyword_score {
+                    return None;
+                }
+                if combined_score < opts.min_combined_score {
+                    return None;
+                }
 
-            if opts.require_semantic_match && semantic_score <= 0.0 {
-                continue;
-            }
-            if opts.require_keyword_match && keyword_score <= 0.0 {
-                continue;
-            }
-            if semantic_score.max(0.0) < opts.min_semantic_score {
-                continue;
-            }
-            if keyword_score < opts.min_keyword_score {
-                continue;
-            }
-            if combined_score < opts.min_combined_score {
-                continue;
-            }
-
-            scored.push((
-                i,
-                combined_score,
-                semantic_score,
-                keyword_score,
-                matched_symbols,
-                matched_symbol_locations,
-            ));
-        }
+                Some((
+                    i,
+                    combined_score,
+                    semantic_score,
+                    keyword_score,
+                    matched_symbols,
+                    matched_symbol_locations,
+                ))
+            })
+            .collect();
 
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -708,13 +758,13 @@ mod tests {
 
     #[test]
     fn test_keyword_score_with_phrase_match() {
-        let doc = SearchDocument {
-            path: "src/auth.ts".to_string(),
-            header: "auth handler".to_string(),
-            symbols: vec!["authenticate".to_string()],
-            symbol_entries: vec![],
-            content: "how does auth work".to_string(),
-        };
+        let doc = SearchDocument::new(
+            "src/auth.ts".to_string(),
+            "auth handler".to_string(),
+            vec!["authenticate".to_string()],
+            vec![],
+            "how does auth work".to_string(),
+        );
         let query = "auth";
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
         let matched = get_matched_symbols(&doc.symbols, &query_terms);
@@ -752,20 +802,20 @@ mod tests {
     #[test]
     fn test_search_index_basic() {
         let docs = vec![
-            SearchDocument {
-                path: "src/auth.ts".to_string(),
-                header: "authentication module".to_string(),
-                symbols: vec!["verifyToken".to_string()],
-                symbol_entries: vec![],
-                content: "JWT verification".to_string(),
-            },
-            SearchDocument {
-                path: "src/db.ts".to_string(),
-                header: "database connection".to_string(),
-                symbols: vec!["connect".to_string()],
-                symbol_entries: vec![],
-                content: "PostgreSQL driver".to_string(),
-            },
+            SearchDocument::new(
+                "src/auth.ts".to_string(),
+                "authentication module".to_string(),
+                vec!["verifyToken".to_string()],
+                vec![],
+                "JWT verification".to_string(),
+            ),
+            SearchDocument::new(
+                "src/db.ts".to_string(),
+                "database connection".to_string(),
+                vec!["connect".to_string()],
+                vec![],
+                "PostgreSQL driver".to_string(),
+            ),
         ];
 
         let query_vec = vec![1.0, 0.0, 0.0];
@@ -795,19 +845,19 @@ mod tests {
 
     #[test]
     fn test_search_index_with_symbol_entries() {
-        let docs = vec![SearchDocument {
-            path: "src/user.ts".to_string(),
-            header: "user service".to_string(),
-            symbols: vec!["getUserById".to_string()],
-            symbol_entries: vec![SymbolSearchEntry {
+        let docs = vec![SearchDocument::new(
+            "src/user.ts".to_string(),
+            "user service".to_string(),
+            vec!["getUserById".to_string()],
+            vec![SymbolSearchEntry {
                 name: "getUserById".to_string(),
                 kind: Some("function".to_string()),
                 line: 10,
                 end_line: Some(25),
                 signature: Some("getUserById(id: string): User".to_string()),
             }],
-            content: "user management".to_string(),
-        }];
+            "user management".to_string(),
+        )];
 
         let query_vec = vec![1.0, 0.0, 0.0];
         let vectors = vec![Some(vec![0.8, 0.2, 0.0])];
@@ -837,13 +887,13 @@ mod tests {
 
     #[test]
     fn test_search_index_filters() {
-        let docs = vec![SearchDocument {
-            path: "src/low.ts".to_string(),
-            header: "low relevance".to_string(),
-            symbols: vec![],
-            symbol_entries: vec![],
-            content: "nothing useful".to_string(),
-        }];
+        let docs = vec![SearchDocument::new(
+            "src/low.ts".to_string(),
+            "low relevance".to_string(),
+            vec![],
+            vec![],
+            "nothing useful".to_string(),
+        )];
 
         let query_vec = vec![1.0, 0.0, 0.0];
         let vectors = vec![Some(vec![0.01, 0.99, 0.0])]; // very low similarity

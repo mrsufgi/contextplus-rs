@@ -502,16 +502,6 @@ impl ContextPlusServer {
         Ok(idx)
     }
 
-    /// Helper: convert cached file_lines HashMap into the Vec<(String, Vec<String>)> format
-    /// expected by blast_radius and semantic_identifier_search.
-    fn file_lines_as_vec(cache: &ProjectCache) -> Vec<(String, Vec<String>)> {
-        cache
-            .file_lines
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
     // --- Tool dispatch ---
 
     async fn dispatch(&self, name: &str, args: serde_json::Map<String, Value>) -> CallToolResult {
@@ -672,12 +662,11 @@ impl ContextPlusServer {
             Self::get_str(&args, "file_context").or_else(|| Self::get_str(&args, "fileContext"));
 
         let cache = self.ensure_project_cache().await?;
-        let file_lines = Self::file_lines_as_vec(&cache);
 
         let result = crate::tools::blast_radius::find_symbol_usages(
             &symbol_name,
             file_context.as_deref(),
-            &file_lines,
+            &cache.file_lines,
         );
         let formatted = crate::tools::blast_radius::format_blast_radius(&symbol_name, &result);
         Ok(Self::ok_text(formatted))
@@ -735,7 +724,6 @@ impl ContextPlusServer {
         let root = self.resolve_root(&args);
 
         let cache = self.ensure_project_cache().await?;
-        let file_lines = Self::file_lines_as_vec(&cache);
 
         // Use cached identifier index (TTL=300s, rebuilds if file count changes)
         let idx = self.ensure_identifier_index(&cache).await?;
@@ -773,7 +761,7 @@ impl ContextPlusServer {
             &idx.docs,
             &idx.vector_buffer,
             idx.dims,
-            &file_lines,
+            &cache.file_lines,
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -1233,13 +1221,13 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 );
                 content_hashes.push((entry.relative_path.clone(), content_hash(&doc_content)));
 
-                docs.push(SearchDocument {
-                    path: entry.relative_path.clone(),
+                docs.push(SearchDocument::new(
+                    entry.relative_path.clone(),
                     header,
-                    symbols: symbol_names,
+                    symbol_names,
                     symbol_entries,
-                    content: doc_content,
-                });
+                    doc_content,
+                ));
             }
 
             if docs.is_empty() {
@@ -2112,33 +2100,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_lines_as_vec_converts_hashmap_correctly() {
-        let mut file_lines = HashMap::new();
-        file_lines.insert(
-            "a.txt".to_string(),
-            vec!["alpha".to_string(), "beta".to_string()],
-        );
-        file_lines.insert("b.txt".to_string(), vec!["gamma".to_string()]);
-
-        let cache = ProjectCache {
-            file_entries: vec![],
-            file_lines,
-            last_refresh: Instant::now(),
-        };
-
-        let vec_result = ContextPlusServer::file_lines_as_vec(&cache);
-        assert_eq!(vec_result.len(), 2, "should have 2 entries");
-
-        // Collect into a map for order-independent comparison
-        let result_map: HashMap<String, Vec<String>> = vec_result.into_iter().collect();
-        assert_eq!(
-            result_map["a.txt"],
-            vec!["alpha".to_string(), "beta".to_string()]
-        );
-        assert_eq!(result_map["b.txt"], vec!["gamma".to_string()]);
-    }
-
     #[tokio::test]
     async fn invalidate_project_cache_sets_cache_to_none() {
         let (_tmp, server) = setup_cache_test(300);
@@ -2778,36 +2739,6 @@ mod tests {
         let skel_sym = code_sym_to_skel_sym(&parent);
         assert_eq!(skel_sym.children.len(), 1);
         assert_eq!(skel_sym.children[0].name, "method_a");
-    }
-
-    // ---------------------------------------------------------------
-    // file_lines_as_vec edge cases
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn file_lines_as_vec_handles_empty_cache() {
-        let cache = ProjectCache {
-            file_entries: vec![],
-            file_lines: HashMap::new(),
-            last_refresh: Instant::now(),
-        };
-        let result = ContextPlusServer::file_lines_as_vec(&cache);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn file_lines_as_vec_preserves_empty_line_vectors() {
-        let mut file_lines = HashMap::new();
-        file_lines.insert("empty.txt".to_string(), vec![]);
-        let cache = ProjectCache {
-            file_entries: vec![],
-            file_lines,
-            last_refresh: Instant::now(),
-        };
-        let result = ContextPlusServer::file_lines_as_vec(&cache);
-        assert_eq!(result.len(), 1);
-        let result_map: HashMap<String, Vec<String>> = result.into_iter().collect();
-        assert!(result_map["empty.txt"].is_empty());
     }
 
     // ---------------------------------------------------------------

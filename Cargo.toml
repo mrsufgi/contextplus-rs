@@ -79,9 +79,6 @@ rand = "0.8"
 # CPU parallelism (affinity matrix, kmeans, find_nearest, symbol parsing)
 rayon = "1"
 
-# HNSW approximate nearest neighbor index
-instant-distance = "0.6"
-
 [dev-dependencies]
 # Mock HTTP server (for Ollama API)
 wiremock = "0.6"

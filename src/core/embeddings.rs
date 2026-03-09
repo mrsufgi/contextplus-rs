@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
@@ -13,24 +13,6 @@ type EmbedFuture<'a> =
 // ---------------------------------------------------------------------------
 
 const MIN_EMBED_INPUT_CHARS: usize = 256;
-
-/// Threshold for switching from brute-force to HNSW approximate nearest neighbor.
-/// HNSW index is built once and cached via OnceLock on first search call.
-/// Brute-force with SIMD+rayon handles 30K vectors in <3ms, so HNSW is only
-/// beneficial for very large stores where the one-time build cost (~14s for 30K)
-/// is amortized over many queries. Set high to prefer brute-force in practice.
-const HNSW_THRESHOLD: usize = 50_000;
-
-/// Point wrapper for instant-distance HNSW index.
-#[derive(Clone)]
-struct HnswPoint(Vec<f32>);
-
-impl instant_distance::Point for HnswPoint {
-    fn distance(&self, other: &Self) -> f32 {
-        // Use simsimd for SIMD-accelerated cosine distance
-        1.0 - cosine_similarity_simsimd(&self.0, &other.0)
-    }
-}
 const SINGLE_INPUT_SHRINK_FACTOR: f64 = 0.75;
 const MAX_SINGLE_INPUT_RETRIES: usize = 8;
 
@@ -287,17 +269,9 @@ unsafe impl Sync for VectorData {}
 // VectorStore
 // ---------------------------------------------------------------------------
 
-/// Cached HNSW index for approximate nearest neighbor search.
-/// Built once on first search call and reused for all subsequent queries.
-struct CachedHnsw {
-    map: instant_distance::HnswMap<HnswPoint, usize>,
-}
-
-// SAFETY: HnswMap is read-only after construction and only uses f32 vectors internally.
-unsafe impl Send for CachedHnsw {}
-unsafe impl Sync for CachedHnsw {}
-
 /// In-memory flat vector store with cosine similarity search via simsimd.
+/// Uses brute-force SIMD+rayon scan — handles 30K vectors in <3ms, which is
+/// fast enough that approximate indices (HNSW) aren't worth the build cost.
 pub struct VectorStore {
     dims: u32,
     count: u32,
@@ -305,8 +279,6 @@ pub struct VectorStore {
     keys: Vec<String>,
     hashes: Vec<String>,
     key_index: HashMap<String, usize>,
-    /// Lazily-built HNSW index for stores with >HNSW_THRESHOLD vectors.
-    hnsw_index: OnceLock<CachedHnsw>,
 }
 
 impl VectorStore {
@@ -324,7 +296,6 @@ impl VectorStore {
             keys,
             hashes,
             key_index,
-            hnsw_index: OnceLock::new(),
         }
     }
 
@@ -364,7 +335,6 @@ impl VectorStore {
             keys,
             hashes,
             key_index,
-            hnsw_index: OnceLock::new(),
         }
     }
 
@@ -435,25 +405,19 @@ impl VectorStore {
     }
 
     /// Find the top-k nearest neighbors by cosine similarity.
-    /// For stores with >1000 vectors, uses HNSW approximate nearest neighbor index.
-    /// For smaller stores, uses brute-force SIMD scan (exact results).
+    /// Uses SIMD+rayon brute-force scan — handles 30K vectors in <3ms.
     /// Returns (key, similarity) pairs sorted by descending similarity.
     pub fn find_nearest(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         if self.count == 0 || query.len() != self.dims as usize {
             return Vec::new();
         }
 
-        if self.count as usize > HNSW_THRESHOLD {
-            self.find_nearest_hnsw(query, top_k)
-        } else {
-            self.find_nearest_brute_force(query, top_k)
-        }
+        self.find_nearest_brute_force(query, top_k)
     }
 
     /// Brute-force exact nearest neighbor search with SIMD cosine similarity.
     /// Parallelized with rayon for large stores.
-    /// Public for benchmarking comparisons.
-    pub fn find_nearest_brute_force(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+    fn find_nearest_brute_force(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         use rayon::prelude::*;
 
         let vectors = self.vectors.as_slice();
@@ -476,44 +440,6 @@ impl VectorStore {
         scored
             .into_iter()
             .map(|(idx, sim)| (self.keys[idx].clone(), sim))
-            .collect()
-    }
-
-    /// HNSW approximate nearest neighbor search for large stores (>1000 vectors).
-    /// The HNSW index is built once on first call and cached via OnceLock.
-    fn find_nearest_hnsw(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
-        let cached = self.hnsw_index.get_or_init(|| {
-            let vectors = self.vectors.as_slice();
-            let dims = self.dims as usize;
-
-            let points: Vec<HnswPoint> = (0..self.count as usize)
-                .map(|i| {
-                    let offset = i * dims;
-                    HnswPoint(vectors[offset..offset + dims].to_vec())
-                })
-                .collect();
-            let values: Vec<usize> = (0..self.count as usize).collect();
-
-            CachedHnsw {
-                map: instant_distance::Builder::default().build(points, values),
-            }
-        });
-
-        let query_point = HnswPoint(query.to_vec());
-        let mut search = instant_distance::Search::default();
-        let results: Vec<_> = cached
-            .map
-            .search(&query_point, &mut search)
-            .take(top_k)
-            .collect();
-
-        results
-            .into_iter()
-            .map(|item| {
-                let idx = *item.value;
-                let sim = 1.0 - item.distance;
-                (self.keys[idx].clone(), sim)
-            })
             .collect()
     }
 

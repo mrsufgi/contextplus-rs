@@ -6,7 +6,7 @@
 //! - Excludes definition lines when fileContext matches
 //! - Uses regex with escaped special chars (prevents ReDoS)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -16,7 +16,7 @@ use crate::tools::semantic_identifiers::{escape_regex, is_definition_line};
 
 /// Type alias for the boxed future returned by file-line providers.
 type FileLinesFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Vec<(String, Vec<String>)>>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<HashMap<String, Vec<String>>>> + Send + 'a>,
 >;
 
 // ---------------------------------------------------------------------------
@@ -54,12 +54,12 @@ pub struct BlastRadiusResult {
 // ---------------------------------------------------------------------------
 
 /// Search for all usages of a symbol across provided file lines.
-/// `file_lines` is a slice of (relative_path, lines_of_file).
+/// `file_lines` maps relative_path -> lines of the file.
 /// Returns usages grouped by file.
 pub fn find_symbol_usages(
     symbol_name: &str,
     file_context: Option<&str>,
-    file_lines: &[(String, Vec<String>)],
+    file_lines: &HashMap<String, Vec<String>>,
 ) -> BlastRadiusResult {
     let escaped = escape_regex(symbol_name);
     // \b only works at word-character boundaries. For symbols with non-word
@@ -186,7 +186,7 @@ pub async fn get_blast_radius(
 mod tests {
     use super::*;
 
-    fn make_file_lines(data: Vec<(&str, Vec<&str>)>) -> Vec<(String, Vec<String>)> {
+    fn make_file_lines(data: Vec<(&str, Vec<&str>)>) -> HashMap<String, Vec<String>> {
         data.into_iter()
             .map(|(path, lines)| {
                 (
@@ -342,10 +342,12 @@ mod tests {
     #[test]
     fn test_context_truncation() {
         let long_line = "a".repeat(200);
-        let file_lines = vec![(
+        let file_lines: HashMap<String, Vec<String>> = [(
             "src/app.ts".to_string(),
             vec![format!("myFunc {}", long_line)],
-        )];
+        )]
+        .into_iter()
+        .collect();
         let result = find_symbol_usages("myFunc", None, &file_lines);
         assert_eq!(result.usages.len(), 1);
         assert!(result.usages[0].context.len() <= MAX_CONTEXT_LEN);

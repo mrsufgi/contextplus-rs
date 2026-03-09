@@ -1,6 +1,7 @@
 use contextplus_rs::core::embeddings::{
     CacheEntry, VectorStore, cosine_similarity_naive, cosine_similarity_simsimd,
 };
+use contextplus_rs::tools::semantic_search::{ResolvedSearchOptions, SearchDocument, SearchIndex};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;
@@ -47,53 +48,24 @@ fn main() {
     println!("  simsimd: {:.3} µs/op", simd_us);
     println!("  speedup: {:.1}x\n", naive_us / simd_us);
 
-    // 2. VectorStore find_nearest at various sizes — compare brute-force vs HNSW
-    println!("--- Brute-force (SIMD+rayon, exact) ---");
+    // 2. VectorStore find_nearest at various sizes (SIMD+rayon brute-force)
+    println!("--- find_nearest (SIMD+rayon, exact) ---");
     for &count in &[1000, 5000, 30000] {
         let keys: Vec<String> = (0..count).map(|i| format!("src/file_{}.ts", i)).collect();
         let hashes: Vec<String> = (0..count).map(|i| format!("hash_{}", i)).collect();
         let vectors = generate_vectors(count, dims);
-        // Force brute-force by using count <= HNSW_THRESHOLD trick: just call the public API
-        // with a store that stays below threshold — or we measure directly
         let store = VectorStore::new(dims as u32, keys, hashes, vectors);
         let query = generate_query(dims);
 
         let runs = if count >= 30000 { 10 } else { 50 };
         // Warm up
-        let _ = store.find_nearest_brute_force(&query, 5);
-        let start = Instant::now();
-        for _ in 0..runs {
-            black_box(store.find_nearest_brute_force(black_box(&query), 5));
-        }
-        let avg_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
-        println!("  {} vectors: {:.2} ms/query", count, avg_ms);
-    }
-
-    println!("\n--- HNSW (cached, approximate) ---");
-    for &count in &[1000, 5000, 30000] {
-        let keys: Vec<String> = (0..count).map(|i| format!("src/file_{}.ts", i)).collect();
-        let hashes: Vec<String> = (0..count).map(|i| format!("hash_{}", i)).collect();
-        let vectors = generate_vectors(count, dims);
-        let store = VectorStore::new(dims as u32, keys, hashes, vectors);
-        let query = generate_query(dims);
-
-        // First call builds HNSW index
-        let start = Instant::now();
         let _ = store.find_nearest(&query, 5);
-        let first_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        // Subsequent calls use cached index
-        let runs = if count >= 30000 { 10 } else { 50 };
         let start = Instant::now();
         for _ in 0..runs {
             black_box(store.find_nearest(black_box(&query), 5));
         }
         let avg_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
-
-        println!(
-            "  {} vectors: build={:.1}ms, query={:.3}ms",
-            count, first_ms, avg_ms
-        );
+        println!("  {} vectors: {:.2} ms/query", count, avg_ms);
     }
 
     // 3. Cache load (rkyv save + load + mmap)
@@ -187,6 +159,53 @@ export type ProfileService = ReturnType<typeof createProfileService>;
         "\nHash check staleness (30K files, 100 iters): {:.2} ms",
         hash_ms
     );
+
+    // 6. SearchIndex hybrid search (flat buffer + simsimd + rayon)
+    println!("\n--- SearchIndex hybrid search ---");
+    for &count in &[1000, 3000] {
+        let docs: Vec<SearchDocument> = (0..count)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("packages/domains/feature_{}/handler_{}.ts", i / 50, i),
+                    format!("handler for feature {}", i),
+                    vec![format!("handleFeature{}", i)],
+                    vec![],
+                    format!("processes feature {} data with validation", i),
+                )
+            })
+            .collect();
+        let vectors: Vec<Option<Vec<f32>>> = (0..count)
+            .map(|i| {
+                Some(
+                    (0..dims)
+                        .map(|d| ((i * 7 + d * 13 + 42) % 1000) as f32 / 1000.0)
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let query_vec = generate_query(dims);
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 0.72,
+            keyword_weight: 0.28,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.1,
+            require_keyword_match: false,
+            require_semantic_match: false,
+        };
+        // Warm up
+        let _ = index.search("feature validation", &query_vec, &opts);
+        let runs = 50;
+        let start = Instant::now();
+        for _ in 0..runs {
+            black_box(index.search("feature validation", black_box(&query_vec), &opts));
+        }
+        let avg_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+        println!("  {} docs: {:.2} ms/query", count, avg_ms);
+    }
 
     println!("\n=== vs TypeScript Baselines ===");
     println!("| Operation                  | TS (optimized) | Rust       | Speedup |");

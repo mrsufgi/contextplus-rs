@@ -5,9 +5,10 @@
 //! - Ranks identifiers by hybrid semantic + keyword score
 //! - Finds and ranks call-sites for each top identifier
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use rayon::prelude::*;
 use regex::Regex;
 
 use crate::error::{ContextPlusError, Result};
@@ -276,7 +277,7 @@ pub fn rank_call_sites(
     query_terms: &HashSet<String>,
     query_vec: &[f32],
     symbol: &IdentifierDoc,
-    file_lines: &[(String, Vec<String>)],
+    file_lines: &HashMap<String, Vec<String>>,
     limit: usize,
     // Optional: pre-computed vectors for call-site text. If None, only keyword score is used.
     callsite_vectors: Option<&dyn CallSiteVectorProvider>,
@@ -391,7 +392,6 @@ pub trait CallSiteVectorProvider {
 pub fn score_identifiers(
     docs: &[IdentifierDoc],
     query_vec: &[f32],
-    query_norm: f64,
     query_terms: &HashSet<String>,
     vector_buffer: &[f32],
     vector_dims: usize,
@@ -400,49 +400,48 @@ pub fn score_identifiers(
     keyword_weight: f64,
     top_k: usize,
 ) -> Vec<RankedIdentifier> {
-    let mut scored: Vec<RankedIdentifier> = Vec::new();
+    let mut scored: Vec<RankedIdentifier> = docs
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, doc)| {
+            if let Some(kinds) = include_kinds
+                && !kinds.contains(&doc.kind.to_lowercase())
+            {
+                return None;
+            }
 
-    for (i, doc) in docs.iter().enumerate() {
-        if let Some(kinds) = include_kinds
-            && !kinds.contains(&doc.kind.to_lowercase())
-        {
-            continue;
-        }
+            // Compute cosine similarity from flat buffer
+            let offset = i * vector_dims;
+            if offset + vector_dims > vector_buffer.len() {
+                return None;
+            }
+            let vec_slice = &vector_buffer[offset..offset + vector_dims];
+            let semantic_score =
+                crate::core::embeddings::cosine_similarity_simsimd(query_vec, vec_slice).max(0.0)
+                    as f64;
 
-        // Compute cosine similarity from flat buffer
-        let offset = i * vector_dims;
-        if offset + vector_dims > vector_buffer.len() {
-            continue;
-        }
-        let mut dot: f64 = 0.0;
-        for j in 0..vector_dims {
-            dot += query_vec[j] as f64 * vector_buffer[offset + j] as f64;
-        }
-        let semantic_score = if query_norm == 0.0 {
-            0.0
-        } else {
-            (dot / query_norm).max(0.0)
-        };
+            let keyword_input =
+                format!("{} {} {} {}", doc.name, doc.signature, doc.path, doc.header);
+            let keyword_score = get_keyword_coverage(query_terms, &keyword_input);
 
-        let keyword_input = format!("{} {} {} {}", doc.name, doc.signature, doc.path, doc.header);
-        let keyword_score = get_keyword_coverage(query_terms, &keyword_input);
+            let total_weight = semantic_weight + keyword_weight;
+            let score = if total_weight > 0.0 {
+                clamp01(
+                    (semantic_weight * semantic_score + keyword_weight * keyword_score)
+                        / total_weight,
+                )
+            } else {
+                semantic_score
+            };
 
-        let total_weight = semantic_weight + keyword_weight;
-        let score = if total_weight > 0.0 {
-            clamp01(
-                (semantic_weight * semantic_score + keyword_weight * keyword_score) / total_weight,
-            )
-        } else {
-            semantic_score
-        };
-
-        scored.push(RankedIdentifier {
-            doc: doc.clone(),
-            semantic_score,
-            keyword_score,
-            score,
-        });
-    }
+            Some(RankedIdentifier {
+                doc: doc.clone(),
+                semantic_score,
+                keyword_score,
+                score,
+            })
+        })
+        .collect();
 
     scored.sort_by(|a, b| {
         b.score
@@ -533,7 +532,7 @@ pub async fn semantic_identifier_search(
     identifier_docs: &[IdentifierDoc],
     vector_buffer: &[f32],
     vector_dims: usize,
-    file_lines: &[(String, Vec<String>)],
+    file_lines: &HashMap<String, Vec<String>>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
     if query.is_empty() {
@@ -559,14 +558,12 @@ pub async fn semantic_identifier_search(
         .into_iter()
         .next()
         .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
-    let query_norm = vector_norm(&query_vec);
     let query_terms: HashSet<String> = split_camel_case(&query).into_iter().collect();
 
     // Score identifiers
     let top = score_identifiers(
         identifier_docs,
         &query_vec,
-        query_norm,
         &query_terms,
         vector_buffer,
         vector_dims,
@@ -757,13 +754,11 @@ mod tests {
             0.9, 0.1, 0.0, // getUserById
             0.1, 0.9, 0.0, // connect
         ];
-        let query_norm = vector_norm(&query_vec);
         let query_terms: HashSet<String> = ["user", "get"].iter().map(|s| s.to_string()).collect();
 
         let results = score_identifiers(
             &docs,
             &query_vec,
-            query_norm,
             &query_terms,
             &vector_buffer,
             3,
@@ -808,14 +803,12 @@ mod tests {
 
         let query_vec = vec![1.0, 0.0];
         let vector_buffer = vec![0.5, 0.5, 0.5, 0.5];
-        let query_norm = vector_norm(&query_vec);
         let query_terms = HashSet::new();
         let kinds = Some(["function"].iter().map(|s| s.to_string()).collect());
 
         let results = score_identifiers(
             &docs,
             &query_vec,
-            query_norm,
             &query_terms,
             &vector_buffer,
             2,
@@ -846,7 +839,7 @@ mod tests {
             text: "getUserById function".to_string(),
         };
 
-        let file_lines = vec![
+        let file_lines: HashMap<String, Vec<String>> = [
             (
                 "src/user.ts".to_string(),
                 vec![
@@ -865,7 +858,9 @@ mod tests {
                     "console.log(user);".to_string(),
                 ],
             ),
-        ];
+        ]
+        .into_iter()
+        .collect();
 
         let query_terms: HashSet<String> = ["user", "get"].iter().map(|s| s.to_string()).collect();
         let query_vec = vec![1.0, 0.0, 0.0];
@@ -893,14 +888,16 @@ mod tests {
             text: "myFunc function".to_string(),
         };
 
-        let file_lines = vec![(
+        let file_lines: HashMap<String, Vec<String>> = [(
             "src/user.ts".to_string(),
             vec![
                 "function myFunc() {".to_string(), // L1 = definition, should be skipped
                 "  return 42;".to_string(),
                 "}".to_string(),
             ],
-        )];
+        )]
+        .into_iter()
+        .collect();
 
         let query_terms = HashSet::new();
         let query_vec = vec![1.0];
@@ -923,7 +920,10 @@ mod tests {
             parent_name: None,
             text: "noMatch".to_string(),
         };
-        let file_lines = vec![("other.ts".to_string(), vec!["const x = 42;".to_string()])];
+        let file_lines: HashMap<String, Vec<String>> =
+            [("other.ts".to_string(), vec!["const x = 42;".to_string()])]
+                .into_iter()
+                .collect();
         let query_terms = HashSet::new();
         let query_vec = vec![1.0];
 
