@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
@@ -15,8 +15,11 @@ type EmbedFuture<'a> =
 const MIN_EMBED_INPUT_CHARS: usize = 256;
 
 /// Threshold for switching from brute-force to HNSW approximate nearest neighbor.
-/// Below this, exact brute-force with SIMD is fast enough (<5ms for 1000 vectors).
-const HNSW_THRESHOLD: usize = 1000;
+/// HNSW index is built once and cached via OnceLock on first search call.
+/// Brute-force with SIMD+rayon handles 30K vectors in <3ms, so HNSW is only
+/// beneficial for very large stores where the one-time build cost (~14s for 30K)
+/// is amortized over many queries. Set high to prefer brute-force in practice.
+const HNSW_THRESHOLD: usize = 50_000;
 
 /// Point wrapper for instant-distance HNSW index.
 #[derive(Clone)]
@@ -284,6 +287,16 @@ unsafe impl Sync for VectorData {}
 // VectorStore
 // ---------------------------------------------------------------------------
 
+/// Cached HNSW index for approximate nearest neighbor search.
+/// Built once on first search call and reused for all subsequent queries.
+struct CachedHnsw {
+    map: instant_distance::HnswMap<HnswPoint, usize>,
+}
+
+// SAFETY: HnswMap is read-only after construction and only uses f32 vectors internally.
+unsafe impl Send for CachedHnsw {}
+unsafe impl Sync for CachedHnsw {}
+
 /// In-memory flat vector store with cosine similarity search via simsimd.
 pub struct VectorStore {
     dims: u32,
@@ -292,6 +305,8 @@ pub struct VectorStore {
     keys: Vec<String>,
     hashes: Vec<String>,
     key_index: HashMap<String, usize>,
+    /// Lazily-built HNSW index for stores with >HNSW_THRESHOLD vectors.
+    hnsw_index: OnceLock<CachedHnsw>,
 }
 
 impl VectorStore {
@@ -309,6 +324,7 @@ impl VectorStore {
             keys,
             hashes,
             key_index,
+            hnsw_index: OnceLock::new(),
         }
     }
 
@@ -348,6 +364,7 @@ impl VectorStore {
             keys,
             hashes,
             key_index,
+            hnsw_index: OnceLock::new(),
         }
     }
 
@@ -435,7 +452,8 @@ impl VectorStore {
 
     /// Brute-force exact nearest neighbor search with SIMD cosine similarity.
     /// Parallelized with rayon for large stores.
-    fn find_nearest_brute_force(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+    /// Public for benchmarking comparisons.
+    pub fn find_nearest_brute_force(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         use rayon::prelude::*;
 
         let vectors = self.vectors.as_slice();
@@ -462,33 +480,38 @@ impl VectorStore {
     }
 
     /// HNSW approximate nearest neighbor search for large stores (>1000 vectors).
-    /// Builds an ephemeral HNSW index on-demand for the current query.
+    /// The HNSW index is built once on first call and cached via OnceLock.
     fn find_nearest_hnsw(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
-        let vectors = self.vectors.as_slice();
-        let dims = self.dims as usize;
+        let cached = self.hnsw_index.get_or_init(|| {
+            let vectors = self.vectors.as_slice();
+            let dims = self.dims as usize;
 
-        // Build HNSW points with indices as values
-        let points: Vec<HnswPoint> = (0..self.count as usize)
-            .map(|i| {
-                let offset = i * dims;
-                HnswPoint(vectors[offset..offset + dims].to_vec())
-            })
-            .collect();
-        let values: Vec<usize> = (0..self.count as usize).collect();
+            let points: Vec<HnswPoint> = (0..self.count as usize)
+                .map(|i| {
+                    let offset = i * dims;
+                    HnswPoint(vectors[offset..offset + dims].to_vec())
+                })
+                .collect();
+            let values: Vec<usize> = (0..self.count as usize).collect();
 
-        // Build index (HnswMap<HnswPoint, usize>)
-        let hnsw = instant_distance::Builder::default().build(points, values);
+            CachedHnsw {
+                map: instant_distance::Builder::default().build(points, values),
+            }
+        });
 
-        // Search
         let query_point = HnswPoint(query.to_vec());
         let mut search = instant_distance::Search::default();
-        let results: Vec<_> = hnsw.search(&query_point, &mut search).take(top_k).collect();
+        let results: Vec<_> = cached
+            .map
+            .search(&query_point, &mut search)
+            .take(top_k)
+            .collect();
 
         results
             .into_iter()
             .map(|item| {
                 let idx = *item.value;
-                let sim = 1.0 - item.distance; // instant-distance uses cosine distance
+                let sim = 1.0 - item.distance;
                 (self.keys[idx].clone(), sim)
             })
             .collect()
