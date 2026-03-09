@@ -555,7 +555,6 @@ impl ContextPlusServer {
         let cache = self.ensure_project_cache().await?;
 
         // Build entries and analyses in spawn_blocking (tree-sitter parsing is CPU-bound)
-        let root_clone = root.clone();
         let (ct_entries, ct_analyses) = tokio::task::spawn_blocking(move || {
             let ct_entries: Vec<ct::FileEntry> = cache
                 .file_entries
@@ -594,7 +593,6 @@ impl ContextPlusServer {
                     }
                 }
             }
-            let _ = &root_clone; // ensure root_clone lives through the closure
             (ct_entries, ct_analyses)
         })
         .await

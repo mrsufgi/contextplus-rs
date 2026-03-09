@@ -287,9 +287,34 @@ pub async fn get_context_tree(
     analyses: &BTreeMap<String, FileAnalysis>,
 ) -> Result<String> {
     let include_symbols = options.include_symbols.unwrap_or(true);
+
+    // Filter by target_path if specified — scope tree to a subdirectory
+    let filtered_entries: Vec<FileEntry>;
+    let filtered_analyses: BTreeMap<String, FileAnalysis>;
+    let (effective_entries, effective_analyses) = if let Some(ref target) = options.target_path {
+        let prefix = if target.ends_with('/') {
+            target.clone()
+        } else {
+            format!("{}/", target)
+        };
+        filtered_entries = entries
+            .iter()
+            .filter(|e| e.relative_path == *target || e.relative_path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        filtered_analyses = analyses
+            .iter()
+            .filter(|(k, _)| k.as_str() == target.as_str() || k.starts_with(&prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (&filtered_entries[..], &filtered_analyses)
+    } else {
+        (entries, analyses)
+    };
+
     Ok(build_context_tree(
-        entries,
-        analyses,
+        effective_entries,
+        effective_analyses,
         include_symbols,
         options.max_tokens,
         options.depth_limit,

@@ -119,7 +119,7 @@ file parsing.
 
 ### Content-Hash Cache Invalidation
 
-Each file's content is hashed (via `content_hash()`) before embedding. On subsequent searches, only
+Each file's content is hashed (via `hash_content()`) before embedding. On subsequent searches, only
 files whose hash differs from the cached hash are re-embedded. Unchanged files skip the Ollama API
 call entirely, making warm searches near-instant.
 
