@@ -573,4 +573,283 @@ mod tests {
             "depth 2 entry should be filtered out"
         );
     }
+
+    // --- Large-scale pruning tests ---
+
+    /// Helper: create a file entry with a directory parent at depth 1.
+    fn make_file_entry(dir_index: usize, file_index: usize) -> (FileEntry, FileEntry) {
+        let dir_path = format!("dir_{}", dir_index);
+        let file_path = format!("dir_{}/file_{}.ts", dir_index, file_index);
+        (
+            FileEntry {
+                relative_path: dir_path,
+                is_directory: true,
+                depth: 1,
+            },
+            FileEntry {
+                relative_path: file_path,
+                is_directory: false,
+                depth: 2,
+            },
+        )
+    }
+
+    /// Helper: create a TreeSymbol with a long signature to consume tokens.
+    fn make_symbol(name: &str) -> TreeSymbol {
+        TreeSymbol {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            line: 1,
+            end_line: 50,
+            signature: format!(
+                "export async function {}(param1: string, param2: number, param3: boolean): Promise<Result<void>>",
+                name
+            ),
+            children: vec![TreeSymbol {
+                name: format!("{}_inner", name),
+                kind: "function".to_string(),
+                line: 10,
+                end_line: 40,
+                signature: format!("function {}_inner(ctx: Context): void", name),
+                children: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_large_scale_pruning_level2_to_level1() {
+        // Create 500 files with 5 symbols each.
+        // Each symbol line is ~120 chars + child ~80 chars = ~200 chars per symbol.
+        // 500 files × 5 symbols × 200 chars = ~500K chars = ~125K tokens at Level 2.
+        // Headers alone: 500 × ~60 chars = ~30K chars = ~7.5K tokens at Level 1 (fits).
+        let mut entries = Vec::new();
+        let mut analyses = BTreeMap::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+
+        for i in 0..500 {
+            let dir_idx = i / 10;
+            let (dir_entry, file_entry) = make_file_entry(dir_idx, i);
+            if seen_dirs.insert(dir_idx) {
+                entries.push(dir_entry);
+            }
+            let path = file_entry.relative_path.clone();
+            entries.push(file_entry);
+
+            let symbols: Vec<TreeSymbol> = (0..5)
+                .map(|s| make_symbol(&format!("func_{}_{}", i, s)))
+                .collect();
+            analyses.insert(
+                path,
+                FileAnalysis {
+                    header: Some(format!("Module {} business logic", i)),
+                    symbols,
+                },
+            );
+        }
+
+        let result = build_context_tree(&entries, &analyses, true, None, None);
+
+        // Verify Level 2 was too large and it pruned to Level 1 (headers only).
+        assert!(
+            result.contains("Level 1"),
+            "500 files with 5 symbols each should exceed 50K tokens and prune to Level 1.\n\
+             Output length: {} chars ({} tokens)\nStarts with: {}",
+            result.len(),
+            estimate_tokens(&result),
+            &result[..result.len().min(200)]
+        );
+        // Level 1 prunes symbols — individual symbol names should NOT appear.
+        assert!(
+            !result.contains("func_0_0"),
+            "Symbol names should be pruned at Level 1"
+        );
+        assert!(
+            !result.contains("[function]"),
+            "Symbol kind markers should be pruned at Level 1"
+        );
+    }
+
+    #[test]
+    fn test_large_scale_pruning_level1_to_level0() {
+        // Need headers-only output to exceed 200K chars (50K tokens).
+        // Each file: ~30 char path + " | " + ~300 char header + indentation = ~340 chars.
+        // 800 files × 340 chars = ~272K chars = ~68K tokens — exceeds budget.
+        let mut entries = Vec::new();
+        let mut analyses = BTreeMap::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+
+        for i in 0..800 {
+            let dir_idx = i / 10;
+            let dir_path = format!("pkg_{}", dir_idx);
+            let file_path = format!("pkg_{}/module_{}.ts", dir_idx, i);
+
+            if seen_dirs.insert(dir_idx) {
+                entries.push(FileEntry {
+                    relative_path: dir_path,
+                    is_directory: true,
+                    depth: 1,
+                });
+            }
+            entries.push(FileEntry {
+                relative_path: file_path.clone(),
+                is_directory: false,
+                depth: 2,
+            });
+
+            // ~300 char header per file
+            let long_header = format!(
+                "Enterprise module {} orchestrates domain-driven design patterns for aggregate root {} \
+                 with CQRS event sourcing and saga coordination across bounded contexts and microservice \
+                 choreography layer integration for distributed transaction management number {}",
+                i, i, i
+            );
+            analyses.insert(
+                file_path,
+                FileAnalysis {
+                    header: Some(long_header),
+                    symbols: vec![],
+                },
+            );
+        }
+
+        let result = build_context_tree(&entries, &analyses, true, None, None);
+
+        // Should prune all the way to Level 0 (file names only).
+        assert!(
+            result.contains("Level 0"),
+            "800 files with ~300-char headers should exceed 50K tokens at Level 1 and prune to Level 0.\n\
+             Output length: {} chars ({} tokens)\nStarts with: {}",
+            result.len(),
+            estimate_tokens(&result),
+            &result[..result.len().min(200)]
+        );
+        // At Level 0, only file names remain — no headers.
+        assert!(
+            !result.contains("Enterprise module"),
+            "Headers should be pruned at Level 0"
+        );
+    }
+
+    #[test]
+    fn test_pruning_cascade_produces_valid_output() {
+        // Create entries that trigger Level 0 pruning and verify the output is well-formed.
+        // 700 files with long headers (~300 chars each) to ensure Level 0 is triggered.
+        let mut entries = Vec::new();
+        let mut analyses = BTreeMap::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+
+        for i in 0..700 {
+            let dir_idx = i / 10;
+            let dir_path = format!("area_{}", dir_idx);
+            let file_path = format!("area_{}/svc_{}.ts", dir_idx, i);
+
+            if seen_dirs.insert(dir_idx) {
+                entries.push(FileEntry {
+                    relative_path: dir_path,
+                    is_directory: true,
+                    depth: 1,
+                });
+            }
+            entries.push(FileEntry {
+                relative_path: file_path.clone(),
+                is_directory: false,
+                depth: 2,
+            });
+
+            analyses.insert(
+                file_path,
+                FileAnalysis {
+                    header: Some("x".repeat(300)),
+                    symbols: vec![make_symbol(&format!("handler_{}", i))],
+                },
+            );
+        }
+
+        let result = build_context_tree(&entries, &analyses, true, None, None);
+
+        // Output must be non-empty.
+        assert!(!result.is_empty(), "Pruned output should not be empty");
+
+        // Output must contain the root marker.
+        assert!(
+            result.contains("./"),
+            "Output should contain the root directory marker"
+        );
+
+        // Output must contain at least some file paths.
+        assert!(
+            result.contains("svc_0.ts"),
+            "Output should contain file names even after full pruning"
+        );
+        assert!(
+            result.contains("area_0/"),
+            "Output should contain directory names"
+        );
+
+        // No garbled text — every line should be printable ASCII or a known Level marker.
+        for line in result.lines() {
+            assert!(
+                line.chars()
+                    .all(|c| c.is_ascii() && !c.is_ascii_control() || c == '\t'),
+                "Line contains non-printable characters: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_depth_limit_reduces_token_count() {
+        // Create 200 entries at various depths (1-5).
+        let mut entries = Vec::new();
+        let mut analyses = BTreeMap::new();
+
+        // Build a nested directory structure: d0/d1/d2/d3/d4/file.ts
+        for depth_chain in 0..40 {
+            let mut path_parts = Vec::new();
+            for d in 0..5 {
+                path_parts.push(format!("l{}_{}", d, depth_chain));
+                let dir_path = path_parts.join("/");
+                entries.push(FileEntry {
+                    relative_path: dir_path,
+                    is_directory: true,
+                    depth: d + 1,
+                });
+            }
+            // Add a file at depth 6
+            let file_path = format!("{}/leaf_{}.ts", path_parts.join("/"), depth_chain);
+            entries.push(FileEntry {
+                relative_path: file_path.clone(),
+                is_directory: false,
+                depth: 6,
+            });
+            analyses.insert(
+                file_path,
+                FileAnalysis {
+                    header: Some(format!("Leaf module {}", depth_chain)),
+                    symbols: vec![make_symbol(&format!("leaf_fn_{}", depth_chain))],
+                },
+            );
+        }
+
+        // Full tree — no depth limit, large token budget to avoid pruning.
+        let full_result = build_context_tree(&entries, &analyses, true, Some(500_000), None);
+        // Depth-limited to 2 — should be significantly shorter.
+        let limited_result = build_context_tree(&entries, &analyses, true, Some(500_000), Some(2));
+
+        let full_tokens = estimate_tokens(&full_result);
+        let limited_tokens = estimate_tokens(&limited_result);
+
+        assert!(
+            limited_tokens < full_tokens,
+            "Depth-limited output ({} tokens) should have fewer tokens than full output ({} tokens)",
+            limited_tokens,
+            full_tokens
+        );
+
+        // The limited version should not contain deep entries.
+        assert!(
+            !limited_result.contains("leaf_"),
+            "Depth-limited to 2 should not contain depth-6 leaf files"
+        );
+    }
 }

@@ -144,10 +144,10 @@ contextplus-rs tree --max-tokens 5000
 ### Code Analysis
 | Tool | Description |
 |------|-------------|
-| `get_context_tree` | Token-aware file tree with symbols and line ranges |
+| `get_context_tree` | Token-aware file tree with symbols and line ranges. Supports `depth_limit` to cap directory depth and `max_tokens` (default 50K) for automatic pruning (Level 2 → 1 → 0) |
 | `get_file_skeleton` | Function signatures and structure without full file read |
 | `get_blast_radius` | Map every file that imports or references a symbol |
-| `run_static_analysis` | Run available linters (tsc, eslint, cargo check, ruff) |
+| `run_static_analysis` | Run available linters (tsc with `--build` for project references, eslint, cargo check, ruff) |
 
 ### Semantic Search
 | Tool | Description |
@@ -180,6 +180,9 @@ contextplus-rs tree --max-tokens 5000
 
 ## Architecture
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed internals (data flow, caching strategy, memory
+layout, performance architecture, and how to add new tools).
+
 ```
 src/
   main.rs                    # CLI + MCP server entry point
@@ -195,7 +198,7 @@ src/
     clustering.rs            # Spectral clustering (nalgebra)
     memory_graph.rs          # petgraph + rkyv persistence
     hub.rs                   # Wikilink parser
-  tools/                     # One file per tool
+  tools/                     # One file per tool (context_tree supports depth_limit filtering)
   git/shadow.rs              # Restore points (file-based backup)
   cache/rkyv_store.rs        # Zero-copy rkyv+mmap VectorStore
 ```
@@ -276,7 +279,7 @@ Warm search on 30K files: **4.3ms**. Hash-check (no-op refresh): **<1ms**.
 ## Development
 
 ```bash
-cargo test                  # 571 tests
+cargo test                  # 584 tests
 cargo bench                 # Criterion benchmarks (cache, cosine, tree-sitter, search)
 cargo clippy --all-targets  # Lint
 cargo fmt --check           # Format check
