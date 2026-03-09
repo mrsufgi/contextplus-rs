@@ -13,6 +13,21 @@ type EmbedFuture<'a> =
 // ---------------------------------------------------------------------------
 
 const MIN_EMBED_INPUT_CHARS: usize = 256;
+
+/// Threshold for switching from brute-force to HNSW approximate nearest neighbor.
+/// Below this, exact brute-force with SIMD is fast enough (<5ms for 1000 vectors).
+const HNSW_THRESHOLD: usize = 1000;
+
+/// Point wrapper for instant-distance HNSW index.
+#[derive(Clone)]
+struct HnswPoint(Vec<f32>);
+
+impl instant_distance::Point for HnswPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        // Use simsimd for SIMD-accelerated cosine distance
+        1.0 - cosine_similarity_simsimd(&self.0, &other.0)
+    }
+}
 const SINGLE_INPUT_SHRINK_FACTOR: f64 = 0.75;
 const MAX_SINGLE_INPUT_RETRIES: usize = 8;
 
@@ -402,23 +417,39 @@ impl VectorStore {
         self.vectors.as_slice()
     }
 
-    /// Find the top-k nearest neighbors by cosine similarity using simsimd.
+    /// Find the top-k nearest neighbors by cosine similarity.
+    /// For stores with >1000 vectors, uses HNSW approximate nearest neighbor index.
+    /// For smaller stores, uses brute-force SIMD scan (exact results).
     /// Returns (key, similarity) pairs sorted by descending similarity.
     pub fn find_nearest(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         if self.count == 0 || query.len() != self.dims as usize {
             return Vec::new();
         }
 
-        let vectors = self.vectors.as_slice();
-        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(self.count as usize);
-
-        for i in 0..self.count as usize {
-            let offset = i * self.dims as usize;
-            let stored = &vectors[offset..offset + self.dims as usize];
-
-            let similarity = cosine_similarity_simsimd(query, stored);
-            scored.push((i, similarity));
+        if self.count as usize > HNSW_THRESHOLD {
+            self.find_nearest_hnsw(query, top_k)
+        } else {
+            self.find_nearest_brute_force(query, top_k)
         }
+    }
+
+    /// Brute-force exact nearest neighbor search with SIMD cosine similarity.
+    /// Parallelized with rayon for large stores.
+    fn find_nearest_brute_force(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+        use rayon::prelude::*;
+
+        let vectors = self.vectors.as_slice();
+        let dims = self.dims as usize;
+
+        let mut scored: Vec<(usize, f32)> = (0..self.count as usize)
+            .into_par_iter()
+            .map(|i| {
+                let offset = i * dims;
+                let stored = &vectors[offset..offset + dims];
+                let similarity = cosine_similarity_simsimd(query, stored);
+                (i, similarity)
+            })
+            .collect();
 
         // Sort descending by similarity
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -427,6 +458,39 @@ impl VectorStore {
         scored
             .into_iter()
             .map(|(idx, sim)| (self.keys[idx].clone(), sim))
+            .collect()
+    }
+
+    /// HNSW approximate nearest neighbor search for large stores (>1000 vectors).
+    /// Builds an ephemeral HNSW index on-demand for the current query.
+    fn find_nearest_hnsw(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+        let vectors = self.vectors.as_slice();
+        let dims = self.dims as usize;
+
+        // Build HNSW points with indices as values
+        let points: Vec<HnswPoint> = (0..self.count as usize)
+            .map(|i| {
+                let offset = i * dims;
+                HnswPoint(vectors[offset..offset + dims].to_vec())
+            })
+            .collect();
+        let values: Vec<usize> = (0..self.count as usize).collect();
+
+        // Build index (HnswMap<HnswPoint, usize>)
+        let hnsw = instant_distance::Builder::default().build(points, values);
+
+        // Search
+        let query_point = HnswPoint(query.to_vec());
+        let mut search = instant_distance::Search::default();
+        let results: Vec<_> = hnsw.search(&query_point, &mut search).take(top_k).collect();
+
+        results
+            .into_iter()
+            .map(|item| {
+                let idx = *item.value;
+                let sim = 1.0 - item.distance; // instant-distance uses cosine distance
+                (self.keys[idx].clone(), sim)
+            })
             .collect()
     }
 

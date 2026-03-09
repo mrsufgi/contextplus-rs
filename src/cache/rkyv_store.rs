@@ -235,8 +235,16 @@ pub fn mmap_vector_store(root_dir: &Path, name: &str) -> Result<Option<VectorSto
 
     // Copy small metadata (keys + hashes are typically <1% of total size)
     let dims = archived.dims.to_native();
-    let keys: Vec<String> = archived.keys.iter().map(|s| s.as_str().to_owned()).collect();
-    let hashes: Vec<String> = archived.hashes.iter().map(|s| s.as_str().to_owned()).collect();
+    let keys: Vec<String> = archived
+        .keys
+        .iter()
+        .map(|s| s.as_str().to_owned())
+        .collect();
+    let hashes: Vec<String> = archived
+        .hashes
+        .iter()
+        .map(|s| s.as_str().to_owned())
+        .collect();
 
     // Zero-copy vector data: reinterpret &[f32_le] as *const f32.
     // SAFETY: On little-endian platforms (x86_64, aarch64), rkyv's f32_le has
@@ -250,9 +258,8 @@ pub fn mmap_vector_store(root_dir: &Path, name: &str) -> Result<Option<VectorSto
 
     // SAFETY: vectors_ptr points into the mmap, is aligned (rkyv guarantees
     // alignment), and the Arc<Mmap> keeps the mapping alive.
-    let store = unsafe {
-        VectorStore::from_mmap(dims, keys, hashes, vectors_ptr, vectors_len, mmap)
-    };
+    let store =
+        unsafe { VectorStore::from_mmap(dims, keys, hashes, vectors_ptr, vectors_len, mmap) };
 
     Ok(Some(store))
 }
@@ -488,11 +495,7 @@ mod tests {
                 "src/api.ts".to_string(),
             ],
             vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
-            vec![
-                0.9, 0.1, 0.0,
-                0.0, 0.9, 0.1,
-                0.5, 0.5, 0.0,
-            ],
+            vec![0.9, 0.1, 0.0, 0.0, 0.9, 0.1, 0.5, 0.5, 0.0],
         );
 
         save_vector_store(dir.path(), "cmp", &store).unwrap();
@@ -516,7 +519,9 @@ mod tests {
                 assert!(
                     (a - b).abs() < 1e-6,
                     "vector mismatch for key '{}': regular={}, mmap={}",
-                    key, a, b
+                    key,
+                    a,
+                    b
                 );
             }
         }
@@ -534,11 +539,7 @@ mod tests {
                 "src/api.ts".to_string(),
             ],
             vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
-            vec![
-                0.9, 0.1, 0.0,
-                0.0, 0.9, 0.1,
-                0.5, 0.5, 0.0,
-            ],
+            vec![0.9, 0.1, 0.0, 0.0, 0.9, 0.1, 0.5, 0.5, 0.0],
         );
 
         save_vector_store(dir.path(), "nn", &store).unwrap();
@@ -556,7 +557,8 @@ mod tests {
             assert!(
                 (r.1 - m.1).abs() < 1e-6,
                 "similarity mismatch: regular={}, mmap={}",
-                r.1, m.1
+                r.1,
+                m.1
             );
         }
     }
@@ -573,7 +575,9 @@ mod tests {
         );
 
         save_vector_store(dir.path(), "cache-test", &store).unwrap();
-        let loaded = mmap_vector_store(dir.path(), "cache-test").unwrap().unwrap();
+        let loaded = mmap_vector_store(dir.path(), "cache-test")
+            .unwrap()
+            .unwrap();
 
         let cache = loaded.to_cache();
         assert_eq!(cache.len(), 1);

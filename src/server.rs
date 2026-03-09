@@ -48,13 +48,13 @@ pub struct SharedState {
     pub root_dir: PathBuf,
     pub ollama: OllamaClient,
     pub memory_graph: GraphStore,
-    pub project_cache: RwLock<Option<ProjectCache>>,
+    pub project_cache: RwLock<Option<Arc<ProjectCache>>>,
     /// Cached embedding vectors keyed by relative file path.
     /// Uses CacheEntry (hash + vector) for content-hash invalidation.
     /// Persisted to disk via rkyv_store for cross-restart survival.
     pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
     /// Cached identifier index — avoids re-embedding all symbols on each call.
-    pub identifier_index: RwLock<Option<IdentifierIndex>>,
+    pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -63,13 +63,36 @@ pub struct ContextPlusServer {
     pub state: Arc<SharedState>,
 }
 
+/// Sanitize a model name for use in cache filenames.
+/// Replaces `/`, `:`, and other non-filename chars with `-`.
+pub fn sanitize_model_name(model: &str) -> String {
+    model
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Build a model-qualified cache name to prevent cross-model cache poisoning.
+/// E.g., `cache_name("embeddings", "snowflake-arctic-embed2")` → `"embeddings-snowflake-arctic-embed2"`.
+pub fn cache_name(base: &str, model: &str) -> String {
+    format!("{}-{}", base, sanitize_model_name(model))
+}
+
 impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
         let ollama = OllamaClient::new(&config);
         let memory_graph = GraphStore::new();
 
+        let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
+
         // Load embedding cache from disk if available (cross-restart persistence)
-        let initial_cache = match rkyv_store::load_vector_store(&root_dir, "embeddings") {
+        let initial_cache = match rkyv_store::load_vector_store(&root_dir, &embed_cache_name) {
             Ok(Some(store)) => {
                 let cache_map = store.to_cache();
                 tracing::info!(
@@ -139,23 +162,17 @@ impl ContextPlusServer {
 
     /// Returns a snapshot of the project cache, lazily initializing or refreshing
     /// when the TTL has expired. All filesystem I/O runs inside `spawn_blocking`.
+    /// Uses Arc to avoid deep-cloning the entire cache on every tool call.
     async fn ensure_project_cache(&self) -> Result<Arc<ProjectCache>> {
         let ttl_secs = self.state.config.cache_ttl_secs;
 
-        // Fast path: cache exists and is fresh
+        // Fast path: cache exists and is fresh — just clone the Arc (cheap)
         {
             let guard = self.state.project_cache.read().await;
             if let Some(ref cache) = *guard
                 && cache.last_refresh.elapsed().as_secs() < ttl_secs
             {
-                let file_entries = cache.file_entries.clone();
-                let file_lines = cache.file_lines.clone();
-                let last_refresh = cache.last_refresh;
-                return Ok(Arc::new(ProjectCache {
-                    file_entries,
-                    file_lines,
-                    last_refresh,
-                }));
+                return Ok(Arc::clone(cache));
             }
         }
 
@@ -187,14 +204,10 @@ impl ContextPlusServer {
 
         let arc_cache = Arc::new(new_cache);
 
-        // Store a clone in the shared state
+        // Store the Arc in shared state (cheap clone of the Arc pointer)
         {
             let mut guard = self.state.project_cache.write().await;
-            *guard = Some(ProjectCache {
-                file_entries: arc_cache.file_entries.clone(),
-                file_lines: arc_cache.file_lines.clone(),
-                last_refresh: arc_cache.last_refresh,
-            });
+            *guard = Some(Arc::clone(&arc_cache));
         }
 
         Ok(arc_cache)
@@ -212,6 +225,100 @@ impl ContextPlusServer {
         *idx_guard = None;
     }
 
+    /// Incrementally re-embed specific changed files without invalidating the entire cache.
+    /// Reads each file, computes content hash, re-embeds only if changed, updates cache.
+    /// Returns (updated_count, skipped_count).
+    pub async fn incremental_reembed(&self, files: &[std::path::PathBuf]) -> (usize, usize) {
+        let mut updated = 0usize;
+        let mut skipped = 0usize;
+
+        let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
+
+        for file_path in files {
+            let rel_path = match file_path.strip_prefix(&self.state.root_dir) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => file_path.to_string_lossy().to_string(),
+            };
+
+            let content = match tokio::fs::read_to_string(file_path).await {
+                Ok(c) => c,
+                Err(_) => {
+                    // File deleted — remove from cache
+                    let mut cache = self.state.embedding_cache.write().await;
+                    cache.remove(&rel_path);
+                    updated += 1;
+                    continue;
+                }
+            };
+
+            let hash = crate::core::parser::hash_content(&content);
+
+            // Check if content actually changed
+            {
+                let cache = self.state.embedding_cache.read().await;
+                if let Some(entry) = cache.get(&rel_path)
+                    && entry.hash == hash
+                {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            let truncated = if content.len() > 500 {
+                crate::core::parser::truncate_to_char_boundary(&content, 500).to_string()
+            } else {
+                content
+            };
+            let header =
+                crate::core::parser::extract_header(&truncated.lines().collect::<Vec<_>>());
+            let text = format!("{} {} {}", header, rel_path, truncated);
+            texts_to_embed.push((rel_path, hash, text));
+        }
+
+        if texts_to_embed.is_empty() {
+            return (updated, skipped);
+        }
+
+        let embed_texts: Vec<String> = texts_to_embed.iter().map(|(_, _, t)| t.clone()).collect();
+        match self.state.ollama.embed(&embed_texts).await {
+            Ok(vectors) => {
+                let mut cache = self.state.embedding_cache.write().await;
+                for (i, (rel_path, hash, _)) in texts_to_embed.iter().enumerate() {
+                    if i < vectors.len() {
+                        cache.insert(
+                            rel_path.clone(),
+                            CacheEntry {
+                                hash: hash.clone(),
+                                vector: vectors[i].clone(),
+                            },
+                        );
+                        updated += 1;
+                    }
+                }
+
+                // Persist to disk outside the write lock scope
+                let store = crate::core::embeddings::VectorStore::from_cache(&cache);
+                drop(cache);
+                let embed_cache_name =
+                    cache_name("embeddings", &self.state.config.ollama_embed_model);
+                if let Some(s) = store
+                    && let Err(e) =
+                        rkyv_store::save_vector_store(&self.state.root_dir, &embed_cache_name, &s)
+                {
+                    tracing::warn!("Failed to save incremental embedding cache: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Incremental re-embed failed: {e}");
+            }
+        }
+
+        // Invalidate project cache + identifier index so they rebuild with fresh data
+        self.invalidate_project_cache().await;
+
+        (updated, skipped)
+    }
+
     /// Ensure the identifier index is built and cached.
     /// Returns cached index if TTL hasn't expired and file count is unchanged.
     /// Otherwise rebuilds: parses all symbols, embeds them, caches the result.
@@ -225,20 +332,14 @@ impl ContextPlusServer {
             .filter(|e| !e.is_directory)
             .count();
 
-        // Fast path: index exists, TTL valid, file count unchanged
+        // Fast path: index exists, TTL valid, file count unchanged — clone Arc (cheap)
         {
             let guard = self.state.identifier_index.read().await;
             if let Some(ref idx) = *guard
                 && idx.file_count == file_count
                 && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
             {
-                return Ok(Arc::new(IdentifierIndex {
-                    docs: idx.docs.clone(),
-                    vector_buffer: idx.vector_buffer.clone(),
-                    dims: idx.dims,
-                    file_count: idx.file_count,
-                    built_at: idx.built_at,
-                }));
+                return Ok(Arc::clone(idx));
             }
         }
 
@@ -290,22 +391,16 @@ impl ContextPlusServer {
         .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
 
         if identifier_docs.is_empty() {
-            let idx = IdentifierIndex {
+            let idx = Arc::new(IdentifierIndex {
                 docs: Vec::new(),
                 vector_buffer: Vec::new(),
                 dims: 0,
                 file_count,
                 built_at: Instant::now(),
-            };
-            let mut guard = self.state.identifier_index.write().await;
-            *guard = Some(IdentifierIndex {
-                docs: idx.docs.clone(),
-                vector_buffer: idx.vector_buffer.clone(),
-                dims: idx.dims,
-                file_count: idx.file_count,
-                built_at: idx.built_at,
             });
-            return Ok(Arc::new(idx));
+            let mut guard = self.state.identifier_index.write().await;
+            *guard = Some(Arc::clone(&idx));
+            return Ok(idx);
         }
 
         // Step 2: Check identifier embedding cache on disk, embed only missing
@@ -316,7 +411,11 @@ impl ContextPlusServer {
         );
 
         // Load identifier-specific embedding cache
-        let id_cache = match rkyv_store::load_cache(&self.state.root_dir, "identifier-embeddings") {
+        let id_cache_name = cache_name(
+            "identifier-embeddings",
+            &self.state.config.ollama_embed_model,
+        );
+        let id_cache = match rkyv_store::load_cache(&self.state.root_dir, &id_cache_name) {
             Ok(Some(data)) => {
                 let store = data.to_store();
                 tracing::info!(cached = store.count(), "Loaded identifier embedding cache");
@@ -363,14 +462,15 @@ impl ContextPlusServer {
             if all_vecs.len() == all_texts.len() {
                 let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
                 let keys = all_texts;
-                let hashes: Vec<String> = keys.iter().map(|_| String::new()).collect();
+                let hashes: Vec<String> = keys
+                    .iter()
+                    .map(|k| crate::core::parser::hash_content(k))
+                    .collect();
                 let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
                 let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
-                if let Err(e) = rkyv_store::save_vector_store(
-                    &self.state.root_dir,
-                    "identifier-embeddings",
-                    &store,
-                ) {
+                if let Err(e) =
+                    rkyv_store::save_vector_store(&self.state.root_dir, &id_cache_name, &store)
+                {
                     tracing::warn!("Failed to save identifier embedding cache: {e}");
                 }
             }
@@ -385,27 +485,21 @@ impl ContextPlusServer {
             .flat_map(|v| v.unwrap_or_else(|| vec![0.0; dims]))
             .collect();
 
-        let idx = IdentifierIndex {
+        let idx = Arc::new(IdentifierIndex {
             docs: identifier_docs,
             vector_buffer: flat_buffer,
             dims,
             file_count,
             built_at: Instant::now(),
-        };
+        });
 
-        // Store in shared state
+        // Store Arc in shared state (cheap pointer clone, no data copy)
         {
             let mut guard = self.state.identifier_index.write().await;
-            *guard = Some(IdentifierIndex {
-                docs: idx.docs.clone(),
-                vector_buffer: idx.vector_buffer.clone(),
-                dims: idx.dims,
-                file_count: idx.file_count,
-                built_at: idx.built_at,
-            });
+            *guard = Some(Arc::clone(&idx));
         }
 
-        Ok(Arc::new(idx))
+        Ok(idx)
     }
 
     /// Helper: convert cached file_lines HashMap into the Vec<(String, Vec<String>)> format
@@ -1210,11 +1304,12 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                         }
                     }
 
-                    // Persist to disk
+                    // Persist to disk with model-qualified name
+                    let code_cache_name = cache_name("embeddings", &config.ollama_embed_model);
                     if let Some(store) =
                         crate::core::embeddings::VectorStore::from_cache(&cache_write)
                         && let Err(e) =
-                            rkyv_store::save_vector_store(store_root, "embeddings", &store)
+                            rkyv_store::save_vector_store(store_root, &code_cache_name, &store)
                     {
                         tracing::warn!("Failed to save embedding cache: {e}");
                     }

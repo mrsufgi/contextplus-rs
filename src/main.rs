@@ -273,14 +273,24 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
             max_files_per_tick: config.embed_tracker_max_files,
             ignore_dirs: config.ignore_dirs.clone(),
         };
+        let server_for_tracker = ContextPlusServer {
+            state: server_state,
+        };
+        let tracker_root = root_dir.clone();
         let callback: contextplus_rs::core::embedding_tracker::RefreshCallback =
-            std::sync::Arc::new(move |_root, _files| {
-                let state = server_state.clone();
+            std::sync::Arc::new(move |_root, files| {
+                let srv = server_for_tracker.clone();
+                let root = tracker_root.clone();
+                let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
                 tokio::spawn(async move {
-                    let mut guard = state.project_cache.write().await;
-                    *guard = None;
-                    tracing::debug!("Project cache invalidated due to file changes");
-                    (0, 0)
+                    let (updated, skipped) = srv.incremental_reembed(&changed_files).await;
+                    tracing::debug!(
+                        updated,
+                        skipped,
+                        "Incremental re-embedding for {} changed files",
+                        changed_files.len()
+                    );
+                    (updated, skipped)
                 })
             });
         match contextplus_rs::core::embedding_tracker::start_tracker(

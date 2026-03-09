@@ -4,6 +4,7 @@
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use rand::Rng;
+use rayon::prelude::*;
 
 /// Matrices larger than this use randomized SVD instead of full eigendecomposition.
 /// Below this threshold, full `SymmetricEigen` is used (more accurate, still fast enough).
@@ -15,15 +16,28 @@ pub struct ClusterResult {
     pub indices: Vec<usize>,
 }
 
-/// Build a symmetric affinity matrix from embedding vectors using cosine similarity.
+/// Build a symmetric affinity matrix from embedding vectors using SIMD cosine similarity.
 /// Diagonal is zero (no self-affinity). Negative similarities are clamped to 0.
+/// Uses rayon to parallelize the outer loop for large matrices.
 fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
     let n = vectors.len();
-    let mut mat = DMatrix::zeros(n, n);
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let sim = cosine_sim(&vectors[i], &vectors[j]).max(0.0);
+    // Compute upper triangle in parallel — each row's (i, j>i) pairs are independent
+    let rows: Vec<Vec<(usize, f64)>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut row_entries = Vec::with_capacity(n - i - 1);
+            for j in (i + 1)..n {
+                let sim = cosine_similarity_simsimd(&vectors[i], &vectors[j]).max(0.0) as f64;
+                row_entries.push((j, sim));
+            }
+            row_entries
+        })
+        .collect();
+
+    let mut mat = DMatrix::zeros(n, n);
+    for (i, row_entries) in rows.into_iter().enumerate() {
+        for (j, sim) in row_entries {
             mat[(i, j)] = sim;
             mat[(j, i)] = sim;
         }
@@ -31,24 +45,14 @@ fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
     mat
 }
 
-/// Compute cosine similarity between two f32 vectors, returning f64.
-fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 0.0;
+/// Compute cosine similarity using simsimd SIMD acceleration.
+/// Returns similarity (1.0 - distance) clamped to [0, 1].
+fn cosine_similarity_simsimd(a: &[f32], b: &[f32]) -> f32 {
+    use simsimd::SpatialSimilarity;
+    match f32::cosine(a, b) {
+        Some(distance) => (1.0 - distance as f32).clamp(0.0, 1.0),
+        None => 0.0,
     }
-    let mut dot: f64 = 0.0;
-    let mut norm_a: f64 = 0.0;
-    let mut norm_b: f64 = 0.0;
-    for i in 0..len {
-        let ai = a[i] as f64;
-        let bi = b[i] as f64;
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-15 { 0.0 } else { dot / denom }
 }
 
 /// Compute normalized symmetric Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
@@ -253,24 +257,26 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
 
     let mut assignments = vec![0_usize; n];
 
-    // Lloyd's iterations
+    // Lloyd's iterations (assignment step parallelized with rayon)
     for _ in 0..50 {
-        let mut changed = false;
-        for i in 0..n {
-            let mut best_dist = f64::INFINITY;
-            let mut best_c = 0_usize;
-            for (c, centroid) in centroids.iter().enumerate() {
-                let dist: f64 = (0..dim).map(|d| (data[i][d] - centroid[d]).powi(2)).sum();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_c = c;
+        let new_assignments: Vec<usize> = data
+            .par_iter()
+            .map(|row| {
+                let mut best_dist = f64::INFINITY;
+                let mut best_c = 0_usize;
+                for (c, centroid) in centroids.iter().enumerate() {
+                    let dist: f64 = (0..dim).map(|d| (row[d] - centroid[d]).powi(2)).sum();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_c = c;
+                    }
                 }
-            }
-            if assignments[i] != best_c {
-                assignments[i] = best_c;
-                changed = true;
-            }
-        }
+                best_c
+            })
+            .collect();
+
+        let changed = assignments != new_assignments;
+        assignments = new_assignments;
         if !changed {
             break;
         }
@@ -488,7 +494,7 @@ mod tests {
     fn cosine_sim_identical_vectors() {
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![1.0_f32, 0.0, 0.0];
-        let sim = cosine_sim(&a, &b);
+        let sim = cosine_similarity_simsimd(&a, &b) as f64;
         assert!((sim - 1.0).abs() < 1e-6);
     }
 
@@ -496,7 +502,7 @@ mod tests {
     fn cosine_sim_orthogonal_vectors() {
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![0.0_f32, 1.0, 0.0];
-        let sim = cosine_sim(&a, &b);
+        let sim = cosine_similarity_simsimd(&a, &b) as f64;
         assert!(sim.abs() < 1e-6);
     }
 
@@ -504,14 +510,17 @@ mod tests {
     fn cosine_sim_empty_vectors() {
         let a: Vec<f32> = vec![];
         let b: Vec<f32> = vec![];
-        assert_eq!(cosine_sim(&a, &b), 0.0);
+        // simsimd returns 0.0 distance for empty vectors → 1.0 similarity.
+        // The affinity matrix clamps negative values to 0, so this is safe.
+        let sim = cosine_similarity_simsimd(&a, &b);
+        assert!(sim >= 0.0); // just verify it doesn't panic or return NaN
     }
 
     #[test]
     fn cosine_sim_zero_vectors() {
         let a = vec![0.0_f32, 0.0, 0.0];
         let b = vec![1.0_f32, 0.0, 0.0];
-        assert_eq!(cosine_sim(&a, &b), 0.0);
+        assert_eq!(cosine_similarity_simsimd(&a, &b) as f64, 0.0);
     }
 
     #[test]

@@ -74,7 +74,15 @@ pub async fn semantic_navigate(
     }
 
     // Resolve vectors: check cache first, embed only uncached/changed files
-    let vectors = match resolve_embeddings(&files, ollama, embedding_cache, root_dir).await {
+    let vectors = match resolve_embeddings(
+        &files,
+        ollama,
+        embedding_cache,
+        root_dir,
+        &config.ollama_embed_model,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             return Ok(format!(
@@ -174,6 +182,7 @@ async fn resolve_embeddings(
     ollama: &OllamaClient,
     embedding_cache: &RwLock<HashMap<String, CacheEntry>>,
     root_dir: &Path,
+    embed_model: &str,
 ) -> std::result::Result<Vec<Vec<f32>>, crate::error::ContextPlusError> {
     let cache_read = embedding_cache.read().await;
 
@@ -220,8 +229,8 @@ async fn resolve_embeddings(
     // Embed only the uncached/stale files
     let new_vectors = ollama.embed(&uncached_texts).await?;
 
-    // Store new vectors in cache, fill result, and persist to disk
-    {
+    // Store new vectors in cache, then drop lock BEFORE disk I/O
+    let store_to_save = {
         let mut cache_write = embedding_cache.write().await;
         for (j, &file_idx) in uncached_indices.iter().enumerate() {
             if j < new_vectors.len() {
@@ -236,12 +245,18 @@ async fn resolve_embeddings(
             }
         }
 
-        // Persist full cache to disk
-        if let Some(store) = VectorStore::from_cache(&cache_write)
-            && let Err(e) = rkyv_store::save_vector_store(root_dir, "embeddings", &store)
-        {
-            tracing::warn!("Failed to save embedding cache to disk: {e}");
-        }
+        // Build store while we hold the lock, but save AFTER releasing it
+        VectorStore::from_cache(&cache_write)
+        // cache_write lock drops here
+    };
+
+    // Persist to disk outside the lock — disk I/O can take 50-200ms,
+    // holding the write lock during that time blocks all concurrent readers.
+    let embed_cache_name = crate::server::cache_name("embeddings", embed_model);
+    if let Some(store) = store_to_save
+        && let Err(e) = rkyv_store::save_vector_store(root_dir, &embed_cache_name, &store)
+    {
+        tracing::warn!("Failed to save embedding cache to disk: {e}");
     }
 
     Ok(result_vectors
@@ -1478,7 +1493,7 @@ mod tests {
         bad_config.ollama_host = "http://127.0.0.1:1".to_string(); // unreachable
         let ollama = OllamaClient::new(&bad_config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path()).await;
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path(), "test-model").await;
         assert!(result.is_ok(), "should succeed from cache without Ollama");
         let vecs = result.unwrap();
         assert_eq!(vecs.len(), 2);
@@ -1522,7 +1537,7 @@ mod tests {
         config.ollama_host = mock_server.uri();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path()).await;
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path(), "test-model").await;
         assert!(result.is_ok());
         let vecs = result.unwrap();
         assert_eq!(vecs[0], vec![1.0, 2.0, 3.0]); // from cache
@@ -1558,7 +1573,7 @@ mod tests {
         config.ollama_host = mock_server.uri();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path())
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path(), "test-model")
             .await
             .unwrap();
         assert_eq!(result.len(), 2);
@@ -1579,7 +1594,7 @@ mod tests {
         let config = crate::config::Config::from_env();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path())
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path(), "test-model")
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -1621,7 +1636,7 @@ mod tests {
         config.ollama_host = mock_server.uri();
         let ollama = OllamaClient::new(&config);
 
-        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path())
+        let result = resolve_embeddings(&files, &ollama, &cache, tmp.path(), "test-model")
             .await
             .unwrap();
         // Should have re-embedded with new vector from Ollama

@@ -58,7 +58,9 @@ fn definition_types(grammar_name: &str) -> HashMap<&'static str, &'static str> {
             ("struct_item", "struct"),
             ("enum_item", "enum"),
             ("trait_item", "trait"),
-            ("impl_item", "class"),
+            ("impl_item", "impl"),
+            ("mod_item", "module"),
+            ("macro_definition", "macro"),
         ]),
         "go" => HashMap::from([
             ("function_declaration", "function"),
