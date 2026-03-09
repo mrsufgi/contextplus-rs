@@ -6,7 +6,7 @@
 //! - Excludes definition lines when fileContext matches
 //! - Uses regex with escaped special chars (prevents ReDoS)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -46,7 +46,7 @@ pub struct SymbolUsage {
 #[derive(Debug)]
 pub struct BlastRadiusResult {
     pub usages: Vec<SymbolUsage>,
-    pub by_file: BTreeMap<String, Vec<SymbolUsage>>,
+    pub by_file: HashMap<String, Vec<SymbolUsage>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ pub fn find_symbol_usages(
         Err(_) => {
             return BlastRadiusResult {
                 usages: vec![],
-                by_file: BTreeMap::new(),
+                by_file: HashMap::new(),
             };
         }
     };
@@ -109,7 +109,7 @@ pub fn find_symbol_usages(
         }
     }
 
-    let mut by_file: BTreeMap<String, Vec<SymbolUsage>> = BTreeMap::new();
+    let mut by_file: HashMap<String, Vec<SymbolUsage>> = HashMap::new();
     for u in &usages {
         by_file.entry(u.file.clone()).or_default().push(u.clone());
     }
@@ -134,7 +134,11 @@ pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> Str
         result.by_file.len()
     ));
 
-    for (file, file_usages) in &result.by_file {
+    // Sort files for deterministic output
+    let mut sorted_files: Vec<&String> = result.by_file.keys().collect();
+    sorted_files.sort();
+    for file in sorted_files {
+        let file_usages = &result.by_file[file];
         lines.push(format!("  {}:", file));
         for u in file_usages {
             lines.push(format!("    L{}: {}", u.line, u.context));
@@ -284,7 +288,7 @@ mod tests {
     fn test_format_no_usages() {
         let result = BlastRadiusResult {
             usages: vec![],
-            by_file: BTreeMap::new(),
+            by_file: HashMap::new(),
         };
         let output = format_blast_radius("myFunc", &result);
         assert_eq!(
@@ -300,7 +304,7 @@ mod tests {
             line: 5,
             context: "const x = myFunc();".to_string(),
         }];
-        let mut by_file = BTreeMap::new();
+        let mut by_file = HashMap::new();
         by_file.insert("src/handler.ts".to_string(), usages.clone());
         let result = BlastRadiusResult { usages, by_file };
         let output = format_blast_radius("myFunc", &result);
@@ -327,7 +331,7 @@ mod tests {
                 context: "import myFunc".to_string(),
             },
         ];
-        let mut by_file = BTreeMap::new();
+        let mut by_file = HashMap::new();
         by_file.insert("src/a.ts".to_string(), usages[..2].to_vec());
         by_file.insert("src/b.ts".to_string(), usages[2..].to_vec());
         let result = BlastRadiusResult { usages, by_file };

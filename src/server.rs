@@ -404,9 +404,9 @@ impl ContextPlusServer {
         }
 
         // Step 2: Check identifier embedding cache on disk, embed only missing
-        let texts: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
+        let n_identifiers = identifier_docs.len();
         tracing::info!(
-            identifiers = texts.len(),
+            identifiers = n_identifiers,
             "Embedding identifiers (using disk cache for warm hits)"
         );
 
@@ -424,25 +424,25 @@ impl ContextPlusServer {
             _ => None,
         };
 
-        // Partition: cached vs uncached identifiers
-        let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+        // Partition: cached vs uncached identifiers (use &str slices for cache lookup)
+        let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_identifiers);
         let mut uncached_indices: Vec<usize> = Vec::new();
         let mut uncached_texts: Vec<String> = Vec::new();
 
-        for (i, text) in texts.iter().enumerate() {
+        for (i, doc) in identifier_docs.iter().enumerate() {
             if let Some(ref store) = id_cache
-                && let Some(vec) = store.get_vector(text)
+                && let Some(vec) = store.get_vector(&doc.text)
             {
                 result_vectors.push(Some(vec.to_vec()));
                 continue;
             }
             result_vectors.push(None);
             uncached_indices.push(i);
-            uncached_texts.push(text.clone());
+            uncached_texts.push(doc.text.clone());
         }
 
         tracing::info!(
-            cached = texts.len() - uncached_indices.len(),
+            cached = n_identifiers - uncached_indices.len(),
             uncached = uncached_indices.len(),
             "Identifier embedding cache hit/miss"
         );
@@ -457,11 +457,10 @@ impl ContextPlusServer {
             }
 
             // Persist updated identifier embedding cache to disk
-            let all_texts: Vec<String> = texts.clone();
             let all_vecs: Vec<Vec<f32>> = result_vectors.iter().filter_map(|v| v.clone()).collect();
-            if all_vecs.len() == all_texts.len() {
+            if all_vecs.len() == n_identifiers {
                 let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
-                let keys = all_texts;
+                let keys: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
                 let hashes: Vec<String> = keys
                     .iter()
                     .map(|k| crate::core::parser::hash_content(k))
@@ -1188,17 +1187,38 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
             let embedding_cache = &state.embedding_cache;
             let store_root = &state.root_dir;
             let entries = walk_with_config(&root, &config);
+
+            // Read all files concurrently (up to 32 at a time)
+            let mut join_set = tokio::task::JoinSet::new();
+            for (i, entry) in entries.iter().enumerate() {
+                let full_path = root.join(&entry.relative_path);
+                let rel_path = entry.relative_path.clone();
+                join_set.spawn(async move {
+                    let content = tokio::fs::read_to_string(&full_path).await.ok();
+                    (i, rel_path, content)
+                });
+            }
+
+            // Collect results in order
+            let mut file_contents: Vec<(usize, String, Option<String>)> =
+                Vec::with_capacity(entries.len());
+            while let Some(result) = join_set.join_next().await {
+                if let Ok(item) = result {
+                    file_contents.push(item);
+                }
+            }
+            file_contents.sort_unstable_by_key(|(i, _, _)| *i);
+
             let mut docs = Vec::new();
             let mut content_hashes = Vec::new();
 
-            for entry in &entries {
-                let full_path = root.join(&entry.relative_path);
-                let content = match tokio::fs::read_to_string(&full_path).await {
-                    Ok(c) => c,
-                    Err(_) => continue,
+            for (_, rel_path, maybe_content) in &file_contents {
+                let content = match maybe_content {
+                    Some(c) => c,
+                    None => continue,
                 };
-                let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                let symbols = parse_with_tree_sitter(&content, ext).unwrap_or_default();
+                let ext = rel_path.rsplit('.').next().unwrap_or("");
+                let symbols = parse_with_tree_sitter(content, ext).unwrap_or_default();
                 let header =
                     crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
 
@@ -1216,13 +1236,13 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
 
                 let doc_content = format!(
                     "{} {}",
-                    detect_language(&entry.relative_path).unwrap_or("unknown"),
+                    detect_language(rel_path).unwrap_or("unknown"),
                     content.chars().take(500).collect::<String>()
                 );
-                content_hashes.push((entry.relative_path.clone(), content_hash(&doc_content)));
+                content_hashes.push((rel_path.clone(), content_hash(&doc_content)));
 
                 docs.push(SearchDocument::new(
-                    entry.relative_path.clone(),
+                    rel_path.clone(),
                     header,
                     symbol_names,
                     symbol_entries,

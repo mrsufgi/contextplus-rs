@@ -298,15 +298,19 @@ pub fn rank_call_sites(
         }
     };
 
-    let mut candidates: Vec<(String, usize, String, f64)> = Vec::new();
+    // Collect candidates as (file_index, line_number, line_offset, keyword_score)
+    // to avoid cloning file Strings and context Strings in the inner loop.
+    let file_entries: Vec<(&String, &Vec<String>)> = file_lines.iter().collect();
+    let mut candidates: Vec<(usize, usize, usize, f64)> = Vec::new();
+    let mut keyword_buf = String::with_capacity(512);
 
-    for (file, lines) in file_lines {
+    for (fi, (file, lines)) in file_entries.iter().enumerate() {
         for (i, line) in lines.iter().enumerate() {
             if !call_pattern.is_match(line) {
                 continue;
             }
             // Skip the symbol's own definition line
-            if file == &symbol.path && i + 1 == symbol.line {
+            if *file == &symbol.path && i + 1 == symbol.line {
                 continue;
             }
             if is_definition_line(line, &symbol.name) {
@@ -319,8 +323,13 @@ pub fn rank_call_sites(
             } else {
                 context
             };
-            let keyword_score = get_keyword_coverage(query_terms, &format!("{} {}", file, context));
-            candidates.push((file.clone(), i + 1, context.to_string(), keyword_score));
+            // Reuse buffer instead of format! allocation per iteration
+            keyword_buf.clear();
+            keyword_buf.push_str(file);
+            keyword_buf.push(' ');
+            keyword_buf.push_str(context);
+            let keyword_score = get_keyword_coverage(query_terms, &keyword_buf);
+            candidates.push((fi, i + 1, i, keyword_score));
         }
     }
 
@@ -340,7 +349,16 @@ pub fn rank_call_sites(
 
     let mut ranked: Vec<CallSite> = candidates
         .iter()
-        .map(|(file, line, context, keyword_score)| {
+        .map(|(fi, line_num, line_idx, keyword_score)| {
+            let (file, lines) = &file_entries[*fi];
+            let raw_line = &lines[*line_idx];
+            let context = raw_line.trim();
+            let context = if context.len() > 220 {
+                &context[..220]
+            } else {
+                context
+            };
+
             let semantic_score = callsite_vectors
                 .and_then(|provider| {
                     let text = format!("{} {}", file, context);
@@ -355,9 +373,9 @@ pub fn rank_call_sites(
                 semantic_score * CALLSITE_SEMANTIC_WEIGHT + keyword_score * CALLSITE_KEYWORD_WEIGHT,
             );
             CallSite {
-                file: file.clone(),
-                line: *line,
-                context: context.clone(),
+                file: (*file).clone(),
+                line: *line_num,
+                context: context.to_string(),
                 semantic_score,
                 keyword_score: *keyword_score,
                 score,

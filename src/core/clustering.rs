@@ -58,29 +58,35 @@ fn cosine_similarity_simsimd(a: &[f32], b: &[f32]) -> f32 {
 /// Compute normalized symmetric Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
 fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
     let n = affinity.nrows();
-    let mut degrees = vec![0.0_f64; n];
-    for i in 0..n {
-        let mut sum = 0.0;
-        for j in 0..n {
-            if i != j {
-                sum += affinity[(i, j)];
-            }
-        }
-        degrees[i] = sum;
-    }
 
+    // Compute degree per row using nalgebra row sums (diagonal subtracted)
+    let d_inv_sqrt: Vec<f64> = (0..n)
+        .map(|i| {
+            let row_sum: f64 = affinity.row(i).iter().sum::<f64>() - affinity[(i, i)];
+            if row_sum > 1e-10 {
+                1.0 / row_sum.sqrt()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    // Build Laplacian: L[i,j] = -W[i,j] * d_inv_sqrt[i] * d_inv_sqrt[j], L[i,i] = 1.0
     let mut laplacian = DMatrix::zeros(n, n);
     for i in 0..n {
-        for j in 0..n {
-            if i == j {
-                laplacian[(i, j)] = 1.0;
-            } else {
-                let di = degrees[i];
-                let dj = degrees[j];
-                if di > 1e-10 && dj > 1e-10 {
-                    laplacian[(i, j)] = -affinity[(i, j)] / (di.sqrt() * dj.sqrt());
-                }
+        laplacian[(i, i)] = 1.0;
+        let di = d_inv_sqrt[i];
+        if di == 0.0 {
+            continue;
+        }
+        for j in (i + 1)..n {
+            let dj = d_inv_sqrt[j];
+            if dj == 0.0 {
+                continue;
             }
+            let val = -affinity[(i, j)] * di * dj;
+            laplacian[(i, j)] = val;
+            laplacian[(j, i)] = val; // symmetric
         }
     }
     laplacian
@@ -236,21 +242,20 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     used.insert(0);
 
     for _ in 1..k {
-        let mut best_idx = 0;
-        let mut best_dist = -1.0_f64;
-        for (i, row) in data.iter().enumerate() {
-            if used.contains(&i) {
-                continue;
-            }
-            let min_dist = centroids
-                .iter()
-                .map(|c| (0..dim).map(|d| (row[d] - c[d]).powi(2)).sum::<f64>())
-                .fold(f64::INFINITY, f64::min);
-            if min_dist > best_dist {
-                best_dist = min_dist;
-                best_idx = i;
-            }
-        }
+        // Parallel distance computation: find point farthest from all current centroids
+        let (best_idx, _) = data
+            .par_iter()
+            .enumerate()
+            .filter(|(i, _)| !used.contains(i))
+            .map(|(i, row)| {
+                let min_dist = centroids
+                    .iter()
+                    .map(|c| (0..dim).map(|d| (row[d] - c[d]).powi(2)).sum::<f64>())
+                    .fold(f64::INFINITY, f64::min);
+                (i, min_dist)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((0, 0.0));
         centroids.push(data[best_idx].clone());
         used.insert(best_idx);
     }

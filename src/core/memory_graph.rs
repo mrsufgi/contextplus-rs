@@ -378,13 +378,18 @@ impl MemoryGraph {
         top_k: usize,
         edge_filter: Option<&[RelationType]>,
     ) -> GraphSearchResult {
-        let nodes: Vec<MemoryNode> = self
+        // Score all nodes by index — no cloning until top_k is known.
+        let mut scored: Vec<(NodeIndex, f64)> = self
             .graph
             .node_indices()
-            .filter_map(|idx| self.graph.node_weight(idx).cloned())
+            .filter_map(|idx| {
+                let node = self.graph.node_weight(idx)?;
+                let score = Self::cosine(query_vec, &node.embedding);
+                Some((idx, score))
+            })
             .collect();
 
-        if nodes.is_empty() {
+        if scored.is_empty() {
             return GraphSearchResult {
                 direct: Vec::new(),
                 neighbors: Vec::new(),
@@ -393,31 +398,29 @@ impl MemoryGraph {
             };
         }
 
-        // Score all nodes against query
-        let mut scored: Vec<(MemoryNode, f64)> = nodes
-            .into_iter()
-            .map(|n| {
-                let score = Self::cosine(query_vec, &n.embedding);
-                (n, score)
-            })
-            .collect();
+        // Partial sort to find top_k
+        let top_k = top_k.min(scored.len());
+        scored.select_nth_unstable_by(top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(top_k);
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Top-k direct hits
+        // Clone only top-k nodes
         let direct_hits: Vec<TraversalResult> = scored
             .iter()
-            .take(top_k)
-            .map(|(node, score)| {
+            .filter_map(|(idx, score)| {
+                let node = self.graph.node_weight(*idx)?.clone();
                 // Update last_accessed
                 if let Some(n) = self.get_node_mut(&node.id) {
                     n.last_accessed = now_millis();
                 }
-                TraversalResult {
-                    node: node.clone(),
+                Some(TraversalResult {
+                    node,
                     depth: 0,
                     path_relations: Vec::new(),
                     relevance_score: (score * 1000.0).round() / 10.0,
-                }
+                })
             })
             .collect();
 
