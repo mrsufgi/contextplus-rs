@@ -505,7 +505,11 @@ impl ContextPlusServer {
 
     // --- Tool dispatch ---
 
-    async fn dispatch(&self, name: &str, args: serde_json::Map<String, Value>) -> CallToolResult {
+    pub async fn dispatch(
+        &self,
+        name: &str,
+        args: serde_json::Map<String, Value>,
+    ) -> CallToolResult {
         match self.dispatch_inner(name, args).await {
             Ok(result) => result,
             Err(e) => Self::err_text(format!("Error: {}", e)),
