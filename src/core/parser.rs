@@ -104,28 +104,50 @@ pub fn extract_header(lines: &[&str]) -> String {
 }
 
 /// Detect language from file extension.
+/// Uses `eq_ignore_ascii_case` to avoid heap-allocating a lowercase String per call.
 pub fn detect_language(file_path: &str) -> Option<&'static str> {
-    let ext = Path::new(file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    match ext.as_deref() {
-        Some("ts") | Some("tsx") => Some("typescript"),
-        Some("js") | Some("jsx") | Some("mjs") => Some("javascript"),
-        Some("py") => Some("python"),
-        Some("rs") => Some("rust"),
-        Some("go") => Some("go"),
-        Some("java") => Some("java"),
-        Some("cs") => Some("csharp"),
-        Some("c") | Some("h") => Some("c"),
-        Some("cpp") | Some("hpp") | Some("cc") => Some("cpp"),
-        Some("rb") => Some("ruby"),
-        Some("swift") => Some("swift"),
-        Some("kt") => Some("kotlin"),
-        Some("lua") => Some("lua"),
-        Some("zig") => Some("zig"),
-        Some("sh") | Some("bash") | Some("zsh") => Some("bash"),
-        _ => None,
+    let ext = Path::new(file_path).extension().and_then(|e| e.to_str())?;
+    if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx") {
+        Some("typescript")
+    } else if ext.eq_ignore_ascii_case("js")
+        || ext.eq_ignore_ascii_case("jsx")
+        || ext.eq_ignore_ascii_case("mjs")
+    {
+        Some("javascript")
+    } else if ext.eq_ignore_ascii_case("py") {
+        Some("python")
+    } else if ext.eq_ignore_ascii_case("rs") {
+        Some("rust")
+    } else if ext.eq_ignore_ascii_case("go") {
+        Some("go")
+    } else if ext.eq_ignore_ascii_case("java") {
+        Some("java")
+    } else if ext.eq_ignore_ascii_case("cs") {
+        Some("csharp")
+    } else if ext.eq_ignore_ascii_case("c") || ext.eq_ignore_ascii_case("h") {
+        Some("c")
+    } else if ext.eq_ignore_ascii_case("cpp")
+        || ext.eq_ignore_ascii_case("hpp")
+        || ext.eq_ignore_ascii_case("cc")
+    {
+        Some("cpp")
+    } else if ext.eq_ignore_ascii_case("rb") {
+        Some("ruby")
+    } else if ext.eq_ignore_ascii_case("swift") {
+        Some("swift")
+    } else if ext.eq_ignore_ascii_case("kt") {
+        Some("kotlin")
+    } else if ext.eq_ignore_ascii_case("lua") {
+        Some("lua")
+    } else if ext.eq_ignore_ascii_case("zig") {
+        Some("zig")
+    } else if ext.eq_ignore_ascii_case("sh")
+        || ext.eq_ignore_ascii_case("bash")
+        || ext.eq_ignore_ascii_case("zsh")
+    {
+        Some("bash")
+    } else {
+        None
     }
 }
 

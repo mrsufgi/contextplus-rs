@@ -388,6 +388,8 @@ pub trait CallSiteVectorProvider {
 // ---------------------------------------------------------------------------
 
 /// Score identifiers against a query using hybrid semantic + keyword ranking.
+/// Uses index-based scoring to avoid cloning IdentifierDoc per candidate — only
+/// the final top_k docs are cloned.
 #[allow(clippy::too_many_arguments)]
 pub fn score_identifiers(
     docs: &[IdentifierDoc],
@@ -400,7 +402,8 @@ pub fn score_identifiers(
     keyword_weight: f64,
     top_k: usize,
 ) -> Vec<RankedIdentifier> {
-    let mut scored: Vec<RankedIdentifier> = docs
+    // Phase 1: Score all docs, collecting only indices + scores (no clone).
+    let mut scored: Vec<(usize, f64, f64, f64)> = docs
         .par_iter()
         .enumerate()
         .filter_map(|(i, doc)| {
@@ -410,7 +413,6 @@ pub fn score_identifiers(
                 return None;
             }
 
-            // Compute cosine similarity from flat buffer
             let offset = i * vector_dims;
             if offset + vector_dims > vector_buffer.len() {
                 return None;
@@ -434,22 +436,33 @@ pub fn score_identifiers(
                 semantic_score
             };
 
-            Some(RankedIdentifier {
-                doc: doc.clone(),
-                semantic_score,
-                keyword_score,
-                score,
-            })
+            Some((i, score, semantic_score, keyword_score))
         })
         .collect();
 
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    // Phase 2: Partial sort + truncate to top_k.
+    let top_k = top_k.min(scored.len());
+    if top_k == 0 {
+        return Vec::new();
+    }
+    scored.select_nth_unstable_by(top_k - 1, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(top_k);
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Phase 3: Clone only the top_k docs.
     scored
+        .into_iter()
+        .map(
+            |(idx, score, semantic_score, keyword_score)| RankedIdentifier {
+                doc: docs[idx].clone(),
+                semantic_score,
+                keyword_score,
+                score,
+            },
+        )
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

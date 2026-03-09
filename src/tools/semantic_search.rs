@@ -80,6 +80,10 @@ pub struct SearchDocument {
     pub search_text: String,
     /// Pre-computed lowercase terms from all fields for term coverage.
     pub search_terms: HashSet<String>,
+    /// Pre-computed camelCase-split token sets per symbol (parallel to `symbols`).
+    pub symbol_tokens: Vec<HashSet<String>>,
+    /// Pre-computed camelCase-split token sets per symbol entry (parallel to `symbol_entries`).
+    pub symbol_entry_tokens: Vec<HashSet<String>>,
 }
 
 impl SearchDocument {
@@ -94,6 +98,14 @@ impl SearchDocument {
         let raw_text = format!("{} {} {} {}", path, header, symbols.join(" "), content);
         let search_text = raw_text.to_lowercase();
         let search_terms = split_camel_case(&raw_text).into_iter().collect();
+        let symbol_tokens = symbols
+            .iter()
+            .map(|s| split_camel_case(s).into_iter().collect())
+            .collect();
+        let symbol_entry_tokens = symbol_entries
+            .iter()
+            .map(|e| split_camel_case(&e.name).into_iter().collect())
+            .collect();
         Self {
             path,
             header,
@@ -102,6 +114,8 @@ impl SearchDocument {
             content,
             search_text,
             search_terms,
+            symbol_tokens,
+            symbol_entry_tokens,
         }
     }
 }
@@ -238,25 +252,27 @@ fn get_term_coverage(query_terms: &HashSet<String>, doc_terms: &HashSet<String>)
     matched as f64 / query_terms.len() as f64
 }
 
-/// Find symbols whose camelCase-split tokens overlap with query terms.
-fn get_matched_symbols(symbols: &[String], query_terms: &HashSet<String>) -> Vec<String> {
+/// Find symbols whose pre-computed tokens overlap with query terms.
+fn get_matched_symbols(
+    symbols: &[String],
+    symbol_tokens: &[HashSet<String>],
+    query_terms: &HashSet<String>,
+) -> Vec<String> {
     if query_terms.is_empty() {
         return Vec::new();
     }
     symbols
         .iter()
-        .filter(|symbol| {
-            split_camel_case(symbol)
-                .iter()
-                .any(|t| query_terms.contains(t))
-        })
-        .cloned()
+        .zip(symbol_tokens.iter())
+        .filter(|(_, tokens)| tokens.iter().any(|t| query_terms.contains(t)))
+        .map(|(s, _)| s.clone())
         .collect()
 }
 
-/// Find symbol entries whose names overlap with query terms.
+/// Find symbol entries whose pre-computed tokens overlap with query terms.
 fn get_matched_symbol_entries<'a>(
     entries: &'a [SymbolSearchEntry],
+    entry_tokens: &[HashSet<String>],
     query_terms: &HashSet<String>,
 ) -> Vec<&'a SymbolSearchEntry> {
     if query_terms.is_empty() {
@@ -264,11 +280,9 @@ fn get_matched_symbol_entries<'a>(
     }
     entries
         .iter()
-        .filter(|e| {
-            split_camel_case(&e.name)
-                .iter()
-                .any(|t| query_terms.contains(t))
-        })
+        .zip(entry_tokens.iter())
+        .filter(|(_, tokens)| tokens.iter().any(|t| query_terms.contains(t)))
+        .map(|(e, _)| e)
         .collect()
 }
 
@@ -280,9 +294,10 @@ fn format_line_range(line: usize, end_line: Option<usize>) -> String {
 }
 
 /// Compute keyword score from term coverage, symbol coverage, and phrase boost.
-/// Uses pre-computed `doc.search_text` and `doc.search_terms` to avoid per-query allocations.
+/// Uses pre-computed `doc.search_text`, `doc.search_terms`, and `doc.symbol_tokens`
+/// to avoid per-query allocations.
 fn compute_keyword_score(
-    query: &str,
+    query_lower: &str,
     query_terms: &HashSet<String>,
     doc: &SearchDocument,
     matched_symbols: &[String],
@@ -290,17 +305,29 @@ fn compute_keyword_score(
     if query_terms.is_empty() {
         return 0.0;
     }
-    let query_lower = query.trim().to_lowercase();
-    let phrase_boost = if !query_lower.is_empty() && doc.search_text.contains(&query_lower) {
+    let phrase_boost = if !query_lower.is_empty() && doc.search_text.contains(query_lower) {
         PHRASE_BOOST
     } else {
         0.0
     };
-    let symbol_terms: HashSet<String> = split_camel_case(&matched_symbols.join(" "))
-        .into_iter()
+    // Build symbol_terms from pre-computed token sets (no split_camel_case at query time)
+    let symbol_terms: HashSet<&String> = doc
+        .symbol_tokens
+        .iter()
+        .zip(doc.symbols.iter())
+        .filter(|(_, sym)| matched_symbols.contains(sym))
+        .flat_map(|(tokens, _)| tokens.iter())
         .collect();
     let term_coverage = get_term_coverage(query_terms, &doc.search_terms);
-    let symbol_coverage = get_term_coverage(query_terms, &symbol_terms);
+    let symbol_coverage = if query_terms.is_empty() {
+        0.0
+    } else {
+        let matched = query_terms
+            .iter()
+            .filter(|t| symbol_terms.contains(t))
+            .count();
+        matched as f64 / query_terms.len() as f64
+    };
     clamp01(
         term_coverage * TERM_COVERAGE_WEIGHT
             + symbol_coverage * SYMBOL_COVERAGE_WEIGHT
@@ -407,6 +434,7 @@ impl SearchIndex {
         opts: &ResolvedSearchOptions,
     ) -> Vec<SearchResult> {
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
+        let query_lower = query.trim().to_lowercase();
 
         #[allow(clippy::type_complexity)]
         let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = self
@@ -421,11 +449,15 @@ impl SearchIndex {
                 let vec_slice = &self.vector_buffer[offset..offset + self.dims];
                 let semantic_score = cosine(query_vec, vec_slice);
 
-                let matched_entries = get_matched_symbol_entries(&doc.symbol_entries, &query_terms);
+                let matched_entries = get_matched_symbol_entries(
+                    &doc.symbol_entries,
+                    &doc.symbol_entry_tokens,
+                    &query_terms,
+                );
                 let matched_symbols = if !matched_entries.is_empty() {
                     matched_entries.iter().map(|e| e.name.clone()).collect()
                 } else {
-                    get_matched_symbols(&doc.symbols, &query_terms)
+                    get_matched_symbols(&doc.symbols, &doc.symbol_tokens, &query_terms)
                 };
                 let matched_symbol_locations: Vec<String> = matched_entries
                     .iter()
@@ -433,7 +465,7 @@ impl SearchIndex {
                     .collect();
 
                 let keyword_score =
-                    compute_keyword_score(query, &query_terms, doc, &matched_symbols);
+                    compute_keyword_score(&query_lower, &query_terms, doc, &matched_symbols);
                 let combined_score = compute_combined_score(semantic_score, keyword_score, opts);
 
                 if opts.require_semantic_match && semantic_score <= 0.0 {
@@ -747,8 +779,12 @@ mod tests {
             "deletePost".to_string(),
             "createUser".to_string(),
         ];
+        let symbol_tokens: Vec<HashSet<String>> = symbols
+            .iter()
+            .map(|s| split_camel_case(s).into_iter().collect())
+            .collect();
         let query_terms: HashSet<String> = ["user"].iter().map(|s| s.to_string()).collect();
-        let matched = get_matched_symbols(&symbols, &query_terms);
+        let matched = get_matched_symbols(&symbols, &symbol_tokens, &query_terms);
         assert!(matched.contains(&"getUserById".to_string()));
         assert!(matched.contains(&"createUser".to_string()));
         assert!(!matched.contains(&"deletePost".to_string()));
@@ -767,8 +803,9 @@ mod tests {
         );
         let query = "auth";
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
-        let matched = get_matched_symbols(&doc.symbols, &query_terms);
-        let score = compute_keyword_score(query, &query_terms, &doc, &matched);
+        let matched = get_matched_symbols(&doc.symbols, &doc.symbol_tokens, &query_terms);
+        let query_lower = query.trim().to_lowercase();
+        let score = compute_keyword_score(&query_lower, &query_terms, &doc, &matched);
         assert!(score > 0.0);
     }
 

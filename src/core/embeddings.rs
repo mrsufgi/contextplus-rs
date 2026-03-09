@@ -339,16 +339,20 @@ impl VectorStore {
     }
 
     /// Build from an EmbeddingCache (HashMap of path -> (hash, vector)).
+    /// Single pass over the cache — no redundant HashMap lookups.
     pub fn from_cache(cache: &HashMap<String, CacheEntry>) -> Option<Self> {
         if cache.is_empty() {
             return None;
         }
-        let keys: Vec<String> = cache.keys().cloned().collect();
-        let dims = cache[&keys[0]].vector.len() as u32;
-        let hashes: Vec<String> = keys.iter().map(|k| cache[k].hash.clone()).collect();
-        let mut vectors = Vec::with_capacity(keys.len() * dims as usize);
-        for key in &keys {
-            vectors.extend_from_slice(&cache[key].vector);
+        let n = cache.len();
+        let dims = cache.values().next()?.vector.len() as u32;
+        let mut keys = Vec::with_capacity(n);
+        let mut hashes = Vec::with_capacity(n);
+        let mut vectors = Vec::with_capacity(n * dims as usize);
+        for (key, entry) in cache {
+            keys.push(key.clone());
+            hashes.push(entry.hash.clone());
+            vectors.extend_from_slice(&entry.vector);
         }
         Some(Self::new(dims, keys, hashes, vectors))
     }
@@ -416,26 +420,44 @@ impl VectorStore {
     }
 
     /// Brute-force exact nearest neighbor search with SIMD cosine similarity.
-    /// Parallelized with rayon for large stores.
+    /// Uses sequential scan for <2K vectors (avoids rayon overhead), parallel for larger stores.
     fn find_nearest_brute_force(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
-        use rayon::prelude::*;
-
         let vectors = self.vectors.as_slice();
         let dims = self.dims as usize;
+        let count = self.count as usize;
 
-        let mut scored: Vec<(usize, f32)> = (0..self.count as usize)
-            .into_par_iter()
-            .map(|i| {
-                let offset = i * dims;
-                let stored = &vectors[offset..offset + dims];
-                let similarity = cosine_similarity_simsimd(query, stored);
-                (i, similarity)
-            })
-            .collect();
+        const PARALLEL_THRESHOLD: usize = 2000;
 
-        // Sort descending by similarity
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut scored: Vec<(usize, f32)> = if count >= PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            (0..count)
+                .into_par_iter()
+                .map(|i| {
+                    let offset = i * dims;
+                    let stored = &vectors[offset..offset + dims];
+                    (i, cosine_similarity_simsimd(query, stored))
+                })
+                .collect()
+        } else {
+            (0..count)
+                .map(|i| {
+                    let offset = i * dims;
+                    let stored = &vectors[offset..offset + dims];
+                    (i, cosine_similarity_simsimd(query, stored))
+                })
+                .collect()
+        };
+
+        // Partial sort: partition top_k elements in O(n) average, then sort only those.
+        let top_k = top_k.min(scored.len());
+        if top_k == 0 {
+            return Vec::new();
+        }
+        scored.select_nth_unstable_by(top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         scored
             .into_iter()
