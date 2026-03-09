@@ -1,7 +1,9 @@
+use contextplus_rs::core::embeddings::{
+    CacheEntry, VectorStore, cosine_similarity_naive, cosine_similarity_simsimd,
+};
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;
-use contextplus_rs::core::embeddings::{cosine_similarity_simsimd, cosine_similarity_naive, VectorStore, CacheEntry};
-use std::collections::HashMap;
 
 fn generate_vectors(n: usize, dims: usize) -> Vec<f32> {
     let mut v = Vec::with_capacity(n * dims);
@@ -14,7 +16,9 @@ fn generate_vectors(n: usize, dims: usize) -> Vec<f32> {
 }
 
 fn generate_query(dims: usize) -> Vec<f32> {
-    (0..dims).map(|d| ((d * 31 + 17) % 1000) as f32 / 1000.0).collect()
+    (0..dims)
+        .map(|d| ((d * 31 + 17) % 1000) as f32 / 1000.0)
+        .collect()
 }
 
 fn main() {
@@ -24,16 +28,20 @@ fn main() {
     // 1. Cosine similarity: SIMD vs naive
     let a: Vec<f32> = (0..dims).map(|d| (d as f32 * 0.001).sin()).collect();
     let b: Vec<f32> = (0..dims).map(|d| (d as f32 * 0.002).cos()).collect();
-    
+
     let iters = 100_000;
     let start = Instant::now();
-    for _ in 0..iters { black_box(cosine_similarity_naive(black_box(&a), black_box(&b))); }
+    for _ in 0..iters {
+        black_box(cosine_similarity_naive(black_box(&a), black_box(&b)));
+    }
     let naive_us = start.elapsed().as_micros() as f64 / iters as f64;
 
     let start = Instant::now();
-    for _ in 0..iters { black_box(cosine_similarity_simsimd(black_box(&a), black_box(&b))); }
+    for _ in 0..iters {
+        black_box(cosine_similarity_simsimd(black_box(&a), black_box(&b)));
+    }
     let simd_us = start.elapsed().as_micros() as f64 / iters as f64;
-    
+
     println!("Cosine similarity (1024 dims, 100K iters):");
     println!("  naive:  {:.3} µs/op", naive_us);
     println!("  simsimd: {:.3} µs/op", simd_us);
@@ -54,7 +62,9 @@ fn main() {
         // Warm up
         let _ = store.find_nearest_brute_force(&query, 5);
         let start = Instant::now();
-        for _ in 0..runs { black_box(store.find_nearest_brute_force(black_box(&query), 5)); }
+        for _ in 0..runs {
+            black_box(store.find_nearest_brute_force(black_box(&query), 5));
+        }
         let avg_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
         println!("  {} vectors: {:.2} ms/query", count, avg_ms);
     }
@@ -75,10 +85,15 @@ fn main() {
         // Subsequent calls use cached index
         let runs = if count >= 30000 { 10 } else { 50 };
         let start = Instant::now();
-        for _ in 0..runs { black_box(store.find_nearest(black_box(&query), 5)); }
+        for _ in 0..runs {
+            black_box(store.find_nearest(black_box(&query), 5));
+        }
         let avg_ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
 
-        println!("  {} vectors: build={:.1}ms, query={:.3}ms", count, first_ms, avg_ms);
+        println!(
+            "  {} vectors: build={:.1}ms, query={:.3}ms",
+            count, first_ms, avg_ms
+        );
     }
 
     // 3. Cache load (rkyv save + load + mmap)
@@ -88,7 +103,10 @@ fn main() {
     for i in 0..count {
         cache.insert(
             format!("src/file_{}.ts", i),
-            CacheEntry { hash: format!("h{}", i), vector: generate_query(dims) },
+            CacheEntry {
+                hash: format!("h{}", i),
+                vector: generate_query(dims),
+            },
         );
     }
     let store = VectorStore::from_cache(&cache).unwrap();
@@ -137,7 +155,11 @@ export type ProfileService = ReturnType<typeof createProfileService>;
         let _ = contextplus_rs::core::tree_sitter::parse_with_tree_sitter(ts_code, "ts");
     }
     let parse_us = start.elapsed().as_micros() as f64 / runs as f64;
-    println!("Tree-sitter parse (TypeScript, 10K iters): {:.1} µs/op ({:.2} ms)", parse_us, parse_us / 1000.0);
+    println!(
+        "Tree-sitter parse (TypeScript, 10K iters): {:.1} µs/op ({:.2} ms)",
+        parse_us,
+        parse_us / 1000.0
+    );
 
     // 5. Hash check (no-op refresh path)
     let count = 30000;
@@ -145,25 +167,48 @@ export type ProfileService = ReturnType<typeof createProfileService>;
     let hashes: Vec<String> = (0..count).map(|i| format!("hash_{}", i)).collect();
     let vectors = generate_vectors(count, dims);
     let store = VectorStore::new(dims as u32, keys, hashes, vectors);
-    let file_hashes: Vec<(String, String)> = (0..count).map(|i| (format!("src/file_{}.ts", i), format!("hash_{}", i))).collect();
-    
+    let file_hashes: Vec<(String, String)> = (0..count)
+        .map(|i| (format!("src/file_{}.ts", i), format!("hash_{}", i)))
+        .collect();
+
     let runs = 100;
     let start = Instant::now();
     for _ in 0..runs {
         let mut stale = 0;
         for (k, h) in &file_hashes {
-            if store.get_hash(k) != Some(h.as_str()) { stale += 1; }
+            if store.get_hash(k) != Some(h.as_str()) {
+                stale += 1;
+            }
         }
         assert_eq!(stale, 0);
     }
     let hash_ms = start.elapsed().as_millis() as f64 / runs as f64;
-    println!("\nHash check staleness (30K files, 100 iters): {:.2} ms", hash_ms);
-    
+    println!(
+        "\nHash check staleness (30K files, 100 iters): {:.2} ms",
+        hash_ms
+    );
+
     println!("\n=== vs TypeScript Baselines ===");
     println!("| Operation                  | TS (optimized) | Rust       | Speedup |");
     println!("|----------------------------|----------------|------------|---------|");
-    println!("| Cosine 1024-dim            | ~5 µs (JS)     | {:.3} µs   | {:.0}x     |", simd_us, 5.0 / simd_us);
-    println!("| Cache load 5K vectors      | ~115 ms        | {:.2} ms   | {:.0}x     |", mmap_ms, 115.0 / mmap_ms);
-    println!("| Tree-sitter parse (TS)     | ~10 ms (WASM)  | {:.2} ms   | {:.0}x     |", parse_us / 1000.0, 10.0 / (parse_us / 1000.0));
-    println!("| Hash check 30K (no-op)     | ~870 ms        | {:.2} ms   | {:.0}x     |", hash_ms, 870.0 / hash_ms);
+    println!(
+        "| Cosine 1024-dim            | ~5 µs (JS)     | {:.3} µs   | {:.0}x     |",
+        simd_us,
+        5.0 / simd_us
+    );
+    println!(
+        "| Cache load 5K vectors      | ~115 ms        | {:.2} ms   | {:.0}x     |",
+        mmap_ms,
+        115.0 / mmap_ms
+    );
+    println!(
+        "| Tree-sitter parse (TS)     | ~10 ms (WASM)  | {:.2} ms   | {:.0}x     |",
+        parse_us / 1000.0,
+        10.0 / (parse_us / 1000.0)
+    );
+    println!(
+        "| Hash check 30K (no-op)     | ~870 ms        | {:.2} ms   | {:.0}x     |",
+        hash_ms,
+        870.0 / hash_ms
+    );
 }
