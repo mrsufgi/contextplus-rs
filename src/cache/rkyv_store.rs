@@ -69,12 +69,15 @@ impl CacheData {
         if cache.is_empty() {
             return None;
         }
-        let keys: Vec<String> = cache.keys().cloned().collect();
-        let dims = cache[&keys[0]].vector.len() as u32;
-        let hashes: Vec<String> = keys.iter().map(|k| cache[k].hash.clone()).collect();
-        let mut vectors = Vec::with_capacity(keys.len() * dims as usize);
-        for key in &keys {
-            vectors.extend_from_slice(&cache[key].vector);
+        let n = cache.len();
+        let dims = cache.values().next()?.vector.len() as u32;
+        let mut keys = Vec::with_capacity(n);
+        let mut hashes = Vec::with_capacity(n);
+        let mut vectors = Vec::with_capacity(n * dims as usize);
+        for (key, entry) in cache {
+            keys.push(key.clone());
+            hashes.push(entry.hash.clone());
+            vectors.extend_from_slice(&entry.vector);
         }
         Some(Self {
             dims,

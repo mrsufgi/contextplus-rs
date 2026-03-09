@@ -181,18 +181,20 @@ impl ContextPlusServer {
         let config = self.state.config.clone();
 
         let new_cache = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+
             let entries = walk_with_config(&root, &config);
-            let mut file_lines = HashMap::new();
-            for entry in &entries {
-                if entry.is_directory {
-                    continue;
-                }
-                let full_path = root.join(&entry.relative_path);
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-                    file_lines.insert(entry.relative_path.clone(), lines);
-                }
-            }
+            let file_lines: HashMap<String, Vec<String>> = entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory)
+                .filter_map(|entry| {
+                    let full_path = root.join(&entry.relative_path);
+                    std::fs::read_to_string(&full_path).ok().map(|content| {
+                        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+                        (entry.relative_path.clone(), lines)
+                    })
+                })
+                .collect();
             ProjectCache {
                 file_entries: entries,
                 file_lines,

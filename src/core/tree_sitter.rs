@@ -1,9 +1,14 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use tree_sitter::{Language, Node, Parser};
 
 use crate::core::parser::CodeSymbol;
 use crate::error::{ContextPlusError, Result};
+
+thread_local! {
+    static PARSER_CACHE: RefCell<HashMap<&'static str, Parser>> = RefCell::new(HashMap::new());
+}
 
 /// Extension-to-grammar mapping for the 10 supported native grammars.
 fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
@@ -212,16 +217,15 @@ pub fn parse_with_tree_sitter(content: &str, ext: &str) -> Result<Vec<CodeSymbol
         return Ok(Vec::new());
     }
 
-    thread_local! {
-        static PARSER: std::cell::RefCell<Parser> = std::cell::RefCell::new(Parser::new());
-    }
-
-    PARSER.with(|parser_cell| {
-        let mut parser = parser_cell.borrow_mut();
+    PARSER_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        let parser = cache.entry(grammar_name).or_insert_with(|| {
+            let mut p = Parser::new();
+            // set_language on first creation; grammar_name is stable so this is always correct
+            let _ = p.set_language(&language);
+            p
+        });
         parser.reset();
-        parser
-            .set_language(&language)
-            .map_err(|e| ContextPlusError::TreeSitter(format!("set_language failed: {}", e)))?;
 
         let tree = parser
             .parse(content, None)
