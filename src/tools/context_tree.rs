@@ -560,11 +560,17 @@ mod tests {
         assert!(result.contains("src/"));
         assert!(result.contains("main.ts"));
         assert!(result.contains("deep/"));
-        assert!(!result.contains("nested.ts"), "depth 3 entry should be filtered out");
+        assert!(
+            !result.contains("nested.ts"),
+            "depth 3 entry should be filtered out"
+        );
 
         // depth_limit=1: should include only depth 0 and 1
         let result = build_context_tree(&entries, &analyses, false, Some(100_000), Some(1));
         assert!(result.contains("src/"));
-        assert!(!result.contains("main.ts"), "depth 2 entry should be filtered out");
+        assert!(
+            !result.contains("main.ts"),
+            "depth 2 entry should be filtered out"
+        );
     }
 }
