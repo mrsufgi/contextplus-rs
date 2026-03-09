@@ -16,7 +16,7 @@ use crate::error::Result;
 // Constants
 // ---------------------------------------------------------------------------
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_LEN_SINGLE: usize = 5000;
 const MAX_OUTPUT_LEN_MULTI: usize = 2000;
 
@@ -55,6 +55,7 @@ fn get_linter_config(ext: &str) -> Option<LinterConfig> {
             cmd: "npx",
             args: vec![
                 "tsc".to_string(),
+                "--build".to_string(),
                 "--noEmit".to_string(),
                 "--pretty".to_string(),
             ],

@@ -15,7 +15,7 @@ use crate::error::Result;
 // ---------------------------------------------------------------------------
 
 const CHARS_PER_TOKEN: usize = 4;
-const DEFAULT_MAX_TOKENS: usize = 20_000;
+const DEFAULT_MAX_TOKENS: usize = 50_000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -235,10 +235,25 @@ pub fn build_context_tree(
     analyses: &BTreeMap<String, FileAnalysis>,
     include_symbols: bool,
     max_tokens: Option<usize>,
+    depth_limit: Option<usize>,
 ) -> String {
     let max_tokens = max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
-    let mut tree = build_tree(entries, analyses, include_symbols);
+    // Apply depth_limit filter: only include entries within the depth budget.
+    // depth_limit=2 means show root (depth 0), depth 1, and depth 2.
+    let filtered: Vec<FileEntry>;
+    let effective_entries = if let Some(limit) = depth_limit {
+        filtered = entries
+            .iter()
+            .filter(|e| e.depth <= limit)
+            .cloned()
+            .collect();
+        &filtered[..]
+    } else {
+        entries
+    };
+
+    let mut tree = build_tree(effective_entries, analyses, include_symbols);
 
     // Level 2: Full content (symbols + headers)
     let rendered = render_tree(&tree, 0);
@@ -277,6 +292,7 @@ pub async fn get_context_tree(
         analyses,
         include_symbols,
         options.max_tokens,
+        options.depth_limit,
     ))
 }
 
@@ -468,7 +484,7 @@ mod tests {
         );
 
         // Set very low token budget to force pruning
-        let result = build_context_tree(&entries, &analyses, true, Some(5));
+        let result = build_context_tree(&entries, &analyses, true, Some(5), None);
         // Should contain Level indicator since it was pruned
         assert!(
             result.contains("Level 1") || result.contains("Level 0"),
@@ -493,7 +509,7 @@ mod tests {
         );
 
         // Extremely low budget
-        let result = build_context_tree(&entries, &analyses, true, Some(1));
+        let result = build_context_tree(&entries, &analyses, true, Some(1), None);
         // Even Level 0 might not fit, but it should at least try
         assert!(result.contains("Level 0") || result.contains("main.ts"));
     }
@@ -507,9 +523,48 @@ mod tests {
         }];
         let analyses = BTreeMap::new();
 
-        let result = build_context_tree(&entries, &analyses, false, Some(100_000));
+        let result = build_context_tree(&entries, &analyses, false, Some(100_000), None);
         // Should NOT contain Level indicator
         assert!(!result.contains("Level"));
         assert!(result.contains("small.ts"));
+    }
+
+    #[test]
+    fn test_depth_limit_filters_deep_entries() {
+        let entries = vec![
+            FileEntry {
+                relative_path: "src".to_string(),
+                is_directory: true,
+                depth: 1,
+            },
+            FileEntry {
+                relative_path: "src/main.ts".to_string(),
+                is_directory: false,
+                depth: 2,
+            },
+            FileEntry {
+                relative_path: "src/deep".to_string(),
+                is_directory: true,
+                depth: 2,
+            },
+            FileEntry {
+                relative_path: "src/deep/nested.ts".to_string(),
+                is_directory: false,
+                depth: 3,
+            },
+        ];
+        let analyses = BTreeMap::new();
+
+        // depth_limit=2: should include depth 0, 1, 2 but NOT depth 3
+        let result = build_context_tree(&entries, &analyses, false, Some(100_000), Some(2));
+        assert!(result.contains("src/"));
+        assert!(result.contains("main.ts"));
+        assert!(result.contains("deep/"));
+        assert!(!result.contains("nested.ts"), "depth 3 entry should be filtered out");
+
+        // depth_limit=1: should include only depth 0 and 1
+        let result = build_context_tree(&entries, &analyses, false, Some(100_000), Some(1));
+        assert!(result.contains("src/"));
+        assert!(!result.contains("main.ts"), "depth 2 entry should be filtered out");
     }
 }
