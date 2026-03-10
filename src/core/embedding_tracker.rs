@@ -46,17 +46,17 @@ impl EmbeddingTrackerConfig {
 }
 
 /// Checks whether a file path should be tracked for embedding updates.
+/// Delegates to walker::should_track using the string representation of the path.
 /// Uses segment-based matching: each path component is compared exactly
 /// against the ignore list, so "node_modules_backup" does NOT match "node_modules".
 pub fn should_track(path: &Path, ignore_dirs: &HashSet<String>) -> bool {
-    for component in path.components() {
-        if let Some(segment) = component.as_os_str().to_str()
-            && ignore_dirs.contains(segment)
-        {
-            return false;
-        }
+    let path_str = path.to_string_lossy();
+    // Normalise to forward slashes (noop on Linux, needed on Windows)
+    if path_str.contains('\\') {
+        crate::core::walker::should_track(&path_str.replace('\\', "/"), ignore_dirs)
+    } else {
+        crate::core::walker::should_track(path_str.as_ref(), ignore_dirs)
     }
-    true
 }
 
 /// Normalizes a path to use forward slashes and strips leading slashes.

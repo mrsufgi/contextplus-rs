@@ -123,6 +123,81 @@ Each file's content is hashed (via `hash_content()`) before embedding. On subseq
 files whose hash differs from the cached hash are re-embedded. Unchanged files skip the Ollama API
 call entirely, making warm searches near-instant.
 
+## Memory Graph
+
+The memory graph (`core/memory_graph.rs`) provides a persistent, semantic knowledge store for
+agent-managed notes, concepts, and cross-file relationships.
+
+### Data Structure
+
+```
+MemoryGraph {
+    graph: RwLock<petgraph::StableGraph<MemoryNode, MemoryEdge, Directed>>
+    node_index: RwLock<HashMap<String, NodeIndex>>  -- O(1) lookup by node ID
+    embed_cache: RwLock<HashMap<String, Vec<f32>>>  -- per-node embedding cache
+}
+```
+
+`petgraph::StableGraph` is used (not `Graph`) because node indices must remain stable across
+removals — `prune_stale_links` deletes decayed edges and orphan nodes without invalidating
+surviving indices.
+
+### Persistence (rkyv)
+
+The graph is serialized to disk via `rkyv` into `.mcp_data/memory_graph.rkyv`. On load, the entire
+file is mmap'd and the rkyv archive is validated with `bytecheck` before access. This gives
+zero-copy read performance for large graphs while maintaining safe deserialization.
+
+**Write path:** `upsert_memory_node` → acquire write lock → insert/update node → serialize entire
+graph to disk (atomic rename). Graph mutations are infrequent so full re-serialization is
+acceptable.
+
+**Read path:** `search_memory_graph` → acquire read lock → compute query embedding → cosine scan
+all node embeddings → BFS from top-k results to expand neighborhood.
+
+### BFS Traversal
+
+`retrieve_with_traversal` and `search_memory_graph` both use BFS from seed nodes, bounded by a
+configurable `max_depth` and `max_nodes` limit. The traversal respects edge weights — decayed edges
+(weight below threshold) are skipped during traversal even if not yet pruned.
+
+## Spectral Clustering
+
+`semantic_navigate` uses spectral clustering to group semantically similar files into labeled
+clusters. This is the most compute-intensive tool, dominated by eigendecomposition.
+
+### Pipeline
+
+```
+1. Collect file embeddings (from VectorStore, skipping uncached files)
+2. Build affinity matrix A (n×n) using Gaussian kernel: A[i,j] = exp(-||vi-vj||² / σ²)
+3. Compute normalized Laplacian L = D^(-½) A D^(-½)  (D = degree matrix)
+4. Extract top-k eigenvectors via nalgebra symmetric eigendecomposition
+5. Rows of eigenvector matrix = spectral embedding (each file → k-dim point)
+6. k-means on spectral embeddings (random restarts, convergence tolerance)
+7. Label each cluster via chat model (OLLAMA_CHAT_MODEL) with thinking disabled
+```
+
+### nalgebra Eigendecomposition
+
+Step 4 uses `nalgebra::SymmetricEigen` which implements the LAPACK `dsyev` algorithm via
+`nalgebra`'s pure-Rust implementation. For n=500 files this takes ~200ms; for n=200 it takes ~30ms.
+The affinity matrix is n×n so memory usage is O(n²) — at 500 files that is ~1MB of f32 data.
+
+### k-means
+
+A simple Lloyd's algorithm with random initialization and configurable max iterations. The spectral
+embedding reduces dimensionality to k (number of clusters) before k-means runs, so the clustering
+step is cheap (~1ms) even for 500 files. The number of clusters k is bounded by `max_clusters` and
+capped at n/4 to avoid degenerate single-item clusters.
+
+### Why Spectral vs Plain k-means?
+
+Plain k-means on high-dimensional embeddings (1024-dim) produces poor clusters because Euclidean
+distance becomes meaningless in high dimensions (the "curse of dimensionality"). Spectral clustering
+first maps points into a low-dimensional space that captures graph connectivity, making k-means
+much more effective at finding semantically coherent groups.
+
 ## Context Tree Pruning
 
 The `get_context_tree` tool supports two parameters for controlling output size:

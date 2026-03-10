@@ -8,6 +8,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::core::embeddings::{CacheEntry, VectorStore};
 use crate::error::{ContextPlusError, Result};
 
+// Compile-time assertion: this crate only runs correctly on little-endian platforms.
+// rkyv serializes f32 as f32_le; on big-endian the zero-copy pointer cast would produce
+// garbage values. (x86_64, aarch64, and RISC-V LE are all little-endian.)
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "contextplus-rs rkyv cache requires a little-endian platform"
+);
+
 // ---------------------------------------------------------------------------
 // Cache directory
 // ---------------------------------------------------------------------------
@@ -256,6 +264,14 @@ pub fn mmap_vector_store(root_dir: &Path, name: &str) -> Result<Option<VectorSto
     let archived_vectors = archived.vectors.as_slice();
     let vectors_ptr = archived_vectors.as_ptr() as *const f32;
     let vectors_len = archived_vectors.len();
+
+    // Runtime alignment check: rkyv guarantees alignment for archived data,
+    // but verify in debug builds that the cast is valid.
+    debug_assert_eq!(
+        vectors_ptr as usize % std::mem::align_of::<f32>(),
+        0,
+        "mmap f32 pointer is not 4-byte aligned"
+    );
 
     let mmap = Arc::new(mmap);
 

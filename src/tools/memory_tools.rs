@@ -347,14 +347,28 @@ pub async fn tool_add_interlinked_context(
 ) -> Result<String> {
     let auto_link = options.auto_link.unwrap_or(true);
 
-    // Prepare items with embeddings
-    let mut prepared_items = Vec::new();
+    // Parse node types upfront before batch embedding
+    let mut node_types = Vec::with_capacity(options.items.len());
     for item in &options.items {
-        let node_type = parse_node_type(&item.node_type)?;
-        let embed_text = format!("{} {}", item.label, item.content);
-        let embedding = fetch_embedding(ollama, &embed_text).await?;
+        node_types.push(parse_node_type(&item.node_type)?);
+    }
+
+    // Batch embed all items in a single HTTP call instead of N separate calls
+    let embed_texts: Vec<String> = options
+        .items
+        .iter()
+        .map(|item| format!("{} {}", item.label, item.content))
+        .collect();
+    let embeddings = ollama.embed(&embed_texts).await?;
+
+    // Zip node types, items, and embeddings into prepared tuples
+    let mut prepared_items = Vec::with_capacity(options.items.len());
+    for (i, item) in options.items.iter().enumerate() {
+        let embedding = embeddings.get(i).cloned().ok_or_else(|| {
+            crate::error::ContextPlusError::Ollama("Missing embedding for item".to_string())
+        })?;
         prepared_items.push((
-            node_type,
+            node_types[i].clone(),
             item.label.clone(),
             item.content.clone(),
             embedding,
@@ -1881,7 +1895,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let embed_response = serde_json::json!({
-            "embeddings": [[0.5, 0.5, 0.5]]
+            "embeddings": [[0.5, 0.5, 0.5], [0.6, 0.6, 0.6]]
         });
         Mock::given(method("POST"))
             .and(path("/api/embed"))
@@ -1991,9 +2005,9 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        // Return identical embeddings so auto-linking triggers
+        // Return identical embeddings so auto-linking triggers (2 items = 2 embeddings)
         let embed_response = serde_json::json!({
-            "embeddings": [[1.0, 0.0, 0.0]]
+            "embeddings": [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
         });
         Mock::given(method("POST"))
             .and(path("/api/embed"))

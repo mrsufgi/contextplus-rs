@@ -4,4 +4,7 @@ pub mod core;
 pub mod error;
 pub mod git;
 pub mod server;
+pub mod server_adapters;
+pub mod server_definitions;
+pub mod server_helpers;
 pub mod tools;

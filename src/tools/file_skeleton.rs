@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use crate::core::safe_path::resolve_safe_path;
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -129,11 +130,14 @@ pub fn render_skeleton(
 
 /// Async entry point using provider traits.
 /// Caller provides the analysis and file content.
+/// Validates `file_path` against `root_dir` to prevent path traversal.
 pub async fn get_file_skeleton(
     options: SkeletonOptions,
     analysis: Option<&SkeletonAnalysis>,
     file_content: Option<&str>,
 ) -> Result<String> {
+    // Validate the user-supplied path — reject traversal attempts.
+    resolve_safe_path(&options.root_dir, &options.file_path)?;
     Ok(render_skeleton(&options.file_path, analysis, file_content))
 }
 

@@ -4,7 +4,7 @@
 //! from disk? This is the #1 bottleneck in the TS version (115ms VectorStore, 1109ms raw).
 //! Rust target: <10ms for 30K vectors × 1024 dims.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use contextplus_rs::cache::rkyv_store::{CacheData, load_cache, load_cache_mmap, save_cache};
@@ -59,10 +59,7 @@ fn bench_cache_load(c: &mut Criterion) {
             BenchmarkId::new("rkyv_read", format!("{}x1024", count)),
             &count,
             |b, _| {
-                b.iter(|| {
-                    let loaded = load_cache(dir.path(), "bench").unwrap().unwrap();
-                    assert_eq!(loaded.dims, 1024);
-                });
+                b.iter(|| black_box(load_cache(dir.path(), "bench").unwrap().unwrap()));
             },
         );
 
@@ -70,10 +67,7 @@ fn bench_cache_load(c: &mut Criterion) {
             BenchmarkId::new("rkyv_mmap", format!("{}x1024", count)),
             &count,
             |b, _| {
-                b.iter(|| {
-                    let loaded = load_cache_mmap(dir.path(), "bench").unwrap().unwrap();
-                    assert_eq!(loaded.dims, 1024);
-                });
+                b.iter(|| black_box(load_cache_mmap(dir.path(), "bench").unwrap().unwrap()));
             },
         );
 
@@ -83,10 +77,7 @@ fn bench_cache_load(c: &mut Criterion) {
             BenchmarkId::new("to_store", format!("{}x1024", count)),
             &count,
             |b, _| {
-                b.iter(|| {
-                    let store = loaded_data.to_store();
-                    assert_eq!(store.count(), count);
-                });
+                b.iter(|| black_box(loaded_data.to_store()));
             },
         );
     }

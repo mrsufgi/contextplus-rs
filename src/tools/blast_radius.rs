@@ -45,8 +45,14 @@ pub struct SymbolUsage {
 
 #[derive(Debug)]
 pub struct BlastRadiusResult {
-    pub usages: Vec<SymbolUsage>,
     pub by_file: HashMap<String, Vec<SymbolUsage>>,
+}
+
+impl BlastRadiusResult {
+    /// Total number of usages across all files.
+    pub fn total_usages(&self) -> usize {
+        self.by_file.values().map(|v| v.len()).sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,13 +79,12 @@ pub fn find_symbol_usages(
         Ok(re) => re,
         Err(_) => {
             return BlastRadiusResult {
-                usages: vec![],
                 by_file: HashMap::new(),
             };
         }
     };
 
-    let mut usages = Vec::new();
+    let mut by_file: HashMap<String, Vec<SymbolUsage>> = HashMap::new();
 
     for (relative_path, lines) in file_lines {
         for (i, line) in lines.iter().enumerate() {
@@ -101,25 +106,24 @@ pub fn find_symbol_usages(
             } else {
                 context
             };
-            usages.push(SymbolUsage {
-                file: relative_path.clone(),
-                line: i + 1,
-                context: context.to_string(),
-            });
+            by_file
+                .entry(relative_path.clone())
+                .or_default()
+                .push(SymbolUsage {
+                    file: relative_path.clone(),
+                    line: i + 1,
+                    context: context.to_string(),
+                });
         }
     }
 
-    let mut by_file: HashMap<String, Vec<SymbolUsage>> = HashMap::new();
-    for u in &usages {
-        by_file.entry(u.file.clone()).or_default().push(u.clone());
-    }
-
-    BlastRadiusResult { usages, by_file }
+    BlastRadiusResult { by_file }
 }
 
 /// Format blast radius results as text output (matching TS format).
 pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> String {
-    if result.usages.is_empty() {
+    let total = result.total_usages();
+    if total == 0 {
         return format!(
             "Symbol \"{}\" is not used anywhere in the codebase.",
             symbol_name
@@ -130,7 +134,7 @@ pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> Str
     lines.push(format!(
         "Blast radius for \"{}\": {} usages in {} files\n",
         symbol_name,
-        result.usages.len(),
+        total,
         result.by_file.len()
     ));
 
@@ -145,10 +149,10 @@ pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> Str
         }
     }
 
-    if result.usages.len() <= 1 {
+    if total <= 1 {
         lines.push(format!(
             "\n!! LOW USAGE: This symbol is used only {} time(s). Consider inlining if it's under 20 lines.",
-            result.usages.len()
+            total
         ));
     }
 
@@ -226,7 +230,7 @@ mod tests {
 
         // Definition in user.ts should be excluded
         // Usage in handler.ts should be included (import + call)
-        assert!(!result.usages.is_empty());
+        assert!(result.total_usages() > 0);
         assert!(result.by_file.contains_key("src/handler.ts"));
         // The definition line in user.ts should be excluded
         let user_usages = result.by_file.get("src/user.ts");
@@ -245,7 +249,7 @@ mod tests {
 
         // Without file_context, definition is not excluded
         let result = find_symbol_usages("myFunc", None, &file_lines);
-        assert_eq!(result.usages.len(), 2);
+        assert_eq!(result.total_usages(), 2);
     }
 
     #[test]
@@ -256,7 +260,7 @@ mod tests {
         )]);
 
         let result = find_symbol_usages("nonExistent", None, &file_lines);
-        assert!(result.usages.is_empty());
+        assert_eq!(result.total_usages(), 0);
     }
 
     #[test]
@@ -268,8 +272,8 @@ mod tests {
 
         // "getUser" should match "getUser(2);" but NOT "getUserById" or "getUserByIdAndName"
         let result = find_symbol_usages("getUser", None, &file_lines);
-        assert_eq!(result.usages.len(), 1);
-        assert_eq!(result.usages[0].line, 2);
+        assert_eq!(result.total_usages(), 1);
+        assert_eq!(result.by_file.values().next().unwrap()[0].line, 2);
     }
 
     #[test]
@@ -281,13 +285,12 @@ mod tests {
 
         // Dollar sign should be escaped properly
         let result = find_symbol_usages("$transaction", None, &file_lines);
-        assert_eq!(result.usages.len(), 2);
+        assert_eq!(result.total_usages(), 2);
     }
 
     #[test]
     fn test_format_no_usages() {
         let result = BlastRadiusResult {
-            usages: vec![],
             by_file: HashMap::new(),
         };
         let output = format_blast_radius("myFunc", &result);
@@ -299,14 +302,14 @@ mod tests {
 
     #[test]
     fn test_format_single_usage_low_warning() {
-        let usages = vec![SymbolUsage {
+        let usage = SymbolUsage {
             file: "src/handler.ts".to_string(),
             line: 5,
             context: "const x = myFunc();".to_string(),
-        }];
+        };
         let mut by_file = HashMap::new();
-        by_file.insert("src/handler.ts".to_string(), usages.clone());
-        let result = BlastRadiusResult { usages, by_file };
+        by_file.insert("src/handler.ts".to_string(), vec![usage]);
+        let result = BlastRadiusResult { by_file };
         let output = format_blast_radius("myFunc", &result);
         assert!(output.contains("LOW USAGE"));
         assert!(output.contains("1 time(s)"));
@@ -314,27 +317,31 @@ mod tests {
 
     #[test]
     fn test_format_multiple_files() {
-        let usages = vec![
-            SymbolUsage {
-                file: "src/a.ts".to_string(),
-                line: 1,
-                context: "use myFunc".to_string(),
-            },
-            SymbolUsage {
-                file: "src/a.ts".to_string(),
-                line: 5,
-                context: "call myFunc".to_string(),
-            },
-            SymbolUsage {
+        let mut by_file = HashMap::new();
+        by_file.insert(
+            "src/a.ts".to_string(),
+            vec![
+                SymbolUsage {
+                    file: "src/a.ts".to_string(),
+                    line: 1,
+                    context: "use myFunc".to_string(),
+                },
+                SymbolUsage {
+                    file: "src/a.ts".to_string(),
+                    line: 5,
+                    context: "call myFunc".to_string(),
+                },
+            ],
+        );
+        by_file.insert(
+            "src/b.ts".to_string(),
+            vec![SymbolUsage {
                 file: "src/b.ts".to_string(),
                 line: 3,
                 context: "import myFunc".to_string(),
-            },
-        ];
-        let mut by_file = HashMap::new();
-        by_file.insert("src/a.ts".to_string(), usages[..2].to_vec());
-        by_file.insert("src/b.ts".to_string(), usages[2..].to_vec());
-        let result = BlastRadiusResult { usages, by_file };
+            }],
+        );
+        let result = BlastRadiusResult { by_file };
         let output = format_blast_radius("myFunc", &result);
         assert!(output.contains("3 usages in 2 files"));
         assert!(output.contains("src/a.ts:"));
@@ -353,7 +360,7 @@ mod tests {
         .into_iter()
         .collect();
         let result = find_symbol_usages("myFunc", None, &file_lines);
-        assert_eq!(result.usages.len(), 1);
-        assert!(result.usages[0].context.len() <= MAX_CONTEXT_LEN);
+        assert_eq!(result.total_usages(), 1);
+        assert!(result.by_file.values().next().unwrap()[0].context.len() <= MAX_CONTEXT_LEN);
     }
 }

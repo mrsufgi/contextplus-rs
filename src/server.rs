@@ -16,11 +16,11 @@ use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::memory_graph::GraphStore;
-use crate::core::parser::detect_language;
 use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::{ContextPlusError, Result};
-use crate::tools::semantic_search::EmbedFn;
+use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
+pub use crate::server_definitions::{make_tool, tool_definitions};
 
 /// Cached project state: walked file entries and their line contents.
 /// Built lazily on first tool call, invalidated by file watcher or TTL expiry.
@@ -46,6 +46,10 @@ const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
 pub struct SharedState {
     pub config: Config,
     pub root_dir: PathBuf,
+    /// Canonicalized version of root_dir — computed once at construction.
+    /// Used by resolve_root() to validate caller-provided rootDir args without
+    /// calling canonicalize() on every tool request.
+    pub canonical_root: PathBuf,
     pub ollama: OllamaClient,
     pub memory_graph: GraphStore,
     pub project_cache: RwLock<Option<Arc<ProjectCache>>>,
@@ -111,8 +115,12 @@ impl ContextPlusServer {
             }
         };
 
+        // Canonicalize once at construction so resolve_root() can skip per-request syscalls.
+        let canonical_root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
+
         let state = Arc::new(SharedState {
             config,
+            canonical_root,
             root_dir,
             ollama,
             memory_graph,
@@ -271,8 +279,7 @@ impl ContextPlusServer {
             } else {
                 content
             };
-            let header =
-                crate::core::parser::extract_header(&truncated.lines().collect::<Vec<_>>());
+            let header = crate::core::parser::extract_header(&truncated);
             let text = format!("{} {} {}", header, rel_path, truncated);
             texts_to_embed.push((rel_path, hash, text));
         }
@@ -363,8 +370,7 @@ impl ContextPlusServer {
                     let content = lines.join("\n");
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                     if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                        let line_refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
-                        let header = crate::core::parser::extract_header(&line_refs);
+                        let header = crate::core::parser::extract_header(&content);
                         for sym in crate::core::parser::flatten_symbols(&symbols, None) {
                             let sig = sym.signature.clone().unwrap_or_default();
                             let text = format!(
@@ -575,8 +581,7 @@ impl ContextPlusServer {
                     let content = lines.join("\n");
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                     if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                        let line_refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
-                        let header = crate::core::parser::extract_header(&line_refs);
+                        let header = crate::core::parser::extract_header(&content);
                         let tree_symbols: Vec<ct::TreeSymbol> =
                             symbols.iter().map(code_sym_to_tree_sym).collect();
                         ct_analyses.insert(
@@ -625,13 +630,32 @@ impl ContextPlusServer {
         let root = self.resolve_root(&args);
         let full_path = root.join(&file_path);
 
-        let content = tokio::fs::read_to_string(&full_path).await.ok();
+        // Round 10B: check ProjectCache.file_lines first to avoid a disk read on warm cache.
+        let cached_content: Option<String> = {
+            let cache_guard = self.state.project_cache.read().await;
+            if let Some(ref cache) = *cache_guard {
+                cache
+                    .file_lines
+                    .get(&file_path)
+                    .map(|lines| lines.join("\n"))
+            } else {
+                None
+            }
+        };
+
+        let disk_content: Option<String> = if cached_content.is_none() {
+            tokio::fs::read_to_string(&full_path).await.ok()
+        } else {
+            None
+        };
+
+        let content = cached_content.or(disk_content);
         let content_ref = content.as_deref();
 
         let analysis = content_ref.and_then(|c| {
             let ext = file_path.rsplit('.').next().unwrap_or("");
             let symbols = parse_with_tree_sitter(c, ext).ok()?;
-            let header = crate::core::parser::extract_header(&c.lines().collect::<Vec<_>>());
+            let header = crate::core::parser::extract_header(c);
             let skel_symbols: Vec<fs::SkeletonSymbol> =
                 symbols.iter().map(code_sym_to_skel_sym).collect();
             Some(fs::SkeletonAnalysis {
@@ -666,12 +690,18 @@ impl ContextPlusServer {
 
         let cache = self.ensure_project_cache().await?;
 
-        let result = crate::tools::blast_radius::find_symbol_usages(
-            &symbol_name,
-            file_context.as_deref(),
-            &cache.file_lines,
-        );
-        let formatted = crate::tools::blast_radius::format_blast_radius(&symbol_name, &result);
+        // find_symbol_usages scans all file lines — CPU-bound, run in blocking thread pool.
+        let formatted = tokio::task::spawn_blocking(move || {
+            let result = crate::tools::blast_radius::find_symbol_usages(
+                &symbol_name,
+                file_context.as_deref(),
+                &cache.file_lines,
+            );
+            crate::tools::blast_radius::format_blast_radius(&symbol_name, &result)
+        })
+        .await
+        .map_err(|e| ContextPlusError::Other(format!("blast_radius spawn_blocking failed: {e}")))?;
+
         Ok(Self::ok_text(formatted))
     }
 
@@ -784,6 +814,8 @@ impl ContextPlusServer {
                 .or_else(|| Self::get_usize(&args, "maxDepth")),
             max_clusters: Self::get_usize(&args, "max_clusters")
                 .or_else(|| Self::get_usize(&args, "maxClusters")),
+            max_output_chars: Self::get_usize(&args, "max_output_chars")
+                .or_else(|| Self::get_usize(&args, "maxOutputChars")),
         };
 
         let result = crate::tools::semantic_navigate::semantic_navigate(
@@ -1084,14 +1116,9 @@ impl ContextPlusServer {
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
         if let Some(requested) = Self::get_str(args, "rootDir") {
             let requested_path = PathBuf::from(&requested);
-            // Normalize both paths to handle `.`, `..`, symlinks, etc.
-            let canonical_root = self
-                .state
-                .root_dir
-                .canonicalize()
-                .unwrap_or_else(|_| self.state.root_dir.clone());
+            // Use pre-canonicalized root (computed once at construction, not per-request).
             if let Ok(canonical_requested) = requested_path.canonicalize()
-                && canonical_requested.starts_with(&canonical_root)
+                && canonical_requested.starts_with(&self.state.canonical_root)
             {
                 return canonical_requested;
             }
@@ -1128,8 +1155,9 @@ impl ServerHandler for ContextPlusServer {
     ) -> impl std::future::Future<Output = std::result::Result<ListToolsResult, rmcp::ErrorData>>
     + Send
     + '_ {
+        // tool_definitions() returns &'static [Tool] — built once via LazyLock, zero allocation.
         std::future::ready(Ok(ListToolsResult {
-            tools: tool_definitions(),
+            tools: tool_definitions().to_vec(),
             meta: None,
             next_cursor: None,
         }))
@@ -1143,193 +1171,6 @@ impl ServerHandler for ContextPlusServer {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
         Ok(self.dispatch(&name, args).await)
-    }
-}
-
-// --- EmbedFn adapter for OllamaClient ---
-
-struct OllamaEmbedder(OllamaClient);
-
-impl EmbedFn for OllamaEmbedder {
-    fn embed(
-        &self,
-        texts: &[String],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>>
-    {
-        let texts = texts.to_vec();
-        Box::pin(async move { self.0.embed(&texts).await })
-    }
-}
-
-// --- WalkAndIndexFn adapter (uses embedding cache for warm hits) ---
-
-use crate::core::embeddings::content_hash;
-use crate::tools::semantic_search::{SearchDocument, SymbolSearchEntry, WalkAndIndexFn};
-
-struct CachedWalkerIndexer {
-    config: Config,
-    ollama: OllamaClient,
-    state: Arc<SharedState>,
-}
-
-impl WalkAndIndexFn for CachedWalkerIndexer {
-    fn walk_and_index(
-        &self,
-        root_dir: &Path,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>>
-                + Send
-                + '_,
-        >,
-    > {
-        let root = root_dir.to_path_buf();
-        let config = self.config.clone();
-        let ollama = self.ollama.clone();
-        let state = self.state.clone();
-        Box::pin(async move {
-            let embedding_cache = &state.embedding_cache;
-            let store_root = &state.root_dir;
-            let entries = walk_with_config(&root, &config);
-
-            // Read all files concurrently (up to 32 at a time)
-            let mut join_set = tokio::task::JoinSet::new();
-            for (i, entry) in entries.iter().enumerate() {
-                let full_path = root.join(&entry.relative_path);
-                let rel_path = entry.relative_path.clone();
-                join_set.spawn(async move {
-                    let content = tokio::fs::read_to_string(&full_path).await.ok();
-                    (i, rel_path, content)
-                });
-            }
-
-            // Collect results in order
-            let mut file_contents: Vec<(usize, String, Option<String>)> =
-                Vec::with_capacity(entries.len());
-            while let Some(result) = join_set.join_next().await {
-                if let Ok(item) = result {
-                    file_contents.push(item);
-                }
-            }
-            file_contents.sort_unstable_by_key(|(i, _, _)| *i);
-
-            let mut docs = Vec::new();
-            let mut content_hashes = Vec::new();
-
-            for (_, rel_path, maybe_content) in &file_contents {
-                let content = match maybe_content {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let ext = rel_path.rsplit('.').next().unwrap_or("");
-                let symbols = parse_with_tree_sitter(content, ext).unwrap_or_default();
-                let header =
-                    crate::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
-
-                let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
-                let symbol_entries: Vec<SymbolSearchEntry> = symbols
-                    .iter()
-                    .map(|s| SymbolSearchEntry {
-                        name: s.name.clone(),
-                        kind: Some(s.kind.clone()),
-                        line: s.line,
-                        end_line: Some(s.end_line),
-                        signature: s.signature.clone(),
-                    })
-                    .collect();
-
-                let doc_content = format!(
-                    "{} {}",
-                    detect_language(rel_path).unwrap_or("unknown"),
-                    content.chars().take(500).collect::<String>()
-                );
-                content_hashes.push((rel_path.clone(), content_hash(&doc_content)));
-
-                docs.push(SearchDocument::new(
-                    rel_path.clone(),
-                    header,
-                    symbol_names,
-                    symbol_entries,
-                    doc_content,
-                ));
-            }
-
-            if docs.is_empty() {
-                return Ok((docs, Vec::new()));
-            }
-
-            // Resolve vectors from cache, embed only uncached/stale files
-            let cache_read = embedding_cache.read().await;
-            let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
-            let mut uncached_indices: Vec<usize> = Vec::new();
-            let mut uncached_texts: Vec<String> = Vec::new();
-
-            for (i, (rel_path, hash)) in content_hashes.iter().enumerate() {
-                if let Some(entry) = cache_read.get(rel_path)
-                    && entry.hash == *hash
-                {
-                    vectors.push(Some(entry.vector.clone()));
-                    continue;
-                }
-                vectors.push(None);
-                uncached_indices.push(i);
-                uncached_texts.push(docs[i].content.clone());
-            }
-            drop(cache_read);
-
-            tracing::info!(
-                cached = docs.len() - uncached_indices.len(),
-                uncached = uncached_indices.len(),
-                "semantic_code_search embedding cache hit/miss"
-            );
-
-            // Embed only uncached files
-            if !uncached_texts.is_empty() {
-                let batch_size = config.embed_batch_size.max(1);
-                let mut new_vectors = Vec::with_capacity(uncached_texts.len());
-                for chunk in uncached_texts.chunks(batch_size) {
-                    match ollama.embed(chunk).await {
-                        Ok(embeddings) => new_vectors.extend(embeddings),
-                        Err(e) => {
-                            tracing::warn!("Embedding batch failed: {e}, filling with None");
-                            for _ in chunk {
-                                new_vectors.push(Vec::new());
-                            }
-                        }
-                    }
-                }
-
-                // Store new vectors in cache and fill result
-                {
-                    let mut cache_write = embedding_cache.write().await;
-                    for (j, &idx) in uncached_indices.iter().enumerate() {
-                        if j < new_vectors.len() && !new_vectors[j].is_empty() {
-                            let (rel_path, hash) = &content_hashes[idx];
-                            cache_write.insert(
-                                rel_path.clone(),
-                                CacheEntry {
-                                    hash: hash.clone(),
-                                    vector: new_vectors[j].clone(),
-                                },
-                            );
-                            vectors[idx] = Some(new_vectors[j].clone());
-                        }
-                    }
-
-                    // Persist to disk with model-qualified name
-                    let code_cache_name = cache_name("embeddings", &config.ollama_embed_model);
-                    if let Some(store) =
-                        crate::core::embeddings::VectorStore::from_cache(&cache_write)
-                        && let Err(e) =
-                            rkyv_store::save_vector_store(store_root, &code_cache_name, &store)
-                    {
-                        tracing::warn!("Failed to save embedding cache: {e}");
-                    }
-                }
-            }
-
-            Ok((docs, vectors))
-        })
     }
 }
 
@@ -1373,424 +1214,7 @@ fn parse_metadata(
     })
 }
 
-// --- Tool definitions ---
-
-fn tool_definitions() -> Vec<Tool> {
-    vec![
-        make_tool(
-            "get_context_tree",
-            "Build a token-aware context tree showing file structure and symbols. Prunes detail levels based on max_tokens budget.",
-            &[
-                (
-                    "target_path",
-                    "string",
-                    false,
-                    "Specific directory or file to analyze (relative to project root)",
-                ),
-                (
-                    "depth_limit",
-                    "integer",
-                    false,
-                    "How many folder levels deep to scan. Use 1-2 for large projects.",
-                ),
-                (
-                    "include_symbols",
-                    "boolean",
-                    false,
-                    "Include function/class/enum names in the tree (default true)",
-                ),
-                (
-                    "max_tokens",
-                    "integer",
-                    false,
-                    "Maximum tokens for output. Auto-prunes if exceeded (default 20000)",
-                ),
-            ],
-        ),
-        make_tool(
-            "get_file_skeleton",
-            "Get function signatures, class definitions, and line ranges for a file without reading full content.",
-            &[(
-                "file_path",
-                "string",
-                true,
-                "Path to the file to inspect (relative to project root)",
-            )],
-        ),
-        make_tool(
-            "get_blast_radius",
-            "Find every file that imports or references a symbol. Maps the full impact of changing it.",
-            &[
-                (
-                    "symbol_name",
-                    "string",
-                    true,
-                    "The function, class, or variable name to trace across the codebase",
-                ),
-                (
-                    "file_context",
-                    "string",
-                    false,
-                    "The file where the symbol is defined. Excludes the definition line from results.",
-                ),
-            ],
-        ),
-        make_tool(
-            "semantic_code_search",
-            "Search code files semantically using natural language queries. Combines embedding similarity with keyword matching for hybrid ranking.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Natural language description of what you're looking for",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "Number of matches to return (default 5, max 50)",
-                ),
-                (
-                    "semantic_weight",
-                    "number",
-                    false,
-                    "Weight for embedding similarity in hybrid ranking (default 0.72)",
-                ),
-                (
-                    "keyword_weight",
-                    "number",
-                    false,
-                    "Weight for keyword overlap in hybrid ranking (default 0.28)",
-                ),
-                (
-                    "min_semantic_score",
-                    "number",
-                    false,
-                    "Minimum semantic score filter (0-1 or 0-100)",
-                ),
-                (
-                    "min_keyword_score",
-                    "number",
-                    false,
-                    "Minimum keyword score filter (0-1 or 0-100)",
-                ),
-                (
-                    "min_combined_score",
-                    "number",
-                    false,
-                    "Minimum final score filter (0-1 or 0-100)",
-                ),
-                (
-                    "require_keyword_match",
-                    "boolean",
-                    false,
-                    "When true, only return files with keyword overlap",
-                ),
-                (
-                    "require_semantic_match",
-                    "boolean",
-                    false,
-                    "When true, only return files with positive semantic similarity",
-                ),
-            ],
-        ),
-        make_tool(
-            "semantic_identifier_search",
-            "Search for functions, classes, and variables by semantic meaning. Returns identifiers with call-site rankings.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Natural language intent to match identifiers and usages",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "How many identifiers to return (default 5)",
-                ),
-                (
-                    "top_calls_per_identifier",
-                    "integer",
-                    false,
-                    "How many ranked call sites per identifier (default 10)",
-                ),
-                (
-                    "include_kinds",
-                    "array",
-                    false,
-                    "Optional kinds filter, e.g. [\"function\", \"method\", \"variable\"]",
-                ),
-                (
-                    "semantic_weight",
-                    "number",
-                    false,
-                    "Weight for semantic similarity score (default 0.78)",
-                ),
-                (
-                    "keyword_weight",
-                    "number",
-                    false,
-                    "Weight for keyword overlap score (default 0.22)",
-                ),
-            ],
-        ),
-        make_tool(
-            "semantic_navigate",
-            "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation.",
-            &[
-                (
-                    "max_depth",
-                    "integer",
-                    false,
-                    "Maximum nesting depth of clusters (default 3)",
-                ),
-                (
-                    "max_clusters",
-                    "integer",
-                    false,
-                    "Maximum sub-clusters per level (default 20)",
-                ),
-            ],
-        ),
-        make_tool(
-            "get_feature_hub",
-            "Navigate Obsidian-style wikilinks to discover feature hubs and their connections.",
-            &[
-                (
-                    "hub_path",
-                    "string",
-                    false,
-                    "Path to a specific hub .md file (relative to root)",
-                ),
-                (
-                    "feature_name",
-                    "string",
-                    false,
-                    "Feature name to search for. Finds matching hub file automatically.",
-                ),
-                (
-                    "show_orphans",
-                    "boolean",
-                    false,
-                    "If true, lists all source files not linked to any hub.",
-                ),
-            ],
-        ),
-        make_tool(
-            "run_static_analysis",
-            "Run available linters (tsc, eslint, cargo check, ruff) on the project or a specific file.",
-            &[(
-                "target_path",
-                "string",
-                false,
-                "Specific file or folder to lint (relative to root). Omit for full project.",
-            )],
-        ),
-        make_tool(
-            "propose_commit",
-            "Write a file with validation (header, comments, nesting, line count) and create a shadow restore point for undo.",
-            &[
-                (
-                    "file_path",
-                    "string",
-                    true,
-                    "Where to save the file (relative to project root)",
-                ),
-                (
-                    "new_content",
-                    "string",
-                    true,
-                    "The complete file content to save",
-                ),
-                ("description", "string", false, "Description of the change"),
-            ],
-        ),
-        make_tool(
-            "list_restore_points",
-            "List all shadow restore points created by propose_commit.",
-            &[],
-        ),
-        make_tool(
-            "undo_change",
-            "Restore files from a shadow restore point created by propose_commit.",
-            &[(
-                "point_id",
-                "string",
-                true,
-                "The restore point ID (format: rp-timestamp-hash). Get from list_restore_points.",
-            )],
-        ),
-        make_tool(
-            "upsert_memory_node",
-            "Create or update a memory graph node. Nodes are uniquely identified by (label, type).",
-            &[
-                (
-                    "type",
-                    "string",
-                    true,
-                    "Node type: concept, file, symbol, note",
-                ),
-                (
-                    "label",
-                    "string",
-                    true,
-                    "Short identifier for the node. Used for deduplication with type.",
-                ),
-                (
-                    "content",
-                    "string",
-                    true,
-                    "Detailed content for the node. Used for embedding generation.",
-                ),
-                (
-                    "metadata",
-                    "object",
-                    false,
-                    "Optional key-value metadata pairs",
-                ),
-            ],
-        ),
-        make_tool(
-            "create_relation",
-            "Create or update a relation between two memory graph nodes.",
-            &[
-                ("source_id", "string", true, "ID of the source memory node"),
-                ("target_id", "string", true, "ID of the target memory node"),
-                (
-                    "relation",
-                    "string",
-                    true,
-                    "Relationship type: relates_to, depends_on, implements, references, similar_to, contains",
-                ),
-                (
-                    "weight",
-                    "number",
-                    false,
-                    "Edge weight 0-1. Higher = stronger relationship (default 1.0)",
-                ),
-                (
-                    "metadata",
-                    "object",
-                    false,
-                    "Optional key-value metadata for the edge",
-                ),
-            ],
-        ),
-        make_tool(
-            "search_memory_graph",
-            "Search the memory graph by semantic similarity and BFS traversal.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Natural language query to search the memory graph",
-                ),
-                (
-                    "max_depth",
-                    "integer",
-                    false,
-                    "How many hops to traverse from direct matches (default 1)",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "Number of direct matches to return (default 5)",
-                ),
-                (
-                    "edge_filter",
-                    "array",
-                    false,
-                    "Only traverse edges of these types. Omit for all types.",
-                ),
-            ],
-        ),
-        make_tool(
-            "prune_stale_links",
-            "Remove memory graph edges with decayed weight below threshold, and orphan nodes.",
-            &[(
-                "threshold",
-                "number",
-                false,
-                "Minimum decayed weight to keep an edge (default 0.15). Lower = keep more edges.",
-            )],
-        ),
-        make_tool(
-            "add_interlinked_context",
-            "Add multiple memory nodes at once with optional auto-linking by semantic similarity.",
-            &[
-                (
-                    "items",
-                    "array",
-                    true,
-                    "Array of nodes to add. Each needs type, label, and content.",
-                ),
-                (
-                    "auto_link",
-                    "boolean",
-                    false,
-                    "Whether to auto-create similarity edges (default true)",
-                ),
-            ],
-        ),
-        make_tool(
-            "retrieve_with_traversal",
-            "Retrieve a memory node and its neighborhood via BFS traversal with depth penalty.",
-            &[
-                (
-                    "start_node_id",
-                    "string",
-                    true,
-                    "ID of the memory node to start traversal from",
-                ),
-                (
-                    "max_depth",
-                    "integer",
-                    false,
-                    "Maximum traversal depth from start node (default 2)",
-                ),
-                (
-                    "edge_filter",
-                    "array",
-                    false,
-                    "Only traverse edges of these types. Omit for all.",
-                ),
-            ],
-        ),
-    ]
-}
-
-fn make_tool(name: &str, description: &str, params: &[(&str, &str, bool, &str)]) -> Tool {
-    let mut properties = serde_json::Map::new();
-    let mut required = Vec::new();
-
-    for (pname, ptype, is_required, pdesc) in params {
-        let mut prop = serde_json::Map::new();
-        prop.insert("type".into(), Value::String(ptype.to_string()));
-        prop.insert("description".into(), Value::String(pdesc.to_string()));
-        properties.insert(pname.to_string(), Value::Object(prop));
-        if *is_required {
-            required.push(Value::String(pname.to_string()));
-        }
-    }
-
-    let mut schema = serde_json::Map::new();
-    schema.insert("type".into(), Value::String("object".into()));
-    schema.insert("properties".into(), Value::Object(properties));
-    if !required.is_empty() {
-        schema.insert("required".into(), Value::Array(required));
-    }
-
-    Tool::new_with_raw(
-        name.to_string(),
-        Some(description.to_string().into()),
-        Arc::new(schema),
-    )
-}
+// make_tool() is re-exported from server_definitions — see imports at top of this file.
 
 #[cfg(test)]
 mod tests {
@@ -1809,7 +1233,7 @@ mod tests {
     fn tool_definitions_returns_all_17_tools() {
         let defs = tool_definitions();
         assert_eq!(defs.len(), 17, "expected 17 tools, got {}", defs.len());
-        for tool in &defs {
+        for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
                 tool.description.is_some(),
@@ -3008,10 +2432,10 @@ mod tests {
     #[test]
     fn tool_definitions_all_tools_have_object_type_schema() {
         let defs = tool_definitions();
-        for tool in &defs {
+        for tool in defs {
             let schema = tool.input_schema.as_ref();
             assert_eq!(
-                schema.get("type").and_then(|v| v.as_str()),
+                schema.get("type").and_then(|v: &serde_json::Value| v.as_str()),
                 Some("object"),
                 "tool '{}' should have type: object in schema",
                 tool.name
@@ -3022,7 +2446,7 @@ mod tests {
     #[test]
     fn tool_definitions_all_tools_have_properties() {
         let defs = tool_definitions();
-        for tool in &defs {
+        for tool in defs {
             let schema = tool.input_schema.as_ref();
             assert!(
                 schema.get("properties").is_some(),

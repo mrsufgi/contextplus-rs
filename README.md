@@ -25,11 +25,11 @@ MCP tools return ranked, structured results. Grep returns raw lines.
 
 | Query | MCP Output | Grep Output | Reduction |
 |-------|-----------|-------------|-----------|
-| File skeleton (profile.ts) | ~400 tokens | ~1,678 tokens | **4x fewer** |
-| Context tree (scheduling) | ~1,250 tokens | ~707K tokens | **566x fewer** |
-| Blast radius (createProfileService) | ~300 tokens | ~1,419 tokens | **5x fewer** |
+| File skeleton (any module) | ~400 tokens | ~1,678 tokens | **4x fewer** |
+| Context tree (any domain) | ~1,250 tokens | ~707K tokens | **566x fewer** |
+| Blast radius (any symbol) | ~300 tokens | ~1,419 tokens | **5x fewer** |
 | Semantic search ("form validation") | ~500 tokens | ~42.7M tokens | **85,000x fewer** |
-| Identifier search ("membership") | ~625 tokens | ~23.9M tokens | **38,000x fewer** |
+| Identifier search ("any concept") | ~625 tokens | ~23.9M tokens | **38,000x fewer** |
 
 ### 20-Search Session Cost
 
@@ -186,7 +186,9 @@ layout, performance architecture, and how to add new tools).
 ```
 src/
   main.rs                    # CLI + MCP server entry point
-  server.rs                  # ServerHandler + tool dispatch
+  server_adapters.rs         # rmcp ServerHandler impl + tool dispatch
+  server_definitions.rs      # Tool definitions (names, descriptions, JSON schemas)
+  server_helpers.rs          # Shared handler utilities
   config.rs                  # Environment variable configuration
   error.rs                   # ContextPlusError enum (thiserror)
   core/
@@ -222,7 +224,7 @@ TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Bash
 
 ## Benchmarks (`cargo bench`)
 
-Four criterion benchmark suites cover the critical hot paths — no Ollama dependency, fully reproducible.
+Nine Criterion benchmark suites cover the critical hot paths — no Ollama dependency, fully reproducible.
 
 ### Cache Load (rkyv + mmap)
 
@@ -279,8 +281,8 @@ Warm search on 30K files: **4.3ms**. Hash-check (no-op refresh): **<1ms**.
 ## Development
 
 ```bash
-cargo test                  # 584 tests
-cargo bench                 # Criterion benchmarks (cache, cosine, tree-sitter, search)
+cargo test                  # 613+ tests
+cargo bench                 # 9 Criterion benchmark suites
 cargo clippy --all-targets  # Lint
 cargo fmt --check           # Format check
 ```

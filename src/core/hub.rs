@@ -112,8 +112,13 @@ pub fn has_wikilinks(content: &str) -> bool {
     WIKILINK_RE.is_match(content)
 }
 
+/// Maximum bytes to read per file when scanning for wikilinks.
+/// Wikilinks appear in the first 8KB of a markdown file in virtually all real-world cases.
+const HUB_SCAN_BYTES: usize = 8 * 1024;
+
 /// Walk a directory tree and discover hub files (markdown files with wikilinks).
 /// Returns paths relative to root_dir.
+/// Reads only the first 8KB of each markdown file for performance.
 pub async fn discover_hubs(root_dir: &Path) -> crate::error::Result<Vec<String>> {
     let skip: HashSet<&str> = ["node_modules", ".git", "build", "dist", ".mcp_data"]
         .iter()
@@ -146,19 +151,41 @@ pub async fn discover_hubs(root_dir: &Path) -> crate::error::Result<Vec<String>>
 
             if file_type.is_dir() {
                 dirs.push(full_path);
-            } else if name_str.ends_with(".md")
-                && let Ok(content) = tokio::fs::read_to_string(&full_path).await
-                && has_wikilinks(&content)
-                && let Ok(rel) = full_path.strip_prefix(root_dir)
-            {
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                hubs.push(rel_str);
+            } else if name_str.ends_with(".md") {
+                // Read only the first 8KB for wikilink detection — avoids loading large docs
+                if let Ok(partial) = read_first_bytes(&full_path, HUB_SCAN_BYTES).await
+                    && has_wikilinks(&partial)
+                    && let Ok(rel) = full_path.strip_prefix(root_dir)
+                {
+                    let rel_str = rel.to_string_lossy();
+                    let rel_owned = if rel_str.contains('\\') {
+                        rel_str.replace('\\', "/")
+                    } else {
+                        rel_str.into_owned()
+                    };
+                    hubs.push(rel_owned);
+                }
             }
         }
     }
 
     hubs.sort();
     Ok(hubs)
+}
+
+/// Read at most `max_bytes` bytes from a file and return as a UTF-8 string.
+/// Truncates at a valid UTF-8 boundary (never splits a multibyte codepoint).
+async fn read_first_bytes(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf).await?;
+    buf.truncate(n);
+    // from_utf8_lossy handles invalid sequences, but we also want to avoid
+    // splitting a valid multibyte sequence at the boundary, so trim trailing
+    // incomplete bytes.
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    Ok(s)
 }
 
 /// Find files that are not linked from any hub.

@@ -5,6 +5,7 @@
 //! - Uses Ollama embeddings for semantic similarity
 //! - Combines semantic score with keyword coverage for hybrid ranking
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -353,12 +354,13 @@ fn compute_combined_score(
 }
 
 /// Truncate query to MAX_QUERY_LEN characters.
-pub fn sanitize_query(query: &str) -> String {
+/// Returns `Cow::Borrowed` when no modification is needed (zero allocation).
+pub fn sanitize_query(query: &str) -> Cow<'_, str> {
     let q = query.trim();
     if q.len() > MAX_QUERY_LEN {
-        crate::core::parser::truncate_to_char_boundary(q, MAX_QUERY_LEN).to_string()
+        Cow::Owned(crate::core::parser::truncate_to_char_boundary(q, MAX_QUERY_LEN).to_string())
     } else {
-        q.to_string()
+        Cow::Borrowed(q)
     }
 }
 
@@ -596,8 +598,9 @@ pub async fn semantic_code_search(
 
     let resolved = resolve_search_options(&options);
 
-    // Get query embedding
-    let query_vecs = embed_fn.embed(std::slice::from_ref(&query)).await?;
+    // Get query embedding — embed takes &[String], so convert Cow<str> to String only once.
+    let query_string = query.as_ref().to_string();
+    let query_vecs = embed_fn.embed(std::slice::from_ref(&query_string)).await?;
     let query_vec = query_vecs
         .into_iter()
         .next()
@@ -609,8 +612,8 @@ pub async fn semantic_code_search(
     let mut index = SearchIndex::new();
     index.index_with_vectors(docs, vectors);
 
-    let results = index.search(&query, &query_vec, &resolved);
-    Ok(format_search_results(&query, &results))
+    let results = index.search(query.as_ref(), &query_vec, &resolved);
+    Ok(format_search_results(query.as_ref(), &results))
 }
 
 // ---------------------------------------------------------------------------

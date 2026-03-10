@@ -256,15 +256,6 @@ fn normalize_kinds(kinds: &Option<Vec<String>>) -> Option<HashSet<String>> {
     }
 }
 
-/// Compute the vector norm (L2) of a vector.
-pub fn vector_norm(vec: &[f32]) -> f64 {
-    let mut sum: f64 = 0.0;
-    for &v in vec {
-        sum += (v as f64) * (v as f64);
-    }
-    sum.sqrt()
-}
-
 // ---------------------------------------------------------------------------
 // Call-site ranking
 // ---------------------------------------------------------------------------
@@ -583,13 +574,14 @@ pub async fn semantic_identifier_search(
         return Ok("No supported identifiers found for semantic identifier search.".to_string());
     }
 
-    // Get query embedding
-    let query_vecs = embed_fn.embed(std::slice::from_ref(&query)).await?;
+    // Get query embedding — embed takes &[String], so convert Cow<str> to String only once.
+    let query_string = query.as_ref().to_string();
+    let query_vecs = embed_fn.embed(std::slice::from_ref(&query_string)).await?;
     let query_vec = query_vecs
         .into_iter()
         .next()
         .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
-    let query_terms: HashSet<String> = split_camel_case(&query).into_iter().collect();
+    let query_terms: HashSet<String> = split_camel_case(query.as_ref()).into_iter().collect();
 
     // Score identifiers
     let top = score_identifiers(
@@ -623,7 +615,11 @@ pub async fn semantic_identifier_search(
         })
         .collect();
 
-    Ok(format_identifier_results(&query, &top, &call_results))
+    Ok(format_identifier_results(
+        query.as_ref(),
+        &top,
+        &call_results,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +629,16 @@ pub async fn semantic_identifier_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compute the vector norm (L2) of a vector.
+    /// Only used in tests — moved here to eliminate dead code warning.
+    fn vector_norm(vec: &[f32]) -> f64 {
+        let mut sum: f64 = 0.0;
+        for &v in vec {
+            sum += (v as f64) * (v as f64);
+        }
+        sum.sqrt()
+    }
 
     // -- is_definition_line tests --
 

@@ -288,7 +288,10 @@ pub async fn get_context_tree(
 ) -> Result<String> {
     let include_symbols = options.include_symbols.unwrap_or(true);
 
-    // Filter by target_path if specified — scope tree to a subdirectory
+    // Filter by target_path if specified — scope tree to a subdirectory.
+    // Entries are REBASED: the target_path prefix is stripped so the tree builder
+    // sees relative paths starting from the target directory, not the repo root.
+    // Without rebasing, the tree builder can't find parent directories and returns empty.
     let filtered_entries: Vec<FileEntry>;
     let filtered_analyses: BTreeMap<String, FileAnalysis>;
     let (effective_entries, effective_analyses) = if let Some(ref target) = options.target_path {
@@ -299,13 +302,20 @@ pub async fn get_context_tree(
         };
         filtered_entries = entries
             .iter()
-            .filter(|e| e.relative_path == *target || e.relative_path.starts_with(&prefix))
-            .cloned()
+            .filter(|e| e.relative_path.starts_with(&prefix))
+            .map(|e| {
+                let rebased = e.relative_path[prefix.len()..].to_string();
+                FileEntry {
+                    relative_path: rebased.clone(),
+                    is_directory: e.is_directory,
+                    depth: rebased.matches('/').count(),
+                }
+            })
             .collect();
         filtered_analyses = analyses
             .iter()
-            .filter(|(k, _)| k.as_str() == target.as_str() || k.starts_with(&prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
             .collect();
         (&filtered_entries[..], &filtered_analyses)
     } else {

@@ -4,7 +4,7 @@
 //! for scanning 30K vectors × 1024 dimensions — the core of every search query.
 //! TS baseline: ~50ms (JS loop). Rust target: <20ms (SIMD).
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use contextplus_rs::core::embeddings::{
     VectorStore, cosine_similarity_naive, cosine_similarity_simsimd,
@@ -115,10 +115,7 @@ fn bench_vectorstore_find_nearest(c: &mut Criterion) {
             BenchmarkId::new("top_5", format!("{}x{}", count, dims)),
             &count,
             |bench, _| {
-                bench.iter(|| {
-                    let results = store.find_nearest(&query, 5);
-                    assert_eq!(results.len(), 5);
-                });
+                bench.iter(|| black_box(store.find_nearest(black_box(&query), 5)));
             },
         );
 
@@ -126,10 +123,7 @@ fn bench_vectorstore_find_nearest(c: &mut Criterion) {
             BenchmarkId::new("top_20", format!("{}x{}", count, dims)),
             &count,
             |bench, _| {
-                bench.iter(|| {
-                    let results = store.find_nearest(&query, 20);
-                    assert_eq!(results.len(), 20);
-                });
+                bench.iter(|| black_box(store.find_nearest(black_box(&query), 20)));
             },
         );
     }

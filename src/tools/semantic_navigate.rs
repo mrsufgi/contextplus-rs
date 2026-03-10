@@ -30,7 +30,11 @@ pub struct SemanticNavigateOptions {
     pub root_dir: String,
     pub max_depth: Option<usize>,
     pub max_clusters: Option<usize>,
+    /// Maximum output characters before truncation (default 50,000).
+    pub max_output_chars: Option<usize>,
 }
+
+const DEFAULT_MAX_OUTPUT_CHARS: usize = 50_000;
 
 /// Information about a source file for clustering.
 #[derive(Debug, Clone)]
@@ -111,16 +115,38 @@ pub async fn semantic_navigate(
         return Ok(lines.join("\n"));
     }
 
-    // Build hierarchical cluster tree
-    let tree = build_hierarchy(&files, &vectors, max_clusters, 0, max_depth, ollama).await;
+    // Build hierarchical cluster tree — pass all files/vectors + a full index slice
+    let all_indices: Vec<usize> = (0..files.len()).collect();
+    let tree = build_hierarchy(
+        &files,
+        &vectors,
+        &all_indices,
+        max_clusters,
+        0,
+        max_depth,
+        ollama,
+    )
+    .await;
     let mut root_node = tree;
     root_node.label = "Project".to_string();
 
-    Ok(format!(
+    let max_chars = options.max_output_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
+    let tree_text = render_cluster_tree(&root_node, 0);
+    let output = format!(
         "Semantic Navigator: {} files organized by meaning\n\n{}",
         files.len(),
-        render_cluster_tree(&root_node, 0)
-    ))
+        tree_text
+    );
+
+    if output.len() > max_chars {
+        let truncated = crate::core::parser::truncate_to_char_boundary(&output, max_chars);
+        Ok(format!(
+            "{}\n\n[Output truncated at {} chars — use max_output_chars to adjust]",
+            truncated, max_chars
+        ))
+    } else {
+        Ok(output)
+    }
 }
 
 /// Walk the directory using shared walker infrastructure and collect source file information.
@@ -227,21 +253,23 @@ async fn resolve_embeddings(
     }
 
     // Embed only the uncached/stale files
-    let new_vectors = ollama.embed(&uncached_texts).await?;
+    let mut new_vectors = ollama.embed(&uncached_texts).await?;
 
-    // Store new vectors in cache, then drop lock BEFORE disk I/O
+    // Store new vectors in cache, then drop lock BEFORE disk I/O.
+    // Use std::mem::take to move vectors out of new_vectors without cloning.
     let store_to_save = {
         let mut cache_write = embedding_cache.write().await;
         for (j, &file_idx) in uncached_indices.iter().enumerate() {
             if j < new_vectors.len() {
+                let vec = std::mem::take(&mut new_vectors[j]);
                 cache_write.insert(
                     files[file_idx].relative_path.clone(),
                     CacheEntry {
                         hash: uncached_hashes[j].clone(),
-                        vector: new_vectors[j].clone(),
+                        vector: vec.clone(),
                     },
                 );
-                result_vectors[file_idx] = Some(new_vectors[j].clone());
+                result_vectors[file_idx] = Some(vec);
             }
         }
 
@@ -441,79 +469,75 @@ fn extract_json_array(text: &str) -> Option<String> {
 }
 
 /// Recursively build hierarchical cluster tree.
+/// Uses index slices into the top-level `all_files`/`all_vectors` to avoid cloning.
 async fn build_hierarchy(
-    files: &[FileInfo],
-    vectors: &[Vec<f32>],
+    all_files: &[FileInfo],
+    all_vectors: &[Vec<f32>],
+    indices: &[usize],
     max_clusters: usize,
     depth: usize,
     max_depth: usize,
     ollama: &OllamaClient,
 ) -> ClusterNode {
-    if files.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
+    let paths: Vec<String> = indices
+        .iter()
+        .map(|&i| all_files[i].relative_path.clone())
+        .collect();
+
+    if indices.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
         return ClusterNode {
             label: String::new(),
-            path_pattern: find_path_pattern(
-                &files
-                    .iter()
-                    .map(|f| f.relative_path.clone())
-                    .collect::<Vec<_>>(),
-            ),
-            files: files.to_vec(),
+            path_pattern: find_path_pattern(&paths),
+            files: indices.iter().map(|&i| all_files[i].clone()).collect(),
             children: Vec::new(),
         };
     }
 
-    let cluster_results = spectral_cluster(vectors, max_clusters);
+    // Build local vectors slice for clustering (indices into all_vectors)
+    let local_vectors: Vec<Vec<f32>> = indices.iter().map(|&i| all_vectors[i].clone()).collect();
+    let cluster_results = spectral_cluster(&local_vectors, max_clusters);
 
     if cluster_results.len() <= 1 {
         return ClusterNode {
             label: String::new(),
-            path_pattern: find_path_pattern(
-                &files
-                    .iter()
-                    .map(|f| f.relative_path.clone())
-                    .collect::<Vec<_>>(),
-            ),
-            files: files.to_vec(),
+            path_pattern: find_path_pattern(&paths),
+            files: indices.iter().map(|&i| all_files[i].clone()).collect(),
             children: Vec::new(),
         };
     }
 
-    // Build child metadata
-    #[allow(clippy::type_complexity)]
-    let child_metas: Vec<(Vec<&FileInfo>, Vec<Vec<f32>>, Option<String>)> = cluster_results
+    // Map cluster result indices (into local_vectors) back to global indices
+    let child_index_groups: Vec<(Vec<usize>, Option<String>)> = cluster_results
         .iter()
         .map(|cluster| {
-            let cluster_files: Vec<&FileInfo> =
-                cluster.indices.iter().map(|&i| &files[i]).collect();
-            let cluster_vectors: Vec<Vec<f32>> = cluster
-                .indices
+            let global_indices: Vec<usize> =
+                cluster.indices.iter().map(|&li| indices[li]).collect();
+            let child_paths: Vec<String> = global_indices
                 .iter()
-                .map(|&i| vectors[i].clone())
+                .map(|&gi| all_files[gi].relative_path.clone())
                 .collect();
-            let paths: Vec<String> = cluster_files
-                .iter()
-                .map(|f| f.relative_path.clone())
-                .collect();
-            let pattern = find_path_pattern(&paths);
-            (cluster_files, cluster_vectors, pattern)
+            let pattern = find_path_pattern(&child_paths);
+            (global_indices, pattern)
         })
         .collect();
 
-    // Get labels for sibling clusters
-    let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_metas
+    // Get labels for sibling clusters — pass &FileInfo slices without cloning vecs
+    let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_index_groups
         .iter()
-        .map(|(files, _, pattern)| (files.clone(), pattern.clone()))
+        .map(|(idxs, pattern)| {
+            let file_refs: Vec<&FileInfo> = idxs.iter().map(|&i| &all_files[i]).collect();
+            (file_refs, pattern.clone())
+        })
         .collect();
     let labels = label_sibling_clusters(&label_input, ollama).await;
 
     // Recurse into children
     let mut children = Vec::new();
-    for (i, (cluster_files, cluster_vectors, _pattern)) in child_metas.into_iter().enumerate() {
-        let owned_files: Vec<FileInfo> = cluster_files.iter().map(|f| (*f).clone()).collect();
+    for (i, (child_indices, _pattern)) in child_index_groups.into_iter().enumerate() {
         let mut child = Box::pin(build_hierarchy(
-            &owned_files,
-            &cluster_vectors,
+            all_files,
+            all_vectors,
+            &child_indices,
             max_clusters,
             depth + 1,
             max_depth,
@@ -529,12 +553,7 @@ async fn build_hierarchy(
 
     ClusterNode {
         label: String::new(),
-        path_pattern: find_path_pattern(
-            &files
-                .iter()
-                .map(|f| f.relative_path.clone())
-                .collect::<Vec<_>>(),
-        ),
+        path_pattern: find_path_pattern(&paths),
         files: Vec::new(),
         children,
     }
@@ -1235,6 +1254,7 @@ mod tests {
             root_dir: "/tmp".to_string(),
             max_depth: None,
             max_clusters: None,
+            max_output_chars: None,
         };
         assert_eq!(opts.root_dir, "/tmp");
         assert!(opts.max_depth.is_none());
@@ -1247,6 +1267,7 @@ mod tests {
             root_dir: "/project".to_string(),
             max_depth: Some(5),
             max_clusters: Some(10),
+            max_output_chars: None,
         };
         assert_eq!(opts.max_depth, Some(5));
         assert_eq!(opts.max_clusters, Some(10));

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use contextplus_rs::cache::rkyv_store::{CacheData, load_cache_mmap, save_cache};
@@ -67,7 +67,7 @@ fn bench_warm_search_pipeline(c: &mut Criterion) {
                     let store = loaded.to_store();
 
                     // 3. Find nearest
-                    let results = store.find_nearest(&query, 5);
+                    let results = store.find_nearest(black_box(&query), 5);
 
                     // 4. Format results (simulates response building)
                     let mut output = String::with_capacity(2048);
@@ -75,8 +75,7 @@ fn bench_warm_search_pipeline(c: &mut Criterion) {
                         output.push_str(&format!("{} (score: {:.4})\n", key, score));
                     }
 
-                    assert_eq!(results.len(), 5);
-                    output
+                    black_box(output)
                 });
             },
         );
@@ -88,13 +87,12 @@ fn bench_warm_search_pipeline(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let results = warm_store.find_nearest(&query, 5);
+                    let results = warm_store.find_nearest(black_box(&query), 5);
                     let mut output = String::with_capacity(2048);
                     for (key, score) in &results {
                         output.push_str(&format!("{} (score: {:.4})\n", key, score));
                     }
-                    assert_eq!(results.len(), 5);
-                    output
+                    black_box(output)
                 });
             },
         );
@@ -123,14 +121,13 @@ fn bench_hash_check(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let mut stale_count = 0;
+                    let mut stale_count = 0u32;
                     for (key, hash) in &file_hashes {
                         if store.get_hash(key) != Some(hash.as_str()) {
                             stale_count += 1;
                         }
                     }
-                    assert_eq!(stale_count, 0);
-                    stale_count
+                    black_box(stale_count)
                 });
             },
         );
@@ -146,14 +143,13 @@ fn bench_hash_check(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let mut stale_count = 0;
+                    let mut stale_count = 0u32;
                     for (key, hash) in &modified_hashes {
                         if store.get_hash(key) != Some(hash.as_str()) {
                             stale_count += 1;
                         }
                     }
-                    assert!(stale_count > 0);
-                    stale_count
+                    black_box(stale_count)
                 });
             },
         );

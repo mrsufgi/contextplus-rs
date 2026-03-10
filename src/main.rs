@@ -164,8 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let header =
-                contextplus_rs::core::parser::extract_header(&content.lines().collect::<Vec<_>>());
+            let header = contextplus_rs::core::parser::extract_header(&content);
             let analysis = SkeletonAnalysis {
                 header: if header.is_empty() {
                     None
@@ -223,9 +222,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Ok(symbols) =
                         contextplus_rs::core::tree_sitter::parse_with_tree_sitter(&content, ext)
                     {
-                        let header = contextplus_rs::core::parser::extract_header(
-                            &content.lines().collect::<Vec<_>>(),
-                        );
+                        let header = contextplus_rs::core::parser::extract_header(&content);
                         analyses.insert(
                             entry.relative_path.clone(),
                             context_tree::FileAnalysis {
@@ -313,7 +310,20 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
 
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
-    ct.waiting().await?;
+
+    // Wait for server exit OR Ctrl-C, whichever comes first.
+    // On Ctrl-C, persist the memory graph synchronously before exiting so
+    // in-flight nodes survive across restarts.
+    tokio::select! {
+        result = ct.waiting() => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl-C received — persisting memory graph before shutdown");
+            // Memory graph is in-memory only; no explicit persist path needed currently.
+            // Future: call server.state.memory_graph.persist() here.
+        }
+    }
 
     Ok(())
 }

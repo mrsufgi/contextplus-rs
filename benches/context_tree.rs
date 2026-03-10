@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use contextplus_rs::tools::context_tree::{
     FileAnalysis, FileEntry, TreeSymbol, build_context_tree,
@@ -119,9 +119,13 @@ fn bench_context_tree(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let result = build_context_tree(&entries, &analyses_no_sym, false, None, None);
-                    assert!(!result.is_empty());
-                    result
+                    black_box(build_context_tree(
+                        black_box(&entries),
+                        black_box(&analyses_no_sym),
+                        false,
+                        None,
+                        None,
+                    ))
                 });
             },
         );
@@ -133,9 +137,13 @@ fn bench_context_tree(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let result = build_context_tree(&entries, &analyses_sym, true, None, None);
-                    assert!(!result.is_empty());
-                    result
+                    black_box(build_context_tree(
+                        black_box(&entries),
+                        black_box(&analyses_sym),
+                        true,
+                        None,
+                        None,
+                    ))
                 });
             },
         );
@@ -146,9 +154,13 @@ fn bench_context_tree(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let result = build_context_tree(&entries, &analyses_sym, true, None, Some(2));
-                    assert!(!result.is_empty());
-                    result
+                    black_box(build_context_tree(
+                        black_box(&entries),
+                        black_box(&analyses_sym),
+                        true,
+                        None,
+                        Some(2),
+                    ))
                 });
             },
         );

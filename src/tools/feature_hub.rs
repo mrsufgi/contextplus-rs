@@ -2,6 +2,7 @@
 // Obsidian-style wikilink navigator for feature-oriented codebase exploration.
 
 use crate::core::hub::{discover_hubs, find_orphaned_files, parse_hub_file, resolve_link};
+use crate::core::safe_path::resolve_safe_path;
 use crate::error::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -96,7 +97,8 @@ pub async fn get_feature_hub(options: FeatureHubOptions) -> Result<String> {
         return Ok("Provide hub_path, feature_name, or set show_orphans=true.".to_string());
     };
 
-    // Case 4: Show specific hub details
+    // Case 4: Show specific hub details — validate path before use.
+    resolve_safe_path(&root, &hub_rel_path)?;
     let hub_full = root.join(&hub_rel_path);
     if tokio::fs::metadata(&hub_full).await.is_err() {
         return Ok(format!("Hub file not found: {}", hub_rel_path));

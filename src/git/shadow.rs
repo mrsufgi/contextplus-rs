@@ -92,7 +92,12 @@ async fn save_manifest(root_dir: &Path, points: &[RestorePoint]) -> Result<()> {
     ensure_data_dir(root_dir).await?;
     let content = serde_json::to_string_pretty(points)
         .map_err(|e| ContextPlusError::Serialization(format!("manifest serialize: {}", e)))?;
-    fs::write(manifest_path(root_dir), content).await?;
+
+    // Atomic write: write to temp file then rename to prevent partial writes on crash.
+    let final_path = manifest_path(root_dir);
+    let tmp_path = final_path.with_extension("json.tmp");
+    fs::write(&tmp_path, &content).await?;
+    fs::rename(&tmp_path, &final_path).await?;
     Ok(())
 }
 

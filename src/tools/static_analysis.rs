@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::task::JoinSet;
+
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -44,7 +46,8 @@ pub struct LintResult {
 #[derive(Debug, Clone)]
 struct LinterConfig {
     cmd: &'static str,
-    args: Vec<String>,
+    /// Compile-time constant args — zero allocation.
+    args: &'static [&'static str],
     /// File that must exist in root_dir for this linter to be available
     config_file: Option<&'static str>,
 }
@@ -53,37 +56,32 @@ fn get_linter_config(ext: &str) -> Option<LinterConfig> {
     match ext {
         ".ts" | ".tsx" => Some(LinterConfig {
             cmd: "npx",
-            args: vec![
-                "tsc".to_string(),
-                "--build".to_string(),
-                "--noEmit".to_string(),
-                "--pretty".to_string(),
-            ],
+            args: &["tsc", "--build", "--noEmit", "--pretty"],
             config_file: Some("tsconfig.json"),
         }),
         ".js" => Some(LinterConfig {
             cmd: "npx",
-            args: vec![
-                "eslint".to_string(),
-                "--no-config-lookup".to_string(),
-                "--rule".to_string(),
-                "{\"no-unused-vars\": \"warn\"}".to_string(),
+            args: &[
+                "eslint",
+                "--no-config-lookup",
+                "--rule",
+                "{\"no-unused-vars\": \"warn\"}",
             ],
             config_file: None,
         }),
         ".py" => Some(LinterConfig {
             cmd: "python",
-            args: vec!["-m".to_string(), "py_compile".to_string()],
+            args: &["-m", "py_compile"],
             config_file: Some("pyproject.toml"),
         }),
         ".rs" => Some(LinterConfig {
             cmd: "cargo",
-            args: vec!["check".to_string(), "--message-format=short".to_string()],
+            args: &["check", "--message-format=short"],
             config_file: Some("Cargo.toml"),
         }),
         ".go" => Some(LinterConfig {
             cmd: "go",
-            args: vec!["vet".to_string()],
+            args: &["vet"],
             config_file: Some("go.mod"),
         }),
         _ => None,
@@ -98,7 +96,7 @@ const KNOWN_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".js", ".py", ".rs", ".go"];
 // ---------------------------------------------------------------------------
 
 /// Run a command with timeout, capturing stdout+stderr.
-async fn run_command(cmd: &str, args: &[String], cwd: &Path) -> LintResult {
+async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> LintResult {
     let result = tokio::time::timeout(COMMAND_TIMEOUT, async {
         tokio::process::Command::new(cmd)
             .args(args)
@@ -176,14 +174,16 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
             None => return Ok(format!("No linter configured for {} files.", ext)),
         };
 
-        let mut args = linter.args.clone();
         let target_str = target_path.to_string_lossy().to_string();
-        match ext.as_str() {
-            ".js" | ".ts" | ".tsx" | ".py" => args.push(target_str),
-            _ => {}
-        }
-
-        let result = run_command(linter.cmd, &args, &options.root_dir).await;
+        // Build args: static slice + optional target path appended for file-targeted linters.
+        let result = match ext.as_str() {
+            ".js" | ".ts" | ".tsx" | ".py" => {
+                let mut args: Vec<&str> = linter.args.to_vec();
+                args.push(target_str.as_str());
+                run_command(linter.cmd, &args, &options.root_dir).await
+            }
+            _ => run_command(linter.cmd, linter.args, &options.root_dir).await,
+        };
 
         if result.exit_code == 0 && result.output.is_empty() {
             return Ok("No issues found. Code is clean.".to_string());
@@ -201,27 +201,53 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
         ));
     }
 
-    // Project-wide mode: try all known linters
-    let mut results = Vec::new();
+    // Project-wide mode: detect available linters, then run them concurrently via JoinSet.
+    let mut available: Vec<(&str, LinterConfig)> = Vec::new();
     for &file_ext in KNOWN_EXTENSIONS {
-        let linter = match detect_available_linter(&options.root_dir, file_ext).await {
-            Some(l) => l,
-            None => continue,
-        };
-
-        let result = run_command(linter.cmd, &linter.args, &options.root_dir).await;
-        if !result.output.is_empty() {
-            let truncated = if result.output.len() > MAX_OUTPUT_LEN_MULTI {
-                crate::core::parser::truncate_to_char_boundary(&result.output, MAX_OUTPUT_LEN_MULTI)
-            } else {
-                &result.output
-            };
-            results.push(format!(
-                "[{}] {} files:\n{}",
-                result.tool, file_ext, truncated
-            ));
+        if let Some(linter) = detect_available_linter(&options.root_dir, file_ext).await {
+            available.push((file_ext, linter));
         }
     }
+
+    if available.is_empty() {
+        return Ok("No linters available or no issues found.".to_string());
+    }
+
+    let root_clone = options.root_dir.clone();
+    let mut join_set: JoinSet<(String, LintResult)> = JoinSet::new();
+
+    for (file_ext, linter) in available {
+        let cwd = root_clone.clone();
+        let ext_str = file_ext.to_string();
+        join_set.spawn(async move {
+            let result = run_command(linter.cmd, linter.args, &cwd).await;
+            (ext_str, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(join_result) = join_set.join_next().await {
+        if let Ok((file_ext, result)) = join_result {
+            if !result.output.is_empty() {
+                let truncated = if result.output.len() > MAX_OUTPUT_LEN_MULTI {
+                    crate::core::parser::truncate_to_char_boundary(
+                        &result.output,
+                        MAX_OUTPUT_LEN_MULTI,
+                    )
+                    .to_string()
+                } else {
+                    result.output.clone()
+                };
+                results.push(format!(
+                    "[{}] {} files:\n{}",
+                    result.tool, file_ext, truncated
+                ));
+            }
+        }
+    }
+
+    // Sort for deterministic output order
+    results.sort();
 
     if results.is_empty() {
         Ok("No linters available or no issues found.".to_string())
@@ -244,7 +270,7 @@ mod tests {
         assert!(config.is_some());
         let config = config.unwrap();
         assert_eq!(config.cmd, "npx");
-        assert!(config.args.contains(&"tsc".to_string()));
+        assert!(config.args.contains(&"tsc"));
         assert_eq!(config.config_file, Some("tsconfig.json"));
     }
 
@@ -292,7 +318,7 @@ mod tests {
     fn test_get_linter_config_js() {
         let config = get_linter_config(".js").unwrap();
         assert_eq!(config.cmd, "npx");
-        assert!(config.args.contains(&"eslint".to_string()));
+        assert!(config.args.contains(&"eslint"));
         assert!(config.config_file.is_none());
     }
 
@@ -351,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_command_echo() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_command("echo", &["hello".to_string()], dir.path()).await;
+        let result = run_command("echo", &["hello"], dir.path()).await;
         assert_eq!(result.exit_code, 0);
         assert!(result.output.contains("hello"));
     }

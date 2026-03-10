@@ -28,7 +28,9 @@ fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
         .map(|i| {
             let mut row_entries = Vec::with_capacity(n - i - 1);
             for j in (i + 1)..n {
-                let sim = cosine_similarity_simsimd(&vectors[i], &vectors[j]).max(0.0) as f64;
+                let sim =
+                    crate::core::embeddings::cosine_similarity_simsimd(&vectors[i], &vectors[j])
+                        .max(0.0) as f64;
                 row_entries.push((j, sim));
             }
             row_entries
@@ -43,16 +45,6 @@ fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
         }
     }
     mat
-}
-
-/// Compute cosine similarity using simsimd SIMD acceleration.
-/// Returns similarity (1.0 - distance) clamped to [0, 1].
-fn cosine_similarity_simsimd(a: &[f32], b: &[f32]) -> f32 {
-    use simsimd::SpatialSimilarity;
-    match f32::cosine(a, b) {
-        Some(distance) => (1.0 - distance as f32).clamp(0.0, 1.0),
-        None => 0.0,
-    }
 }
 
 /// Compute normalized symmetric Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
@@ -170,12 +162,13 @@ fn randomized_eigen(
     let v_small = &eigen_small.eigenvectors;
     let full_eigenvectors = &q * v_small;
 
-    // Reorder columns to match sorted eigenvalues
+    // Reorder columns to match sorted eigenvalues.
+    // Use column-copy via nalgebra's column view API — single memcpy per column
+    // rather than element-by-element indexing.
     let mut eigenvectors = DMatrix::zeros(n, take);
     for (new_col, &(orig_col, _)) in indexed_evals[..take].iter().enumerate() {
-        for row in 0..n {
-            eigenvectors[(row, new_col)] = full_eigenvectors[(row, orig_col)];
-        }
+        let src = full_eigenvectors.column(orig_col);
+        eigenvectors.column_mut(new_col).copy_from(&src);
     }
 
     (eigenvalues, eigenvectors)
@@ -195,29 +188,28 @@ fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     let ncols = indexed_evals.len();
     let mut eigenvectors = DMatrix::zeros(n, ncols);
     for (new_col, &(orig_col, _)) in indexed_evals.iter().enumerate() {
-        for row in 0..n {
-            eigenvectors[(row, new_col)] = eigen.eigenvectors[(row, orig_col)];
-        }
+        let src = eigen.eigenvectors.column(orig_col);
+        eigenvectors.column_mut(new_col).copy_from(&src);
     }
 
     (eigenvalues, eigenvectors)
 }
 
 /// Use eigengap heuristic to find optimal k: largest gap in sorted eigenvalues.
+/// Eigenvalues are expected to already be sorted ascending (both full_eigen and
+/// randomized_eigen guarantee this), so we skip the redundant sort.
 fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
-    let mut sorted: Vec<f64> = eigenvalues.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    if sorted.len() <= 2 {
-        return sorted.len().min(2);
+    // eigenvalues are pre-sorted ascending by our callers — no need to sort again
+    if eigenvalues.len() <= 2 {
+        return eigenvalues.len().min(2);
     }
 
-    let limit = max_k.min(sorted.len() - 1);
+    let limit = max_k.min(eigenvalues.len() - 1);
     let mut best_gap = 0.0_f64;
     let mut best_k = 2_usize;
 
     for k in 2..=limit {
-        let gap = sorted[k] - sorted[k - 1];
+        let gap = eigenvalues[k] - eigenvalues[k - 1];
         if gap > best_gap {
             best_gap = gap;
             best_k = k;
@@ -227,6 +219,7 @@ fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
 }
 
 /// K-means++ initialization + Lloyd's algorithm on the eigenvector embedding.
+/// Uses flat Vec<f64> buffers with stride indexing for cache-friendly access.
 fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     let n = data.len();
     if n == 0 || k == 0 {
@@ -234,29 +227,37 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     }
     let dim = data[0].len();
 
-    // K-means++ initialization
-    let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(k);
+    // Flat centroid buffer: centroids[c * dim .. (c+1) * dim] is centroid c.
+    // This avoids Vec<Vec<f64>> indirection and improves cache locality.
+    let mut centroids = vec![0.0_f64; k * dim];
     let mut used = std::collections::HashSet::new();
 
-    centroids.push(data[0].clone());
+    // K-means++ initialization: seed first centroid from first data point
+    centroids[..dim].copy_from_slice(&data[0]);
     used.insert(0);
 
-    for _ in 1..k {
+    for seed_c in 1..k {
         // Parallel distance computation: find point farthest from all current centroids
+        let c_so_far = seed_c; // number of centroids already placed
         let (best_idx, _) = data
             .par_iter()
             .enumerate()
             .filter(|(i, _)| !used.contains(i))
             .map(|(i, row)| {
-                let min_dist = centroids
-                    .iter()
-                    .map(|c| (0..dim).map(|d| (row[d] - c[d]).powi(2)).sum::<f64>())
+                let min_dist = (0..c_so_far)
+                    .map(|c| {
+                        let base = c * dim;
+                        (0..dim)
+                            .map(|d| (row[d] - centroids[base + d]).powi(2))
+                            .sum::<f64>()
+                    })
                     .fold(f64::INFINITY, f64::min);
                 (i, min_dist)
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or((0, 0.0));
-        centroids.push(data[best_idx].clone());
+        let base = seed_c * dim;
+        centroids[base..base + dim].copy_from_slice(&data[best_idx]);
         used.insert(best_idx);
     }
 
@@ -269,8 +270,11 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
             .map(|row| {
                 let mut best_dist = f64::INFINITY;
                 let mut best_c = 0_usize;
-                for (c, centroid) in centroids.iter().enumerate() {
-                    let dist: f64 = (0..dim).map(|d| (row[d] - centroid[d]).powi(2)).sum();
+                for c in 0..k {
+                    let base = c * dim;
+                    let dist: f64 = (0..dim)
+                        .map(|d| (row[d] - centroids[base + d]).powi(2))
+                        .sum();
                     if dist < best_dist {
                         best_dist = dist;
                         best_c = c;
@@ -286,22 +290,25 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
             break;
         }
 
-        // Update centroids
-        let mut sums = vec![vec![0.0_f64; dim]; k];
+        // Update centroids: flat sums buffer, same stride as centroids
+        let mut sums = vec![0.0_f64; k * dim];
         let mut counts = vec![0_u32; k];
         for i in 0..n {
             let c = assignments[i];
             counts[c] += 1;
+            let base = c * dim;
             for d in 0..dim {
-                sums[c][d] += data[i][d];
+                sums[base + d] += data[i][d];
             }
         }
-        for c in 0..k {
-            if counts[c] == 0 {
+        for (c, &count_val) in counts.iter().enumerate().take(k) {
+            if count_val == 0 {
                 continue;
             }
+            let base = c * dim;
+            let count = count_val as f64;
             for d in 0..dim {
-                centroids[c][d] = sums[c][d] / counts[c] as f64;
+                centroids[base + d] = sums[base + d] / count;
             }
         }
     }
@@ -367,15 +374,16 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
 
     let assignments = kmeans(&embedding, k);
 
-    // Group indices by cluster assignment
-    let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
+    // Group indices by cluster assignment using a flat Vec<Vec<usize>> indexed by cluster id.
+    // Avoids HashMap overhead (hashing, collision, rehashing) for the simple 0..k key range.
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); k];
     for (i, &c) in assignments.iter().enumerate() {
-        clusters.entry(c).or_default().push(i);
+        clusters[c].push(i);
     }
 
     clusters
-        .into_values()
+        .into_iter()
+        .filter(|indices| !indices.is_empty())
         .map(|indices| ClusterResult { indices })
         .collect()
 }
@@ -497,6 +505,7 @@ mod tests {
 
     #[test]
     fn cosine_sim_identical_vectors() {
+        use crate::core::embeddings::cosine_similarity_simsimd;
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![1.0_f32, 0.0, 0.0];
         let sim = cosine_similarity_simsimd(&a, &b) as f64;
@@ -505,6 +514,7 @@ mod tests {
 
     #[test]
     fn cosine_sim_orthogonal_vectors() {
+        use crate::core::embeddings::cosine_similarity_simsimd;
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![0.0_f32, 1.0, 0.0];
         let sim = cosine_similarity_simsimd(&a, &b) as f64;
@@ -513,6 +523,7 @@ mod tests {
 
     #[test]
     fn cosine_sim_empty_vectors() {
+        use crate::core::embeddings::cosine_similarity_simsimd;
         let a: Vec<f32> = vec![];
         let b: Vec<f32> = vec![];
         // simsimd returns 0.0 distance for empty vectors → 1.0 similarity.
@@ -523,6 +534,7 @@ mod tests {
 
     #[test]
     fn cosine_sim_zero_vectors() {
+        use crate::core::embeddings::cosine_similarity_simsimd;
         let a = vec![0.0_f32, 0.0, 0.0];
         let b = vec![1.0_f32, 0.0, 0.0];
         assert_eq!(cosine_similarity_simsimd(&a, &b) as f64, 0.0);

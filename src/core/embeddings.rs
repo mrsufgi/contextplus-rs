@@ -45,6 +45,7 @@ impl OllamaClient {
     pub fn new(config: &Config) -> Self {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
+            .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("reqwest client build");
         Self {
@@ -319,6 +320,17 @@ impl VectorStore {
         vectors_len: usize,
         mmap: Arc<memmap2::Mmap>,
     ) -> Self {
+        // Debug-mode bounds check: pointer must lie within the mmap region.
+        debug_assert!(
+            {
+                let mmap_start = mmap.as_ptr() as usize;
+                let mmap_end = mmap_start + mmap.len();
+                let ptr_addr = vectors_ptr as usize;
+                let ptr_end = ptr_addr + vectors_len * std::mem::size_of::<f32>();
+                ptr_addr >= mmap_start && ptr_end <= mmap_end
+            },
+            "mmap vectors_ptr out of bounds"
+        );
         let count = keys.len() as u32;
         let mut key_index = HashMap::with_capacity(keys.len());
         for (i, key) in keys.iter().enumerate() {

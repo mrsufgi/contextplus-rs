@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::error::{ContextPlusError, Result};
 
@@ -836,8 +836,9 @@ impl MemoryGraph {
 // --- Persistence ---
 
 /// Thread-safe graph store with lazy loading and debounced persistence.
+/// Uses RwLock so concurrent read-only operations (search, traverse) don't block each other.
 pub struct GraphStore {
-    graphs: Mutex<HashMap<String, MemoryGraph>>,
+    graphs: RwLock<HashMap<String, MemoryGraph>>,
 }
 
 impl Default for GraphStore {
@@ -849,16 +850,32 @@ impl Default for GraphStore {
 impl GraphStore {
     pub fn new() -> Self {
         Self {
-            graphs: Mutex::new(HashMap::new()),
+            graphs: RwLock::new(HashMap::new()),
         }
     }
 
     /// Get or load the graph for a given root directory.
+    /// Takes a write lock since loading populates the map and `f` may mutate the graph.
     pub async fn get_graph<F, R>(&self, root_dir: &str, f: F) -> Result<R>
     where
         F: FnOnce(&mut MemoryGraph) -> R,
     {
-        let mut graphs = self.graphs.lock().await;
+        // Fast path: check with read lock first
+        {
+            let graphs = self.graphs.read().await;
+            if graphs.contains_key(root_dir) {
+                drop(graphs);
+                // Re-acquire write lock for mutation
+                let mut graphs = self.graphs.write().await;
+                let graph = graphs.get_mut(root_dir).ok_or_else(|| {
+                    ContextPlusError::Other("Graph not found after check".to_string())
+                })?;
+                return Ok(f(graph));
+            }
+        }
+        // Slow path: load from disk under write lock
+        let mut graphs = self.graphs.write().await;
+        // Double-check after acquiring write lock (another task may have loaded it)
         if !graphs.contains_key(root_dir) {
             let graph = load_graph_from_disk(root_dir).await?;
             graphs.insert(root_dir.to_string(), graph);
@@ -871,7 +888,7 @@ impl GraphStore {
 
     /// Persist the graph for a root directory to disk.
     pub async fn persist(&self, root_dir: &str) -> Result<()> {
-        let mut graphs = self.graphs.lock().await;
+        let mut graphs = self.graphs.write().await;
         if let Some(graph) = graphs.get_mut(root_dir)
             && graph.is_dirty()
         {

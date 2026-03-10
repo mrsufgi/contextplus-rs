@@ -74,7 +74,16 @@ pub fn walk_directory(opts: &WalkOptions) -> Vec<FileEntry> {
         }
 
         let relative = match path.strip_prefix(root_dir) {
-            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Ok(rel) => {
+                // On Windows paths may use backslashes; on Linux/macOS this is a no-op
+                // so skip the allocation when there's nothing to replace.
+                let s = rel.to_string_lossy();
+                if cfg!(windows) || s.contains('\\') {
+                    s.replace('\\', "/")
+                } else {
+                    s.into_owned()
+                }
+            }
             Err(_) => continue,
         };
 

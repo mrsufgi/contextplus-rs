@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use contextplus_rs::tools::semantic_identifiers::{IdentifierDoc, score_identifiers};
 
@@ -84,19 +84,17 @@ fn bench_score_identifiers(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let results = score_identifiers(
-                        &docs,
-                        &query_vec,
-                        &query_terms,
-                        &vector_buffer,
+                    black_box(score_identifiers(
+                        black_box(&docs),
+                        black_box(&query_vec),
+                        black_box(&query_terms),
+                        black_box(&vector_buffer),
                         dims,
                         &None,
                         0.78,
                         0.22,
                         5,
-                    );
-                    assert_eq!(results.len(), 5);
-                    results
+                    ))
                 });
             },
         );
@@ -107,19 +105,17 @@ fn bench_score_identifiers(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let results = score_identifiers(
-                        &docs,
-                        &query_vec,
-                        &query_terms,
-                        &vector_buffer,
+                    black_box(score_identifiers(
+                        black_box(&docs),
+                        black_box(&query_vec),
+                        black_box(&query_terms),
+                        black_box(&vector_buffer),
                         dims,
                         &None,
                         0.78,
                         0.22,
                         20,
-                    );
-                    assert_eq!(results.len(), 20);
-                    results
+                    ))
                 });
             },
         );
@@ -136,19 +132,17 @@ fn bench_score_identifiers(c: &mut Criterion) {
             &count,
             |bench, _| {
                 bench.iter(|| {
-                    let results = score_identifiers(
-                        &docs,
-                        &query_vec,
-                        &query_terms,
-                        &vector_buffer,
+                    black_box(score_identifiers(
+                        black_box(&docs),
+                        black_box(&query_vec),
+                        black_box(&query_terms),
+                        black_box(&vector_buffer),
                         dims,
-                        &kind_filter,
+                        black_box(&kind_filter),
                         0.78,
                         0.22,
                         5,
-                    );
-                    assert!(!results.is_empty());
-                    results
+                    ))
                 });
             },
         );

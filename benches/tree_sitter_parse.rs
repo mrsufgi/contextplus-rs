@@ -3,7 +3,7 @@
 //! Measures parse + symbol extraction time per language.
 //! TS baseline: 5-20ms (WASM). Rust target: 1-5ms (native C grammars).
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use contextplus_rs::core::tree_sitter::parse_with_tree_sitter;
 
@@ -464,10 +464,7 @@ fn bench_parse_per_language(c: &mut Criterion) {
 
     for (lang, ext, code) in &samples {
         group.bench_with_input(BenchmarkId::new("parse", *lang), lang, |bench, _| {
-            bench.iter(|| {
-                let symbols = parse_with_tree_sitter(code, ext).unwrap();
-                assert!(!symbols.is_empty(), "no symbols parsed for {}", lang);
-            });
+            bench.iter(|| black_box(parse_with_tree_sitter(black_box(code), ext).unwrap()));
         });
     }
 
@@ -481,14 +478,10 @@ fn bench_parse_all_languages(c: &mut Criterion) {
         bench.iter(|| {
             let mut total_symbols = 0;
             for (_, ext, code) in &samples {
-                let symbols = parse_with_tree_sitter(code, ext).unwrap();
+                let symbols = parse_with_tree_sitter(black_box(code), ext).unwrap();
                 total_symbols += symbols.len();
             }
-            assert!(
-                total_symbols > 20,
-                "expected >20 symbols across 10 languages"
-            );
-            total_symbols
+            black_box(total_symbols)
         });
     });
 }

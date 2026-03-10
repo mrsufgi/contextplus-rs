@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use contextplus_rs::tools::blast_radius::find_symbol_usages;
 
@@ -63,9 +63,11 @@ fn bench_find_symbol_usages(c: &mut Criterion) {
             &file_count,
             |bench, _| {
                 bench.iter(|| {
-                    let result = find_symbol_usages(symbol, None, &file_lines);
-                    assert!(!result.usages.is_empty());
-                    result
+                    black_box(find_symbol_usages(
+                        black_box(symbol),
+                        None,
+                        black_box(&file_lines),
+                    ))
                 });
             },
         );
@@ -76,7 +78,13 @@ fn bench_find_symbol_usages(c: &mut Criterion) {
             BenchmarkId::new("with_context", format!("{}_files_{}l", file_count, lines)),
             &file_count,
             |bench, _| {
-                bench.iter(|| find_symbol_usages(symbol, Some(&first_file), &file_lines));
+                bench.iter(|| {
+                    black_box(find_symbol_usages(
+                        black_box(symbol),
+                        Some(black_box(&first_file)),
+                        black_box(&file_lines),
+                    ))
+                });
             },
         );
     }
@@ -88,7 +96,13 @@ fn bench_find_symbol_usages(c: &mut Criterion) {
         BenchmarkId::new("special_chars", "500_files_100l"),
         &500,
         |bench, _| {
-            bench.iter(|| find_symbol_usages(special_symbol, None, &special_lines));
+            bench.iter(|| {
+                black_box(find_symbol_usages(
+                    black_box(special_symbol),
+                    None,
+                    black_box(&special_lines),
+                ))
+            });
         },
     );
 

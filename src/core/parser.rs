@@ -24,13 +24,17 @@ fn radix36(mut n: u32) -> String {
         return "0".to_string();
     }
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = Vec::with_capacity(8);
+    // A u32 in base 36 needs at most 7 digits (36^7 > 2^32), use stack buffer.
+    let mut buf = [0u8; 7];
+    let mut len = 0usize;
     while n > 0 {
-        buf.push(DIGITS[(n % 36) as usize]);
+        buf[len] = DIGITS[(n % 36) as usize];
         n /= 36;
+        len += 1;
     }
-    buf.reverse();
-    String::from_utf8(buf).unwrap()
+    buf[..len].reverse();
+    // SAFETY: buf contains only ASCII digits/lowercase letters from DIGITS.
+    unsafe { String::from_utf8_unchecked(buf[..len].to_vec()) }
 }
 
 /// Truncate a string to at most `max_bytes` bytes, but never split a UTF-8 codepoint.
@@ -77,9 +81,10 @@ pub struct FileAnalysis {
 
 /// Extract a human-readable header from the first few lines of a file.
 /// Strips comment markers and skips imports/use statements.
-pub fn extract_header(lines: &[&str]) -> String {
+/// Accepts a `&str` directly — callers no longer need to `.lines().collect()`.
+pub fn extract_header(content: &str) -> String {
     let mut header_lines: Vec<String> = Vec::new();
-    for line in lines.iter().take(10) {
+    for line in content.lines().take(10) {
         let stripped = line
             .trim_start_matches("//")
             .trim_start_matches('#')
@@ -157,10 +162,20 @@ pub fn is_supported_file(file_path: &str) -> bool {
 }
 
 /// Flatten nested symbols into a flat list with parent info.
+/// Uses an accumulator parameter to avoid intermediate Vec allocations per recursion level.
 pub fn flatten_symbols(symbols: &[CodeSymbol], parent_name: Option<&str>) -> Vec<SymbolLocation> {
     let mut result = Vec::new();
+    flatten_symbols_into(symbols, parent_name, &mut result);
+    result
+}
+
+fn flatten_symbols_into(
+    symbols: &[CodeSymbol],
+    parent_name: Option<&str>,
+    out: &mut Vec<SymbolLocation>,
+) {
     for sym in symbols {
-        result.push(SymbolLocation {
+        out.push(SymbolLocation {
             name: sym.name.clone(),
             kind: sym.kind.clone(),
             line: sym.line,
@@ -169,10 +184,9 @@ pub fn flatten_symbols(symbols: &[CodeSymbol], parent_name: Option<&str>) -> Vec
             parent_name: parent_name.map(|s| s.to_string()),
         });
         if !sym.children.is_empty() {
-            result.extend(flatten_symbols(&sym.children, Some(&sym.name)));
+            flatten_symbols_into(&sym.children, Some(&sym.name), out);
         }
     }
-    result
 }
 
 /// Format a symbol for display.
@@ -243,12 +257,8 @@ mod tests {
 
     #[test]
     fn extract_header_basic() {
-        let lines = vec![
-            "// Multi-language symbol extraction with tree-sitter AST",
-            "// Supports 36 languages via WASM grammars",
-            "import { readFile } from 'fs/promises';",
-        ];
-        let header = extract_header(&lines);
+        let content = "// Multi-language symbol extraction with tree-sitter AST\n// Supports 36 languages via WASM grammars\nimport { readFile } from 'fs/promises';";
+        let header = extract_header(content);
         assert_eq!(
             header,
             "Multi-language symbol extraction with tree-sitter AST | Supports 36 languages via WASM grammars"
@@ -257,19 +267,14 @@ mod tests {
 
     #[test]
     fn extract_header_skips_imports() {
-        let lines = vec![
-            "import something from 'module';",
-            "use std::io;",
-            "// Actual header line",
-        ];
-        let header = extract_header(&lines);
+        let content = "import something from 'module';\nuse std::io;\n// Actual header line";
+        let header = extract_header(content);
         assert_eq!(header, "Actual header line");
     }
 
     #[test]
     fn extract_header_empty_input() {
-        let lines: Vec<&str> = vec![];
-        assert_eq!(extract_header(&lines), "");
+        assert_eq!(extract_header(""), "");
     }
 
     #[test]
