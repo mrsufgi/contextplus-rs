@@ -227,22 +227,22 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
 
     let mut results = Vec::new();
     while let Some(join_result) = join_set.join_next().await {
-        if let Ok((file_ext, result)) = join_result {
-            if !result.output.is_empty() {
-                let truncated = if result.output.len() > MAX_OUTPUT_LEN_MULTI {
-                    crate::core::parser::truncate_to_char_boundary(
-                        &result.output,
-                        MAX_OUTPUT_LEN_MULTI,
-                    )
-                    .to_string()
-                } else {
-                    result.output.clone()
-                };
-                results.push(format!(
-                    "[{}] {} files:\n{}",
-                    result.tool, file_ext, truncated
-                ));
-            }
+        if let Ok((file_ext, result)) = join_result
+            && !result.output.is_empty()
+        {
+            let truncated = if result.output.len() > MAX_OUTPUT_LEN_MULTI {
+                crate::core::parser::truncate_to_char_boundary(
+                    &result.output,
+                    MAX_OUTPUT_LEN_MULTI,
+                )
+                .to_string()
+            } else {
+                result.output.clone()
+            };
+            results.push(format!(
+                "[{}] {} files:\n{}",
+                result.tool, file_ext, truncated
+            ));
         }
     }
 
