@@ -2,7 +2,7 @@
 name = "contextplus-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "High-performance MCP server for semantic code analysis via Ollama embeddings"
 license = "MIT"
 repository = "https://github.com/mrsufgi/contextplus-rs"
