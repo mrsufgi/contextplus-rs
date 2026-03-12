@@ -231,11 +231,8 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
             && !result.output.is_empty()
         {
             let truncated = if result.output.len() > MAX_OUTPUT_LEN_MULTI {
-                crate::core::parser::truncate_to_char_boundary(
-                    &result.output,
-                    MAX_OUTPUT_LEN_MULTI,
-                )
-                .to_string()
+                crate::core::parser::truncate_to_char_boundary(&result.output, MAX_OUTPUT_LEN_MULTI)
+                    .to_string()
             } else {
                 result.output.clone()
             };
