@@ -15,7 +15,10 @@ use crate::error::Result;
 // ---------------------------------------------------------------------------
 
 const CHARS_PER_TOKEN: usize = 4;
-const DEFAULT_MAX_TOKENS: usize = 50_000;
+/// Default token budget — sized to fit within typical MCP client response limits.
+/// Claude Code rejects tool results above ~95K chars (~24K tokens).
+/// 20K tokens × 4 chars = 80K chars — safe ceiling with room for metadata.
+const DEFAULT_MAX_TOKENS: usize = 20_000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -271,13 +274,65 @@ pub fn build_context_tree(
         );
     }
 
-    // Level 0: File names only
+    // Level 0: File names only — progressively reduce depth until it fits
     prune_headers(&mut tree);
     let rendered = render_tree(&tree, 0);
-    format!(
-        "[Level 0: File names only, project too large for {} tokens]\n\n{}",
-        max_tokens, rendered
-    )
+    if estimate_tokens(&rendered) <= max_tokens {
+        return format!(
+            "[Level 0: File names only, symbols/headers pruned to fit {} tokens]\n\n{}",
+            max_tokens, rendered
+        );
+    }
+
+    // Even Level 0 at full depth is too large — progressively reduce depth
+    let max_depth = effective_entries
+        .iter()
+        .map(|e| e.depth)
+        .max()
+        .unwrap_or(0);
+
+    for depth in (1..max_depth).rev() {
+        let depth_filtered: Vec<FileEntry> = effective_entries
+            .iter()
+            .filter(|e| e.depth <= depth)
+            .cloned()
+            .collect();
+        let mut depth_tree = build_tree(&depth_filtered, &BTreeMap::new(), false);
+        prune_headers(&mut depth_tree);
+        let rendered = render_tree(&depth_tree, 0);
+        if estimate_tokens(&rendered) <= max_tokens {
+            return format!(
+                "[Level 0: File names only, depth limited to {}, project too large for {} tokens]\n\n{}",
+                depth, max_tokens, rendered
+            );
+        }
+    }
+
+    // Last resort: depth 1 (top-level only), truncated if needed
+    let depth_filtered: Vec<FileEntry> = effective_entries
+        .iter()
+        .filter(|e| e.depth <= 1)
+        .cloned()
+        .collect();
+    let mut depth_tree = build_tree(&depth_filtered, &BTreeMap::new(), false);
+    prune_headers(&mut depth_tree);
+    let rendered = render_tree(&depth_tree, 0);
+    let max_chars = max_tokens * CHARS_PER_TOKEN;
+    if rendered.len() > max_chars {
+        let truncated = &rendered[..max_chars.min(rendered.len())];
+        // Find last newline to avoid cutting mid-line
+        let cutoff = truncated.rfind('\n').unwrap_or(truncated.len());
+        format!(
+            "[Level 0: Top-level only, truncated to fit {} tokens]\n\n{}",
+            max_tokens,
+            &truncated[..cutoff]
+        )
+    } else {
+        format!(
+            "[Level 0: Top-level entries only, project too large for {} tokens]\n\n{}",
+            max_tokens, rendered
+        )
+    }
 }
 
 /// Async entry point that uses provider traits for file walking and analysis.
@@ -885,6 +940,72 @@ mod tests {
         assert!(
             !limited_result.contains("leaf_"),
             "Depth-limited to 2 should not contain depth-6 leaf files"
+        );
+    }
+
+    #[test]
+    fn test_level0_progressive_depth_reduction() {
+        // Create a large tree where even Level 0 (file names only) exceeds a small token budget.
+        // 2000 files across 200 dirs at depth 2, plus deeper files at depth 3-4.
+        let mut entries = Vec::new();
+        let mut analyses = BTreeMap::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+
+        for i in 0..2000 {
+            let dir_idx = i / 10;
+            let dir_path = format!("pkg_{}", dir_idx);
+            let file_path = format!("pkg_{}/mod_{}.ts", dir_idx, i);
+
+            if seen_dirs.insert(dir_path.clone()) {
+                entries.push(FileEntry {
+                    relative_path: dir_path.clone(),
+                    is_directory: true,
+                    depth: 1,
+                });
+                // Add a subdirectory with deeper files
+                let sub_dir = format!("{}/sub", dir_path);
+                entries.push(FileEntry {
+                    relative_path: sub_dir.clone(),
+                    is_directory: true,
+                    depth: 2,
+                });
+                let deep_file = format!("{}/deep_{}.ts", sub_dir, dir_idx);
+                entries.push(FileEntry {
+                    relative_path: deep_file.clone(),
+                    is_directory: false,
+                    depth: 3,
+                });
+            }
+            entries.push(FileEntry {
+                relative_path: file_path.clone(),
+                is_directory: false,
+                depth: 2,
+            });
+
+            // Long header to ensure Level 1 also exceeds budget
+            analyses.insert(
+                file_path,
+                FileAnalysis {
+                    header: Some("x".repeat(200)),
+                    symbols: vec![],
+                },
+            );
+        }
+
+        // Set a very small token budget that Level 0 full depth will exceed
+        let result = build_context_tree(&entries, &analyses, true, Some(500), None);
+
+        // Should have been progressively depth-reduced
+        assert!(
+            result.contains("Level 0"),
+            "Should fall through to Level 0 progressive reduction"
+        );
+        // Verify output fits within budget (500 tokens = 2000 chars)
+        let result_tokens = estimate_tokens(&result);
+        assert!(
+            result_tokens <= 600, // allow small overhead for the header line
+            "Progressive depth reduction should bring output near {} tokens, got {} tokens ({} chars)",
+            500, result_tokens, result.len()
         );
     }
 }
