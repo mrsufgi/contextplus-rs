@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::fs;
 
-
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tempfile::TempDir;
 

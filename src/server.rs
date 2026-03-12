@@ -2435,7 +2435,9 @@ mod tests {
         for tool in defs {
             let schema = tool.input_schema.as_ref();
             assert_eq!(
-                schema.get("type").and_then(|v: &serde_json::Value| v.as_str()),
+                schema
+                    .get("type")
+                    .and_then(|v: &serde_json::Value| v.as_str()),
                 Some("object"),
                 "tool '{}' should have type: object in schema",
                 tool.name

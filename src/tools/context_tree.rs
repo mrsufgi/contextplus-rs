@@ -285,11 +285,7 @@ pub fn build_context_tree(
     }
 
     // Even Level 0 at full depth is too large — progressively reduce depth
-    let max_depth = effective_entries
-        .iter()
-        .map(|e| e.depth)
-        .max()
-        .unwrap_or(0);
+    let max_depth = effective_entries.iter().map(|e| e.depth).max().unwrap_or(0);
 
     for depth in (1..max_depth).rev() {
         let depth_filtered: Vec<FileEntry> = effective_entries
@@ -1005,7 +1001,9 @@ mod tests {
         assert!(
             result_tokens <= 600, // allow small overhead for the header line
             "Progressive depth reduction should bring output near {} tokens, got {} tokens ({} chars)",
-            500, result_tokens, result.len()
+            500,
+            result_tokens,
+            result.len()
         );
     }
 }
