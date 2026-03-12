@@ -2,7 +2,7 @@
 //!
 //! Ports the TypeScript `file-skeleton.ts` logic:
 //! - Returns structural skeleton: signatures, params, return types only
-//! - Format: [kind] L{line}-L{endLine} signature;
+//! - Format: `[kind] L{line}-L{endLine} signature;`
 //! - Falls back to first N lines for unsupported or symbol-less files
 
 use std::path::PathBuf;

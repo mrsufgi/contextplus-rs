@@ -96,33 +96,38 @@ mod tests {
         TempDir::new().expect("tempdir")
     }
 
+    /// Canonicalize the TempDir path to handle macOS /tmp -> /private/tmp symlink.
+    fn canonical_root(dir: &TempDir) -> PathBuf {
+        dir.path().canonicalize().unwrap()
+    }
+
     #[test]
     fn resolve_simple_relative_path() {
         let dir = make_root();
-        let root = dir.path();
+        let root = canonical_root(&dir);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
-        let resolved = resolve_safe_path(root, "src/main.rs").unwrap();
-        assert!(resolved.starts_with(root));
+        let resolved = resolve_safe_path(&root, "src/main.rs").unwrap();
+        assert!(resolved.starts_with(&root));
         assert!(resolved.ends_with("main.rs"));
     }
 
     #[test]
     fn resolve_nonexistent_path_within_root() {
         let dir = make_root();
-        let root = dir.path();
+        let root = canonical_root(&dir);
 
-        let resolved = resolve_safe_path(root, "new_file.rs").unwrap();
-        assert!(resolved.starts_with(root));
+        let resolved = resolve_safe_path(&root, "new_file.rs").unwrap();
+        assert!(resolved.starts_with(&root));
     }
 
     #[test]
     fn rejects_path_traversal() {
         let dir = make_root();
-        let root = dir.path();
+        let root = canonical_root(&dir);
 
-        let result = resolve_safe_path(root, "../../etc/passwd");
+        let result = resolve_safe_path(&root, "../../etc/passwd");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ContextPlusError::PathTraversal(_)));
@@ -131,9 +136,9 @@ mod tests {
     #[test]
     fn rejects_absolute_path() {
         let dir = make_root();
-        let root = dir.path();
+        let root = canonical_root(&dir);
 
-        let result = resolve_safe_path(root, "/etc/passwd");
+        let result = resolve_safe_path(&root, "/etc/passwd");
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -144,21 +149,21 @@ mod tests {
     #[test]
     fn allows_nested_path() {
         let dir = make_root();
-        let root = dir.path();
+        let root = canonical_root(&dir);
 
-        let resolved = resolve_safe_path(root, "a/b/c/d.ts").unwrap();
-        assert!(resolved.starts_with(root));
+        let resolved = resolve_safe_path(&root, "a/b/c/d.ts").unwrap();
+        assert!(resolved.starts_with(&root));
     }
 
     #[test]
     fn normalizes_dotdot_that_stays_inside() {
         let dir = make_root();
-        let root = dir.path();
+        let root = canonical_root(&dir);
         std::fs::create_dir_all(root.join("src/core")).unwrap();
         std::fs::write(root.join("src/core/lib.rs"), "").unwrap();
 
         // src/core/../core/lib.rs -> src/core/lib.rs — still inside root
-        let resolved = resolve_safe_path(root, "src/core/../core/lib.rs").unwrap();
-        assert!(resolved.starts_with(root));
+        let resolved = resolve_safe_path(&root, "src/core/../core/lib.rs").unwrap();
+        assert!(resolved.starts_with(&root));
     }
 }
