@@ -7,8 +7,9 @@ use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::error::{ContextPlusError, Result};
 
@@ -837,8 +838,14 @@ impl MemoryGraph {
 
 /// Thread-safe graph store with lazy loading and debounced persistence.
 /// Uses RwLock so concurrent read-only operations (search, traverse) don't block each other.
+///
+/// Debounced save: after every mutation, a 500ms timer is (re-)started. When it
+/// fires the dirty graph is written to disk. `flush()` persists immediately and
+/// cancels any pending debounce — use it on graceful shutdown.
 pub struct GraphStore {
     graphs: RwLock<HashMap<String, MemoryGraph>>,
+    save_notify: Arc<Notify>,
+    shutdown_notify: Arc<Notify>,
 }
 
 impl Default for GraphStore {
@@ -847,35 +854,74 @@ impl Default for GraphStore {
     }
 }
 
+/// Debounce interval for saves after mutations.
+const DEBOUNCE_MS: u64 = 500;
+
 impl GraphStore {
     pub fn new() -> Self {
         Self {
             graphs: RwLock::new(HashMap::new()),
+            save_notify: Arc::new(Notify::new()),
+            shutdown_notify: Arc::new(Notify::new()),
         }
     }
 
+    /// Spawn the background debounce task.
+    pub fn spawn_debounce_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let store = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = store.save_notify.notified() => {
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(DEBOUNCE_MS)) => break,
+                                _ = store.save_notify.notified() => continue,
+                            }
+                        }
+                        if let Err(e) = store.persist_all_dirty().await {
+                            tracing::warn!("Debounced graph save failed: {e}");
+                        }
+                    }
+                    _ = store.shutdown_notify.notified() => {
+                        if let Err(e) = store.persist_all_dirty().await {
+                            tracing::warn!("Shutdown graph save failed: {e}");
+                        }
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    fn schedule_save(&self) {
+        self.save_notify.notify_one();
+    }
+
     /// Get or load the graph for a given root directory.
-    /// Takes a write lock since loading populates the map and `f` may mutate the graph.
+    /// Automatically schedules a debounced save if the graph becomes dirty.
     pub async fn get_graph<F, R>(&self, root_dir: &str, f: F) -> Result<R>
     where
         F: FnOnce(&mut MemoryGraph) -> R,
     {
-        // Fast path: check with read lock first
+        let result;
         {
             let graphs = self.graphs.read().await;
             if graphs.contains_key(root_dir) {
                 drop(graphs);
-                // Re-acquire write lock for mutation
                 let mut graphs = self.graphs.write().await;
                 let graph = graphs.get_mut(root_dir).ok_or_else(|| {
                     ContextPlusError::Other("Graph not found after check".to_string())
                 })?;
-                return Ok(f(graph));
+                let was_dirty = graph.is_dirty();
+                result = f(graph);
+                if !was_dirty && graph.is_dirty() {
+                    self.schedule_save();
+                }
+                return Ok(result);
             }
         }
-        // Slow path: load from disk under write lock
         let mut graphs = self.graphs.write().await;
-        // Double-check after acquiring write lock (another task may have loaded it)
         if !graphs.contains_key(root_dir) {
             let graph = load_graph_from_disk(root_dir).await?;
             graphs.insert(root_dir.to_string(), graph);
@@ -883,7 +929,12 @@ impl GraphStore {
         let graph = graphs.get_mut(root_dir).ok_or_else(|| {
             ContextPlusError::Other("Graph not found after insertion".to_string())
         })?;
-        Ok(f(graph))
+        let was_dirty = graph.is_dirty();
+        result = f(graph);
+        if !was_dirty && graph.is_dirty() {
+            self.schedule_save();
+        }
+        Ok(result)
     }
 
     /// Persist the graph for a root directory to disk.
@@ -895,6 +946,25 @@ impl GraphStore {
             persist_graph_to_disk(root_dir, graph).await?;
             graph.mark_clean();
         }
+        Ok(())
+    }
+
+    /// Persist ALL dirty graphs to disk.
+    async fn persist_all_dirty(&self) -> Result<()> {
+        let mut graphs = self.graphs.write().await;
+        for (root_dir, graph) in graphs.iter_mut() {
+            if graph.is_dirty() {
+                persist_graph_to_disk(root_dir, graph).await?;
+                graph.mark_clean();
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush: persist immediately and signal the debounce task to shut down.
+    pub async fn flush(&self) -> Result<()> {
+        self.persist_all_dirty().await?;
+        self.shutdown_notify.notify_one();
         Ok(())
     }
 }
@@ -1532,4 +1602,63 @@ mod tests {
         assert_eq!(stats.nodes, 2);
         assert_eq!(stats.edges, 1);
     }
+    #[tokio::test]
+    async fn graph_save_load_roundtrip_json_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let store = Arc::new(GraphStore::new());
+        store.get_graph(&root, |graph| {
+            let a = graph.upsert_node(NodeType::Concept, "billing", "billing module", vec![0.5, 0.5],
+                Some(HashMap::from([("domain".to_string(), "finance".to_string())])));
+            let b = graph.upsert_node(NodeType::Symbol, "charge_card", "charges a credit card", vec![0.3, 0.7], None);
+            graph.create_relation(&a.id, &b.id, RelationType::Contains, Some(0.9), None);
+        }).await.expect("create");
+        store.flush().await.expect("flush");
+        let json_path = dir.path().join(".mcp_data").join("memory-graph.json");
+        assert!(json_path.exists());
+        let store2 = Arc::new(GraphStore::new());
+        let stats = store2.get_graph(&root, |graph| {
+            let s = graph.stats();
+            let billing = graph.find_node("billing", &NodeType::Concept);
+            assert!(billing.is_some());
+            assert_eq!(billing.unwrap().metadata.get("domain"), Some(&"finance".to_string()));
+            s
+        }).await.expect("reload");
+        assert_eq!(stats.nodes, 2);
+        assert_eq!(stats.edges, 1);
+    }
+
+    #[tokio::test]
+    async fn debounce_does_not_write_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let store = Arc::new(GraphStore::new());
+        let _handle = store.spawn_debounce_task();
+        store.get_graph(&root, |graph| {
+            graph.upsert_node(NodeType::Note, "test", "a note", vec![1.0], None);
+        }).await.expect("upsert");
+        let json_path = dir.path().join(".mcp_data").join("memory-graph.json");
+        assert!(!json_path.exists(), "should NOT exist immediately");
+        tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+        assert!(json_path.exists(), "should exist after debounce");
+        store.flush().await.expect("flush");
+    }
+
+    #[tokio::test]
+    async fn flush_persists_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let store = Arc::new(GraphStore::new());
+        store.get_graph(&root, |graph| {
+            graph.upsert_node(NodeType::Concept, "quick", "fast save", vec![0.1], None);
+        }).await.expect("upsert");
+        store.flush().await.expect("flush");
+        let json_path = dir.path().join(".mcp_data").join("memory-graph.json");
+        assert!(json_path.exists());
+        let content = tokio::fs::read_to_string(&json_path).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("nodes").is_some());
+        assert!(parsed.get("edges").is_some());
+    }
+
 }

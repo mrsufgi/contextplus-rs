@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use contextplus_rs::config::Config;
@@ -262,6 +263,15 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
 
     let server = ContextPlusServer::new(root_dir.clone(), config.clone());
 
+    // Pre-load memory graph from disk
+    let root_str = root_dir.to_string_lossy().to_string();
+    if let Err(e) = server.state.memory_graph.get_graph(&root_str, |_graph| {}).await {
+        tracing::warn!("Failed to pre-load memory graph from disk: {e}");
+    }
+
+    // Spawn background debounce task for memory graph persistence
+    let _debounce_handle = server.state.memory_graph.spawn_debounce_task();
+
     // Start the file watcher to invalidate project cache on source changes
     let _tracker_handle = if config.embed_tracker_enabled {
         let server_state = server.state.clone();
@@ -308,21 +318,24 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         None
     };
 
+    let memory_graph = Arc::clone(&server.state.memory_graph);
+
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
 
     // Wait for server exit OR Ctrl-C, whichever comes first.
-    // On Ctrl-C, persist the memory graph synchronously before exiting so
-    // in-flight nodes survive across restarts.
     tokio::select! {
         result = ct.waiting() => {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl-C received — persisting memory graph before shutdown");
-            // Memory graph is in-memory only; no explicit persist path needed currently.
-            // Future: call server.state.memory_graph.persist() here.
         }
+    }
+
+    // Always flush memory graph on exit
+    if let Err(e) = memory_graph.flush().await {
+        tracing::warn!("Failed to persist memory graph on shutdown: {e}");
     }
 
     Ok(())
