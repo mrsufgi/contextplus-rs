@@ -37,6 +37,12 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-bash = "0.25"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.24"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
+tree-sitter-kotlin-ng = "1"
 
 # Vector SIMD cosine similarity (returns distance, use 1.0 - d for similarity)
 simsimd = "6"
