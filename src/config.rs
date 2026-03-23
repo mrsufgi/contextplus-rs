@@ -86,7 +86,6 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-
 fn build_ignore_dirs() -> HashSet<String> {
     let mut dirs: HashSet<String> = BASE_IGNORE_DIRS.iter().map(|s| (*s).to_string()).collect();
     if let Ok(extra) = env::var("CONTEXTPLUS_IGNORE_DIRS") {
@@ -111,7 +110,9 @@ impl Config {
             ollama_chat_model: env_or("OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
             ollama_api_key: env::var("OLLAMA_API_KEY").ok(),
             embed_batch_size: batch_size,
-            embed_tracker_mode: parse_tracker_mode(env::var("CONTEXTPLUS_EMBED_TRACKER").ok().as_deref()),
+            embed_tracker_mode: parse_tracker_mode(
+                env::var("CONTEXTPLUS_EMBED_TRACKER").ok().as_deref(),
+            ),
             embed_tracker_debounce_ms: env_parse(
                 "CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS",
                 DEFAULT_EMBED_TRACKER_DEBOUNCE_MS,
@@ -297,20 +298,29 @@ mod tests {
     fn tracker_mode_variants() {
         for val in &["off", "false", "0", "no", "disabled", "none"] {
             with_env(&[("CONTEXTPLUS_EMBED_TRACKER", val)], || {
-                assert_eq!(Config::from_env().embed_tracker_mode, TrackerMode::Off,
-                    "expected Off for '{val}'");
+                assert_eq!(
+                    Config::from_env().embed_tracker_mode,
+                    TrackerMode::Off,
+                    "expected Off for '{val}'"
+                );
             });
         }
         for val in &["eager", "startup", "boot"] {
             with_env(&[("CONTEXTPLUS_EMBED_TRACKER", val)], || {
-                assert_eq!(Config::from_env().embed_tracker_mode, TrackerMode::Eager,
-                    "expected Eager for '{val}'");
+                assert_eq!(
+                    Config::from_env().embed_tracker_mode,
+                    TrackerMode::Eager,
+                    "expected Eager for '{val}'"
+                );
             });
         }
         for val in &["true", "1", "yes", "lazy"] {
             with_env(&[("CONTEXTPLUS_EMBED_TRACKER", val)], || {
-                assert_eq!(Config::from_env().embed_tracker_mode, TrackerMode::Lazy,
-                    "expected Lazy for '{val}'");
+                assert_eq!(
+                    Config::from_env().embed_tracker_mode,
+                    TrackerMode::Lazy,
+                    "expected Lazy for '{val}'"
+                );
             });
         }
     }
