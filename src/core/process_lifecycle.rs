@@ -14,7 +14,7 @@ use tokio::time::{Duration, sleep};
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 15 * 60 * 1000; // 15 min
 pub const MIN_IDLE_TIMEOUT_MS: u64 = 60 * 1000; // 1 min
 pub const DEFAULT_PARENT_POLL_MS: u64 = 5 * 1000; // 5 s
-pub const MIN_PARENT_POLL_MS: u64 = 1 * 1000; // 1 s
+pub const MIN_PARENT_POLL_MS: u64 = 1_000; // 1 s
 
 const DISABLED_VALUES: &[&str] = &["0", "false", "off", "disabled", "none"];
 
