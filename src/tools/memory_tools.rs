@@ -188,7 +188,10 @@ pub async fn tool_create_relation(
             .get_graph(&options.root_dir, |graph| graph.node_exists(id))
             .await?;
         if !exists {
-            return Ok(format!("\u{274C} Failed: source node not found (id: '{}')", id));
+            return Ok(format!(
+                "\u{274C} Failed: source node not found (id: '{}')",
+                id
+            ));
         }
         id.clone()
     } else if let Some(ref label) = options.source_label {
@@ -217,7 +220,10 @@ pub async fn tool_create_relation(
             .get_graph(&options.root_dir, |graph| graph.node_exists(id))
             .await?;
         if !exists {
-            return Ok(format!("\u{274C} Failed: target node not found (id: '{}')", id));
+            return Ok(format!(
+                "\u{274C} Failed: target node not found (id: '{}')",
+                id
+            ));
         }
         id.clone()
     } else if let Some(ref label) = options.target_label {
@@ -388,7 +394,10 @@ pub async fn tool_add_interlinked_context(
 
     store.persist(&options.root_dir).await?;
 
-    let mut sections = vec![format!("\u{2705} Added {} interlinked nodes", result.nodes.len())];
+    let mut sections = vec![format!(
+        "\u{2705} Added {} interlinked nodes",
+        result.nodes.len()
+    )];
 
     if result.edges.is_empty() {
         sections.push("  No auto-links above threshold".to_string());
@@ -1184,7 +1193,10 @@ mod tests {
         .await
         .expect("ok");
 
-        assert!(result.contains("\u{1F9F9} Pruning complete"), "got: {result}");
+        assert!(
+            result.contains("\u{1F9F9} Pruning complete"),
+            "got: {result}"
+        );
         assert!(result.contains("Removed: 0"), "got: {result}");
         assert!(result.contains("Remaining edges: 0"), "got: {result}");
     }
@@ -1215,7 +1227,10 @@ mod tests {
         .await
         .expect("ok");
 
-        assert!(result.contains("\u{1F9F9} Pruning complete"), "got: {result}");
+        assert!(
+            result.contains("\u{1F9F9} Pruning complete"),
+            "got: {result}"
+        );
         // Fresh edge should not be pruned (decay ~ 1.0, well above 0.1)
         assert!(result.contains("Remaining edges: 1"), "got: {result}");
     }
