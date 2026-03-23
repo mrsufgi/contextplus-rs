@@ -162,6 +162,7 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
             .unwrap_or_default();
 
     // Filter to supported extensions and non-directories, then read content
+    let max_file_size = config.max_embed_file_size as u64;
     let mut files = Vec::new();
     for entry in entries {
         if entry.is_directory {
@@ -173,10 +174,10 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if !allowed_extensions.contains(ext) {
-            continue;
+        if !allowed_extensions.contains(ext) { continue; }
+        if let Ok(meta) = tokio::fs::metadata(&entry.path).await {
+            if meta.len() > max_file_size { continue; }
         }
-
         if let Ok(content) = tokio::fs::read_to_string(&entry.path).await {
             let header = extract_header(&content);
             let truncated_content = if content.len() > 500 {

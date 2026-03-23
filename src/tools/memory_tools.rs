@@ -1446,6 +1446,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1491,6 +1494,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1547,6 +1553,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1609,6 +1618,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1661,6 +1673,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1738,6 +1753,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1801,6 +1819,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1855,6 +1876,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1914,6 +1938,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1972,6 +1999,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2026,6 +2056,9 @@ mod tests {
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            max_embed_file_size: 50*1024,
+            embed_num_gpu: None, embed_main_gpu: None, embed_num_thread: None,
+            embed_num_batch: None, embed_num_ctx: None, embed_low_vram: None,
         };
         let ollama = OllamaClient::new(&config);
 

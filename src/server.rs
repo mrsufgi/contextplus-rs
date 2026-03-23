@@ -242,6 +242,8 @@ impl ContextPlusServer {
         let mut updated = 0usize;
         let mut skipped = 0usize;
 
+        let max_file_size = self.state.config.max_embed_file_size as u64;
+
         let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
 
         for file_path in files {
@@ -249,6 +251,10 @@ impl ContextPlusServer {
                 Ok(r) => r.to_string_lossy().to_string(),
                 Err(_) => file_path.to_string_lossy().to_string(),
             };
+
+            if let Ok(meta) = tokio::fs::metadata(file_path).await {
+                if meta.len() > max_file_size { skipped += 1; continue; }
+            }
 
             let content = match tokio::fs::read_to_string(file_path).await {
                 Ok(c) => c,
