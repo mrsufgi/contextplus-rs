@@ -420,7 +420,10 @@ fn test_init_standard_config_structure() {
 
     let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-    assert!(parsed.get("mcpServers").is_some(), "should have mcpServers key");
+    assert!(
+        parsed.get("mcpServers").is_some(),
+        "should have mcpServers key"
+    );
     let servers = &parsed["mcpServers"];
     assert!(
         servers.get("contextplus").is_some(),
@@ -475,13 +478,19 @@ fn test_init_opencode_config_structure() {
 
     let cp = &parsed["mcp"]["contextplus"];
     assert_eq!(cp["type"], "local", "opencode type should be 'local'");
-    assert!(cp["command"].is_array(), "opencode command should be an array");
+    assert!(
+        cp["command"].is_array(),
+        "opencode command should be an array"
+    );
     assert_eq!(cp["enabled"], true, "opencode should be enabled");
     assert!(
         cp.get("environment").is_some(),
         "opencode uses 'environment' not 'env'"
     );
-    assert_eq!(cp["environment"]["OLLAMA_EMBED_MODEL"], "snowflake-arctic-embed2");
+    assert_eq!(
+        cp["environment"]["OLLAMA_EMBED_MODEL"],
+        "snowflake-arctic-embed2"
+    );
 }
 
 /// Test that all agent targets produce valid config paths ending in .json.
