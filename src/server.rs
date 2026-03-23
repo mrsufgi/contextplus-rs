@@ -605,10 +605,10 @@ impl ContextPlusServer {
 
         let options = ct::ContextTreeOptions {
             root_dir: root,
-            target_path: Self::get_str(&args, "targetPath"),
-            depth_limit: Self::get_usize(&args, "depthLimit"),
-            include_symbols: Self::get_bool(&args, "includeSymbols"),
-            max_tokens: Self::get_usize(&args, "maxTokens"),
+            target_path: Self::get_str(&args, "target_path"),
+            depth_limit: Self::get_usize(&args, "depth_limit"),
+            include_symbols: Self::get_bool(&args, "include_symbols"),
+            max_tokens: Self::get_usize(&args, "max_tokens"),
         };
 
         let result = ct::get_context_tree(options, &ct_entries, &ct_analyses).await?;
@@ -622,9 +622,7 @@ impl ContextPlusServer {
         use crate::tools::file_skeleton as fs;
 
         let file_path = Self::get_str(&args, "file_path")
-            .or_else(|| Self::get_str(&args, "filePath"))
             .or_else(|| Self::get_str(&args, "target_path"))
-            .or_else(|| Self::get_str(&args, "targetPath"))
             .ok_or_else(|| ContextPlusError::Other("file_path is required".into()))?;
 
         let root = self.resolve_root(&args);
@@ -683,10 +681,8 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         let symbol_name = Self::get_str(&args, "symbol_name")
-            .or_else(|| Self::get_str(&args, "symbolName"))
             .ok_or_else(|| ContextPlusError::Other("symbol_name is required".into()))?;
-        let file_context =
-            Self::get_str(&args, "file_context").or_else(|| Self::get_str(&args, "fileContext"));
+        let file_context = Self::get_str(&args, "file_context");
 
         let cache = self.ensure_project_cache().await?;
 
@@ -716,21 +712,14 @@ impl ContextPlusServer {
         let options = crate::tools::semantic_search::SemanticSearchOptions {
             root_dir: root.clone(),
             query,
-            top_k: Self::get_usize(&args, "top_k").or_else(|| Self::get_usize(&args, "topK")),
-            semantic_weight: Self::get_f64(&args, "semantic_weight")
-                .or_else(|| Self::get_f64(&args, "semanticWeight")),
-            keyword_weight: Self::get_f64(&args, "keyword_weight")
-                .or_else(|| Self::get_f64(&args, "keywordWeight")),
-            min_semantic_score: Self::get_f64(&args, "min_semantic_score")
-                .or_else(|| Self::get_f64(&args, "minSemanticScore")),
-            min_keyword_score: Self::get_f64(&args, "min_keyword_score")
-                .or_else(|| Self::get_f64(&args, "minKeywordScore")),
-            min_combined_score: Self::get_f64(&args, "min_combined_score")
-                .or_else(|| Self::get_f64(&args, "minCombinedScore")),
-            require_keyword_match: Self::get_bool(&args, "require_keyword_match")
-                .or_else(|| Self::get_bool(&args, "requireKeywordMatch")),
-            require_semantic_match: Self::get_bool(&args, "require_semantic_match")
-                .or_else(|| Self::get_bool(&args, "requireSemanticMatch")),
+            top_k: Self::get_usize(&args, "top_k"),
+            semantic_weight: Self::get_f64(&args, "semantic_weight"),
+            keyword_weight: Self::get_f64(&args, "keyword_weight"),
+            min_semantic_score: Self::get_f64(&args, "min_semantic_score"),
+            min_keyword_score: Self::get_f64(&args, "min_keyword_score"),
+            min_combined_score: Self::get_f64(&args, "min_combined_score"),
+            require_keyword_match: Self::get_bool(&args, "require_keyword_match"),
+            require_semantic_match: Self::get_bool(&args, "require_semantic_match"),
         };
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());
@@ -770,16 +759,12 @@ impl ContextPlusServer {
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
             query,
-            top_k: Self::get_usize(&args, "top_k").or_else(|| Self::get_usize(&args, "topK")),
-            top_calls_per_identifier: Self::get_usize(&args, "top_calls_per_identifier")
-                .or_else(|| Self::get_usize(&args, "topCallsPerIdentifier")),
-            semantic_weight: Self::get_f64(&args, "semantic_weight")
-                .or_else(|| Self::get_f64(&args, "semanticWeight")),
-            keyword_weight: Self::get_f64(&args, "keyword_weight")
-                .or_else(|| Self::get_f64(&args, "keywordWeight")),
+            top_k: Self::get_usize(&args, "top_k"),
+            top_calls_per_identifier: Self::get_usize(&args, "top_calls_per_identifier"),
+            semantic_weight: Self::get_f64(&args, "semantic_weight"),
+            keyword_weight: Self::get_f64(&args, "keyword_weight"),
             include_kinds: args
                 .get("include_kinds")
-                .or_else(|| args.get("includeKinds"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -810,12 +795,9 @@ impl ContextPlusServer {
 
         let options = crate::tools::semantic_navigate::SemanticNavigateOptions {
             root_dir: root.to_string_lossy().into(),
-            max_depth: Self::get_usize(&args, "max_depth")
-                .or_else(|| Self::get_usize(&args, "maxDepth")),
-            max_clusters: Self::get_usize(&args, "max_clusters")
-                .or_else(|| Self::get_usize(&args, "maxClusters")),
-            max_output_chars: Self::get_usize(&args, "max_output_chars")
-                .or_else(|| Self::get_usize(&args, "maxOutputChars")),
+            max_depth: Self::get_usize(&args, "max_depth"),
+            max_clusters: Self::get_usize(&args, "max_clusters"),
+            max_output_chars: Self::get_usize(&args, "max_output_chars"),
         };
 
         let result = crate::tools::semantic_navigate::semantic_navigate(
@@ -834,13 +816,13 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         let root = self.resolve_root(&args);
-        let hub_path = Self::get_str(&args, "hubPath");
+        let hub_path = Self::get_str(&args, "hub_path");
 
         let options = crate::tools::feature_hub::FeatureHubOptions {
             root_dir: root.to_string_lossy().into(),
             hub_path,
-            feature_name: Self::get_str(&args, "featureName"),
-            show_orphans: Self::get_bool(&args, "showOrphans"),
+            feature_name: Self::get_str(&args, "feature_name"),
+            show_orphans: Self::get_bool(&args, "show_orphans"),
         };
 
         let result = crate::tools::feature_hub::get_feature_hub(options).await?;
@@ -852,7 +834,7 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         let root = self.resolve_root(&args);
-        let target_path = Self::get_str(&args, "targetPath");
+        let target_path = Self::get_str(&args, "target_path");
 
         let options = crate::tools::static_analysis::StaticAnalysisOptions {
             root_dir: root,
@@ -868,10 +850,8 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         let file_path = Self::get_str(&args, "file_path")
-            .or_else(|| Self::get_str(&args, "filePath"))
             .ok_or_else(|| ContextPlusError::Other("file_path is required".into()))?;
         let content = Self::get_str(&args, "new_content")
-            .or_else(|| Self::get_str(&args, "content"))
             .ok_or_else(|| ContextPlusError::Other("new_content is required".into()))?;
         let description = Self::get_str(&args, "description");
         let root = self.resolve_root(&args);
@@ -920,7 +900,6 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         let restore_point_id = Self::get_str(&args, "point_id")
-            .or_else(|| Self::get_str(&args, "restorePointId"))
             .ok_or_else(|| ContextPlusError::Other("point_id is required".into()))?;
         let root = self.resolve_root(&args);
 
@@ -945,7 +924,6 @@ impl ContextPlusServer {
         let options = crate::tools::memory_tools::UpsertMemoryNodeOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
             node_type: Self::get_str(&args, "type")
-                .or_else(|| Self::get_str(&args, "nodeType"))
                 .unwrap_or_else(|| "concept".to_string()),
             label: Self::get_str(&args, "label")
                 .ok_or_else(|| ContextPlusError::Other("label is required".into()))?,
@@ -969,19 +947,13 @@ impl ContextPlusServer {
         let options = crate::tools::memory_tools::CreateRelationOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
             // TS API: source_id / target_id (direct node IDs)
-            source_id: Self::get_str(&args, "source_id")
-                .or_else(|| Self::get_str(&args, "sourceId")),
-            source_label: Self::get_str(&args, "source_label")
-                .or_else(|| Self::get_str(&args, "sourceLabel")),
+            source_id: Self::get_str(&args, "source_id"),
+            source_label: Self::get_str(&args, "source_label"),
             source_type: Self::get_str(&args, "source_type")
-                .or_else(|| Self::get_str(&args, "sourceType"))
                 .unwrap_or_else(|| "concept".to_string()),
-            target_id: Self::get_str(&args, "target_id")
-                .or_else(|| Self::get_str(&args, "targetId")),
-            target_label: Self::get_str(&args, "target_label")
-                .or_else(|| Self::get_str(&args, "targetLabel")),
+            target_id: Self::get_str(&args, "target_id"),
+            target_label: Self::get_str(&args, "target_label"),
             target_type: Self::get_str(&args, "target_type")
-                .or_else(|| Self::get_str(&args, "targetType"))
                 .unwrap_or_else(|| "concept".to_string()),
             relation: Self::get_str(&args, "relation").unwrap_or_else(|| "relates_to".to_string()),
             weight: Self::get_f64(&args, "weight").map(|w| w as f32),
@@ -1002,12 +974,10 @@ impl ContextPlusServer {
             root_dir: self.root_dir().to_string_lossy().into(),
             query: Self::get_str(&args, "query")
                 .ok_or_else(|| ContextPlusError::Other("query is required".into()))?,
-            max_depth: Self::get_usize(&args, "max_depth")
-                .or_else(|| Self::get_usize(&args, "maxDepth")),
-            top_k: Self::get_usize(&args, "top_k").or_else(|| Self::get_usize(&args, "topK")),
+            max_depth: Self::get_usize(&args, "max_depth"),
+            top_k: Self::get_usize(&args, "top_k"),
             edge_filter: args
                 .get("edge_filter")
-                .or_else(|| args.get("edgeFilter"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -1054,7 +1024,6 @@ impl ContextPlusServer {
                         let obj = item.as_object()?;
                         Some(crate::tools::memory_tools::InterlinkedItem {
                             node_type: Self::get_str(obj, "type")
-                                .or_else(|| Self::get_str(obj, "nodeType"))
                                 .unwrap_or_else(|| "concept".to_string()),
                             label: Self::get_str(obj, "label")?,
                             content: Self::get_str(obj, "content")?,
@@ -1068,8 +1037,7 @@ impl ContextPlusServer {
         let options = crate::tools::memory_tools::AddInterlinkedContextOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
             items,
-            auto_link: Self::get_bool(&args, "auto_link")
-                .or_else(|| Self::get_bool(&args, "autoLink")),
+            auto_link: Self::get_bool(&args, "auto_link"),
         };
 
         let store = &self.state.memory_graph;
@@ -1090,13 +1058,10 @@ impl ContextPlusServer {
         let options = crate::tools::memory_tools::RetrieveWithTraversalOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
             node_id: Self::get_str(&args, "start_node_id")
-                .or_else(|| Self::get_str(&args, "nodeId"))
                 .ok_or_else(|| ContextPlusError::Other("start_node_id is required".into()))?,
-            max_depth: Self::get_usize(&args, "max_depth")
-                .or_else(|| Self::get_usize(&args, "maxDepth")),
+            max_depth: Self::get_usize(&args, "max_depth"),
             edge_filter: args
                 .get("edge_filter")
-                .or_else(|| args.get("edgeFilter"))
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -2248,7 +2213,7 @@ mod tests {
     async fn dispatch_propose_commit_missing_content_returns_error() {
         let server = test_server();
         let mut args = serde_json::Map::new();
-        args.insert("filePath".to_string(), json!("test.txt"));
+        args.insert("file_path".to_string(), json!("test.txt"));
         let result = server.dispatch("propose_commit", args).await;
         assert_eq!(result.is_error, Some(true));
         let text = match &result.content[0].raw {
@@ -2518,15 +2483,15 @@ mod tests {
 
     #[test]
     fn string_array_extraction_pattern() {
-        // This mirrors the pattern used for includeKinds and edgeFilter
+        // This mirrors the pattern used for include_kinds and edge_filter
         let mut args = serde_json::Map::new();
         args.insert(
-            "includeKinds".to_string(),
+            "include_kinds".to_string(),
             json!(["function", "class", "method"]),
         );
 
         let result: Option<Vec<String>> =
-            args.get("includeKinds")
+            args.get("include_kinds")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -2542,7 +2507,7 @@ mod tests {
     fn string_array_extraction_returns_none_when_missing() {
         let args = serde_json::Map::new();
         let result: Option<Vec<String>> =
-            args.get("includeKinds")
+            args.get("include_kinds")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
