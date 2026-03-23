@@ -255,7 +255,6 @@ fn shrink_input(input: &str) -> String {
     crate::core::parser::truncate_to_char_boundary(input, next_len).to_string()
 }
 
-
 // ---------------------------------------------------------------------------
 // Embedding chunk + merge
 // ---------------------------------------------------------------------------
