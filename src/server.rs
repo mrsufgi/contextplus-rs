@@ -923,8 +923,7 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         let options = crate::tools::memory_tools::UpsertMemoryNodeOptions {
             root_dir: self.root_dir().to_string_lossy().into(),
-            node_type: Self::get_str(&args, "type")
-                .unwrap_or_else(|| "concept".to_string()),
+            node_type: Self::get_str(&args, "type").unwrap_or_else(|| "concept".to_string()),
             label: Self::get_str(&args, "label")
                 .ok_or_else(|| ContextPlusError::Other("label is required".into()))?,
             content: Self::get_str(&args, "content")
