@@ -131,6 +131,11 @@ impl ContextPlusServer {
         Self { state }
     }
 
+    /// Cancel all in-flight embedding requests (used during shutdown).
+    pub fn cancel_all_embeddings(&self) {
+        self.state.ollama.cancel_all_embeddings();
+    }
+
     fn root_dir(&self) -> &Path {
         &self.state.root_dir
     }

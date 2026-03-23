@@ -308,20 +308,21 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         None
     };
 
+    // Keep a handle to shared state so we can cancel embeddings on shutdown.
+    let state_for_shutdown = server.state.clone();
+
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
 
     // Wait for server exit OR Ctrl-C, whichever comes first.
-    // On Ctrl-C, persist the memory graph synchronously before exiting so
-    // in-flight nodes survive across restarts.
+    // On Ctrl-C, cancel in-flight embeddings before exiting.
     tokio::select! {
         result = ct.waiting() => {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received — persisting memory graph before shutdown");
-            // Memory graph is in-memory only; no explicit persist path needed currently.
-            // Future: call server.state.memory_graph.persist() here.
+            tracing::info!("Ctrl-C received — cancelling embeddings and shutting down");
+            state_for_shutdown.ollama.cancel_all_embeddings();
         }
     }
 
