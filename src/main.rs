@@ -322,7 +322,10 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         std::process::exit(0);
     });
     if config.idle_timeout_ms > 0 {
-        tracing::info!("Idle shutdown monitor started ({}ms)", config.idle_timeout_ms);
+        tracing::info!(
+            "Idle shutdown monitor started ({}ms)",
+            config.idle_timeout_ms
+        );
     }
 
     // Store idle monitor on shared state so tool handlers can touch it.
@@ -336,17 +339,14 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
     #[cfg(unix)]
     let _parent_monitor = {
         let parent_pid = std::os::unix::process::parent_id();
-        let handle = process_lifecycle::start_parent_monitor(
-            parent_pid,
-            config.parent_poll_ms,
-            move || {
+        let handle =
+            process_lifecycle::start_parent_monitor(parent_pid, config.parent_poll_ms, move || {
                 tracing::info!(
                     "Parent process (pid={}) exited — initiating shutdown",
                     parent_pid
                 );
                 std::process::exit(0);
-            },
-        );
+            });
         tracing::info!(
             "Parent PID monitor started (pid={}, poll={}ms)",
             parent_pid,
@@ -361,11 +361,9 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
     // --- Signal handling ---
     // Handle SIGTERM, SIGHUP, SIGINT for graceful shutdown.
     #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
-    let mut sighup =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     tokio::select! {
         result = ct.waiting() => {

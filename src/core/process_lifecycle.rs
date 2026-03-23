@@ -2,8 +2,8 @@
 // Ports the TypeScript process-lifecycle.ts to async Rust with tokio.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
 
