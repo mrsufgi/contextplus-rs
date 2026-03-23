@@ -13,6 +13,7 @@ pub struct Config {
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
     pub cache_ttl_secs: u64,
+    pub embed_chunk_chars: usize,
 }
 
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
@@ -22,6 +23,9 @@ const DEFAULT_EMBED_BATCH_SIZE: usize = 50;
 const DEFAULT_EMBED_TRACKER_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_EMBED_TRACKER_MAX_FILES: usize = 8;
 const DEFAULT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_EMBED_CHUNK_CHARS: usize = 2000;
+const MIN_EMBED_CHUNK_CHARS: usize = 256;
+const MAX_EMBED_CHUNK_CHARS: usize = 8000;
 const MIN_EMBED_BATCH_SIZE: usize = 5;
 const MAX_EMBED_BATCH_SIZE: usize = 512;
 
@@ -99,6 +103,11 @@ impl Config {
             ),
             ignore_dirs: build_ignore_dirs(),
             cache_ttl_secs: env_parse("CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            embed_chunk_chars: env_parse(
+                "CONTEXTPLUS_EMBED_CHUNK_CHARS",
+                DEFAULT_EMBED_CHUNK_CHARS,
+            )
+            .clamp(MIN_EMBED_CHUNK_CHARS, MAX_EMBED_CHUNK_CHARS),
         }
     }
 }
@@ -161,6 +170,7 @@ mod tests {
                 "CONTEXTPLUS_EMBED_TRACKER_MAX_FILES",
                 "CONTEXTPLUS_IGNORE_DIRS",
                 "CONTEXTPLUS_CACHE_TTL_SECS",
+                "CONTEXTPLUS_EMBED_CHUNK_CHARS",
             ],
             || {
                 let cfg = Config::from_env();
@@ -176,6 +186,7 @@ mod tests {
                 assert!(cfg.ignore_dirs.contains(".git"));
                 assert!(cfg.ignore_dirs.contains("target"));
                 assert_eq!(cfg.cache_ttl_secs, 300);
+                assert_eq!(cfg.embed_chunk_chars, 2000);
             },
         );
     }
@@ -283,6 +294,26 @@ mod tests {
         });
         with_env(&[("CONTEXTPLUS_EMBED_TRACKER", "no")], || {
             assert!(!Config::from_env().embed_tracker_enabled);
+        });
+    }
+
+    #[test]
+    fn embed_chunk_chars_clamps() {
+        with_env(&[("CONTEXTPLUS_EMBED_CHUNK_CHARS", "100")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.embed_chunk_chars, MIN_EMBED_CHUNK_CHARS);
+        });
+        with_env(&[("CONTEXTPLUS_EMBED_CHUNK_CHARS", "99999")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.embed_chunk_chars, MAX_EMBED_CHUNK_CHARS);
+        });
+    }
+
+    #[test]
+    fn embed_chunk_chars_custom() {
+        with_env(&[("CONTEXTPLUS_EMBED_CHUNK_CHARS", "4000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.embed_chunk_chars, 4000);
         });
     }
 }
