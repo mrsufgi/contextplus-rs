@@ -1137,15 +1137,15 @@ impl ServerHandler for ContextPlusServer {
                 .enable_resources()
                 .build(),
         )
-            .with_server_info(Implementation::new(
-                "contextplus",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(
-                "Context+ semantic code analysis server. Provides semantic search, \
+        .with_server_info(Implementation::new(
+            "contextplus",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Context+ semantic code analysis server. Provides semantic search, \
              blast radius analysis, context trees, file skeletons, navigation, \
              memory graph, and more.",
-            )
+        )
     }
 
     fn list_resources(
@@ -1153,8 +1153,8 @@ impl ServerHandler for ContextPlusServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = std::result::Result<ListResourcesResult, rmcp::ErrorData>>
-           + Send
-           + '_ {
+    + Send
+    + '_ {
         let resource = RawResource::new(INSTRUCTIONS_RESOURCE_URI, "contextplus_instructions")
             .with_description("Context+ usage instructions and best practices")
             .with_mime_type("text/markdown")

@@ -1607,23 +1607,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
         let store = Arc::new(GraphStore::new());
-        store.get_graph(&root, |graph| {
-            let a = graph.upsert_node(NodeType::Concept, "billing", "billing module", vec![0.5, 0.5],
-                Some(HashMap::from([("domain".to_string(), "finance".to_string())])));
-            let b = graph.upsert_node(NodeType::Symbol, "charge_card", "charges a credit card", vec![0.3, 0.7], None);
-            graph.create_relation(&a.id, &b.id, RelationType::Contains, Some(0.9), None);
-        }).await.expect("create");
+        store
+            .get_graph(&root, |graph| {
+                let a = graph.upsert_node(
+                    NodeType::Concept,
+                    "billing",
+                    "billing module",
+                    vec![0.5, 0.5],
+                    Some(HashMap::from([(
+                        "domain".to_string(),
+                        "finance".to_string(),
+                    )])),
+                );
+                let b = graph.upsert_node(
+                    NodeType::Symbol,
+                    "charge_card",
+                    "charges a credit card",
+                    vec![0.3, 0.7],
+                    None,
+                );
+                graph.create_relation(&a.id, &b.id, RelationType::Contains, Some(0.9), None);
+            })
+            .await
+            .expect("create");
         store.flush().await.expect("flush");
         let json_path = dir.path().join(".mcp_data").join("memory-graph.json");
         assert!(json_path.exists());
         let store2 = Arc::new(GraphStore::new());
-        let stats = store2.get_graph(&root, |graph| {
-            let s = graph.stats();
-            let billing = graph.find_node("billing", &NodeType::Concept);
-            assert!(billing.is_some());
-            assert_eq!(billing.unwrap().metadata.get("domain"), Some(&"finance".to_string()));
-            s
-        }).await.expect("reload");
+        let stats = store2
+            .get_graph(&root, |graph| {
+                let s = graph.stats();
+                let billing = graph.find_node("billing", &NodeType::Concept);
+                assert!(billing.is_some());
+                assert_eq!(
+                    billing.unwrap().metadata.get("domain"),
+                    Some(&"finance".to_string())
+                );
+                s
+            })
+            .await
+            .expect("reload");
         assert_eq!(stats.nodes, 2);
         assert_eq!(stats.edges, 1);
     }
@@ -1634,9 +1657,12 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
         let store = Arc::new(GraphStore::new());
         let _handle = store.spawn_debounce_task();
-        store.get_graph(&root, |graph| {
-            graph.upsert_node(NodeType::Note, "test", "a note", vec![1.0], None);
-        }).await.expect("upsert");
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(NodeType::Note, "test", "a note", vec![1.0], None);
+            })
+            .await
+            .expect("upsert");
         let json_path = dir.path().join(".mcp_data").join("memory-graph.json");
         assert!(!json_path.exists(), "should NOT exist immediately");
         tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
@@ -1649,9 +1675,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
         let store = Arc::new(GraphStore::new());
-        store.get_graph(&root, |graph| {
-            graph.upsert_node(NodeType::Concept, "quick", "fast save", vec![0.1], None);
-        }).await.expect("upsert");
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(NodeType::Concept, "quick", "fast save", vec![0.1], None);
+            })
+            .await
+            .expect("upsert");
         store.flush().await.expect("flush");
         let json_path = dir.path().join(".mcp_data").join("memory-graph.json");
         assert!(json_path.exists());
@@ -1660,5 +1689,4 @@ mod tests {
         assert!(parsed.get("nodes").is_some());
         assert!(parsed.get("edges").is_some());
     }
-
 }

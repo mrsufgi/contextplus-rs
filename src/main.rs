@@ -265,7 +265,12 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
 
     // Pre-load memory graph from disk
     let root_str = root_dir.to_string_lossy().to_string();
-    if let Err(e) = server.state.memory_graph.get_graph(&root_str, |_graph| {}).await {
+    if let Err(e) = server
+        .state
+        .memory_graph
+        .get_graph(&root_str, |_graph| {})
+        .await
+    {
         tracing::warn!("Failed to pre-load memory graph from disk: {e}");
     }
 
