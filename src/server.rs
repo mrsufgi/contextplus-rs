@@ -252,11 +252,11 @@ impl ContextPlusServer {
                 Err(_) => file_path.to_string_lossy().to_string(),
             };
 
-            if let Ok(meta) = tokio::fs::metadata(file_path).await {
-                if meta.len() > max_file_size {
-                    skipped += 1;
-                    continue;
-                }
+            if let Ok(meta) = tokio::fs::metadata(file_path).await
+                && meta.len() > max_file_size
+            {
+                skipped += 1;
+                continue;
             }
 
             let content = match tokio::fs::read_to_string(file_path).await {

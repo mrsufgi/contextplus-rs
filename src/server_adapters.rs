@@ -67,10 +67,10 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 let full_path = root.join(&entry.relative_path);
                 let rel_path = entry.relative_path.clone();
                 join_set.spawn(async move {
-                    if let Ok(meta) = tokio::fs::metadata(&full_path).await {
-                        if meta.len() > max_file_size {
-                            return (i, rel_path, None);
-                        }
+                    if let Ok(meta) = tokio::fs::metadata(&full_path).await
+                        && meta.len() > max_file_size
+                    {
+                        return (i, rel_path, None);
                     }
                     let content = tokio::fs::read_to_string(&full_path).await.ok();
                     (i, rel_path, content)
