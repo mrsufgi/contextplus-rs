@@ -1,5 +1,35 @@
 use std::collections::HashSet;
 use std::env;
+use std::fmt;
+
+/// Controls how the embedding tracker starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerMode {
+    Off,
+    Lazy,
+    Eager,
+}
+
+impl fmt::Display for TrackerMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrackerMode::Off => write!(f, "off"),
+            TrackerMode::Lazy => write!(f, "lazy"),
+            TrackerMode::Eager => write!(f, "eager"),
+        }
+    }
+}
+
+/// Parse a string into a TrackerMode.
+pub fn parse_tracker_mode(value: Option<&str>) -> TrackerMode {
+    match value.map(|v| v.trim().to_lowercase()).as_deref() {
+        Some("off") | Some("false") | Some("0") | Some("no") | Some("disabled") | Some("none") => {
+            TrackerMode::Off
+        }
+        Some("eager") | Some("startup") | Some("boot") => TrackerMode::Eager,
+        _ => TrackerMode::Lazy,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -8,7 +38,7 @@ pub struct Config {
     pub ollama_chat_model: String,
     pub ollama_api_key: Option<String>,
     pub embed_batch_size: usize,
-    pub embed_tracker_enabled: bool,
+    pub embed_tracker_mode: TrackerMode,
     pub embed_tracker_debounce_ms: u64,
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
@@ -56,13 +86,6 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
-    match env::var(key).ok().as_deref() {
-        Some("true") | Some("1") | Some("yes") => true,
-        Some("false") | Some("0") | Some("no") => false,
-        _ => default,
-    }
-}
 
 fn build_ignore_dirs() -> HashSet<String> {
     let mut dirs: HashSet<String> = BASE_IGNORE_DIRS.iter().map(|s| (*s).to_string()).collect();
@@ -88,7 +111,7 @@ impl Config {
             ollama_chat_model: env_or("OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
             ollama_api_key: env::var("OLLAMA_API_KEY").ok(),
             embed_batch_size: batch_size,
-            embed_tracker_enabled: env_bool("CONTEXTPLUS_EMBED_TRACKER", true),
+            embed_tracker_mode: parse_tracker_mode(env::var("CONTEXTPLUS_EMBED_TRACKER").ok().as_deref()),
             embed_tracker_debounce_ms: env_parse(
                 "CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS",
                 DEFAULT_EMBED_TRACKER_DEBOUNCE_MS,
@@ -169,7 +192,7 @@ mod tests {
                 assert_eq!(cfg.ollama_chat_model, "llama3.2");
                 assert!(cfg.ollama_api_key.is_none());
                 assert_eq!(cfg.embed_batch_size, 50);
-                assert!(cfg.embed_tracker_enabled);
+                assert_eq!(cfg.embed_tracker_mode, TrackerMode::Lazy);
                 assert_eq!(cfg.embed_tracker_debounce_ms, 700);
                 assert_eq!(cfg.embed_tracker_max_files, 8);
                 assert!(cfg.ignore_dirs.contains("node_modules"));
@@ -200,7 +223,7 @@ mod tests {
                 assert_eq!(cfg.ollama_chat_model, "my-chat");
                 assert_eq!(cfg.ollama_api_key.as_deref(), Some("secret-key"));
                 assert_eq!(cfg.embed_batch_size, 100);
-                assert!(!cfg.embed_tracker_enabled);
+                assert_eq!(cfg.embed_tracker_mode, TrackerMode::Off);
                 assert_eq!(cfg.embed_tracker_debounce_ms, 1500);
                 assert_eq!(cfg.embed_tracker_max_files, 20);
             },
@@ -271,18 +294,37 @@ mod tests {
     }
 
     #[test]
-    fn tracker_bool_variants() {
-        with_env(&[("CONTEXTPLUS_EMBED_TRACKER", "1")], || {
-            assert!(Config::from_env().embed_tracker_enabled);
-        });
-        with_env(&[("CONTEXTPLUS_EMBED_TRACKER", "yes")], || {
-            assert!(Config::from_env().embed_tracker_enabled);
-        });
-        with_env(&[("CONTEXTPLUS_EMBED_TRACKER", "0")], || {
-            assert!(!Config::from_env().embed_tracker_enabled);
-        });
-        with_env(&[("CONTEXTPLUS_EMBED_TRACKER", "no")], || {
-            assert!(!Config::from_env().embed_tracker_enabled);
-        });
+    fn tracker_mode_variants() {
+        for val in &["off", "false", "0", "no", "disabled", "none"] {
+            with_env(&[("CONTEXTPLUS_EMBED_TRACKER", val)], || {
+                assert_eq!(Config::from_env().embed_tracker_mode, TrackerMode::Off,
+                    "expected Off for '{val}'");
+            });
+        }
+        for val in &["eager", "startup", "boot"] {
+            with_env(&[("CONTEXTPLUS_EMBED_TRACKER", val)], || {
+                assert_eq!(Config::from_env().embed_tracker_mode, TrackerMode::Eager,
+                    "expected Eager for '{val}'");
+            });
+        }
+        for val in &["true", "1", "yes", "lazy"] {
+            with_env(&[("CONTEXTPLUS_EMBED_TRACKER", val)], || {
+                assert_eq!(Config::from_env().embed_tracker_mode, TrackerMode::Lazy,
+                    "expected Lazy for '{val}'");
+            });
+        }
+    }
+
+    #[test]
+    fn parse_tracker_mode_unit() {
+        assert_eq!(parse_tracker_mode(None), TrackerMode::Lazy);
+        assert_eq!(parse_tracker_mode(Some("")), TrackerMode::Lazy);
+        assert_eq!(parse_tracker_mode(Some("off")), TrackerMode::Off);
+        assert_eq!(parse_tracker_mode(Some("OFF")), TrackerMode::Off);
+        assert_eq!(parse_tracker_mode(Some(" False ")), TrackerMode::Off);
+        assert_eq!(parse_tracker_mode(Some("eager")), TrackerMode::Eager);
+        assert_eq!(parse_tracker_mode(Some("BOOT")), TrackerMode::Eager);
+        assert_eq!(parse_tracker_mode(Some("startup")), TrackerMode::Eager);
+        assert_eq!(parse_tracker_mode(Some("anything_else")), TrackerMode::Lazy);
     }
 }

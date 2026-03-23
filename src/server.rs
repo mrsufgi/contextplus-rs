@@ -13,7 +13,10 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::cache::rkyv_store;
-use crate::config::Config;
+use crate::config::{Config, TrackerMode};
+use crate::core::embedding_tracker::{
+    EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
+};
 use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::memory_graph::GraphStore;
 use crate::core::tree_sitter::parse_with_tree_sitter;
@@ -59,6 +62,8 @@ pub struct SharedState {
     pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
     /// Cached identifier index — avoids re-embedding all symbols on each call.
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
+    /// Tracker handle for lazy-start mode.
+    pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -127,8 +132,63 @@ impl ContextPlusServer {
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
+            tracker_handle: std::sync::Mutex::new(None),
         });
         Self { state }
+    }
+
+    /// Build a refresh callback for the embedding tracker.
+    pub fn build_tracker_callback(&self) -> RefreshCallback {
+        let server = self.clone();
+        let root = self.state.root_dir.clone();
+        Arc::new(move |_root, files| {
+            let srv = server.clone();
+            let root = root.clone();
+            let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
+            tokio::spawn(async move {
+                let (updated, skipped) = srv.incremental_reembed(&changed_files).await;
+                tracing::debug!(
+                    updated,
+                    skipped,
+                    "Incremental re-embedding for {} changed files",
+                    changed_files.len()
+                );
+                (updated, skipped)
+            })
+        })
+    }
+
+    /// Start the embedding tracker if not already running and mode is not Off.
+    pub fn ensure_tracker_started(&self) {
+        if self.state.config.embed_tracker_mode == TrackerMode::Off {
+            return;
+        }
+        let mut guard = self.state.tracker_handle.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let tracker_config = EmbeddingTrackerConfig {
+            debounce_ms: self.state.config.embed_tracker_debounce_ms,
+            max_files_per_tick: self.state.config.embed_tracker_max_files,
+            ignore_dirs: self.state.config.ignore_dirs.clone(),
+        };
+        let callback = self.build_tracker_callback();
+        match crate::core::embedding_tracker::start_tracker(
+            self.state.root_dir.clone(),
+            tracker_config,
+            callback,
+        ) {
+            Ok(handle) => {
+                tracing::info!(
+                    mode = %self.state.config.embed_tracker_mode,
+                    "Embedding tracker started"
+                );
+                *guard = Some(handle);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start embedding tracker: {e}");
+            }
+        }
     }
 
     fn root_dir(&self) -> &Path {
@@ -705,6 +765,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         let root = self.resolve_root(&args);
@@ -739,6 +800,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         use crate::tools::semantic_identifiers::*;
 
         let query = Self::get_str(&args, "query")
@@ -789,6 +851,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         // query is optional in TS version — accepted but unused for clustering
         let _query = Self::get_str(&args, "query");
         let root = self.resolve_root(&args);
