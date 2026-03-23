@@ -35,12 +35,8 @@ fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
         ".rb" | "rb" => Some(("ruby", tree_sitter_ruby::LANGUAGE.into())),
         ".php" | "php" => Some(("php", tree_sitter_php::LANGUAGE_PHP.into())),
         ".cs" | "cs" => Some(("c_sharp", tree_sitter_c_sharp::LANGUAGE.into())),
-        ".kt" | "kt" | ".kts" | "kts" => {
-            Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()))
-        }
-        ".html" | "html" | ".htm" | "htm" => {
-            Some(("html", tree_sitter_html::LANGUAGE.into()))
-        }
+        ".kt" | "kt" | ".kts" | "kts" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
+        ".html" | "html" | ".htm" | "htm" => Some(("html", tree_sitter_html::LANGUAGE.into())),
         ".css" | "css" => Some(("css", tree_sitter_css::LANGUAGE.into())),
         _ => None,
     }
@@ -508,7 +504,6 @@ struct Rectangle {
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Shape"));
     }
-
 
     #[test]
     fn parse_ruby_code() {

@@ -13,8 +13,8 @@ use crate::core::walker::walk_with_config;
 use crate::error::Result;
 use crate::server::{SharedState, cache_name};
 use crate::tools::semantic_search::{
-    EmbedFn, SearchDocument, SymbolSearchEntry, WalkAndIndexFn, extract_plain_text_header,
-    is_text_index_candidate, MAX_TEXT_DOC_CHARS,
+    EmbedFn, MAX_TEXT_DOC_CHARS, SearchDocument, SymbolSearchEntry, WalkAndIndexFn,
+    extract_plain_text_header, is_text_index_candidate,
 };
 
 // --- OllamaEmbedder ---
