@@ -24,17 +24,40 @@ const MAX_SINGLE_INPUT_RETRIES: usize = 8;
 /// Runtime options for Ollama embed requests.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbedRuntimeOptions {
-    #[serde(skip_serializing_if="Option::is_none")] pub num_gpu: Option<i32>,
-    #[serde(skip_serializing_if="Option::is_none")] pub main_gpu: Option<i32>,
-    #[serde(skip_serializing_if="Option::is_none")] pub num_thread: Option<i32>,
-    #[serde(skip_serializing_if="Option::is_none")] pub num_batch: Option<i32>,
-    #[serde(skip_serializing_if="Option::is_none")] pub num_ctx: Option<i32>,
-    #[serde(skip_serializing_if="Option::is_none")] pub low_vram: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_gpu: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_gpu: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_thread: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_batch: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_vram: Option<bool>,
 }
 impl EmbedRuntimeOptions {
     pub fn from_config(config: &Config) -> Option<Self> {
-        let o=Self{num_gpu:config.embed_num_gpu,main_gpu:config.embed_main_gpu,num_thread:config.embed_num_thread,num_batch:config.embed_num_batch,num_ctx:config.embed_num_ctx,low_vram:config.embed_low_vram};
-        if o.num_gpu.is_none()&&o.main_gpu.is_none()&&o.num_thread.is_none()&&o.num_batch.is_none()&&o.num_ctx.is_none()&&o.low_vram.is_none(){None}else{Some(o)}
+        let o = Self {
+            num_gpu: config.embed_num_gpu,
+            main_gpu: config.embed_main_gpu,
+            num_thread: config.embed_num_thread,
+            num_batch: config.embed_num_batch,
+            num_ctx: config.embed_num_ctx,
+            low_vram: config.embed_low_vram,
+        };
+        if o.num_gpu.is_none()
+            && o.main_gpu.is_none()
+            && o.num_thread.is_none()
+            && o.num_batch.is_none()
+            && o.num_ctx.is_none()
+            && o.low_vram.is_none()
+        {
+            None
+        } else {
+            Some(o)
+        }
     }
 }
 
@@ -1035,9 +1058,70 @@ mod tests {
         assert_eq!(sim, 0.0, "zero vector should return 0.0");
     }
 
-    #[test] fn ero_none(){let mut c=Config::from_env();c.embed_num_gpu=None;c.embed_main_gpu=None;c.embed_num_thread=None;c.embed_num_batch=None;c.embed_num_ctx=None;c.embed_low_vram=None;assert!(EmbedRuntimeOptions::from_config(&c).is_none());}
-    #[test] fn ero_some(){let mut c=Config::from_env();c.embed_num_gpu=Some(1);c.embed_main_gpu=None;c.embed_num_thread=None;c.embed_num_batch=None;c.embed_num_ctx=None;c.embed_low_vram=None;assert_eq!(EmbedRuntimeOptions::from_config(&c).unwrap().num_gpu,Some(1));}
-    #[test] fn ero_ser(){let o=EmbedRuntimeOptions{num_gpu:Some(1),main_gpu:None,num_thread:None,num_batch:None,num_ctx:Some(2048),low_vram:Some(true)};let j=serde_json::to_value(&o).unwrap();assert_eq!(j["num_gpu"],1);assert!(j.get("main_gpu").is_none());}
-    #[test] fn req_no_opts(){let r=EmbedRequest{model:"t",input:&[],options:None};assert!(serde_json::to_value(&r).unwrap().get("options").is_none());}
-    #[test] fn req_with_opts(){let o=EmbedRuntimeOptions{num_gpu:Some(2),main_gpu:Some(0),num_thread:None,num_batch:None,num_ctx:None,low_vram:None};let i=vec!["hi".into()];let r=EmbedRequest{model:"t",input:&i,options:Some(&o)};assert_eq!(serde_json::to_value(&r).unwrap()["options"]["num_gpu"],2);}
+    #[test]
+    fn ero_none() {
+        let mut c = Config::from_env();
+        c.embed_num_gpu = None;
+        c.embed_main_gpu = None;
+        c.embed_num_thread = None;
+        c.embed_num_batch = None;
+        c.embed_num_ctx = None;
+        c.embed_low_vram = None;
+        assert!(EmbedRuntimeOptions::from_config(&c).is_none());
+    }
+    #[test]
+    fn ero_some() {
+        let mut c = Config::from_env();
+        c.embed_num_gpu = Some(1);
+        c.embed_main_gpu = None;
+        c.embed_num_thread = None;
+        c.embed_num_batch = None;
+        c.embed_num_ctx = None;
+        c.embed_low_vram = None;
+        assert_eq!(
+            EmbedRuntimeOptions::from_config(&c).unwrap().num_gpu,
+            Some(1)
+        );
+    }
+    #[test]
+    fn ero_ser() {
+        let o = EmbedRuntimeOptions {
+            num_gpu: Some(1),
+            main_gpu: None,
+            num_thread: None,
+            num_batch: None,
+            num_ctx: Some(2048),
+            low_vram: Some(true),
+        };
+        let j = serde_json::to_value(&o).unwrap();
+        assert_eq!(j["num_gpu"], 1);
+        assert!(j.get("main_gpu").is_none());
+    }
+    #[test]
+    fn req_no_opts() {
+        let r = EmbedRequest {
+            model: "t",
+            input: &[],
+            options: None,
+        };
+        assert!(serde_json::to_value(&r).unwrap().get("options").is_none());
+    }
+    #[test]
+    fn req_with_opts() {
+        let o = EmbedRuntimeOptions {
+            num_gpu: Some(2),
+            main_gpu: Some(0),
+            num_thread: None,
+            num_batch: None,
+            num_ctx: None,
+            low_vram: None,
+        };
+        let i = vec!["hi".into()];
+        let r = EmbedRequest {
+            model: "t",
+            input: &i,
+            options: Some(&o),
+        };
+        assert_eq!(serde_json::to_value(&r).unwrap()["options"]["num_gpu"], 2);
+    }
 }

@@ -174,9 +174,13 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if !allowed_extensions.contains(ext) { continue; }
+        if !allowed_extensions.contains(ext) {
+            continue;
+        }
         if let Ok(meta) = tokio::fs::metadata(&entry.path).await {
-            if meta.len() > max_file_size { continue; }
+            if meta.len() > max_file_size {
+                continue;
+            }
         }
         if let Ok(content) = tokio::fs::read_to_string(&entry.path).await {
             let header = extract_header(&content);
