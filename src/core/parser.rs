@@ -290,27 +290,27 @@ pub fn parse_with_regex_fallback(content: &str) -> Vec<CodeSymbol> {
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         for (pattern, kind) in GENERIC_PATTERNS.iter() {
-            if let Some(caps) = pattern.captures(trimmed) {
-                if let Some(name_match) = caps.get(1) {
-                    let name = name_match.as_str().to_string();
-                    let end_line = find_brace_block_end(&lines, i);
-                    let signature = trimmed
-                        .trim_end_matches(|c: char| c == '{' || c.is_whitespace())
-                        .to_string();
-                    symbols.push(CodeSymbol {
-                        name,
-                        kind: kind.to_string(),
-                        line: i + 1,
-                        end_line,
-                        signature: Some(if signature.len() > 150 {
-                            format!("{}...", truncate_to_char_boundary(&signature, 150))
-                        } else {
-                            signature
-                        }),
-                        children: Vec::new(),
-                    });
-                    break; // first match wins for this line
-                }
+            if let Some(caps) = pattern.captures(trimmed)
+                && let Some(name_match) = caps.get(1)
+            {
+                let name = name_match.as_str().to_string();
+                let end_line = find_brace_block_end(&lines, i);
+                let signature = trimmed
+                    .trim_end_matches(|c: char| c == '{' || c.is_whitespace())
+                    .to_string();
+                symbols.push(CodeSymbol {
+                    name,
+                    kind: kind.to_string(),
+                    line: i + 1,
+                    end_line,
+                    signature: Some(if signature.len() > 150 {
+                        format!("{}...", truncate_to_char_boundary(&signature, 150))
+                    } else {
+                        signature
+                    }),
+                    children: Vec::new(),
+                });
+                break; // first match wins for this line
             }
         }
     }
