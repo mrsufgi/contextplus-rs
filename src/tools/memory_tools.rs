@@ -169,7 +169,7 @@ pub async fn tool_upsert_memory_node(
     store.persist(&options.root_dir).await?;
 
     Ok(format!(
-        "Memory node upserted: {}\n  ID: {}\n  Type: {}\n  Access count: {}\n\nGraph: {} nodes, {} edges",
+        "\u{2705} Memory node upserted: {}\n  ID: {}\n  Type: {}\n  Access count: {}\n\nGraph: {} nodes, {} edges",
         node.label, node.id, node.node_type, node.access_count, stats.nodes, stats.edges
     ))
 }
@@ -188,7 +188,7 @@ pub async fn tool_create_relation(
             .get_graph(&options.root_dir, |graph| graph.node_exists(id))
             .await?;
         if !exists {
-            return Ok(format!("Failed: source node not found (id: '{}')", id));
+            return Ok(format!("\u{274C} Failed: source node not found (id: '{}')", id));
         }
         id.clone()
     } else if let Some(ref label) = options.source_label {
@@ -202,13 +202,13 @@ pub async fn tool_create_relation(
             Some(id) => id,
             None => {
                 return Ok(format!(
-                    "Failed: source node not found (label: '{}', type: '{}')",
+                    "\u{274C} Failed: source node not found (label: '{}', type: '{}')",
                     label, options.source_type
                 ));
             }
         }
     } else {
-        return Ok("Failed: either source_id or source_label is required".to_string());
+        return Ok("\u{274C} Failed: either source_id or source_label is required".to_string());
     };
 
     // Resolve target: prefer direct ID, fall back to label+type lookup
@@ -217,7 +217,7 @@ pub async fn tool_create_relation(
             .get_graph(&options.root_dir, |graph| graph.node_exists(id))
             .await?;
         if !exists {
-            return Ok(format!("Failed: target node not found (id: '{}')", id));
+            return Ok(format!("\u{274C} Failed: target node not found (id: '{}')", id));
         }
         id.clone()
     } else if let Some(ref label) = options.target_label {
@@ -231,13 +231,13 @@ pub async fn tool_create_relation(
             Some(id) => id,
             None => {
                 return Ok(format!(
-                    "Failed: target node not found (label: '{}', type: '{}')",
+                    "\u{274C} Failed: target node not found (label: '{}', type: '{}')",
                     label, options.target_type
                 ));
             }
         }
     } else {
-        return Ok("Failed: either target_id or target_label is required".to_string());
+        return Ok("\u{274C} Failed: either target_id or target_label is required".to_string());
     };
 
     let edge = store
@@ -260,11 +260,11 @@ pub async fn tool_create_relation(
 
     match edge {
         Some(e) => Ok(format!(
-            "Relation created: {} --[{}]--> {}\n  Edge ID: {}\n  Weight: {}\n\nGraph: {} nodes, {} edges",
+            "\u{2705} Relation created: {} --[{}]--> {}\n  Edge ID: {}\n  Weight: {}\n\nGraph: {} nodes, {} edges",
             source_id, e.relation, target_id, e.id, e.weight, stats.nodes, stats.edges
         )),
         None => Ok(format!(
-            "Failed: one or both node IDs not found (source: {}, target: {})",
+            "\u{274C} Failed: one or both node IDs not found (source: {}, target: {})",
             source_id, target_id
         )),
     }
@@ -334,7 +334,7 @@ pub async fn tool_prune_stale_links(
     store.persist(&options.root_dir).await?;
 
     Ok(format!(
-        "Pruning complete\n  Removed: {} stale links/orphan nodes\n  Remaining edges: {}",
+        "\u{1F9F9} Pruning complete\n  Removed: {} stale links/orphan nodes\n  Remaining edges: {}",
         result.removed, result.remaining_edges
     ))
 }
@@ -388,7 +388,7 @@ pub async fn tool_add_interlinked_context(
 
     store.persist(&options.root_dir).await?;
 
-    let mut sections = vec![format!("Added {} interlinked nodes", result.nodes.len())];
+    let mut sections = vec![format!("\u{2705} Added {} interlinked nodes", result.nodes.len())];
 
     if result.edges.is_empty() {
         sections.push("  No auto-links above threshold".to_string());
@@ -439,7 +439,7 @@ pub async fn tool_retrieve_with_traversal(
     store.persist(&options.root_dir).await?;
 
     if results.is_empty() {
-        return Ok(format!("Node not found: {}", options.node_id));
+        return Ok(format!("\u{274C} Node not found: {}", options.node_id));
     }
 
     let mut sections = vec![format!(
@@ -1184,7 +1184,7 @@ mod tests {
         .await
         .expect("ok");
 
-        assert!(result.contains("Pruning complete"), "got: {result}");
+        assert!(result.contains("\u{1F9F9} Pruning complete"), "got: {result}");
         assert!(result.contains("Removed: 0"), "got: {result}");
         assert!(result.contains("Remaining edges: 0"), "got: {result}");
     }
@@ -1215,7 +1215,7 @@ mod tests {
         .await
         .expect("ok");
 
-        assert!(result.contains("Pruning complete"), "got: {result}");
+        assert!(result.contains("\u{1F9F9} Pruning complete"), "got: {result}");
         // Fresh edge should not be pruned (decay ~ 1.0, well above 0.1)
         assert!(result.contains("Remaining edges: 1"), "got: {result}");
     }
@@ -1238,7 +1238,7 @@ mod tests {
 
         // Verify output format structure
         let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines[0], "Pruning complete");
+        assert_eq!(lines[0], "\u{1F9F9} Pruning complete");
         assert!(lines[1].contains("Removed:"), "got: {}", lines[1]);
         assert!(
             lines[1].contains("stale links/orphan nodes"),
@@ -1270,7 +1270,7 @@ mod tests {
         .await
         .expect("ok");
 
-        assert_eq!(result, "Node not found: nonexistent-id");
+        assert_eq!(result, "\u{274C} Node not found: nonexistent-id");
     }
 
     #[tokio::test]

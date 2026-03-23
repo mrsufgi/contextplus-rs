@@ -42,6 +42,29 @@ pub struct IdentifierIndex {
 
 const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
 
+/// Format a Unix timestamp (seconds since epoch) as ISO 8601 string.
+fn format_unix_timestamp(ts: u64) -> String {
+    const SECS_PER_DAY: u64 = 86400;
+    const SECS_PER_HOUR: u64 = 3600;
+    const SECS_PER_MIN: u64 = 60;
+    let days = ts / SECS_PER_DAY;
+    let time_of_day = ts % SECS_PER_DAY;
+    let hours = time_of_day / SECS_PER_HOUR;
+    let minutes = (time_of_day % SECS_PER_HOUR) / SECS_PER_MIN;
+    let seconds = time_of_day % SECS_PER_MIN;
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hours, minutes, seconds)
+}
+
 /// Shared state accessible by all tool handlers.
 pub struct SharedState {
     pub config: Config,
@@ -884,12 +907,13 @@ impl ContextPlusServer {
         let mut output = String::from("Restore Points:\n\n");
         for pt in &points {
             let file_names: Vec<&str> = pt.files.iter().map(|f| f.original_path.as_str()).collect();
+            let iso_ts = format_unix_timestamp(pt.timestamp);
             output.push_str(&format!(
-                "  {} (ts: {}, {})\n    Files: {}\n\n",
+                "{} | {} | {} | {}\n",
                 pt.id,
-                pt.timestamp,
+                iso_ts,
+                file_names.join(", "),
                 pt.description,
-                file_names.join(", ")
             ));
         }
         Ok(Self::ok_text(output))
@@ -2562,5 +2586,38 @@ mod tests {
         });
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn format_unix_epoch() {
+        assert_eq!(format_unix_timestamp(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_known_timestamp() {
+        // 2024-01-15T12:30:45Z = 1705318245
+        assert_eq!(format_unix_timestamp(1705318245), "2024-01-15T11:30:45Z");
+    }
+
+    #[test]
+    fn format_y2k_timestamp() {
+        // 2000-01-01T00:00:00Z = 946684800
+        assert_eq!(format_unix_timestamp(946684800), "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn restore_point_pipe_format() {
+        let iso_ts = format_unix_timestamp(1705318245);
+        let line = format!(
+            "{} | {} | {} | {}\n",
+            "rp-123-abc456",
+            iso_ts,
+            "src/main.rs, src/lib.rs",
+            "test restore",
+        );
+        assert_eq!(
+            line,
+            "rp-123-abc456 | 2024-01-15T11:30:45Z | src/main.rs, src/lib.rs | test restore\n"
+        );
     }
 }
