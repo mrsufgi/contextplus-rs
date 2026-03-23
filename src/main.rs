@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use contextplus_rs::config::Config;
+use contextplus_rs::core::process_lifecycle;
 use contextplus_rs::server::ContextPlusServer;
 use rmcp::ServiceExt;
 
@@ -308,22 +310,92 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         None
     };
 
+    // --- Process lifecycle monitors ---
+
+    // Idle shutdown: fires after config.idle_timeout_ms of no tool calls.
+    let idle_timeout_ms = config.idle_timeout_ms;
+    let idle_monitor = process_lifecycle::create_idle_monitor(idle_timeout_ms, move || {
+        tracing::info!(
+            "Idle timeout ({}ms) reached — initiating shutdown",
+            idle_timeout_ms
+        );
+        std::process::exit(0);
+    });
+    if config.idle_timeout_ms > 0 {
+        tracing::info!("Idle shutdown monitor started ({}ms)", config.idle_timeout_ms);
+    }
+
+    // Store idle monitor on shared state so tool handlers can touch it.
+    let idle_monitor = Arc::new(idle_monitor);
+    {
+        let mut guard = server.state.idle_monitor.write().await;
+        *guard = Some(idle_monitor.clone());
+    }
+
+    // Parent PID monitor: detect orphaned process.
+    #[cfg(unix)]
+    let _parent_monitor = {
+        let parent_pid = std::os::unix::process::parent_id();
+        let handle = process_lifecycle::start_parent_monitor(
+            parent_pid,
+            config.parent_poll_ms,
+            move || {
+                tracing::info!(
+                    "Parent process (pid={}) exited — initiating shutdown",
+                    parent_pid
+                );
+                std::process::exit(0);
+            },
+        );
+        tracing::info!(
+            "Parent PID monitor started (pid={}, poll={}ms)",
+            parent_pid,
+            config.parent_poll_ms
+        );
+        handle
+    };
+
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
 
-    // Wait for server exit OR Ctrl-C, whichever comes first.
-    // On Ctrl-C, persist the memory graph synchronously before exiting so
-    // in-flight nodes survive across restarts.
+    // --- Signal handling ---
+    // Handle SIGTERM, SIGHUP, SIGINT for graceful shutdown.
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut sighup =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
     tokio::select! {
         result = ct.waiting() => {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received — persisting memory graph before shutdown");
-            // Memory graph is in-memory only; no explicit persist path needed currently.
-            // Future: call server.state.memory_graph.persist() here.
+            tracing::info!("SIGINT received — shutting down");
+        }
+        _ = async {
+            #[cfg(unix)]
+            { sigterm.recv().await }
+            #[cfg(not(unix))]
+            { std::future::pending::<Option<()>>().await }
+        } => {
+            tracing::info!("SIGTERM received — shutting down");
+        }
+        _ = async {
+            #[cfg(unix)]
+            { sighup.recv().await }
+            #[cfg(not(unix))]
+            { std::future::pending::<Option<()>>().await }
+        } => {
+            tracing::info!("SIGHUP received — shutting down");
         }
     }
+
+    // Graceful cleanup
+    idle_monitor.stop();
+    #[cfg(unix)]
+    _parent_monitor.stop();
 
     Ok(())
 }
