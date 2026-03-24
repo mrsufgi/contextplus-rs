@@ -59,6 +59,8 @@ pub struct SharedState {
     pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
     /// Cached identifier index — avoids re-embedding all symbols on each call.
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
+    /// Idle monitor handle — tool handlers touch this to reset the idle timer.
+    pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -127,6 +129,7 @@ impl ContextPlusServer {
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
+            idle_monitor: RwLock::new(None),
         });
         Self { state }
     }
@@ -1138,6 +1141,10 @@ impl ServerHandler for ContextPlusServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, rmcp::ErrorData> {
+        // Reset idle timer on every tool call.
+        if let Some(monitor) = self.state.idle_monitor.read().await.as_ref() {
+            monitor.touch();
+        }
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
         Ok(self.dispatch(&name, args).await)

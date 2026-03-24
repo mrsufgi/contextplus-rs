@@ -13,6 +13,8 @@ pub struct Config {
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
     pub cache_ttl_secs: u64,
+    pub idle_timeout_ms: u64,
+    pub parent_poll_ms: u64,
     pub embed_chunk_chars: usize,
 }
 
@@ -103,6 +105,12 @@ impl Config {
             ),
             ignore_dirs: build_ignore_dirs(),
             cache_ttl_secs: env_parse("CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            idle_timeout_ms: crate::core::process_lifecycle::get_idle_shutdown_ms(
+                env::var("CONTEXTPLUS_IDLE_TIMEOUT_MS").ok().as_deref(),
+            ),
+            parent_poll_ms: crate::core::process_lifecycle::get_parent_poll_ms(
+                env::var("CONTEXTPLUS_PARENT_POLL_MS").ok().as_deref(),
+            ),
             embed_chunk_chars: env_parse(
                 "CONTEXTPLUS_EMBED_CHUNK_CHARS",
                 DEFAULT_EMBED_CHUNK_CHARS,
@@ -170,6 +178,8 @@ mod tests {
                 "CONTEXTPLUS_EMBED_TRACKER_MAX_FILES",
                 "CONTEXTPLUS_IGNORE_DIRS",
                 "CONTEXTPLUS_CACHE_TTL_SECS",
+                "CONTEXTPLUS_IDLE_TIMEOUT_MS",
+                "CONTEXTPLUS_PARENT_POLL_MS",
                 "CONTEXTPLUS_EMBED_CHUNK_CHARS",
             ],
             || {
@@ -186,6 +196,8 @@ mod tests {
                 assert!(cfg.ignore_dirs.contains(".git"));
                 assert!(cfg.ignore_dirs.contains("target"));
                 assert_eq!(cfg.cache_ttl_secs, 300);
+                assert_eq!(cfg.idle_timeout_ms, 900_000); // 15 min default
+                assert_eq!(cfg.parent_poll_ms, 5_000); // 5s default
                 assert_eq!(cfg.embed_chunk_chars, 2000);
             },
         );
@@ -278,6 +290,50 @@ mod tests {
         with_env(&[("OLLAMA_CHAT_MODEL", "qwen3:8b")], || {
             let cfg = Config::from_env();
             assert_eq!(cfg.ollama_chat_model, "qwen3:8b");
+        });
+    }
+
+    #[test]
+    fn idle_timeout_disabled() {
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "0")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 0);
+        });
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "off")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 0);
+        });
+    }
+
+    #[test]
+    fn idle_timeout_custom() {
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "120000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 120_000);
+        });
+    }
+
+    #[test]
+    fn idle_timeout_clamps_to_min() {
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "5000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 60_000); // MIN_IDLE_TIMEOUT_MS
+        });
+    }
+
+    #[test]
+    fn parent_poll_custom() {
+        with_env(&[("CONTEXTPLUS_PARENT_POLL_MS", "3000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.parent_poll_ms, 3_000);
+        });
+    }
+
+    #[test]
+    fn parent_poll_clamps_to_min() {
+        with_env(&[("CONTEXTPLUS_PARENT_POLL_MS", "500")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.parent_poll_ms, 1_000); // MIN_PARENT_POLL_MS
         });
     }
 

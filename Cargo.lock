@@ -333,6 +333,7 @@ dependencies = [
  "clap",
  "criterion",
  "ignore",
+ "libc",
  "memmap2",
  "nalgebra",
  "notify-debouncer-full",

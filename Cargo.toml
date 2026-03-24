@@ -62,6 +62,9 @@ ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Unix process checks
+libc = "0.2"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
