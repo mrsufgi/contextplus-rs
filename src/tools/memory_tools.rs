@@ -1441,11 +1441,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1486,11 +1489,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1542,11 +1548,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1604,11 +1613,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1656,11 +1668,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1733,11 +1748,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1796,11 +1814,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1850,11 +1871,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1909,11 +1933,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1967,11 +1994,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2021,11 +2051,14 @@ mod tests {
             ollama_chat_model: "test-chat".to_string(),
             ollama_api_key: None,
             embed_batch_size: 32,
-            embed_tracker_enabled: false,
+            embed_tracker_mode: crate::config::TrackerMode::Off,
             embed_tracker_debounce_ms: 0,
             embed_tracker_max_files: 0,
             ignore_dirs: std::collections::HashSet::new(),
             cache_ttl_secs: 300,
+            idle_timeout_ms: 0,
+            parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 

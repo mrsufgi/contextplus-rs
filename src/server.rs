@@ -13,7 +13,10 @@ use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock};
 
 use crate::cache::rkyv_store;
-use crate::config::Config;
+use crate::config::{Config, TrackerMode};
+use crate::core::embedding_tracker::{
+    EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
+};
 use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::memory_graph::GraphStore;
 use crate::core::tree_sitter::parse_with_tree_sitter;
@@ -66,6 +69,10 @@ pub struct SharedState {
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
     /// Cached instructions content — fetched once from remote, then served from memory.
     pub instructions_cache: OnceCell<String>,
+    /// Tracker handle for lazy-start mode.
+    pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
+    /// Idle monitor handle — tool handlers touch this to reset the idle timer.
+    pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -135,8 +142,69 @@ impl ContextPlusServer {
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
             instructions_cache: OnceCell::new(),
+            tracker_handle: std::sync::Mutex::new(None),
+            idle_monitor: RwLock::new(None),
         });
         Self { state }
+    }
+
+    /// Build a refresh callback for the embedding tracker.
+    pub fn build_tracker_callback(&self) -> RefreshCallback {
+        let server = self.clone();
+        let root = self.state.root_dir.clone();
+        Arc::new(move |_root, files| {
+            let srv = server.clone();
+            let root = root.clone();
+            let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
+            tokio::spawn(async move {
+                let (updated, skipped) = srv.incremental_reembed(&changed_files).await;
+                tracing::debug!(
+                    updated,
+                    skipped,
+                    "Incremental re-embedding for {} changed files",
+                    changed_files.len()
+                );
+                (updated, skipped)
+            })
+        })
+    }
+
+    /// Start the embedding tracker if not already running and mode is not Off.
+    pub fn ensure_tracker_started(&self) {
+        if self.state.config.embed_tracker_mode == TrackerMode::Off {
+            return;
+        }
+        let mut guard = self.state.tracker_handle.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let tracker_config = EmbeddingTrackerConfig {
+            debounce_ms: self.state.config.embed_tracker_debounce_ms,
+            max_files_per_tick: self.state.config.embed_tracker_max_files,
+            ignore_dirs: self.state.config.ignore_dirs.clone(),
+        };
+        let callback = self.build_tracker_callback();
+        match crate::core::embedding_tracker::start_tracker(
+            self.state.root_dir.clone(),
+            tracker_config,
+            callback,
+        ) {
+            Ok(handle) => {
+                tracing::info!(
+                    mode = %self.state.config.embed_tracker_mode,
+                    "Embedding tracker started"
+                );
+                *guard = Some(handle);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start embedding tracker: {e}");
+            }
+        }
+    }
+
+    /// Cancel all in-flight embedding requests (used during shutdown).
+    pub fn cancel_all_embeddings(&self) {
+        self.state.ollama.cancel_all_embeddings();
     }
 
     fn root_dir(&self) -> &Path {
@@ -404,9 +472,10 @@ impl ContextPlusServer {
                         let header = crate::core::parser::extract_header(&content);
                         for sym in crate::core::parser::flatten_symbols(&symbols, None) {
                             let sig = sym.signature.clone().unwrap_or_default();
+                            let parent = sym.parent_name.as_deref().unwrap_or("");
                             let text = format!(
-                                "{} {} {} {}",
-                                sym.name, sym.kind, entry.relative_path, sig
+                                "{} {} {} {} {} {}",
+                                sym.name, sym.kind, sig, entry.relative_path, header, parent
                             );
                             docs.push(crate::tools::semantic_identifiers::IdentifierDoc {
                                 id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
@@ -736,6 +805,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         let root = self.resolve_root(&args);
@@ -770,6 +840,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         use crate::tools::semantic_identifiers::*;
 
         let query = Self::get_str(&args, "query")
@@ -820,6 +891,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         // query is optional in TS version — accepted but unused for clustering
         let _query = Self::get_str(&args, "query");
         let root = self.resolve_root(&args);
@@ -1209,6 +1281,10 @@ impl ServerHandler for ContextPlusServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, rmcp::ErrorData> {
+        // Reset idle timer on every tool call.
+        if let Some(monitor) = self.state.idle_monitor.read().await.as_ref() {
+            monitor.touch();
+        }
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
         Ok(self.dispatch(&name, args).await)

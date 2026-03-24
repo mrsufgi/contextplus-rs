@@ -24,6 +24,8 @@ pub struct WalkOptions<'a> {
 
 /// Segment-based path ignore check.
 /// Checks if any path segment matches the ignore set.
+/// Also skips any segment starting with `.` (hidden files/dirs), matching
+/// the TS walker's `entry.name.startsWith(".")` check.
 /// This is the correct approach (matching our TS fork fix) — prevents
 /// false positives from prefix matching like "generated" matching "gen".
 pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
@@ -31,6 +33,9 @@ pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
         return false;
     }
     for segment in path.split('/') {
+        if segment.starts_with('.') {
+            return false;
+        }
         if ignore_dirs.contains(segment) {
             return false;
         }
@@ -173,6 +178,56 @@ mod tests {
     }
 
     #[test]
+    fn should_track_skips_hidden_files() {
+        let ignore = make_ignore_set(&[]);
+        // Any segment starting with '.' should be skipped (matches TS behavior)
+        assert!(!should_track(".hidden_file", &ignore));
+        assert!(!should_track("src/.env", &ignore));
+        assert!(!should_track(".config/settings.json", &ignore));
+        assert!(!should_track("deep/path/.secret/key", &ignore));
+        // Non-hidden files should pass
+        assert!(should_track("src/main.rs", &ignore));
+        assert!(should_track("config/settings.json", &ignore));
+    }
+
+    #[test]
+    fn should_track_skips_all_known_ignore_dirs() {
+        // Verify every entry from the TS ALWAYS_IGNORE set is handled.
+        // Dot-prefixed entries are caught by the hidden check;
+        // the rest must be in the ignore set.
+        let ts_always_ignore = [
+            "node_modules",
+            ".git",
+            ".svn",
+            ".hg",
+            "__pycache__",
+            ".DS_Store",
+            "dist",
+            "build",
+            ".next",
+            ".nuxt",
+            "target",
+            ".mcp_data",
+            ".mcp-shadow-history",
+            "coverage",
+            ".cache",
+            ".turbo",
+            ".parcel-cache",
+        ];
+
+        let config = crate::config::Config::from_env();
+
+        for entry in &ts_always_ignore {
+            let test_path = format!("{}/some_file.ts", entry);
+            assert!(
+                !should_track(&test_path, &config.ignore_dirs),
+                "Expected should_track to reject path segment '{}', but it was accepted",
+                entry
+            );
+        }
+    }
+
+    #[test]
     fn walk_directory_basic() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
@@ -222,6 +277,42 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert!(paths.contains(&"src/main.rs"));
         assert!(!paths.iter().any(|p| p.contains("node_modules")));
+    }
+
+    #[test]
+    fn walk_directory_skips_hidden_files() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".hidden_dir")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/.env"), "SECRET=foo").unwrap();
+        fs::write(root.join(".hidden_dir/config"), "hidden").unwrap();
+        fs::write(root.join(".gitignore"), "*.tmp").unwrap();
+
+        let ignore = make_ignore_set(&[]);
+        let entries = walk_directory(&WalkOptions {
+            root_dir: root,
+            target_path: None,
+            depth_limit: None,
+            ignore_dirs: &ignore,
+        });
+
+        let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+        assert!(paths.contains(&"src/main.rs"));
+        assert!(
+            !paths.iter().any(|p| p.contains(".hidden_dir")),
+            "Hidden directory .hidden_dir should be skipped"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains(".env")),
+            "Hidden file .env should be skipped"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains(".gitignore")),
+            "Hidden file .gitignore should be skipped"
+        );
     }
 
     #[test]
@@ -281,6 +372,42 @@ mod tests {
         assert!(paths.contains(&"a/top.rs"));
         // depth_limit=2 means we go 2 levels deep from start
         assert!(paths.contains(&"a/b/mid.rs") || !paths.contains(&"a/b/c/deep.rs"));
+    }
+
+    #[test]
+    fn ignore_set_matches_ts_always_ignore() {
+        use crate::config::Config;
+
+        let ts_always_ignore: HashSet<&str> = [
+            "node_modules",
+            ".git",
+            ".svn",
+            ".hg",
+            "__pycache__",
+            ".DS_Store",
+            "dist",
+            "build",
+            ".next",
+            ".nuxt",
+            "target",
+            ".mcp_data",
+            ".mcp-shadow-history",
+            "coverage",
+            ".cache",
+            ".turbo",
+            ".parcel-cache",
+        ]
+        .into_iter()
+        .collect();
+
+        let config = Config::from_env();
+        for entry in &ts_always_ignore {
+            assert!(
+                config.ignore_dirs.contains(*entry),
+                "Rust ignore_dirs is missing '{}' which is in TS ALWAYS_IGNORE",
+                entry
+            );
+        }
     }
 
     #[test]

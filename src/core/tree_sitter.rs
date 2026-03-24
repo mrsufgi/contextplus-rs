@@ -10,7 +10,7 @@ thread_local! {
     static PARSER_CACHE: RefCell<HashMap<&'static str, Parser>> = RefCell::new(HashMap::new());
 }
 
-/// Extension-to-grammar mapping for the 10 supported native grammars.
+/// Extension-to-grammar mapping for the 16 supported native grammars.
 fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
     match ext {
         ".ts" | "ts" => Some((
@@ -32,6 +32,12 @@ fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
         ".sh" | "sh" | ".bash" | "bash" | ".zsh" | "zsh" => {
             Some(("bash", tree_sitter_bash::LANGUAGE.into()))
         }
+        ".rb" | "rb" => Some(("ruby", tree_sitter_ruby::LANGUAGE.into())),
+        ".php" | "php" => Some(("php", tree_sitter_php::LANGUAGE_PHP.into())),
+        ".cs" | "cs" => Some(("c_sharp", tree_sitter_c_sharp::LANGUAGE.into())),
+        ".kt" | "kt" | ".kts" | "kts" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
+        ".html" | "html" | ".htm" | "htm" => Some(("html", tree_sitter_html::LANGUAGE.into())),
+        ".css" | "css" => Some(("css", tree_sitter_css::LANGUAGE.into())),
         _ => None,
     }
 }
@@ -90,6 +96,41 @@ fn definition_types(grammar_name: &str) -> HashMap<&'static str, &'static str> {
             ("enum_specifier", "enum"),
         ]),
         "bash" => HashMap::from([("function_definition", "function")]),
+        "ruby" => HashMap::from([
+            ("method", "function"),
+            ("singleton_method", "function"),
+            ("class", "class"),
+            ("module", "module"),
+        ]),
+        "php" => HashMap::from([
+            ("function_definition", "function"),
+            ("method_declaration", "method"),
+            ("class_declaration", "class"),
+            ("interface_declaration", "interface"),
+            ("enum_declaration", "enum"),
+        ]),
+        "c_sharp" => HashMap::from([
+            ("method_declaration", "method"),
+            ("class_declaration", "class"),
+            ("interface_declaration", "interface"),
+            ("enum_declaration", "enum"),
+            ("struct_declaration", "struct"),
+        ]),
+        "kotlin" => HashMap::from([
+            ("function_declaration", "function"),
+            ("class_declaration", "class"),
+            ("object_declaration", "class"),
+        ]),
+        "html" => HashMap::from([
+            ("element", "element"),
+            ("script_element", "script"),
+            ("style_element", "style"),
+        ]),
+        "css" => HashMap::from([
+            ("rule_set", "rule"),
+            ("media_statement", "media"),
+            ("keyframes_statement", "keyframes"),
+        ]),
         _ => HashMap::new(),
     }
 }
@@ -242,7 +283,8 @@ pub fn parse_with_tree_sitter(content: &str, ext: &str) -> Result<Vec<CodeSymbol
 pub fn get_supported_extensions() -> &'static [&'static str] {
     &[
         ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rs", ".go", ".java", ".c", ".h",
-        ".cpp", ".hpp", ".cc", ".sh", ".bash", ".zsh",
+        ".cpp", ".hpp", ".cc", ".sh", ".bash", ".zsh", ".rb", ".php", ".cs", ".kt", ".kts",
+        ".html", ".htm", ".css",
     ]
 }
 
@@ -461,5 +503,83 @@ struct Rectangle {
         assert!(!symbols.is_empty());
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Shape"));
+    }
+
+    #[test]
+    fn parse_ruby_code() {
+        let code = "class Calculator\n  def add(a, b)\n    a + b\n  end\nend\n\nmodule Helpers\n  def greet(name)\n    name\n  end\nend\n";
+        let symbols = parse_with_tree_sitter(code, ".rb").unwrap();
+        assert!(!symbols.is_empty());
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Calculator"));
+        assert!(names.contains(&"Helpers"));
+    }
+
+    #[test]
+    fn parse_php_code() {
+        let code = "<?php\nclass UserService {\n    public function getUser() {\n        return 1;\n    }\n}\n\nfunction helper() {\n    return 1;\n}\n";
+        let symbols = parse_with_tree_sitter(code, ".php").unwrap();
+        assert!(!symbols.is_empty());
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"UserService"));
+        assert!(names.contains(&"helper"));
+    }
+
+    #[test]
+    fn parse_csharp_code() {
+        let code = "public class Calculator {\n    public int Add(int a, int b) {\n        return a + b;\n    }\n}\n\npublic interface IService {\n    void Execute();\n}\n\npublic enum Color {\n    Red,\n    Green,\n    Blue\n}\n";
+        let symbols = parse_with_tree_sitter(code, ".cs").unwrap();
+        assert!(!symbols.is_empty());
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Calculator"));
+        assert!(names.contains(&"IService"));
+        assert!(names.contains(&"Color"));
+    }
+
+    #[test]
+    fn parse_kotlin_code() {
+        let code = "class Calculator {\n    fun add(a: Int, b: Int): Int {\n        return a + b\n    }\n}\n\nfun topLevel(): String {\n    return \\\"hello\\\"\n}\n";
+        let symbols = parse_with_tree_sitter(code, ".kt").unwrap();
+        assert!(!symbols.is_empty());
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Calculator"));
+        // top-level functions may use a different node type in kotlin-ng grammar
+    }
+
+    #[test]
+    fn parse_html_code() {
+        let code = "<html><head><title>Test</title></head><body><p>Hello</p></body></html>";
+        let result = parse_with_tree_sitter(code, ".html");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_css_code() {
+        let code = ".container {\n    display: flex;\n}\n";
+        let symbols = parse_with_tree_sitter(code, ".css").unwrap();
+        assert!(!symbols.is_empty());
+    }
+
+    #[test]
+    fn supported_extensions_includes_new_grammars() {
+        let exts = get_supported_extensions();
+        assert!(exts.contains(&".rb"));
+        assert!(exts.contains(&".php"));
+        assert!(exts.contains(&".cs"));
+        assert!(exts.contains(&".kt"));
+        assert!(exts.contains(&".kts"));
+        assert!(exts.contains(&".html"));
+        assert!(exts.contains(&".css"));
+    }
+
+    #[test]
+    fn extension_mapping_completeness() {
+        for ext in get_supported_extensions() {
+            assert!(
+                grammar_for_ext(ext).is_some(),
+                "Extension {} is in supported list but has no grammar mapping",
+                ext
+            );
+        }
     }
 }

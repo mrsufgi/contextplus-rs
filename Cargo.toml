@@ -24,6 +24,7 @@ rmcp = { version = "1", features = ["server", "transport-io"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Tree-sitter (native, compile-time linked — versions per-crate)
@@ -37,6 +38,12 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-bash = "0.25"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.24"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.25"
+tree-sitter-kotlin-ng = "1"
 
 # Vector SIMD cosine similarity (returns distance, use 1.0 - d for similarity)
 simsimd = "6"
@@ -60,6 +67,9 @@ ignore = "0.4"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Unix process checks
+libc = "0.2"
 
 # Error handling
 thiserror = "2"
