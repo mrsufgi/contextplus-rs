@@ -12,7 +12,10 @@ use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::Result;
 use crate::server::{SharedState, cache_name};
-use crate::tools::semantic_search::{EmbedFn, SearchDocument, SymbolSearchEntry, WalkAndIndexFn};
+use crate::tools::semantic_search::{
+    EmbedFn, MAX_TEXT_DOC_CHARS, SearchDocument, SymbolSearchEntry, WalkAndIndexFn,
+    extract_plain_text_header, is_text_index_candidate,
+};
 
 // --- OllamaEmbedder ---
 
@@ -60,12 +63,18 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
             let store_root = &state.root_dir;
             let entries = walk_with_config(&root, &config);
 
+            let max_file_size = config.max_embed_file_size as u64;
             // Read all files concurrently (up to 32 at a time)
             let mut join_set = tokio::task::JoinSet::new();
             for (i, entry) in entries.iter().enumerate() {
                 let full_path = root.join(&entry.relative_path);
                 let rel_path = entry.relative_path.clone();
                 join_set.spawn(async move {
+                    if let Ok(meta) = tokio::fs::metadata(&full_path).await
+                        && meta.len() > max_file_size
+                    {
+                        return (i, rel_path, None);
+                    }
                     let content = tokio::fs::read_to_string(&full_path).await.ok();
                     (i, rel_path, content)
                 });
@@ -89,6 +98,23 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     Some(c) => c,
                     None => continue,
                 };
+
+                // Text/data file path: index raw content for semantic search
+                if is_text_index_candidate(rel_path) {
+                    let truncated: String = content.chars().take(MAX_TEXT_DOC_CHARS).collect();
+                    let header = extract_plain_text_header(&truncated);
+                    content_hashes.push((rel_path.clone(), content_hash(&truncated)));
+                    docs.push(SearchDocument::new(
+                        rel_path.clone(),
+                        header,
+                        vec![],
+                        vec![],
+                        truncated,
+                    ));
+                    continue;
+                }
+
+                // Code file path: parse with tree-sitter
                 let ext = rel_path.rsplit('.').next().unwrap_or("");
                 let symbols = parse_with_tree_sitter(content, ext).unwrap_or_default();
                 let header = crate::core::parser::extract_header(content);

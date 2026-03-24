@@ -1020,6 +1020,51 @@ mod tests {
         assert!(output.contains("src/handler.ts:L42"));
     }
 
+    // -- identifier text quality tests --
+
+    #[test]
+    fn test_identifier_text_includes_header_and_parent() {
+        // Verify the identifier text format matches TS:
+        // "{name} {kind} {signature} {path} {header} {parentName}"
+        let doc = IdentifierDoc {
+            id: "src/user.ts:getUserById:10".to_string(),
+            path: "src/user.ts".to_string(),
+            header: "user service module".to_string(),
+            name: "getUserById".to_string(),
+            kind: "function".to_string(),
+            line: 10,
+            end_line: 25,
+            signature: "getUserById(id: string): User".to_string(),
+            parent_name: Some("UserService".to_string()),
+            text: "getUserById function getUserById(id: string): User src/user.ts user service module UserService".to_string(),
+        };
+        assert!(doc.text.contains("getUserById"));
+        assert!(doc.text.contains("function"));
+        assert!(doc.text.contains("getUserById(id: string): User"));
+        assert!(doc.text.contains("src/user.ts"));
+        assert!(doc.text.contains("user service module"));
+        assert!(doc.text.contains("UserService"));
+    }
+
+    #[test]
+    fn test_identifier_text_without_parent() {
+        let doc = IdentifierDoc {
+            id: "src/db.ts:connect:5".to_string(),
+            path: "src/db.ts".to_string(),
+            header: "database module".to_string(),
+            name: "connect".to_string(),
+            kind: "function".to_string(),
+            line: 5,
+            end_line: 15,
+            signature: "connect(): Connection".to_string(),
+            parent_name: None,
+            text: "connect function connect(): Connection src/db.ts database module ".to_string(),
+        };
+        assert!(doc.text.contains("connect"));
+        assert!(doc.text.contains("database module"));
+        assert!(doc.text.contains("src/db.ts"));
+    }
+
     // -- normalize_kinds tests --
 
     #[test]

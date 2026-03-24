@@ -4,6 +4,7 @@ pub mod embeddings;
 pub mod hub;
 pub mod memory_graph;
 pub mod parser;
+pub mod process_lifecycle;
 pub mod safe_path;
 pub mod tree_sitter;
 pub mod utils;

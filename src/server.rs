@@ -10,10 +10,13 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 
 use crate::cache::rkyv_store;
-use crate::config::Config;
+use crate::config::{Config, TrackerMode};
+use crate::core::embedding_tracker::{
+    EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
+};
 use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::memory_graph::GraphStore;
 use crate::core::tree_sitter::parse_with_tree_sitter;
@@ -68,6 +71,11 @@ fn format_unix_timestamp(ts: u64) -> String {
     )
 }
 
+/// URL to fetch the instructions resource content from.
+const INSTRUCTIONS_SOURCE_URL: &str = "https://contextplus.vercel.app/api/instructions";
+/// MCP resource URI for the instructions resource.
+const INSTRUCTIONS_RESOURCE_URI: &str = "contextplus://instructions";
+
 /// Shared state accessible by all tool handlers.
 pub struct SharedState {
     pub config: Config,
@@ -77,7 +85,7 @@ pub struct SharedState {
     /// calling canonicalize() on every tool request.
     pub canonical_root: PathBuf,
     pub ollama: OllamaClient,
-    pub memory_graph: GraphStore,
+    pub memory_graph: Arc<GraphStore>,
     pub project_cache: RwLock<Option<Arc<ProjectCache>>>,
     /// Cached embedding vectors keyed by relative file path.
     /// Uses CacheEntry (hash + vector) for content-hash invalidation.
@@ -85,6 +93,12 @@ pub struct SharedState {
     pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
     /// Cached identifier index — avoids re-embedding all symbols on each call.
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
+    /// Cached instructions content — fetched once from remote, then served from memory.
+    pub instructions_cache: OnceCell<String>,
+    /// Tracker handle for lazy-start mode.
+    pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
+    /// Idle monitor handle — tool handlers touch this to reset the idle timer.
+    pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -117,7 +131,7 @@ pub fn cache_name(base: &str, model: &str) -> String {
 impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
         let ollama = OllamaClient::new(&config);
-        let memory_graph = GraphStore::new();
+        let memory_graph = Arc::new(GraphStore::new());
 
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
 
@@ -153,12 +167,97 @@ impl ContextPlusServer {
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
+            instructions_cache: OnceCell::new(),
+            tracker_handle: std::sync::Mutex::new(None),
+            idle_monitor: RwLock::new(None),
         });
         Self { state }
     }
 
+    /// Build a refresh callback for the embedding tracker.
+    pub fn build_tracker_callback(&self) -> RefreshCallback {
+        let server = self.clone();
+        let root = self.state.root_dir.clone();
+        Arc::new(move |_root, files| {
+            let srv = server.clone();
+            let root = root.clone();
+            let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
+            tokio::spawn(async move {
+                let (updated, skipped) = srv.incremental_reembed(&changed_files).await;
+                tracing::debug!(
+                    updated,
+                    skipped,
+                    "Incremental re-embedding for {} changed files",
+                    changed_files.len()
+                );
+                (updated, skipped)
+            })
+        })
+    }
+
+    /// Start the embedding tracker if not already running and mode is not Off.
+    pub fn ensure_tracker_started(&self) {
+        if self.state.config.embed_tracker_mode == TrackerMode::Off {
+            return;
+        }
+        let mut guard = self.state.tracker_handle.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let tracker_config = EmbeddingTrackerConfig {
+            debounce_ms: self.state.config.embed_tracker_debounce_ms,
+            max_files_per_tick: self.state.config.embed_tracker_max_files,
+            ignore_dirs: self.state.config.ignore_dirs.clone(),
+        };
+        let callback = self.build_tracker_callback();
+        match crate::core::embedding_tracker::start_tracker(
+            self.state.root_dir.clone(),
+            tracker_config,
+            callback,
+        ) {
+            Ok(handle) => {
+                tracing::info!(
+                    mode = %self.state.config.embed_tracker_mode,
+                    "Embedding tracker started"
+                );
+                *guard = Some(handle);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start embedding tracker: {e}");
+            }
+        }
+    }
+
+    /// Cancel all in-flight embedding requests (used during shutdown).
+    pub fn cancel_all_embeddings(&self) {
+        self.state.ollama.cancel_all_embeddings();
+    }
+
     fn root_dir(&self) -> &Path {
         &self.state.root_dir
+    }
+
+    /// Fetch instructions content (cached after first successful fetch).
+    async fn get_instructions(&self) -> String {
+        self.state
+            .instructions_cache
+            .get_or_init(|| async {
+                match reqwest::get(INSTRUCTIONS_SOURCE_URL).await {
+                    Ok(resp) => match resp.text().await {
+                        Ok(text) => text,
+                        Err(e) => {
+                            tracing::warn!("Failed to read instructions response body: {e}");
+                            "Context+ instructions are temporarily unavailable.".to_string()
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch instructions from remote: {e}");
+                        "Context+ instructions are temporarily unavailable.".to_string()
+                    }
+                }
+            })
+            .await
+            .clone()
     }
 
     fn get_str(args: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -268,6 +367,8 @@ impl ContextPlusServer {
         let mut updated = 0usize;
         let mut skipped = 0usize;
 
+        let max_file_size = self.state.config.max_embed_file_size as u64;
+
         let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
 
         for file_path in files {
@@ -275,6 +376,13 @@ impl ContextPlusServer {
                 Ok(r) => r.to_string_lossy().to_string(),
                 Err(_) => file_path.to_string_lossy().to_string(),
             };
+
+            if let Ok(meta) = tokio::fs::metadata(file_path).await
+                && meta.len() > max_file_size
+            {
+                skipped += 1;
+                continue;
+            }
 
             let content = match tokio::fs::read_to_string(file_path).await {
                 Ok(c) => c,
@@ -399,9 +507,10 @@ impl ContextPlusServer {
                         let header = crate::core::parser::extract_header(&content);
                         for sym in crate::core::parser::flatten_symbols(&symbols, None) {
                             let sig = sym.signature.clone().unwrap_or_default();
+                            let parent = sym.parent_name.as_deref().unwrap_or("");
                             let text = format!(
-                                "{} {} {} {}",
-                                sym.name, sym.kind, entry.relative_path, sig
+                                "{} {} {} {} {} {}",
+                                sym.name, sym.kind, sig, entry.relative_path, header, parent
                             );
                             docs.push(crate::tools::semantic_identifiers::IdentifierDoc {
                                 id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
@@ -731,6 +840,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         let root = self.resolve_root(&args);
@@ -765,6 +875,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         use crate::tools::semantic_identifiers::*;
 
         let query = Self::get_str(&args, "query")
@@ -815,6 +926,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        self.ensure_tracker_started();
         // query is optional in TS version — accepted but unused for clustering
         let _query = Self::get_str(&args, "query");
         let root = self.resolve_root(&args);
@@ -1127,16 +1239,62 @@ impl ContextPlusServer {
 
 impl ServerHandler for ContextPlusServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "contextplus",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(
-                "Context+ semantic code analysis server. Provides semantic search, \
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "contextplus",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Context+ semantic code analysis server. Provides semantic search, \
              blast radius analysis, context trees, file skeletons, navigation, \
              memory graph, and more.",
-            )
+        )
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = std::result::Result<ListResourcesResult, rmcp::ErrorData>>
+    + Send
+    + '_ {
+        let resource = RawResource::new(INSTRUCTIONS_RESOURCE_URI, "contextplus_instructions")
+            .with_description("Context+ usage instructions and best practices")
+            .with_mime_type("text/markdown")
+            .no_annotation();
+        std::future::ready(Ok(ListResourcesResult {
+            resources: vec![resource],
+            meta: None,
+            next_cursor: None,
+        }))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ReadResourceResult, rmcp::ErrorData> {
+        if request.uri == INSTRUCTIONS_RESOURCE_URI {
+            let text = self.get_instructions().await;
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
+                    uri: INSTRUCTIONS_RESOURCE_URI.to_string(),
+                    mime_type: Some("text/markdown".to_string()),
+                    text,
+                    meta: None,
+                },
+            ]))
+        } else {
+            Err(rmcp::ErrorData::invalid_params(
+                format!("Unknown resource URI: {}", request.uri),
+                None,
+            ))
+        }
     }
 
     fn list_tools(
@@ -1159,6 +1317,10 @@ impl ServerHandler for ContextPlusServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, rmcp::ErrorData> {
+        // Reset idle timer on every tool call.
+        if let Some(monitor) = self.state.idle_monitor.read().await.as_ref() {
+            monitor.touch();
+        }
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
         Ok(self.dispatch(&name, args).await)

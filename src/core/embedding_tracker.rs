@@ -16,6 +16,9 @@ const MIN_FILES_PER_TICK: usize = 5;
 const MAX_FILES_PER_TICK: usize = 200;
 const MIN_DEBOUNCE_MS: u64 = 100;
 
+/// Maximum number of pending file change events before new events are dropped.
+pub const MAX_PENDING_FILES: usize = 50;
+
 /// Configuration for the embedding tracker.
 #[derive(Debug, Clone)]
 pub struct EmbeddingTrackerConfig {
@@ -166,11 +169,29 @@ pub fn start_tracker(
                     break;
                 }
                 Some(files) = event_rx.recv() => {
-                    pending_set.extend(files);
+                    for f in files {
+                        if pending_set.len() >= MAX_PENDING_FILES {
+                            warn!(
+                                "Embedding tracker pending cap ({}) reached, dropping event for: {}",
+                                MAX_PENDING_FILES, f
+                            );
+                            break;
+                        }
+                        pending_set.insert(f);
+                    }
 
                     // Drain any additional queued events without waiting
                     while let Ok(more) = event_rx.try_recv() {
-                        pending_set.extend(more);
+                        for f in more {
+                            if pending_set.len() >= MAX_PENDING_FILES {
+                                warn!(
+                                    "Embedding tracker pending cap ({}) reached, dropping events",
+                                    MAX_PENDING_FILES
+                                );
+                                break;
+                            }
+                            pending_set.insert(f);
+                        }
                     }
 
                     if pending_set.is_empty() {
@@ -290,10 +311,14 @@ mod tests {
     }
 
     #[test]
-    fn should_track_empty_ignore_tracks_all() {
+    fn should_track_empty_ignore_tracks_non_hidden() {
         let ignore = HashSet::new();
+        // With empty ignore set, non-hidden paths are tracked
         assert!(should_track(Path::new("node_modules/foo.js"), &ignore));
-        assert!(should_track(Path::new(".git/HEAD"), &ignore));
+        assert!(should_track(Path::new("src/main.rs"), &ignore));
+        // Hidden paths (starting with '.') are always skipped, matching TS behavior
+        assert!(!should_track(Path::new(".git/HEAD"), &ignore));
+        assert!(!should_track(Path::new(".env"), &ignore));
     }
 
     #[test]
@@ -478,5 +503,10 @@ mod tests {
         }
 
         handle.stop().await;
+    }
+
+    #[test]
+    fn pending_cap_constant_is_50() {
+        assert_eq!(MAX_PENDING_FILES, 50);
     }
 }

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
 
@@ -12,15 +14,55 @@ type EmbedFuture<'a> =
 // Constants
 // ---------------------------------------------------------------------------
 
-const MIN_EMBED_INPUT_CHARS: usize = 256;
+const MIN_EMBED_INPUT_CHARS: usize = 1;
 const SINGLE_INPUT_SHRINK_FACTOR: f64 = 0.75;
-const MAX_SINGLE_INPUT_RETRIES: usize = 8;
+const MAX_SINGLE_INPUT_RETRIES: usize = 40;
 
 // ---------------------------------------------------------------------------
 // OllamaClient
 // ---------------------------------------------------------------------------
 
 /// HTTP client for Ollama embedding and chat APIs with adaptive batch/retry.
+/// Runtime options for Ollama embed requests.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbedRuntimeOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_gpu: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_gpu: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_thread: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_batch: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_vram: Option<bool>,
+}
+impl EmbedRuntimeOptions {
+    pub fn from_config(config: &Config) -> Option<Self> {
+        let o = Self {
+            num_gpu: config.embed_num_gpu,
+            main_gpu: config.embed_main_gpu,
+            num_thread: config.embed_num_thread,
+            num_batch: config.embed_num_batch,
+            num_ctx: config.embed_num_ctx,
+            low_vram: config.embed_low_vram,
+        };
+        if o.num_gpu.is_none()
+            && o.main_gpu.is_none()
+            && o.num_thread.is_none()
+            && o.num_batch.is_none()
+            && o.num_ctx.is_none()
+            && o.low_vram.is_none()
+        {
+            None
+        } else {
+            Some(o)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OllamaClient {
     client: reqwest::Client,
@@ -28,12 +70,17 @@ pub struct OllamaClient {
     model: String,
     chat_model: String,
     batch_size: usize,
+    embed_options: Option<EmbedRuntimeOptions>,
+    embed_chunk_chars: usize,
+    cancel_token: CancellationToken,
 }
 
 #[derive(serde::Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<&'a EmbedRuntimeOptions>,
 }
 
 #[derive(serde::Deserialize)]
@@ -54,22 +101,57 @@ impl OllamaClient {
             model: config.ollama_embed_model.clone(),
             chat_model: config.ollama_chat_model.clone(),
             batch_size: config.embed_batch_size,
+            embed_options: EmbedRuntimeOptions::from_config(config),
+            embed_chunk_chars: config.embed_chunk_chars,
+            cancel_token: CancellationToken::new(),
         }
     }
 
+    /// Cancel all in-flight embedding requests.
+    /// The token is shared via Arc internally, so all clones see the cancellation.
+    /// After cancellation, new requests will also fail until a fresh client is created.
+    /// This is intentional for shutdown scenarios.
+    pub fn cancel_all_embeddings(&self) {
+        self.cancel_token.cancel();
+    }
+
     /// Embed a slice of texts, returning one vector per text.
-    /// Handles batching and adaptive retry on context length errors.
+    /// Handles chunking of oversized inputs, batching, and adaptive retry.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(chunk).await?;
-            all_embeddings.extend(batch_result);
+        // Split each input into chunks; short inputs produce a single chunk.
+        let chunked_inputs: Vec<Vec<&str>> = texts
+            .iter()
+            .map(|t| split_embedding_input(t, self.embed_chunk_chars))
+            .collect();
+
+        // Flatten all chunks into a single list for batched embedding.
+        let flattened: Vec<String> = chunked_inputs
+            .iter()
+            .flat_map(|chunks| chunks.iter().map(|s| (*s).to_string()))
+            .collect();
+
+        // Embed all chunks in batches.
+        let mut flat_embeddings = Vec::with_capacity(flattened.len());
+        for batch in flattened.chunks(self.batch_size) {
+            let batch_result = self.embed_batch_adaptive(batch).await?;
+            flat_embeddings.extend(batch_result);
         }
-        Ok(all_embeddings)
+
+        // Merge chunk embeddings back into one vector per original input.
+        let mut results = Vec::with_capacity(texts.len());
+        let mut offset = 0;
+        for chunks in &chunked_inputs {
+            let vectors = &flat_embeddings[offset..offset + chunks.len()];
+            let weights: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+            results.push(merge_embedding_vectors(vectors, &weights)?);
+            offset += chunks.len();
+        }
+
+        Ok(results)
     }
 
     /// Get the configured batch size.
@@ -176,19 +258,27 @@ impl OllamaClient {
     }
 
     async fn call_embed_api(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Check cancellation before starting the request
+        if self.cancel_token.is_cancelled() {
+            return Err(ContextPlusError::Cancelled);
+        }
+
         let url = format!("{}/api/embed", self.host);
         let body = EmbedRequest {
             model: &self.model,
             input: inputs,
+            options: self.embed_options.as_ref(),
         };
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?;
+        let token = self.cancel_token.clone();
+        let response = tokio::select! {
+            _ = token.cancelled() => {
+                return Err(ContextPlusError::Cancelled);
+            }
+            result = self.client.post(&url).json(&body).send() => {
+                result.map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -227,6 +317,77 @@ fn shrink_input(input: &str) -> String {
         return crate::core::parser::truncate_to_char_boundary(input, input.len() - 1).to_string();
     }
     crate::core::parser::truncate_to_char_boundary(input, next_len).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Embedding chunk + merge
+// ---------------------------------------------------------------------------
+
+/// Split text into chunks of at most `chunk_chars` bytes, respecting char boundaries.
+/// If the text fits in one chunk, returns a single-element vec (no copy).
+pub fn split_embedding_input(text: &str, chunk_chars: usize) -> Vec<&str> {
+    let chunk_chars = chunk_chars.max(1);
+    if text.len() <= chunk_chars {
+        return vec![text];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + chunk_chars).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = start + 1;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+/// Weighted average of multiple embedding vectors.
+/// `weights` are typically the character counts of each chunk.
+/// Returns the merged vector with the same dimensionality as the inputs.
+pub fn merge_embedding_vectors(vectors: &[Vec<f32>], weights: &[usize]) -> Result<Vec<f32>> {
+    if vectors.is_empty() {
+        return Err(ContextPlusError::Ollama(
+            "Cannot merge empty embedding vectors".into(),
+        ));
+    }
+    if vectors.len() == 1 {
+        return Ok(vectors[0].clone());
+    }
+    let dim = vectors[0].len();
+    let mut merged = vec![0.0f32; dim];
+    let mut total_weight: f64 = 0.0;
+
+    for (i, vector) in vectors.iter().enumerate() {
+        if vector.len() != dim {
+            return Err(ContextPlusError::Ollama(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                dim,
+                vector.len()
+            )));
+        }
+        let w = (*weights.get(i).unwrap_or(&1)).max(1) as f64;
+        total_weight += w;
+        for (d, val) in vector.iter().enumerate() {
+            merged[d] += val * w as f32;
+        }
+    }
+
+    if total_weight > 0.0 {
+        let inv = 1.0 / total_weight as f32;
+        for v in &mut merged {
+            *v *= inv;
+        }
+    }
+
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------
@@ -765,10 +926,11 @@ mod tests {
     }
 
     #[test]
-    fn shrink_input_short_stays() {
-        let input = "short";
+    fn shrink_input_at_minimum_stays() {
+        // With MIN_EMBED_INPUT_CHARS=1, a single char should not shrink further
+        let input = "a";
         let shrunk = shrink_input(input);
-        assert_eq!(shrunk, "short");
+        assert_eq!(shrunk, "a");
     }
 
     // -- hash_content for cache invalidation --
@@ -1011,5 +1173,309 @@ mod tests {
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity_naive(&a, &b);
         assert_eq!(sim, 0.0, "zero vector should return 0.0");
+    }
+
+    #[test]
+    fn ero_none() {
+        let mut c = Config::from_env();
+        c.embed_num_gpu = None;
+        c.embed_main_gpu = None;
+        c.embed_num_thread = None;
+        c.embed_num_batch = None;
+        c.embed_num_ctx = None;
+        c.embed_low_vram = None;
+        assert!(EmbedRuntimeOptions::from_config(&c).is_none());
+    }
+    #[test]
+    fn ero_some() {
+        let mut c = Config::from_env();
+        c.embed_num_gpu = Some(1);
+        c.embed_main_gpu = None;
+        c.embed_num_thread = None;
+        c.embed_num_batch = None;
+        c.embed_num_ctx = None;
+        c.embed_low_vram = None;
+        assert_eq!(
+            EmbedRuntimeOptions::from_config(&c).unwrap().num_gpu,
+            Some(1)
+        );
+    }
+    #[test]
+    fn ero_ser() {
+        let o = EmbedRuntimeOptions {
+            num_gpu: Some(1),
+            main_gpu: None,
+            num_thread: None,
+            num_batch: None,
+            num_ctx: Some(2048),
+            low_vram: Some(true),
+        };
+        let j = serde_json::to_value(&o).unwrap();
+        assert_eq!(j["num_gpu"], 1);
+        assert!(j.get("main_gpu").is_none());
+    }
+    #[test]
+    fn req_no_opts() {
+        let r = EmbedRequest {
+            model: "t",
+            input: &[],
+            options: None,
+        };
+        assert!(serde_json::to_value(&r).unwrap().get("options").is_none());
+    }
+    #[test]
+    fn req_with_opts() {
+        let o = EmbedRuntimeOptions {
+            num_gpu: Some(2),
+            main_gpu: Some(0),
+            num_thread: None,
+            num_batch: None,
+            num_ctx: None,
+            low_vram: None,
+        };
+        let i = vec!["hi".into()];
+        let r = EmbedRequest {
+            model: "t",
+            input: &i,
+            options: Some(&o),
+        };
+        assert_eq!(serde_json::to_value(&r).unwrap()["options"]["num_gpu"], 2);
+    }
+
+    // -- adaptive retry constant tests --
+
+    #[test]
+    fn constants_match_typescript_reference() {
+        assert_eq!(MIN_EMBED_INPUT_CHARS, 1);
+        assert_eq!(MAX_SINGLE_INPUT_RETRIES, 40);
+        assert!((SINGLE_INPUT_SHRINK_FACTOR - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn shrink_input_iterates_toward_minimum() {
+        let mut input = "x".repeat(10000);
+        let mut iterations = 0;
+        while input.len() > MIN_EMBED_INPUT_CHARS {
+            let next = shrink_input(&input);
+            if next.len() == input.len() {
+                break;
+            }
+            input = next;
+            iterations += 1;
+            assert!(iterations <= MAX_SINGLE_INPUT_RETRIES);
+        }
+        assert_eq!(input.len(), MIN_EMBED_INPUT_CHARS);
+    }
+
+    // -- adaptive embed_single_adaptive with wiremock --
+
+    #[tokio::test]
+    async fn embed_single_adaptive_shrinks_on_context_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    ResponseTemplate::new(400)
+                        .set_body_string("input length exceeds context length")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config);
+        let input = "a".repeat(500);
+        let result = client.embed_single_adaptive(&input).await;
+
+        assert!(result.is_ok(), "should succeed after adaptive shrinking");
+        assert_eq!(result.unwrap(), vec![0.1, 0.2, 0.3]);
+        assert!(call_count.load(Ordering::SeqCst) >= 3);
+    }
+
+    // -- adaptive embed_batch_adaptive with wiremock --
+
+    #[tokio::test]
+    async fn embed_batch_adaptive_splits_on_context_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let input_count = body["input"].as_array().unwrap().len();
+                if n == 0 && input_count > 2 {
+                    ResponseTemplate::new(400)
+                        .set_body_string("input length exceeds context length")
+                } else {
+                    let embeddings: Vec<Vec<f32>> =
+                        (0..input_count).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"embeddings": embeddings}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config);
+        let texts: Vec<String> = (0..4).map(|i| format!("text_{}", i)).collect();
+        let result = client.embed_batch_adaptive(&texts).await;
+
+        assert!(result.is_ok(), "batch should succeed after splitting");
+        let embeddings = result.unwrap();
+        assert_eq!(embeddings.len(), 4);
+    }
+
+    // -- cancellation tests --
+
+    #[tokio::test]
+    async fn cancellation_stops_embed_requests() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[1.0, 2.0, 3.0]]}))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config);
+        let texts = vec!["hello world".to_string()];
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.embed(&texts).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.cancel_all_embeddings();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(ContextPlusError::Cancelled)),
+            "error should be Cancelled variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_request_returns_cancelled() {
+        let mut config = Config::from_env();
+        config.ollama_host = "http://localhost:0".to_string();
+        let client = OllamaClient::new(&config);
+
+        client.cancel_all_embeddings();
+
+        let result = client.embed(&["test".to_string()]).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ContextPlusError::Cancelled)));
+    }
+}
+
+#[cfg(test)]
+mod chunk_merge_tests {
+    use crate::core::embeddings::{merge_embedding_vectors, split_embedding_input};
+
+    #[test]
+    fn split_short_input_returns_single_chunk() {
+        let chunks = split_embedding_input("hello world", 2000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "hello world");
+    }
+
+    #[test]
+    fn split_exact_boundary() {
+        let chunks = split_embedding_input("abcde", 5);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn split_long_input() {
+        let chunks = split_embedding_input("abcdefghij", 3);
+        assert_eq!(chunks, vec!["abc", "def", "ghi", "j"]);
+    }
+
+    #[test]
+    fn split_preserves_content() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        let chunks = split_embedding_input(text, 10);
+        let reassembled: String = chunks.into_iter().collect();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn split_multibyte() {
+        let text = "😀😁😂";
+        let chunks = split_embedding_input(text, 5);
+        let reassembled: String = chunks.into_iter().collect();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn split_empty() {
+        let chunks = split_embedding_input("", 100);
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn merge_single() {
+        let merged = merge_embedding_vectors(&[vec![1.0, 2.0, 3.0]], &[10]).unwrap();
+        assert_eq!(merged, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn merge_equal_weights() {
+        let merged = merge_embedding_vectors(&[vec![2.0, 4.0], vec![4.0, 6.0]], &[1, 1]).unwrap();
+        assert!((merged[0] - 3.0).abs() < 1e-5);
+        assert!((merged[1] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn merge_weighted() {
+        let merged = merge_embedding_vectors(&[vec![10.0, 0.0], vec![0.0, 10.0]], &[3, 1]).unwrap();
+        assert!((merged[0] - 7.5).abs() < 1e-5);
+        assert!((merged[1] - 2.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn merge_empty_errors() {
+        assert!(merge_embedding_vectors(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn merge_dim_mismatch_errors() {
+        assert!(merge_embedding_vectors(&[vec![1.0, 2.0], vec![3.0]], &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn merge_preserves_dim() {
+        let dim = 384;
+        let v1: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let v2: Vec<f32> = (0..dim).map(|i| (dim - i) as f32).collect();
+        let merged = merge_embedding_vectors(&[v1, v2], &[100, 200]).unwrap();
+        assert_eq!(merged.len(), dim);
     }
 }
