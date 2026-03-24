@@ -30,6 +30,7 @@ pub struct OllamaClient {
     model: String,
     chat_model: String,
     batch_size: usize,
+    embed_chunk_chars: usize,
     cancel_token: CancellationToken,
 }
 
@@ -57,6 +58,7 @@ impl OllamaClient {
             model: config.ollama_embed_model.clone(),
             chat_model: config.ollama_chat_model.clone(),
             batch_size: config.embed_batch_size,
+            embed_chunk_chars: config.embed_chunk_chars,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -70,18 +72,42 @@ impl OllamaClient {
     }
 
     /// Embed a slice of texts, returning one vector per text.
-    /// Handles batching and adaptive retry on context length errors.
+    /// Handles chunking of oversized inputs, batching, and adaptive retry.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(chunk).await?;
-            all_embeddings.extend(batch_result);
+        // Split each input into chunks; short inputs produce a single chunk.
+        let chunked_inputs: Vec<Vec<&str>> = texts
+            .iter()
+            .map(|t| split_embedding_input(t, self.embed_chunk_chars))
+            .collect();
+
+        // Flatten all chunks into a single list for batched embedding.
+        let flattened: Vec<String> = chunked_inputs
+            .iter()
+            .flat_map(|chunks| chunks.iter().map(|s| (*s).to_string()))
+            .collect();
+
+        // Embed all chunks in batches.
+        let mut flat_embeddings = Vec::with_capacity(flattened.len());
+        for batch in flattened.chunks(self.batch_size) {
+            let batch_result = self.embed_batch_adaptive(batch).await?;
+            flat_embeddings.extend(batch_result);
         }
-        Ok(all_embeddings)
+
+        // Merge chunk embeddings back into one vector per original input.
+        let mut results = Vec::with_capacity(texts.len());
+        let mut offset = 0;
+        for chunks in &chunked_inputs {
+            let vectors = &flat_embeddings[offset..offset + chunks.len()];
+            let weights: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+            results.push(merge_embedding_vectors(vectors, &weights)?);
+            offset += chunks.len();
+        }
+
+        Ok(results)
     }
 
     /// Get the configured batch size.
@@ -246,6 +272,77 @@ fn shrink_input(input: &str) -> String {
         return crate::core::parser::truncate_to_char_boundary(input, input.len() - 1).to_string();
     }
     crate::core::parser::truncate_to_char_boundary(input, next_len).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Embedding chunk + merge
+// ---------------------------------------------------------------------------
+
+/// Split text into chunks of at most `chunk_chars` bytes, respecting char boundaries.
+/// If the text fits in one chunk, returns a single-element vec (no copy).
+pub fn split_embedding_input(text: &str, chunk_chars: usize) -> Vec<&str> {
+    let chunk_chars = chunk_chars.max(1);
+    if text.len() <= chunk_chars {
+        return vec![text];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + chunk_chars).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = start + 1;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+/// Weighted average of multiple embedding vectors.
+/// `weights` are typically the character counts of each chunk.
+/// Returns the merged vector with the same dimensionality as the inputs.
+pub fn merge_embedding_vectors(vectors: &[Vec<f32>], weights: &[usize]) -> Result<Vec<f32>> {
+    if vectors.is_empty() {
+        return Err(ContextPlusError::Ollama(
+            "Cannot merge empty embedding vectors".into(),
+        ));
+    }
+    if vectors.len() == 1 {
+        return Ok(vectors[0].clone());
+    }
+    let dim = vectors[0].len();
+    let mut merged = vec![0.0f32; dim];
+    let mut total_weight: f64 = 0.0;
+
+    for (i, vector) in vectors.iter().enumerate() {
+        if vector.len() != dim {
+            return Err(ContextPlusError::Ollama(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                dim,
+                vector.len()
+            )));
+        }
+        let w = (*weights.get(i).unwrap_or(&1)).max(1) as f64;
+        total_weight += w;
+        for (d, val) in vector.iter().enumerate() {
+            merged[d] += val * w as f32;
+        }
+    }
+
+    if total_weight > 0.0 {
+        let inv = 1.0 / total_weight as f32;
+        for v in &mut merged {
+            *v *= inv;
+        }
+    }
+
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,5 +1280,90 @@ mod tests {
         let result = client.embed(&["test".to_string()]).await;
         assert!(result.is_err());
         assert!(matches!(result, Err(ContextPlusError::Cancelled)));
+    }
+}
+
+#[cfg(test)]
+mod chunk_merge_tests {
+    use crate::core::embeddings::{merge_embedding_vectors, split_embedding_input};
+
+    #[test]
+    fn split_short_input_returns_single_chunk() {
+        let chunks = split_embedding_input("hello world", 2000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "hello world");
+    }
+
+    #[test]
+    fn split_exact_boundary() {
+        let chunks = split_embedding_input("abcde", 5);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn split_long_input() {
+        let chunks = split_embedding_input("abcdefghij", 3);
+        assert_eq!(chunks, vec!["abc", "def", "ghi", "j"]);
+    }
+
+    #[test]
+    fn split_preserves_content() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        let chunks = split_embedding_input(text, 10);
+        let reassembled: String = chunks.into_iter().collect();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn split_multibyte() {
+        let text = "😀😁😂";
+        let chunks = split_embedding_input(text, 5);
+        let reassembled: String = chunks.into_iter().collect();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn split_empty() {
+        let chunks = split_embedding_input("", 100);
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn merge_single() {
+        let merged = merge_embedding_vectors(&[vec![1.0, 2.0, 3.0]], &[10]).unwrap();
+        assert_eq!(merged, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn merge_equal_weights() {
+        let merged = merge_embedding_vectors(&[vec![2.0, 4.0], vec![4.0, 6.0]], &[1, 1]).unwrap();
+        assert!((merged[0] - 3.0).abs() < 1e-5);
+        assert!((merged[1] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn merge_weighted() {
+        let merged = merge_embedding_vectors(&[vec![10.0, 0.0], vec![0.0, 10.0]], &[3, 1]).unwrap();
+        assert!((merged[0] - 7.5).abs() < 1e-5);
+        assert!((merged[1] - 2.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn merge_empty_errors() {
+        assert!(merge_embedding_vectors(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn merge_dim_mismatch_errors() {
+        assert!(merge_embedding_vectors(&[vec![1.0, 2.0], vec![3.0]], &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn merge_preserves_dim() {
+        let dim = 384;
+        let v1: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let v2: Vec<f32> = (0..dim).map(|i| (dim - i) as f32).collect();
+        let merged = merge_embedding_vectors(&[v1, v2], &[100, 200]).unwrap();
+        assert_eq!(merged.len(), dim);
     }
 }
