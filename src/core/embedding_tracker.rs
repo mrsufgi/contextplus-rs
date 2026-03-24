@@ -290,10 +290,14 @@ mod tests {
     }
 
     #[test]
-    fn should_track_empty_ignore_tracks_all() {
+    fn should_track_empty_ignore_tracks_non_hidden() {
         let ignore = HashSet::new();
+        // With empty ignore set, non-hidden paths are tracked
         assert!(should_track(Path::new("node_modules/foo.js"), &ignore));
-        assert!(should_track(Path::new(".git/HEAD"), &ignore));
+        assert!(should_track(Path::new("src/main.rs"), &ignore));
+        // Hidden paths (starting with '.') are always skipped, matching TS behavior
+        assert!(!should_track(Path::new(".git/HEAD"), &ignore));
+        assert!(!should_track(Path::new(".env"), &ignore));
     }
 
     #[test]
