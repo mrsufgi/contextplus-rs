@@ -264,51 +264,12 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
 
     let server = ContextPlusServer::new(root_dir.clone(), config.clone());
 
-    // Start the file watcher to invalidate project cache on source changes
-    let _tracker_handle = if config.embed_tracker_enabled {
-        let server_state = server.state.clone();
-        let tracker_config = contextplus_rs::core::embedding_tracker::EmbeddingTrackerConfig {
-            debounce_ms: config.embed_tracker_debounce_ms,
-            max_files_per_tick: config.embed_tracker_max_files,
-            ignore_dirs: config.ignore_dirs.clone(),
-        };
-        let server_for_tracker = ContextPlusServer {
-            state: server_state,
-        };
-        let tracker_root = root_dir.clone();
-        let callback: contextplus_rs::core::embedding_tracker::RefreshCallback =
-            std::sync::Arc::new(move |_root, files| {
-                let srv = server_for_tracker.clone();
-                let root = tracker_root.clone();
-                let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
-                tokio::spawn(async move {
-                    let (updated, skipped) = srv.incremental_reembed(&changed_files).await;
-                    tracing::debug!(
-                        updated,
-                        skipped,
-                        "Incremental re-embedding for {} changed files",
-                        changed_files.len()
-                    );
-                    (updated, skipped)
-                })
-            });
-        match contextplus_rs::core::embedding_tracker::start_tracker(
-            root_dir,
-            tracker_config,
-            callback,
-        ) {
-            Ok(handle) => {
-                tracing::info!("File watcher started for project cache invalidation");
-                Some(handle)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start file watcher: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Embedding tracker modes: Eager (start now), Lazy (start on first semantic call), Off
+    use contextplus_rs::config::TrackerMode;
+    tracing::info!(mode = %config.embed_tracker_mode, "Embedding tracker mode");
+    if config.embed_tracker_mode == TrackerMode::Eager {
+        server.ensure_tracker_started();
+    }
 
     // --- Process lifecycle monitors ---
 
