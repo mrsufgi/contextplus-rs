@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
 
@@ -12,9 +14,9 @@ type EmbedFuture<'a> =
 // Constants
 // ---------------------------------------------------------------------------
 
-const MIN_EMBED_INPUT_CHARS: usize = 256;
+const MIN_EMBED_INPUT_CHARS: usize = 1;
 const SINGLE_INPUT_SHRINK_FACTOR: f64 = 0.75;
-const MAX_SINGLE_INPUT_RETRIES: usize = 8;
+const MAX_SINGLE_INPUT_RETRIES: usize = 40;
 
 // ---------------------------------------------------------------------------
 // OllamaClient
@@ -28,6 +30,7 @@ pub struct OllamaClient {
     model: String,
     chat_model: String,
     batch_size: usize,
+    cancel_token: CancellationToken,
 }
 
 #[derive(serde::Serialize)]
@@ -54,7 +57,16 @@ impl OllamaClient {
             model: config.ollama_embed_model.clone(),
             chat_model: config.ollama_chat_model.clone(),
             batch_size: config.embed_batch_size,
+            cancel_token: CancellationToken::new(),
         }
+    }
+
+    /// Cancel all in-flight embedding requests.
+    /// The token is shared via Arc internally, so all clones see the cancellation.
+    /// After cancellation, new requests will also fail until a fresh client is created.
+    /// This is intentional for shutdown scenarios.
+    pub fn cancel_all_embeddings(&self) {
+        self.cancel_token.cancel();
     }
 
     /// Embed a slice of texts, returning one vector per text.
@@ -176,19 +188,26 @@ impl OllamaClient {
     }
 
     async fn call_embed_api(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Check cancellation before starting the request
+        if self.cancel_token.is_cancelled() {
+            return Err(ContextPlusError::Cancelled);
+        }
+
         let url = format!("{}/api/embed", self.host);
         let body = EmbedRequest {
             model: &self.model,
             input: inputs,
         };
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?;
+        let token = self.cancel_token.clone();
+        let response = tokio::select! {
+            _ = token.cancelled() => {
+                return Err(ContextPlusError::Cancelled);
+            }
+            result = self.client.post(&url).json(&body).send() => {
+                result.map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -765,10 +784,11 @@ mod tests {
     }
 
     #[test]
-    fn shrink_input_short_stays() {
-        let input = "short";
+    fn shrink_input_at_minimum_stays() {
+        // With MIN_EMBED_INPUT_CHARS=1, a single char should not shrink further
+        let input = "a";
         let shrunk = shrink_input(input);
-        assert_eq!(shrunk, "short");
+        assert_eq!(shrunk, "a");
     }
 
     // -- hash_content for cache invalidation --
@@ -1011,5 +1031,157 @@ mod tests {
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity_naive(&a, &b);
         assert_eq!(sim, 0.0, "zero vector should return 0.0");
+    }
+
+    // -- adaptive retry constant tests --
+
+    #[test]
+    fn constants_match_typescript_reference() {
+        assert_eq!(MIN_EMBED_INPUT_CHARS, 1);
+        assert_eq!(MAX_SINGLE_INPUT_RETRIES, 40);
+        assert!((SINGLE_INPUT_SHRINK_FACTOR - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn shrink_input_iterates_toward_minimum() {
+        let mut input = "x".repeat(10000);
+        let mut iterations = 0;
+        while input.len() > MIN_EMBED_INPUT_CHARS {
+            let next = shrink_input(&input);
+            if next.len() == input.len() {
+                break;
+            }
+            input = next;
+            iterations += 1;
+            assert!(iterations <= MAX_SINGLE_INPUT_RETRIES);
+        }
+        assert_eq!(input.len(), MIN_EMBED_INPUT_CHARS);
+    }
+
+    // -- adaptive embed_single_adaptive with wiremock --
+
+    #[tokio::test]
+    async fn embed_single_adaptive_shrinks_on_context_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    ResponseTemplate::new(400)
+                        .set_body_string("input length exceeds context length")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config);
+        let input = "a".repeat(500);
+        let result = client.embed_single_adaptive(&input).await;
+
+        assert!(result.is_ok(), "should succeed after adaptive shrinking");
+        assert_eq!(result.unwrap(), vec![0.1, 0.2, 0.3]);
+        assert!(call_count.load(Ordering::SeqCst) >= 3);
+    }
+
+    // -- adaptive embed_batch_adaptive with wiremock --
+
+    #[tokio::test]
+    async fn embed_batch_adaptive_splits_on_context_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |req: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let input_count = body["input"].as_array().unwrap().len();
+                if n == 0 && input_count > 2 {
+                    ResponseTemplate::new(400)
+                        .set_body_string("input length exceeds context length")
+                } else {
+                    let embeddings: Vec<Vec<f32>> =
+                        (0..input_count).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"embeddings": embeddings}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config);
+        let texts: Vec<String> = (0..4).map(|i| format!("text_{}", i)).collect();
+        let result = client.embed_batch_adaptive(&texts).await;
+
+        assert!(result.is_ok(), "batch should succeed after splitting");
+        let embeddings = result.unwrap();
+        assert_eq!(embeddings.len(), 4);
+    }
+
+    // -- cancellation tests --
+
+    #[tokio::test]
+    async fn cancellation_stops_embed_requests() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[1.0, 2.0, 3.0]]}))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config);
+        let texts = vec!["hello world".to_string()];
+
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move { client_clone.embed(&texts).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.cancel_all_embeddings();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(ContextPlusError::Cancelled)),
+            "error should be Cancelled variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_request_returns_cancelled() {
+        let mut config = Config::from_env();
+        config.ollama_host = "http://localhost:0".to_string();
+        let client = OllamaClient::new(&config);
+
+        client.cancel_all_embeddings();
+
+        let result = client.embed(&["test".to_string()]).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ContextPlusError::Cancelled)));
     }
 }

@@ -16,6 +16,8 @@ pub enum ContextPlusError {
     Config(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Embedding cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
