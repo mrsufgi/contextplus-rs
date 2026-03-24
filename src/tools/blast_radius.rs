@@ -151,7 +151,7 @@ pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> Str
 
     if total <= 1 {
         lines.push(format!(
-            "\n!! LOW USAGE: This symbol is used only {} time(s). Consider inlining if it's under 20 lines.",
+            "\n\u{26A0} LOW USAGE: This symbol is used only {} time(s). Consider inlining if it's under 20 lines.",
             total
         ));
     }
@@ -362,5 +362,27 @@ mod tests {
         let result = find_symbol_usages("myFunc", None, &file_lines);
         assert_eq!(result.total_usages(), 1);
         assert!(result.by_file.values().next().unwrap()[0].context.len() <= MAX_CONTEXT_LEN);
+    }
+
+    #[test]
+    fn low_usage_warning_uses_warning_emoji_not_ascii() {
+        let usage = SymbolUsage {
+            file: "src/handler.ts".to_string(),
+            line: 5,
+            context: "const x = myFunc();".to_string(),
+        };
+        let mut by_file = HashMap::new();
+        by_file.insert("src/handler.ts".to_string(), vec![usage]);
+        let result = BlastRadiusResult { by_file };
+        let output = format_blast_radius("myFunc", &result);
+        assert!(
+            output.contains("\u{26A0} LOW USAGE"),
+            "Low usage warning should use warning emoji, got: {}",
+            output
+        );
+        assert!(
+            !output.contains("!! LOW USAGE"),
+            "Should not contain ASCII !! prefix"
+        );
     }
 }

@@ -212,7 +212,7 @@ pub async fn propose_commit(
             all_errors.len()
         )];
         for e in all_errors.iter().take(10) {
-            result.push(format!("  [{}] {}", e.rule, e.message));
+            result.push(format!("  \u{274C} [{}] {}", e.rule, e.message));
         }
         if all_errors.len() > 10 {
             result.push(format!(
@@ -243,12 +243,12 @@ pub async fn propose_commit(
     fs::write(&full_path, content).await?;
 
     // Build result message
-    let mut result = vec![format!("File saved: {}", file_path)];
+    let mut result = vec![format!("\u{2705} File saved: {}", file_path)];
 
     if !warnings.is_empty() {
-        result.push(format!("\n{} warning(s):", warnings.len()));
+        result.push(format!("\n\u{26A0} {} warning(s):", warnings.len()));
         for w in &warnings {
-            result.push(format!("  [{}] {}", w.rule, w.message));
+            result.push(format!("  \u{26A0} [{}] {}", w.rule, w.message));
         }
     }
 
@@ -604,5 +604,49 @@ mod tests {
         let content = "// header\n// line2\nmalicious content";
         let result = propose_commit(root, "../../etc/evil", content, None).await;
         assert!(result.is_err() || result.unwrap().contains("traversal"));
+    }
+    #[tokio::test]
+    async fn success_output_starts_with_checkmark_emoji() {
+        let dir = TempDir::new().unwrap();
+        let content = "// File description here\n// FEATURE: Test\nfn main() {}\n";
+        let result = propose_commit(dir.path(), "src/main.rs", content, Some("test"))
+            .await
+            .unwrap();
+        assert!(
+            result.starts_with("\u{2705} File saved:"),
+            "Success output should start with checkmark emoji, got: {}",
+            &result[..result.len().min(50)]
+        );
+    }
+
+    #[tokio::test]
+    async fn warning_output_uses_warning_emoji() {
+        let dir = TempDir::new().unwrap();
+        let content = "fn main() {}\n";
+        let result = propose_commit(dir.path(), "app.rs", content, None)
+            .await
+            .unwrap();
+        assert!(
+            result.contains("\u{26A0}"),
+            "Warning output should contain warning emoji, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_output_uses_cross_emoji() {
+        let dir = TempDir::new().unwrap();
+        let mut lines = vec!["// header 1", "// header 2"];
+        lines.extend(std::iter::repeat_n("// unauthorized comment", 10));
+        lines.push("fn main() {}");
+        let content = lines.join("\n");
+        let result = propose_commit(dir.path(), "bad.rs", &content, None)
+            .await
+            .unwrap();
+        assert!(
+            result.contains("\u{274C}"),
+            "Rejection output should contain cross emoji, got: {}",
+            &result[..result.len().min(200)]
+        );
     }
 }
