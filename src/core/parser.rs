@@ -1,4 +1,7 @@
 use std::path::Path;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 /// Java-style string hash, ported exactly from TypeScript.
 /// `hash = ((hash << 5) - hash) + charCode | 0` then base-36 encode.
@@ -140,7 +143,7 @@ pub fn detect_language(file_path: &str) -> Option<&'static str> {
         Some("ruby")
     } else if ext.eq_ignore_ascii_case("swift") {
         Some("swift")
-    } else if ext.eq_ignore_ascii_case("kt") {
+    } else if ext.eq_ignore_ascii_case("kt") || ext.eq_ignore_ascii_case("kts") {
         Some("kotlin")
     } else if ext.eq_ignore_ascii_case("lua") {
         Some("lua")
@@ -151,6 +154,16 @@ pub fn detect_language(file_path: &str) -> Option<&'static str> {
         || ext.eq_ignore_ascii_case("zsh")
     {
         Some("bash")
+    } else if ext.eq_ignore_ascii_case("php") {
+        Some("php")
+    } else if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
+        Some("html")
+    } else if ext.eq_ignore_ascii_case("css") {
+        Some("css")
+    } else if ext.eq_ignore_ascii_case("toml") {
+        Some("toml")
+    } else if ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml") {
+        Some("yaml")
     } else {
         None
     }
@@ -222,6 +235,88 @@ pub fn format_symbol(sym: &CodeSymbol, indent: usize) -> String {
     result
 }
 
+// --- Regex fallback parser ---
+// When tree-sitter has no grammar for a language (or parsing fails), we fall
+// back to line-by-line regex matching to extract top-level symbols.
+
+/// Generic regex patterns that match common definition keywords across many languages.
+static GENERIC_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![
+        (
+            Regex::new(r"^(?:pub\s+)?(?:export\s+)?(?:async\s+)?(?:fn|func|function|def)\s+(\w+)")
+                .unwrap(),
+            "function",
+        ),
+        (
+            Regex::new(r"^(?:pub\s+)?(?:export\s+)?(?:abstract\s+)?(?:class|struct)\s+(\w+)")
+                .unwrap(),
+            "class",
+        ),
+        (
+            Regex::new(r"^(?:pub\s+)?(?:export\s+)?(?:enum|interface|type|trait|protocol)\s+(\w+)")
+                .unwrap(),
+            "enum",
+        ),
+    ]
+});
+
+/// Find the end of a brace-delimited block starting from `start_idx`.
+fn find_brace_block_end(lines: &[&str], start_idx: usize) -> usize {
+    let mut depth: i32 = 0;
+    let mut seen_opening = false;
+
+    for (i, line) in lines.iter().enumerate().skip(start_idx) {
+        for ch in line.chars() {
+            if ch == '{' {
+                depth += 1;
+                seen_opening = true;
+            } else if ch == '}' && seen_opening {
+                depth -= 1;
+                if depth <= 0 {
+                    return i + 1; // 1-indexed end line
+                }
+            }
+        }
+    }
+    start_idx + 1
+}
+
+/// Parse source code with regex fallback, extracting top-level symbols.
+/// This is used when tree-sitter does not support the language or fails.
+pub fn parse_with_regex_fallback(content: &str) -> Vec<CodeSymbol> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut symbols = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        for (pattern, kind) in GENERIC_PATTERNS.iter() {
+            if let Some(caps) = pattern.captures(trimmed)
+                && let Some(name_match) = caps.get(1)
+            {
+                let name = name_match.as_str().to_string();
+                let end_line = find_brace_block_end(&lines, i);
+                let signature = trimmed
+                    .trim_end_matches(|c: char| c == '{' || c.is_whitespace())
+                    .to_string();
+                symbols.push(CodeSymbol {
+                    name,
+                    kind: kind.to_string(),
+                    line: i + 1,
+                    end_line,
+                    signature: Some(if signature.len() > 150 {
+                        format!("{}...", truncate_to_char_boundary(&signature, 150))
+                    } else {
+                        signature
+                    }),
+                    children: Vec::new(),
+                });
+                break; // first match wins for this line
+            }
+        }
+    }
+    symbols
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +384,16 @@ mod tests {
         assert_eq!(detect_language("foo.c"), Some("c"));
         assert_eq!(detect_language("foo.cpp"), Some("cpp"));
         assert_eq!(detect_language("foo.sh"), Some("bash"));
+        assert_eq!(detect_language("foo.rb"), Some("ruby"));
+        assert_eq!(detect_language("foo.php"), Some("php"));
+        assert_eq!(detect_language("foo.cs"), Some("csharp"));
+        assert_eq!(detect_language("foo.kt"), Some("kotlin"));
+        assert_eq!(detect_language("foo.kts"), Some("kotlin"));
+        assert_eq!(detect_language("foo.html"), Some("html"));
+        assert_eq!(detect_language("foo.css"), Some("css"));
+        assert_eq!(detect_language("foo.toml"), Some("toml"));
+        assert_eq!(detect_language("foo.yaml"), Some("yaml"));
+        assert_eq!(detect_language("foo.yml"), Some("yaml"));
         assert_eq!(detect_language("foo.unknown"), None);
         assert_eq!(detect_language("noext"), None);
     }
@@ -297,6 +402,8 @@ mod tests {
     fn is_supported_file_works() {
         assert!(is_supported_file("main.rs"));
         assert!(is_supported_file("app.ts"));
+        assert!(is_supported_file("style.css"));
+        assert!(is_supported_file("config.toml"));
         assert!(!is_supported_file("readme.md"));
         assert!(!is_supported_file("data.json"));
     }
@@ -338,5 +445,83 @@ mod tests {
         };
         let output = format_symbol(&sym, 0);
         assert!(output.contains("function: fn doStuff(x: i32) -> i32 (L10-L20)"));
+    }
+
+    // --- Regex fallback tests ---
+
+    #[test]
+    fn regex_fallback_extracts_functions() {
+        let code = "function greet(name) {\n    console.log(name);\n}\n\ndef process(data):\n    return data\n\nfn compute(x: i32) -> i32 {\n    x * 2\n}\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert!(symbols.len() >= 3);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"greet"));
+        assert!(names.contains(&"process"));
+        assert!(names.contains(&"compute"));
+        assert!(symbols.iter().all(|s| s.kind == "function"));
+    }
+
+    #[test]
+    fn regex_fallback_extracts_classes_and_structs() {
+        let code = "class MyClass {\n    constructor() {}\n}\n\nstruct Point {\n    x: f64,\n    y: f64,\n}\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert!(symbols.len() >= 2);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"MyClass"));
+        assert!(names.contains(&"Point"));
+        assert!(symbols.iter().all(|s| s.kind == "class"));
+    }
+
+    #[test]
+    fn regex_fallback_extracts_enums_interfaces_traits() {
+        let code = "enum Color {\n    Red,\n    Green,\n}\n\ninterface Drawable {\n    draw(): void;\n}\n\ntrait Display {\n    fn fmt(&self) -> String;\n}\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert!(symbols.len() >= 3);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Color"));
+        assert!(names.contains(&"Drawable"));
+        assert!(names.contains(&"Display"));
+    }
+
+    #[test]
+    fn regex_fallback_handles_empty_content() {
+        let symbols = parse_with_regex_fallback("");
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn regex_fallback_handles_no_symbols() {
+        let code = "// just a comment\nlet x = 5;\nprint('hello');\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn regex_fallback_swift_like_code() {
+        let code = "class ViewController {\n    func viewDidLoad() {\n        super.viewDidLoad()\n    }\n}\n\nstruct Point {\n    var x: Double\n    var y: Double\n}\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert!(symbols.len() >= 2);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"ViewController"));
+        assert!(names.contains(&"Point"));
+    }
+
+    #[test]
+    fn regex_fallback_sets_line_numbers() {
+        let code = "function hello() {\n    return 1;\n}\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].line, 1);
+        assert_eq!(symbols[0].end_line, 3);
+    }
+
+    #[test]
+    fn regex_fallback_extracts_signature() {
+        let code = "export async function fetchData(url: string) {\n    return fetch(url);\n}\n";
+        let symbols = parse_with_regex_fallback(code);
+        assert_eq!(symbols.len(), 1);
+        let sig = symbols[0].signature.as_ref().unwrap();
+        assert!(sig.contains("fetchData"));
+        assert!(!sig.ends_with('{'));
     }
 }

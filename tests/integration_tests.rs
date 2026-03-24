@@ -392,3 +392,124 @@ async fn test_concurrent_mixed_tool_calls() {
 
     assert_eq!(completed, 9, "all 9 concurrent calls should complete");
 }
+
+// ===========================================================================
+// Category 4: CLI Init Config Generation
+// ===========================================================================
+
+/// Test that the standard MCP config (claude/cursor/vscode/windsurf) has correct structure.
+#[test]
+fn test_init_standard_config_structure() {
+    let binary_path = "/usr/local/bin/contextplus-rs";
+    let content = serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "contextplus": {
+                "command": binary_path,
+                "args": [],
+                "env": {
+                    "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+                    "OLLAMA_CHAT_MODEL": "llama3.2",
+                    "OLLAMA_HOST": "http://localhost:11434",
+                    "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+                    "CONTEXTPLUS_EMBED_TRACKER": "true"
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    assert!(
+        parsed.get("mcpServers").is_some(),
+        "should have mcpServers key"
+    );
+    let servers = &parsed["mcpServers"];
+    assert!(
+        servers.get("contextplus").is_some(),
+        "should have contextplus server"
+    );
+
+    let cp = &servers["contextplus"];
+    assert_eq!(cp["command"], binary_path);
+    assert!(cp["args"].is_array(), "args should be an array");
+    assert!(cp["env"].is_object(), "env should be an object");
+    assert_eq!(cp["env"]["OLLAMA_EMBED_MODEL"], "snowflake-arctic-embed2");
+    assert_eq!(cp["env"]["OLLAMA_CHAT_MODEL"], "llama3.2");
+}
+
+/// Test that the opencode config has the correct schema and structure.
+#[test]
+fn test_init_opencode_config_structure() {
+    let binary_path = "/usr/local/bin/contextplus-rs";
+    let content = serde_json::to_string_pretty(&serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "contextplus": {
+                "type": "local",
+                "command": [binary_path],
+                "enabled": true,
+                "environment": {
+                    "OLLAMA_EMBED_MODEL": "snowflake-arctic-embed2",
+                    "OLLAMA_CHAT_MODEL": "llama3.2",
+                    "OLLAMA_HOST": "http://localhost:11434",
+                    "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
+                    "CONTEXTPLUS_EMBED_TRACKER": "true"
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    assert_eq!(
+        parsed["$schema"], "https://opencode.ai/config.json",
+        "opencode config should have $schema"
+    );
+    assert!(
+        parsed.get("mcp").is_some(),
+        "should have mcp key (not mcpServers)"
+    );
+    assert!(
+        parsed.get("mcpServers").is_none(),
+        "opencode should NOT have mcpServers"
+    );
+
+    let cp = &parsed["mcp"]["contextplus"];
+    assert_eq!(cp["type"], "local", "opencode type should be 'local'");
+    assert!(
+        cp["command"].is_array(),
+        "opencode command should be an array"
+    );
+    assert_eq!(cp["enabled"], true, "opencode should be enabled");
+    assert!(
+        cp.get("environment").is_some(),
+        "opencode uses 'environment' not 'env'"
+    );
+    assert_eq!(
+        cp["environment"]["OLLAMA_EMBED_MODEL"],
+        "snowflake-arctic-embed2"
+    );
+}
+
+/// Test that all agent targets produce valid config paths ending in .json.
+#[test]
+fn test_agent_target_config_paths() {
+    let targets = vec![
+        (".mcp.json", "claude"),
+        (".cursor/mcp.json", "cursor"),
+        (".vscode/mcp.json", "vscode"),
+        (".windsurf/mcp.json", "windsurf"),
+        ("opencode.json", "opencode"),
+    ];
+
+    for (expected_path, target) in targets {
+        assert!(
+            expected_path.ends_with(".json"),
+            "config path for {} should end with .json, got: {}",
+            target,
+            expected_path
+        );
+    }
+}

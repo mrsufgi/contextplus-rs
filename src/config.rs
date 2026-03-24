@@ -43,6 +43,9 @@ pub struct Config {
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
     pub cache_ttl_secs: u64,
+    pub idle_timeout_ms: u64,
+    pub parent_poll_ms: u64,
+    pub embed_chunk_chars: usize,
 }
 
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
@@ -52,6 +55,9 @@ const DEFAULT_EMBED_BATCH_SIZE: usize = 50;
 const DEFAULT_EMBED_TRACKER_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_EMBED_TRACKER_MAX_FILES: usize = 8;
 const DEFAULT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_EMBED_CHUNK_CHARS: usize = 2000;
+const MIN_EMBED_CHUNK_CHARS: usize = 256;
+const MAX_EMBED_CHUNK_CHARS: usize = 8000;
 const MIN_EMBED_BATCH_SIZE: usize = 5;
 const MAX_EMBED_BATCH_SIZE: usize = 512;
 
@@ -123,6 +129,17 @@ impl Config {
             ),
             ignore_dirs: build_ignore_dirs(),
             cache_ttl_secs: env_parse("CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            idle_timeout_ms: crate::core::process_lifecycle::get_idle_shutdown_ms(
+                env::var("CONTEXTPLUS_IDLE_TIMEOUT_MS").ok().as_deref(),
+            ),
+            parent_poll_ms: crate::core::process_lifecycle::get_parent_poll_ms(
+                env::var("CONTEXTPLUS_PARENT_POLL_MS").ok().as_deref(),
+            ),
+            embed_chunk_chars: env_parse(
+                "CONTEXTPLUS_EMBED_CHUNK_CHARS",
+                DEFAULT_EMBED_CHUNK_CHARS,
+            )
+            .clamp(MIN_EMBED_CHUNK_CHARS, MAX_EMBED_CHUNK_CHARS),
         }
     }
 }
@@ -185,6 +202,9 @@ mod tests {
                 "CONTEXTPLUS_EMBED_TRACKER_MAX_FILES",
                 "CONTEXTPLUS_IGNORE_DIRS",
                 "CONTEXTPLUS_CACHE_TTL_SECS",
+                "CONTEXTPLUS_IDLE_TIMEOUT_MS",
+                "CONTEXTPLUS_PARENT_POLL_MS",
+                "CONTEXTPLUS_EMBED_CHUNK_CHARS",
             ],
             || {
                 let cfg = Config::from_env();
@@ -200,6 +220,9 @@ mod tests {
                 assert!(cfg.ignore_dirs.contains(".git"));
                 assert!(cfg.ignore_dirs.contains("target"));
                 assert_eq!(cfg.cache_ttl_secs, 300);
+                assert_eq!(cfg.idle_timeout_ms, 900_000); // 15 min default
+                assert_eq!(cfg.parent_poll_ms, 5_000); // 5s default
+                assert_eq!(cfg.embed_chunk_chars, 2000);
             },
         );
     }
@@ -336,5 +359,69 @@ mod tests {
         assert_eq!(parse_tracker_mode(Some("BOOT")), TrackerMode::Eager);
         assert_eq!(parse_tracker_mode(Some("startup")), TrackerMode::Eager);
         assert_eq!(parse_tracker_mode(Some("anything_else")), TrackerMode::Lazy);
+    }
+
+    #[test]
+    fn idle_timeout_disabled() {
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "0")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 0);
+        });
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "off")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 0);
+        });
+    }
+
+    #[test]
+    fn idle_timeout_custom() {
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "120000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 120_000);
+        });
+    }
+
+    #[test]
+    fn idle_timeout_clamps_to_min() {
+        with_env(&[("CONTEXTPLUS_IDLE_TIMEOUT_MS", "5000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.idle_timeout_ms, 60_000); // MIN_IDLE_TIMEOUT_MS
+        });
+    }
+
+    #[test]
+    fn parent_poll_custom() {
+        with_env(&[("CONTEXTPLUS_PARENT_POLL_MS", "3000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.parent_poll_ms, 3_000);
+        });
+    }
+
+    #[test]
+    fn parent_poll_clamps_to_min() {
+        with_env(&[("CONTEXTPLUS_PARENT_POLL_MS", "500")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.parent_poll_ms, 1_000); // MIN_PARENT_POLL_MS
+        });
+    }
+
+    #[test]
+    fn embed_chunk_chars_clamps() {
+        with_env(&[("CONTEXTPLUS_EMBED_CHUNK_CHARS", "100")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.embed_chunk_chars, MIN_EMBED_CHUNK_CHARS);
+        });
+        with_env(&[("CONTEXTPLUS_EMBED_CHUNK_CHARS", "99999")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.embed_chunk_chars, MAX_EMBED_CHUNK_CHARS);
+        });
+    }
+
+    #[test]
+    fn embed_chunk_chars_custom() {
+        with_env(&[("CONTEXTPLUS_EMBED_CHUNK_CHARS", "4000")], || {
+            let cfg = Config::from_env();
+            assert_eq!(cfg.embed_chunk_chars, 4000);
+        });
     }
 }

@@ -40,6 +40,58 @@ const PHRASE_BOOST: f64 = 0.15;
 const TERM_COVERAGE_WEIGHT: f64 = 0.65;
 const SYMBOL_COVERAGE_WEIGHT: f64 = 0.20;
 
+/// Maximum characters of raw content to include for text file documents.
+pub const MAX_TEXT_DOC_CHARS: usize = 4000;
+
+/// Default maximum file size (bytes) for text files to be indexed.
+pub const DEFAULT_MAX_EMBED_FILE_SIZE: u64 = 50 * 1024;
+
+/// Extensions that identify text/data files eligible for semantic search indexing.
+const TEXT_INDEX_EXTENSIONS: &[&str] = &[
+    ".md", ".txt", ".json", ".jsonc", ".geojson", ".csv", ".tsv", ".ndjson", ".yaml", ".yml",
+    ".toml", ".lock", ".env",
+];
+
+// ---------------------------------------------------------------------------
+// Text file indexing helpers
+// ---------------------------------------------------------------------------
+
+/// Check if a file path has a text/data extension eligible for indexing.
+pub fn is_text_index_candidate(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    TEXT_INDEX_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Extract a plain-text header from content: up to 2 non-empty lines, each capped at 120 chars.
+pub fn extract_plain_text_header(content: &str) -> String {
+    let mut header_lines: Vec<&str> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let capped = if trimmed.len() > 120 {
+            &trimmed[..120]
+        } else {
+            trimmed
+        };
+        header_lines.push(capped);
+        if header_lines.len() >= 2 {
+            break;
+        }
+    }
+    header_lines.join(" | ")
+}
+
+/// Read the `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` env var, falling back to the default.
+pub fn get_max_embed_file_size() -> u64 {
+    std::env::var("CONTEXTPLUS_MAX_EMBED_FILE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(1024))
+        .unwrap_or(DEFAULT_MAX_EMBED_FILE_SIZE)
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -1012,5 +1064,93 @@ mod tests {
         assert_eq!(normalize_top_k(Some(100), 5), MAX_TOP_K);
         assert_eq!(normalize_top_k(Some(0), 5), 5); // fallback for 0
         assert_eq!(normalize_top_k(None, 5), 5);
+    }
+
+    // -- is_text_index_candidate tests --
+
+    #[test]
+    fn test_text_index_candidate_markdown() {
+        assert!(is_text_index_candidate("README.md"));
+        assert!(is_text_index_candidate("docs/guide.MD"));
+    }
+
+    #[test]
+    fn test_text_index_candidate_json_yaml_toml() {
+        assert!(is_text_index_candidate("package.json"));
+        assert!(is_text_index_candidate("config.yaml"));
+        assert!(is_text_index_candidate("settings.yml"));
+        assert!(is_text_index_candidate("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_text_index_candidate_data_formats() {
+        assert!(is_text_index_candidate("data.csv"));
+        assert!(is_text_index_candidate("data.tsv"));
+        assert!(is_text_index_candidate("stream.ndjson"));
+        assert!(is_text_index_candidate("config.jsonc"));
+        assert!(is_text_index_candidate("map.geojson"));
+    }
+
+    #[test]
+    fn test_text_index_candidate_special() {
+        assert!(is_text_index_candidate("yarn.lock"));
+        assert!(is_text_index_candidate(".env"));
+        assert!(is_text_index_candidate("notes.txt"));
+    }
+
+    #[test]
+    fn test_text_index_candidate_code_files_rejected() {
+        assert!(!is_text_index_candidate("main.rs"));
+        assert!(!is_text_index_candidate("app.ts"));
+        assert!(!is_text_index_candidate("index.js"));
+        assert!(!is_text_index_candidate("lib.py"));
+        assert!(!is_text_index_candidate("main.go"));
+    }
+
+    // -- extract_plain_text_header tests --
+
+    #[test]
+    fn test_extract_plain_text_header_basic() {
+        let content = "# My Title\nSome description\n\nMore content";
+        let header = extract_plain_text_header(content);
+        assert_eq!(header, "# My Title | Some description");
+    }
+
+    #[test]
+    fn test_extract_plain_text_header_skips_empty_lines() {
+        let content = "\n\n  \nFirst line\n\nSecond line";
+        let header = extract_plain_text_header(content);
+        assert_eq!(header, "First line | Second line");
+    }
+
+    #[test]
+    fn test_extract_plain_text_header_caps_line_length() {
+        let long_line = "x".repeat(200);
+        let content = format!("{}\nshort", long_line);
+        let header = extract_plain_text_header(&content);
+        assert!(header.starts_with(&"x".repeat(120)));
+        assert!(header.contains(" | short"));
+    }
+
+    #[test]
+    fn test_extract_plain_text_header_single_line() {
+        let content = "Only one meaningful line";
+        let header = extract_plain_text_header(content);
+        assert_eq!(header, "Only one meaningful line");
+    }
+
+    #[test]
+    fn test_extract_plain_text_header_empty() {
+        let header = extract_plain_text_header("");
+        assert_eq!(header, "");
+    }
+
+    // -- MAX_TEXT_DOC_CHARS content cap test --
+
+    #[test]
+    fn test_text_content_cap() {
+        let content: String = "a".repeat(5000);
+        let truncated: String = content.chars().take(MAX_TEXT_DOC_CHARS).collect();
+        assert_eq!(truncated.len(), MAX_TEXT_DOC_CHARS);
     }
 }

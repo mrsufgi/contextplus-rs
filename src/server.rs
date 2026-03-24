@@ -64,6 +64,8 @@ pub struct SharedState {
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
     /// Tracker handle for lazy-start mode.
     pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
+    /// Idle monitor handle — tool handlers touch this to reset the idle timer.
+    pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -133,6 +135,7 @@ impl ContextPlusServer {
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
             tracker_handle: std::sync::Mutex::new(None),
+            idle_monitor: RwLock::new(None),
         });
         Self { state }
     }
@@ -189,6 +192,11 @@ impl ContextPlusServer {
                 tracing::warn!("Failed to start embedding tracker: {e}");
             }
         }
+    }
+
+    /// Cancel all in-flight embedding requests (used during shutdown).
+    pub fn cancel_all_embeddings(&self) {
+        self.state.ollama.cancel_all_embeddings();
     }
 
     fn root_dir(&self) -> &Path {
@@ -433,9 +441,10 @@ impl ContextPlusServer {
                         let header = crate::core::parser::extract_header(&content);
                         for sym in crate::core::parser::flatten_symbols(&symbols, None) {
                             let sig = sym.signature.clone().unwrap_or_default();
+                            let parent = sym.parent_name.as_deref().unwrap_or("");
                             let text = format!(
-                                "{} {} {} {}",
-                                sym.name, sym.kind, entry.relative_path, sig
+                                "{} {} {} {} {} {}",
+                                sym.name, sym.kind, sig, entry.relative_path, header, parent
                             );
                             docs.push(crate::tools::semantic_identifiers::IdentifierDoc {
                                 id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
@@ -1195,6 +1204,10 @@ impl ServerHandler for ContextPlusServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, rmcp::ErrorData> {
+        // Reset idle timer on every tool call.
+        if let Some(monitor) = self.state.idle_monitor.read().await.as_ref() {
+            monitor.touch();
+        }
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
         Ok(self.dispatch(&name, args).await)
