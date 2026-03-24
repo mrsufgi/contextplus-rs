@@ -1448,6 +1448,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1495,6 +1496,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1553,6 +1555,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1617,6 +1620,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1671,6 +1675,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1750,6 +1755,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1815,6 +1821,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1871,6 +1878,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1932,6 +1940,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1992,6 +2001,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2048,6 +2058,7 @@ mod tests {
             cache_ttl_secs: 300,
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
+            embed_chunk_chars: 2000,
         };
         let ollama = OllamaClient::new(&config);
 

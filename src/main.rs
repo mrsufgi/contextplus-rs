@@ -355,11 +355,15 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         handle
     };
 
+    // Keep a handle to shared state so we can cancel embeddings on shutdown.
+    let state_for_shutdown = server.state.clone();
+
     let transport = rmcp::transport::io::stdio();
     let ct = server.serve(transport).await?;
 
     // --- Signal handling ---
     // Handle SIGTERM, SIGHUP, SIGINT for graceful shutdown.
+    // On shutdown, cancel in-flight embeddings before exiting.
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
@@ -370,7 +374,8 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("SIGINT received — shutting down");
+            tracing::info!("SIGINT received — cancelling embeddings and shutting down");
+            state_for_shutdown.ollama.cancel_all_embeddings();
         }
         _ = async {
             #[cfg(unix)]
@@ -379,6 +384,7 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
             { std::future::pending::<Option<()>>().await }
         } => {
             tracing::info!("SIGTERM received — shutting down");
+            state_for_shutdown.ollama.cancel_all_embeddings();
         }
         _ = async {
             #[cfg(unix)]
@@ -387,6 +393,7 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
             { std::future::pending::<Option<()>>().await }
         } => {
             tracing::info!("SIGHUP received — shutting down");
+            state_for_shutdown.ollama.cancel_all_embeddings();
         }
     }
 

@@ -24,6 +24,7 @@ rmcp = { version = "1", features = ["server", "transport-io"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Tree-sitter (native, compile-time linked — versions per-crate)
