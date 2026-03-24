@@ -264,6 +264,20 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
 
     let server = ContextPlusServer::new(root_dir.clone(), config.clone());
 
+    // Pre-load memory graph from disk
+    let root_str = root_dir.to_string_lossy().to_string();
+    if let Err(e) = server
+        .state
+        .memory_graph
+        .get_graph(&root_str, |_graph| {})
+        .await
+    {
+        tracing::warn!("Failed to pre-load memory graph from disk: {e}");
+    }
+
+    // Spawn background debounce task for memory graph persistence
+    let _debounce_handle = server.state.memory_graph.spawn_debounce_task();
+
     // Embedding tracker modes: Eager (start now), Lazy (start on first semantic call), Off
     use contextplus_rs::config::TrackerMode;
     tracing::info!(mode = %config.embed_tracker_mode, "Embedding tracker mode");
@@ -316,6 +330,8 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         handle
     };
 
+    let memory_graph = Arc::clone(&server.state.memory_graph);
+
     // Keep a handle to shared state so we can cancel embeddings on shutdown.
     let state_for_shutdown = server.state.clone();
 
@@ -324,7 +340,7 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
 
     // --- Signal handling ---
     // Handle SIGTERM, SIGHUP, SIGINT for graceful shutdown.
-    // On shutdown, cancel in-flight embeddings before exiting.
+    // On shutdown, cancel in-flight embeddings and persist memory graph before exiting.
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
@@ -356,6 +372,11 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
             tracing::info!("SIGHUP received — shutting down");
             state_for_shutdown.ollama.cancel_all_embeddings();
         }
+    }
+
+    // Always flush memory graph on exit
+    if let Err(e) = memory_graph.flush().await {
+        tracing::warn!("Failed to persist memory graph on shutdown: {e}");
     }
 
     // Graceful cleanup

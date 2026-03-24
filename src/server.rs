@@ -10,7 +10,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 
 use crate::cache::rkyv_store;
 use crate::config::{Config, TrackerMode};
@@ -45,6 +45,11 @@ pub struct IdentifierIndex {
 
 const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
 
+/// URL to fetch the instructions resource content from.
+const INSTRUCTIONS_SOURCE_URL: &str = "https://contextplus.vercel.app/api/instructions";
+/// MCP resource URI for the instructions resource.
+const INSTRUCTIONS_RESOURCE_URI: &str = "contextplus://instructions";
+
 /// Shared state accessible by all tool handlers.
 pub struct SharedState {
     pub config: Config,
@@ -54,7 +59,7 @@ pub struct SharedState {
     /// calling canonicalize() on every tool request.
     pub canonical_root: PathBuf,
     pub ollama: OllamaClient,
-    pub memory_graph: GraphStore,
+    pub memory_graph: Arc<GraphStore>,
     pub project_cache: RwLock<Option<Arc<ProjectCache>>>,
     /// Cached embedding vectors keyed by relative file path.
     /// Uses CacheEntry (hash + vector) for content-hash invalidation.
@@ -62,6 +67,8 @@ pub struct SharedState {
     pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
     /// Cached identifier index — avoids re-embedding all symbols on each call.
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
+    /// Cached instructions content — fetched once from remote, then served from memory.
+    pub instructions_cache: OnceCell<String>,
     /// Tracker handle for lazy-start mode.
     pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
     /// Idle monitor handle — tool handlers touch this to reset the idle timer.
@@ -98,7 +105,7 @@ pub fn cache_name(base: &str, model: &str) -> String {
 impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
         let ollama = OllamaClient::new(&config);
-        let memory_graph = GraphStore::new();
+        let memory_graph = Arc::new(GraphStore::new());
 
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
 
@@ -134,6 +141,7 @@ impl ContextPlusServer {
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
+            instructions_cache: OnceCell::new(),
             tracker_handle: std::sync::Mutex::new(None),
             idle_monitor: RwLock::new(None),
         });
@@ -201,6 +209,29 @@ impl ContextPlusServer {
 
     fn root_dir(&self) -> &Path {
         &self.state.root_dir
+    }
+
+    /// Fetch instructions content (cached after first successful fetch).
+    async fn get_instructions(&self) -> String {
+        self.state
+            .instructions_cache
+            .get_or_init(|| async {
+                match reqwest::get(INSTRUCTIONS_SOURCE_URL).await {
+                    Ok(resp) => match resp.text().await {
+                        Ok(text) => text,
+                        Err(e) => {
+                            tracing::warn!("Failed to read instructions response body: {e}");
+                            "Context+ instructions are temporarily unavailable.".to_string()
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch instructions from remote: {e}");
+                        "Context+ instructions are temporarily unavailable.".to_string()
+                    }
+                }
+            })
+            .await
+            .clone()
     }
 
     fn get_str(args: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -1172,16 +1203,62 @@ impl ContextPlusServer {
 
 impl ServerHandler for ContextPlusServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "contextplus",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(
-                "Context+ semantic code analysis server. Provides semantic search, \
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "contextplus",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Context+ semantic code analysis server. Provides semantic search, \
              blast radius analysis, context trees, file skeletons, navigation, \
              memory graph, and more.",
-            )
+        )
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = std::result::Result<ListResourcesResult, rmcp::ErrorData>>
+    + Send
+    + '_ {
+        let resource = RawResource::new(INSTRUCTIONS_RESOURCE_URI, "contextplus_instructions")
+            .with_description("Context+ usage instructions and best practices")
+            .with_mime_type("text/markdown")
+            .no_annotation();
+        std::future::ready(Ok(ListResourcesResult {
+            resources: vec![resource],
+            meta: None,
+            next_cursor: None,
+        }))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ReadResourceResult, rmcp::ErrorData> {
+        if request.uri == INSTRUCTIONS_RESOURCE_URI {
+            let text = self.get_instructions().await;
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
+                    uri: INSTRUCTIONS_RESOURCE_URI.to_string(),
+                    mime_type: Some("text/markdown".to_string()),
+                    text,
+                    meta: None,
+                },
+            ]))
+        } else {
+            Err(rmcp::ErrorData::invalid_params(
+                format!("Unknown resource URI: {}", request.uri),
+                None,
+            ))
+        }
     }
 
     fn list_tools(
