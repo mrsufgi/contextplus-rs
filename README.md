@@ -26,7 +26,7 @@ MCP tools return ranked, structured results. Grep returns raw lines.
 | Query | MCP Output | Grep Output | Reduction |
 |-------|-----------|-------------|-----------|
 | File skeleton (any module) | ~400 tokens | ~1,678 tokens | **4x fewer** |
-| Context tree (any domain) | ~1,250 tokens | ~707K tokens | **566x fewer** |
+| Context tree (any directory) | ~1,250 tokens | ~707K tokens | **566x fewer** |
 | Blast radius (any symbol) | ~300 tokens | ~1,419 tokens | **5x fewer** |
 | Semantic search ("form validation") | ~500 tokens | ~42.7M tokens | **85,000x fewer** |
 | Identifier search ("any concept") | ~625 tokens | ~23.9M tokens | **38,000x fewer** |
@@ -52,9 +52,13 @@ MCP tools return ranked, structured results. Grep returns raw lines.
 Rust eliminates all overhead via:
 - **Zero-copy cache** with `rkyv` + `memmap2` (no deserialization)
 - **SIMD cosine similarity** via `simsimd` (AVX-512/AVX2 auto-dispatch)
-- **Native tree-sitter** (compiled in, no WASM VM)
+- **Native tree-sitter** (compiled in, no WASM VM) — 15 languages + regex fallback
 - **Binary serialization** (rkyv replaces JSON for memory graph)
 - **Disk-persistent embedding cache** with content-hash staleness detection
+- **Adaptive embedding retry** with exponential backoff and cancellation tokens
+- **Automatic chunking** for oversized embedding inputs (chunk → embed → merge)
+- **Process lifecycle management** — idle timeout, parent PID orphan detection, SIGTERM/SIGHUP handling
+- **Memory graph disk persistence** with debounced flush on mutation
 
 ## Install
 
@@ -85,13 +89,24 @@ Same environment variables as the TypeScript version:
 |----------|---------|-------------|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_EMBED_MODEL` | `snowflake-arctic-embed2` | Embedding model |
-| `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model for cluster labels (recommended: `qwen3.5:9b`) |
+| `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model for cluster labels |
 | `OLLAMA_API_KEY` | _(none)_ | Optional API key |
-| `CONTEXTPLUS_EMBED_BATCH_SIZE` | `32` | Embedding batch size |
-| `CONTEXTPLUS_EMBED_TRACKER` | `true` | Enable file watcher |
+| `CONTEXTPLUS_EMBED_BATCH_SIZE` | `50` | Embedding batch size (clamped 5–512) |
+| `CONTEXTPLUS_EMBED_TRACKER` | `lazy` | Tracker mode: `lazy` (start on first search), `eager` (start at boot), `off` |
 | `CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS` | `700` | File watcher debounce |
 | `CONTEXTPLUS_EMBED_TRACKER_MAX_FILES` | `8` | Max files per watcher tick |
+| `CONTEXTPLUS_EMBED_CHUNK_CHARS` | `2000` | Max chars per embedding input (clamped 256–8000). Oversized inputs are chunked and merged |
+| `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `50KB` | Skip files larger than this for embedding (min 1KB) |
 | `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated) |
+| `CONTEXTPLUS_CACHE_TTL_SECS` | `300` | Embedding cache TTL in seconds |
+| `CONTEXTPLUS_IDLE_TIMEOUT_MS` | `900000` | Auto-shutdown after idle period (0 or `off` to disable, min 60s) |
+| `CONTEXTPLUS_PARENT_POLL_MS` | `5000` | Poll interval for parent PID monitor (min 1s) |
+| `CONTEXTPLUS_EMBED_NUM_GPU` | _(none)_ | Ollama `num_gpu` option (GPU layer count) |
+| `CONTEXTPLUS_EMBED_MAIN_GPU` | _(none)_ | Ollama `main_gpu` option (primary GPU index) |
+| `CONTEXTPLUS_EMBED_NUM_THREAD` | _(none)_ | Ollama `num_thread` option |
+| `CONTEXTPLUS_EMBED_NUM_BATCH` | _(none)_ | Ollama `num_batch` option |
+| `CONTEXTPLUS_EMBED_NUM_CTX` | _(none)_ | Ollama `num_ctx` option |
+| `CONTEXTPLUS_EMBED_LOW_VRAM` | _(none)_ | Ollama `low_vram` option (`true`/`false`) |
 
 ## Usage
 
@@ -116,7 +131,7 @@ Add to your MCP config (`~/.claude/mcp.json` or project `.mcp.json`):
         "OLLAMA_CHAT_MODEL": "qwen3.5:9b",
         "OLLAMA_HOST": "http://127.0.0.1:11434",
         "CONTEXTPLUS_EMBED_BATCH_SIZE": "256",
-        "CONTEXTPLUS_EMBED_TRACKER": "true"
+        "CONTEXTPLUS_EMBED_TRACKER": "eager"
       }
     }
   }
@@ -138,6 +153,12 @@ contextplus-rs skeleton src/main.rs
 # Print context tree
 contextplus-rs tree --max-tokens 5000
 ```
+
+## MCP Resources
+
+| URI | Description |
+|-----|-------------|
+| `contextplus://instructions` | Returns tool usage instructions fetched from the Context+ API. Cached in memory after first fetch |
 
 ## Tools (17)
 
@@ -192,14 +213,17 @@ src/
   config.rs                  # Environment variable configuration
   error.rs                   # ContextPlusError enum (thiserror)
   core/
-    embeddings.rs            # OllamaClient + VectorStore + simsimd cosine
-    tree_sitter.rs           # Native multi-lang parser (10 languages)
-    parser.rs                # Code symbol extraction + hash_content
+    embeddings.rs            # OllamaClient + adaptive retry + chunking + cancellation
+    tree_sitter.rs           # Native multi-lang parser (15 languages)
+    parser.rs                # Code symbol extraction + regex fallback for unsupported langs
     walker.rs                # gitignore-aware file walker (ignore crate)
-    embedding_tracker.rs     # File watcher with debounced refresh
+    embedding_tracker.rs     # File watcher with lazy/eager/off modes
     clustering.rs            # Spectral clustering (nalgebra)
-    memory_graph.rs          # petgraph + rkyv persistence
+    memory_graph.rs          # petgraph + rkyv disk persistence with debounced flush
     hub.rs                   # Wikilink parser
+    process_lifecycle.rs     # Idle timeout + parent PID orphan detection
+    safe_path.rs             # Path traversal prevention
+    utils.rs                 # Shared utilities
   tools/                     # One file per tool (context_tree supports depth_limit filtering)
   git/shadow.rs              # Restore points (file-based backup)
   cache/rkyv_store.rs        # Zero-copy rkyv+mmap VectorStore
@@ -207,7 +231,9 @@ src/
 
 ### Supported Languages (tree-sitter)
 
-TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Bash
+TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Bash, Ruby, PHP, C#, Kotlin, HTML, CSS
+
+Unsupported file types fall back to regex-based symbol extraction.
 
 ### Key Crates
 
@@ -216,7 +242,7 @@ TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C, C++, Bash
 | `rmcp` | MCP SDK with stdio transport |
 | `simsimd` | SIMD-accelerated cosine distance |
 | `rkyv` + `memmap2` | Zero-copy cache persistence |
-| `tree-sitter` | Native code parsing (10 languages) |
+| `tree-sitter` | Native code parsing (15 languages) |
 | `petgraph` | Memory graph with stable indices |
 | `nalgebra` | Spectral clustering (eigendecomposition) |
 | `notify` | File system watching |
@@ -248,7 +274,7 @@ At 5K vectors (typical project size), total load is **~4ms**. At 30K vectors, mm
 
 30K-vector scan in 4.1ms — well under the 20ms target.
 
-### Tree-sitter Parse (native, 10 languages)
+### Tree-sitter Parse (native, 15 languages)
 
 | Language | Parse time |
 |----------|-----------|
@@ -262,9 +288,9 @@ At 5K vectors (typical project size), total load is **~4ms**. At 30K vectors, mm
 | C | 98 µs |
 | C++ | 91 µs |
 | Bash | ~83 µs |
-| **All 10 combined** | **~1.4 ms** |
+| **All 15 combined** | **~2.1 ms** |
 
-All 10 languages parsed in **1.4ms total** — vs 50-200ms for WASM in TS.
+All 15 languages parsed in **~2.1ms total** — vs 50-200ms for WASM in TS.
 
 ### Warm Search Pipeline
 
@@ -281,7 +307,7 @@ Warm search on 30K files: **4.3ms**. Hash-check (no-op refresh): **<1ms**.
 ## Development
 
 ```bash
-cargo test                  # 613+ tests
+cargo test                  # 1050+ tests
 cargo bench                 # 9 Criterion benchmark suites
 cargo clippy --all-targets  # Lint
 cargo fmt --check           # Format check
