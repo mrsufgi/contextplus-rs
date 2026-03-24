@@ -373,9 +373,10 @@ impl ContextPlusServer {
                         let header = crate::core::parser::extract_header(&content);
                         for sym in crate::core::parser::flatten_symbols(&symbols, None) {
                             let sig = sym.signature.clone().unwrap_or_default();
+                            let parent = sym.parent_name.as_deref().unwrap_or("");
                             let text = format!(
-                                "{} {} {} {}",
-                                sym.name, sym.kind, entry.relative_path, sig
+                                "{} {} {} {} {} {}",
+                                sym.name, sym.kind, sig, entry.relative_path, header, parent
                             );
                             docs.push(crate::tools::semantic_identifiers::IdentifierDoc {
                                 id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
