@@ -43,6 +43,13 @@ pub struct Config {
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
     pub cache_ttl_secs: u64,
+    pub max_embed_file_size: usize,
+    pub embed_num_gpu: Option<i32>,
+    pub embed_main_gpu: Option<i32>,
+    pub embed_num_thread: Option<i32>,
+    pub embed_num_batch: Option<i32>,
+    pub embed_num_ctx: Option<i32>,
+    pub embed_low_vram: Option<bool>,
     pub idle_timeout_ms: u64,
     pub parent_poll_ms: u64,
     pub embed_chunk_chars: usize,
@@ -60,6 +67,8 @@ const MIN_EMBED_CHUNK_CHARS: usize = 256;
 const MAX_EMBED_CHUNK_CHARS: usize = 8000;
 const MIN_EMBED_BATCH_SIZE: usize = 5;
 const MAX_EMBED_BATCH_SIZE: usize = 512;
+const DEFAULT_MAX_EMBED_FILE_SIZE: usize = 50 * 1024;
+const MIN_MAX_EMBED_FILE_SIZE: usize = 1024;
 
 const BASE_IGNORE_DIRS: &[&str] = &[
     "node_modules",
@@ -92,6 +101,16 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn env_opt<T: std::str::FromStr>(key: &str) -> Option<T> {
+    env::var(key).ok().and_then(|v| v.parse().ok())
+}
+fn env_opt_bool(key: &str) -> Option<bool> {
+    match env::var(key).ok().as_deref() {
+        Some("true") | Some("1") | Some("yes") => Some(true),
+        Some("false") | Some("0") | Some("no") => Some(false),
+        _ => None,
+    }
+}
 fn build_ignore_dirs() -> HashSet<String> {
     let mut dirs: HashSet<String> = BASE_IGNORE_DIRS.iter().map(|s| (*s).to_string()).collect();
     if let Ok(extra) = env::var("CONTEXTPLUS_IGNORE_DIRS") {
@@ -129,6 +148,17 @@ impl Config {
             ),
             ignore_dirs: build_ignore_dirs(),
             cache_ttl_secs: env_parse("CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            max_embed_file_size: env_parse(
+                "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",
+                DEFAULT_MAX_EMBED_FILE_SIZE,
+            )
+            .max(MIN_MAX_EMBED_FILE_SIZE),
+            embed_num_gpu: env_opt("CONTEXTPLUS_EMBED_NUM_GPU"),
+            embed_main_gpu: env_opt("CONTEXTPLUS_EMBED_MAIN_GPU"),
+            embed_num_thread: env_opt("CONTEXTPLUS_EMBED_NUM_THREAD"),
+            embed_num_batch: env_opt("CONTEXTPLUS_EMBED_NUM_BATCH"),
+            embed_num_ctx: env_opt("CONTEXTPLUS_EMBED_NUM_CTX"),
+            embed_low_vram: env_opt_bool("CONTEXTPLUS_EMBED_LOW_VRAM"),
             idle_timeout_ms: crate::core::process_lifecycle::get_idle_shutdown_ms(
                 env::var("CONTEXTPLUS_IDLE_TIMEOUT_MS").ok().as_deref(),
             ),
@@ -423,5 +453,86 @@ mod tests {
             let cfg = Config::from_env();
             assert_eq!(cfg.embed_chunk_chars, 4000);
         });
+    }
+
+    #[test]
+    fn max_file_size_default() {
+        with_cleared_env(&["CONTEXTPLUS_MAX_EMBED_FILE_SIZE"], || {
+            assert_eq!(Config::from_env().max_embed_file_size, 50 * 1024);
+        });
+    }
+    #[test]
+    fn max_file_size_custom() {
+        with_env(&[("CONTEXTPLUS_MAX_EMBED_FILE_SIZE", "102400")], || {
+            assert_eq!(Config::from_env().max_embed_file_size, 102400);
+        });
+    }
+    #[test]
+    fn max_file_size_clamps() {
+        with_env(&[("CONTEXTPLUS_MAX_EMBED_FILE_SIZE", "100")], || {
+            assert_eq!(
+                Config::from_env().max_embed_file_size,
+                MIN_MAX_EMBED_FILE_SIZE
+            );
+        });
+    }
+    #[test]
+    fn gpu_opts_none() {
+        with_cleared_env(
+            &[
+                "CONTEXTPLUS_EMBED_NUM_GPU",
+                "CONTEXTPLUS_EMBED_MAIN_GPU",
+                "CONTEXTPLUS_EMBED_NUM_THREAD",
+                "CONTEXTPLUS_EMBED_NUM_BATCH",
+                "CONTEXTPLUS_EMBED_NUM_CTX",
+                "CONTEXTPLUS_EMBED_LOW_VRAM",
+            ],
+            || {
+                let c = Config::from_env();
+                assert!(
+                    c.embed_num_gpu.is_none()
+                        && c.embed_main_gpu.is_none()
+                        && c.embed_num_thread.is_none()
+                        && c.embed_num_batch.is_none()
+                        && c.embed_num_ctx.is_none()
+                        && c.embed_low_vram.is_none()
+                );
+            },
+        );
+    }
+    #[test]
+    fn gpu_opts_set() {
+        with_env(
+            &[
+                ("CONTEXTPLUS_EMBED_NUM_GPU", "1"),
+                ("CONTEXTPLUS_EMBED_MAIN_GPU", "0"),
+                ("CONTEXTPLUS_EMBED_NUM_THREAD", "4"),
+                ("CONTEXTPLUS_EMBED_NUM_BATCH", "512"),
+                ("CONTEXTPLUS_EMBED_NUM_CTX", "2048"),
+                ("CONTEXTPLUS_EMBED_LOW_VRAM", "true"),
+            ],
+            || {
+                let c = Config::from_env();
+                assert_eq!(c.embed_num_gpu, Some(1));
+                assert_eq!(c.embed_main_gpu, Some(0));
+                assert_eq!(c.embed_num_thread, Some(4));
+                assert_eq!(c.embed_num_batch, Some(512));
+                assert_eq!(c.embed_num_ctx, Some(2048));
+                assert_eq!(c.embed_low_vram, Some(true));
+            },
+        );
+    }
+    #[test]
+    fn gpu_opts_invalid() {
+        with_env(
+            &[
+                ("CONTEXTPLUS_EMBED_NUM_GPU", "x"),
+                ("CONTEXTPLUS_EMBED_LOW_VRAM", "maybe"),
+            ],
+            || {
+                let c = Config::from_env();
+                assert!(c.embed_num_gpu.is_none() && c.embed_low_vram.is_none());
+            },
+        );
     }
 }
