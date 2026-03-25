@@ -156,25 +156,22 @@ pub async fn semantic_navigate(
         }
     }
 
-    // Spectral-cluster large groups in parallel (depth 1+)
-    let hierarchy_futures: Vec<_> = large_groups
-        .iter()
-        .map(|(_, indices)| {
-            Box::pin(build_hierarchy(
-                &files,
-                &vectors,
-                indices,
-                max_clusters,
-                1,
-                max_depth,
-                ollama,
-            ))
-        })
-        .collect();
-
-    let hierarchy_results = futures::future::join_all(hierarchy_futures).await;
-    for ((label, _), mut node) in large_groups.into_iter().zip(hierarchy_results) {
-        node.label = label;
+    // Spectral-cluster large groups sequentially.
+    // Each group's build_hierarchy calls ollama.chat for labeling (~11s per call on CPU).
+    // Running groups in parallel fires 20+ concurrent LLM calls that queue for 220s+.
+    // Sequential ensures each group's labels complete before the next starts.
+    for (dir_label, group_indices) in large_groups {
+        let mut node = build_hierarchy(
+            &files,
+            &vectors,
+            &group_indices,
+            max_clusters,
+            1,
+            max_depth,
+            ollama,
+        )
+        .await;
+        node.label = dir_label;
         children.push(node);
     }
 
