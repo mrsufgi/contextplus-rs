@@ -83,7 +83,7 @@ pub async fn semantic_navigate(
     // which produces different vectors than search ("{lang} {content}").
     let nav_cache_name = nav_cache_name(&config.ollama_embed_model);
     let mut nav_cache: HashMap<String, CacheEntry> = HashMap::new();
-    if let Ok(Some(store)) = rkyv_store::load_vector_store(root_dir, &nav_cache_name) {
+    if let Ok(Some(store)) = rkyv_store::mmap_vector_store(root_dir, &nav_cache_name) {
         let dims = store.dims() as usize;
         let flat = store.vectors_data();
         let keys = store.keys();

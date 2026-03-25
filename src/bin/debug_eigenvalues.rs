@@ -29,7 +29,7 @@ fn main() {
 
     // --- Cache load ---
     let t0 = Instant::now();
-    let store = rkyv_store::load_vector_store(root, &cache_name)
+    let store = rkyv_store::mmap_vector_store(root, &cache_name)
         .unwrap_or_else(|e| panic!("Failed to load embedding cache at {}: {e}", root.display()))
         .unwrap_or_else(|| panic!("No cache file found at {}/{cache_name}", root.display()));
     let cache_load_ms = t0.elapsed().as_millis();

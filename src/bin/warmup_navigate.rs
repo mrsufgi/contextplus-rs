@@ -58,7 +58,7 @@ async fn main() {
     // Load existing cache
     let cache_name = nav_cache_name(&config.ollama_embed_model);
     let mut cache: HashMap<String, CacheEntry> = HashMap::new();
-    if let Ok(Some(store)) = rkyv_store::load_vector_store(root, &cache_name) {
+    if let Ok(Some(store)) = rkyv_store::mmap_vector_store(root, &cache_name) {
         let dims = store.dims() as usize;
         let flat = store.vectors_data();
         let keys = store.keys();

@@ -136,7 +136,7 @@ impl ContextPlusServer {
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
 
         // Load embedding cache from disk if available (cross-restart persistence)
-        let initial_cache = match rkyv_store::load_vector_store(&root_dir, &embed_cache_name) {
+        let initial_cache = match rkyv_store::mmap_vector_store(&root_dir, &embed_cache_name) {
             Ok(Some(store)) => {
                 let cache_map = store.to_cache();
                 tracing::info!(
