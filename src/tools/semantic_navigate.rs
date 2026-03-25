@@ -3,7 +3,7 @@
 
 use crate::cache::rkyv_store;
 use crate::config::Config;
-use crate::core::clustering::{find_path_pattern, spectral_cluster_with_min};
+use crate::core::clustering::spectral_cluster_with_min;
 use crate::core::embeddings::VectorStore;
 use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::walker;
@@ -50,7 +50,7 @@ pub async fn semantic_navigate(
     options: SemanticNavigateOptions,
     ollama: &OllamaClient,
     config: &Config,
-    embedding_cache: &RwLock<HashMap<String, CacheEntry>>,
+    _embedding_cache: &RwLock<HashMap<String, CacheEntry>>,
     root_dir: &Path,
 ) -> Result<String> {
     let max_clusters = options.max_clusters.unwrap_or(20);
@@ -292,12 +292,58 @@ pub async fn semantic_navigate(
                         .unwrap_or_else(|| format!("Cluster {}", ci + 1))
                 });
 
-            // For depth 2+, just make leaf nodes (no further LLM calls)
-            sub_children.push(ClusterNode {
-                label,
-                files: global_indices.iter().map(|&i| files[i].clone()).collect(),
-                children: Vec::new(),
-            });
+            // Depth 2: for large sub-clusters, do one more round of spectral clustering
+            if global_indices.len() > MAX_FILES_PER_LEAF && max_depth > 2 {
+                let sub_vecs: Vec<Vec<f32>> = global_indices.iter().map(|&i| vectors[i].clone()).collect();
+                let mc = max_clusters;
+                let sub_results = tokio::task::spawn_blocking(move || {
+                    spectral_cluster_with_min(&sub_vecs, mc, 2)
+                })
+                .await
+                .unwrap_or_else(|_| vec![]);
+
+                if sub_results.len() > 1 {
+                    let mut depth2_children: Vec<ClusterNode> = Vec::new();
+                    for sub_cluster in &sub_results {
+                        let d2_indices: Vec<usize> = sub_cluster.indices.iter().map(|&li| global_indices[li]).collect();
+                        let refs: Vec<&FileInfo> = d2_indices.iter().map(|&i| &files[i]).collect();
+                        let d2_label = derive_cluster_label(&refs)
+                            .unwrap_or_else(|| format!("Cluster {}", depth2_children.len() + 1));
+                        depth2_children.push(ClusterNode {
+                            label: d2_label,
+                            files: d2_indices.iter().map(|&i| files[i].clone()).collect(),
+                            children: Vec::new(),
+                        });
+                    }
+                    // Deduplicate depth-2 labels
+                    let mut d2_labels: Vec<String> = depth2_children.iter().map(|c| c.label.clone()).collect();
+                    let d2_input: Vec<(Vec<&FileInfo>, Option<String>)> = depth2_children.iter()
+                        .map(|c| (c.files.iter().collect::<Vec<&FileInfo>>(), None))
+                        .collect();
+                    deduplicate_sibling_labels(&mut d2_labels, &d2_input);
+                    for (i, child) in depth2_children.iter_mut().enumerate() {
+                        child.label = d2_labels[i].clone();
+                    }
+
+                    sub_children.push(ClusterNode {
+                        label,
+                        files: Vec::new(),
+                        children: depth2_children,
+                    });
+                } else {
+                    sub_children.push(ClusterNode {
+                        label,
+                        files: global_indices.iter().map(|&i| files[i].clone()).collect(),
+                        children: Vec::new(),
+                    });
+                }
+            } else {
+                sub_children.push(ClusterNode {
+                    label,
+                    files: global_indices.iter().map(|&i| files[i].clone()).collect(),
+                    children: Vec::new(),
+                });
+            }
         }
 
         children.push(ClusterNode {
@@ -502,6 +548,65 @@ async fn resolve_embeddings(
         .collect())
 }
 
+/// Deduplicate sibling cluster labels by appending disambiguators.
+/// E.g., "domains/scheduling" ×3 → "domains/scheduling (tests)", "domains/scheduling (service)", "domains/scheduling #3"
+fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileInfo>, Option<String>)]) {
+    let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, label) in labels.iter().enumerate() {
+        seen.entry(label.to_lowercase()).or_default().push(i);
+    }
+
+    for (_key, indices) in &seen {
+        if indices.len() <= 1 {
+            continue;
+        }
+        for (seq, &idx) in indices.iter().enumerate() {
+            if idx < clusters.len() {
+                let (files, _) = &clusters[idx];
+                if let Some(disambig) = find_label_disambiguator(files) {
+                    labels[idx] = format!("{} ({})", labels[idx], disambig);
+                } else {
+                    labels[idx] = format!("{} #{}", labels[idx], seq + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Find a disambiguator for a cluster — checks for test files, architecture layers, etc.
+fn find_label_disambiguator(files: &[&FileInfo]) -> Option<String> {
+    // Test files
+    let test_count = files.iter().filter(|f| {
+        f.relative_path.contains(".test.") || f.relative_path.contains(".spec.")
+            || f.relative_path.contains("/test/") || f.relative_path.contains("/tests/")
+    }).count();
+    if test_count > files.len() / 2 {
+        return Some("tests".to_string());
+    }
+
+    // Architecture layers
+    let layers = [
+        ("service", "service"), ("repository", "repository"), ("repo", "repository"),
+        ("delivery", "delivery"), ("domain", "domain"), ("http", "http"),
+        ("temporal", "temporal"),
+    ];
+    let mut layer_counts: HashMap<&str, usize> = HashMap::new();
+    for f in files {
+        for (pattern, label) in &layers {
+            if f.relative_path.contains(&format!("/{}/", pattern)) {
+                *layer_counts.entry(label).or_default() += 1;
+            }
+        }
+    }
+    if let Some((layer, count)) = layer_counts.iter().max_by_key(|(_, c)| **c) {
+        if *count > files.len() / 3 {
+            return Some(layer.to_string());
+        }
+    }
+
+    None
+}
+
 /// Extract a header comment from the first few lines of a file.
 pub fn extract_header(content: &str) -> String {
     let mut header_lines = Vec::new();
@@ -539,131 +644,6 @@ async fn label_files(files: &[FileInfo]) -> Vec<String> {
     }).collect()
 }
 
-/// Label sibling clusters using path patterns first, Ollama chat only for unlabeled clusters.
-///
-/// Optimization: if every cluster has a path_pattern, skip LLM entirely (~6s saved per call).
-/// For mixed cases, only send unlabeled clusters to the LLM in a single batched call.
-async fn label_sibling_clusters(
-    clusters: &[(Vec<&FileInfo>, Option<String>)],
-    ollama: &OllamaClient,
-) -> Vec<String> {
-    if clusters.is_empty() {
-        return Vec::new();
-    }
-
-    // Use path-based labels with smart fallbacks. LLM labeling is too slow
-    // on CPU (~11s per call) and causes MCP timeouts when there are 10+ clusters.
-    // derive_cluster_label finds the distinguishing directory segments.
-    let mut labels: Vec<Option<String>> = clusters
-        .iter()
-        .map(|(files, _pattern)| {
-            if files.len() <= 3 {
-                // Small cluster: just use file names
-                let names: Vec<&str> = files
-                    .iter()
-                    .filter_map(|f| f.relative_path.split('/').next_back())
-                    .collect();
-                let joined = names.join(", ");
-                Some(if joined.len() > 40 {
-                    crate::core::parser::truncate_to_char_boundary(&joined, 40).to_string()
-                } else {
-                    joined
-                })
-            } else {
-                None // Send to LLM
-            }
-        })
-        .collect();
-
-    // If all clusters are tiny (<=3 files each), skip LLM
-    if labels.iter().all(|l| l.is_some()) {
-        return labels.into_iter().map(|l| l.unwrap()).collect();
-    }
-
-    // Collect indices of unlabeled clusters for batched LLM call
-    let unlabeled: Vec<usize> = labels
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.is_none())
-        .map(|(i, _)| i)
-        .collect();
-
-    const MAX_FILES_PER_LABEL: usize = 10;
-
-    let descriptions: Vec<String> = unlabeled
-        .iter()
-        .enumerate()
-        .map(|(desc_idx, &cluster_idx)| {
-            let (files, _) = &clusters[cluster_idx];
-            let sample_files = if files.len() > MAX_FILES_PER_LABEL {
-                &files[..MAX_FILES_PER_LABEL]
-            } else {
-                files
-            };
-            let file_list = sample_files
-                .iter()
-                .map(|f| {
-                    let desc = if f.header.is_empty() {
-                        "no description"
-                    } else {
-                        &f.header
-                    };
-                    format!("{}: {}", f.relative_path, desc)
-                })
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            format!(
-                "Cluster {} ({} files):\n  {}",
-                desc_idx + 1,
-                files.len(),
-                file_list
-            )
-        })
-        .collect();
-
-    let prompt = format!(
-        "Label each cluster with EXACTLY 2 words. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
-        descriptions.join("\n\n"),
-        unlabeled.len()
-    );
-
-    match ollama.chat(&prompt).await {
-        Ok(response) => {
-            if let Some(json_str) = extract_json_array(&response) {
-                match serde_json::from_str::<Vec<String>>(&json_str) {
-                    Ok(llm_labels) => {
-                        for (j, &cluster_idx) in unlabeled.iter().enumerate() {
-                            if let Some(label) = llm_labels.get(j) {
-                                labels[cluster_idx] = Some(label.clone());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "LLM returned invalid JSON for cluster labels");
-                    }
-                }
-            } else {
-                tracing::warn!(response_len = response.len(), "LLM response contained no JSON array");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, unlabeled = unlabeled.len(), "LLM labeling failed");
-        }
-    }
-
-    // Fill any remaining unlabeled with path-based fallbacks
-    labels
-        .into_iter()
-        .enumerate()
-        .map(|(i, l)| {
-            l.unwrap_or_else(|| {
-                let (files, _) = &clusters[i];
-                derive_cluster_label(files)
-                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
-            })
-        })
-        .collect()
-}
 
 /// Derive a human-readable label for a cluster from its file paths.
 ///
@@ -692,6 +672,112 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             common_depth = d + 1;
         } else {
             break;
+        }
+    }
+
+    // ── Content-pattern heuristics for homogeneous domain clusters ──
+    // These fire BEFORE the segment-based heuristic so that clusters where
+    // all files share a deep common prefix still get meaningful labels.
+    // We scan ALL directory segments (including common prefix) because the
+    // architecture layer name may be part of the shared prefix itself.
+
+    // 1. Test file detection: if >50% of files are test files, label as "tests"
+    {
+        let test_count = files
+            .iter()
+            .filter(|f| {
+                let p = &f.relative_path;
+                p.ends_with(".test.ts")
+                    || p.ends_with(".test.tsx")
+                    || p.ends_with(".spec.ts")
+                    || p.ends_with(".spec.tsx")
+                    || p.ends_with("_test.go")
+                    || p.ends_with("_test.rs")
+            })
+            .count();
+        if test_count > files.len() / 2 {
+            return Some("tests".to_string());
+        }
+    }
+
+    // 2. Architecture layer detection: check ALL path segments for well-known
+    //    layer names, pick the most frequent one.
+    {
+        let layer_map: &[(&[&str], &str)] = &[
+            (&["service"], "service"),
+            (&["repository", "repo"], "repository"),
+            (&["domain"], "domain entities"),
+            (&["test", "tests", "__tests__"], "tests"),
+        ];
+        // Two-segment layers (checked first for specificity)
+        let two_seg_map: &[(&str, &str, &str)] = &[
+            ("delivery", "http", "http routes"),
+            ("delivery", "temporal", "temporal workflows"),
+            ("delivery", "nats", "nats consumers"),
+        ];
+
+        let mut layer_counts: HashMap<&str, usize> = HashMap::new();
+
+        for p in &paths {
+            let dir_segs = &p[..p.len().saturating_sub(1)]; // all dir segments, exclude filename
+            // Check two-segment layers first
+            let mut matched = false;
+            for (seg1, seg2, label) in two_seg_map {
+                if dir_segs.len() >= 2
+                    && dir_segs.iter().any(|s| s.eq_ignore_ascii_case(seg1))
+                    && dir_segs.iter().any(|s| s.eq_ignore_ascii_case(seg2))
+                {
+                    *layer_counts.entry(label).or_default() += 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+            // Check single-segment layers
+            for (keywords, label) in layer_map {
+                if dir_segs
+                    .iter()
+                    .any(|s| keywords.iter().any(|k| s.eq_ignore_ascii_case(k)))
+                {
+                    *layer_counts.entry(label).or_default() += 1;
+                    break;
+                }
+            }
+        }
+
+        if let Some((label, count)) = layer_counts.iter().max_by_key(|(_, c)| **c) {
+            if *count > files.len() / 2 {
+                return Some(label.to_string());
+            }
+        }
+    }
+
+    // 3. Common file extension grouping: if >50% share a distinctive extension
+    {
+        let mut ext_counts: HashMap<&str, usize> = HashMap::new();
+        let mut index_count: usize = 0;
+        for f in files {
+            let fname = f.relative_path.split('/').next_back().unwrap_or("");
+            if fname == "index.ts" || fname == "index.js" || fname == "index.tsx" || fname == "mod.rs" {
+                index_count += 1;
+            }
+            if let Some(ext) = fname.rsplit('.').next() {
+                *ext_counts.entry(ext).or_default() += 1;
+            }
+        }
+        if index_count > files.len() / 2 {
+            return Some("barrel exports".to_string());
+        }
+        if let Some((ext, count)) = ext_counts.iter().max_by_key(|(_, c)| **c) {
+            if *count > files.len() / 2 {
+                match *ext {
+                    "proto" => return Some("proto definitions".to_string()),
+                    "sql" => return Some("migrations".to_string()),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -873,132 +959,6 @@ fn extract_json_array(text: &str) -> Option<String> {
     }
 }
 
-/// Recursively build hierarchical cluster tree.
-/// Uses index slices into the top-level `all_files`/`all_vectors` to avoid cloning.
-async fn build_hierarchy(
-    all_files: &[FileInfo],
-    all_vectors: &[Vec<f32>],
-    indices: &[usize],
-    max_clusters: usize,
-    depth: usize,
-    max_depth: usize,
-    ollama: &OllamaClient,
-) -> ClusterNode {
-    if indices.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
-        return ClusterNode {
-            label: String::new(),
-            files: indices.iter().map(|&i| all_files[i].clone()).collect(),
-            children: Vec::new(),
-        };
-    }
-
-    // Build local vectors slice for clustering — moved into spawn_blocking
-    // to avoid blocking the tokio executor during O(n^3) eigendecomposition.
-    let local_vectors: Vec<Vec<f32>> = indices.iter().map(|&i| all_vectors[i].clone()).collect();
-    let mc = max_clusters;
-    let cluster_results = tokio::task::spawn_blocking(move || {
-        spectral_cluster_with_min(&local_vectors, mc, 2)
-    })
-    .await
-    .unwrap_or_else(|_| vec![]);
-
-    if cluster_results.len() <= 1 {
-        return ClusterNode {
-            label: String::new(),
-            files: indices.iter().map(|&i| all_files[i].clone()).collect(),
-            children: Vec::new(),
-        };
-    }
-
-    // Find the parent's common prefix to suppress redundant path_patterns.
-    // Within a directory group, all files share e.g. "packages/domains/billing/",
-    // so find_path_pattern always returns "packages/domains/billing/*" — useless.
-    // Only keep path_pattern if it's MORE specific than the parent prefix.
-    let parent_prefix = {
-        let parts: Vec<Vec<&str>> = indices.iter().map(|&i| all_files[i].relative_path.split('/').collect::<Vec<_>>()).collect();
-        let min_depth = parts.iter().map(|p| p.len()).min().unwrap_or(0);
-        let mut prefix_depth = 0;
-        for d in 0..min_depth.saturating_sub(1) {
-            if parts.iter().all(|p| p[d] == parts[0][d]) {
-                prefix_depth = d + 1;
-            } else {
-                break;
-            }
-        }
-        prefix_depth
-    };
-
-    // Map cluster result indices back to global indices
-    let child_index_groups: Vec<(Vec<usize>, Option<String>)> = cluster_results
-        .iter()
-        .map(|cluster| {
-            let global_indices: Vec<usize> =
-                cluster.indices.iter().map(|&li| indices[li]).collect();
-            let child_paths: Vec<String> = global_indices
-                .iter()
-                .map(|&gi| all_files[gi].relative_path.clone())
-                .collect();
-            let pattern = find_path_pattern(&child_paths);
-            // Suppress pattern if it's just the parent prefix + "*"
-            // (e.g., "packages/domains/billing/*" when parent is "packages/domains/billing/")
-            let useful_pattern = pattern.filter(|p| {
-                let p_depth = p.split('/').count();
-                p_depth > parent_prefix + 1
-            });
-            (global_indices, useful_pattern)
-        })
-        .collect();
-
-    // Get labels for sibling clusters — pass &FileInfo slices without cloning vecs
-    let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_index_groups
-        .iter()
-        .map(|(idxs, pattern)| {
-            let file_refs: Vec<&FileInfo> = idxs.iter().map(|&i| &all_files[i]).collect();
-            (file_refs, pattern.clone())
-        })
-        .collect();
-
-    // Label FIRST, then recurse. Sequential to avoid Ollama contention.
-    // Each LLM call takes ~11s on CPU. Concurrent labeling at multiple depths
-    // queues 10+ calls, causing 110s+ waits and timeouts.
-    let labels = label_sibling_clusters(&label_input, ollama).await;
-
-    // Then recurse into children (their labeling calls will run after ours complete)
-    let child_futures: Vec<_> = child_index_groups
-        .iter()
-        .map(|(child_indices, _pattern)| {
-            Box::pin(build_hierarchy(
-                all_files,
-                all_vectors,
-                child_indices,
-                max_clusters,
-                depth + 1,
-                max_depth,
-                ollama,
-            ))
-        })
-        .collect();
-
-    let child_results = futures::future::join_all(child_futures).await;
-
-    let children: Vec<ClusterNode> = child_results
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut child)| {
-            child.label = labels
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("Cluster {}", i + 1));
-            child
-        })
-        .collect();
-
-    ClusterNode {
-        label: String::new(),
-        files: Vec::new(),
-        children,
-    }
-}
 
 /// Render a cluster tree as indented text.
 fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
@@ -1047,7 +1007,6 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::embeddings::content_hash;
 
     #[test]
     fn extract_header_comment_slashes() {
@@ -2203,6 +2162,91 @@ mod tests {
         let label = derive_cluster_label(&refs);
         // No common prefix, no dominant segment, no common filename prefix, no headers → None
         assert_eq!(label, None);
+    }
+
+
+    #[test]
+    fn derive_cluster_label_test_files() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/scheduling/service/appointment.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/scheduling/service/availability.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/scheduling/domain/date-range.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("tests".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_repository_layer() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/scheduling/repository/pg/appointment.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/scheduling/repository/pg/service.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/scheduling/repository/pg/availability.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("repository".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_service_layer() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/billing/service/invoice.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/service/payment.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/service/refund.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("service".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_http_routes() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/billing/delivery/http/invoice-handler.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/delivery/http/payment-handler.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/delivery/http/routes.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("http routes".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_proto_files() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/proto/billing/invoice.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/proto/billing/payment.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/proto/billing/refund.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("proto definitions".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_barrel_exports() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/billing/service/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/repository/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/domain/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("barrel exports".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_sql_migrations() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/db/migrations/001_create_users.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/db/migrations/002_create_orgs.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/db/migrations/003_add_billing.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("migrations".to_string()));
     }
 
     // ── count_files_in_node tests ────────────────────────────────────
