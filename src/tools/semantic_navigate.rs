@@ -3,17 +3,20 @@
 
 use crate::cache::rkyv_store;
 use crate::config::Config;
-use crate::core::clustering::{find_path_pattern, spectral_cluster};
+use crate::core::clustering::{find_path_pattern, spectral_cluster_with_min};
 use crate::core::embeddings::VectorStore;
 use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
 use crate::core::walker;
 use crate::error::Result;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
 const MAX_FILES_PER_LEAF: usize = 20;
+
+/// Maximum files to cluster. Workspaces larger than this are sampled to keep
+/// spectral clustering (O(n²) affinity matrix) and Ollama labeling tractable.
+const MAX_NAVIGATE_FILES: usize = 1500;
 
 /// Extensions accepted for semantic navigation (without leading dot).
 /// Superset of tree_sitter::get_supported_extensions — includes data formats
@@ -30,14 +33,10 @@ pub struct SemanticNavigateOptions {
     pub root_dir: String,
     pub max_depth: Option<usize>,
     pub max_clusters: Option<usize>,
-    /// Maximum output characters before truncation (default 50,000).
-    pub max_output_chars: Option<usize>,
 }
 
-const DEFAULT_MAX_OUTPUT_CHARS: usize = 50_000;
-
 /// Information about a source file for clustering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct FileInfo {
     relative_path: String,
     header: String,
@@ -72,18 +71,51 @@ pub async fn semantic_navigate(
     let root = PathBuf::from(&options.root_dir);
 
     // Walk directory for source files using shared walker infrastructure
-    let files = collect_source_files_via_walker(&root, config).await?;
+    let mut files = collect_source_files_via_walker(&root, config).await?;
     if files.is_empty() {
         return Ok("No supported source files found in the project.".to_string());
     }
 
-    // Resolve vectors: check cache first, embed only uncached/changed files
+    // Cap file count to keep spectral clustering tractable.
+    // Sample evenly across the sorted file list to preserve directory diversity.
+    let sampled = files.len() > MAX_NAVIGATE_FILES;
+    if sampled {
+        let total = files.len();
+        let step = total as f64 / MAX_NAVIGATE_FILES as f64;
+        let sampled_files: Vec<FileInfo> = (0..MAX_NAVIGATE_FILES)
+            .map(|i| {
+                let idx = (i as f64 * step).floor() as usize;
+                std::mem::take(&mut files[idx.min(total - 1)])
+            })
+            .collect();
+        files = sampled_files;
+    }
+
+    // Navigate uses its OWN embedding cache (not the shared one from semantic_code_search).
+    // Navigate embeds with path-weighted text ("{path} {path} {path} {header} {content}")
+    // which produces different vectors than search ("{lang} {content}").
+    let nav_cache_name = format!("navigate-{}", config.ollama_embed_model);
+    let mut nav_cache: HashMap<String, CacheEntry> = HashMap::new();
+    if let Ok(Some(store)) = rkyv_store::load_vector_store(root_dir, &nav_cache_name) {
+        let dims = store.dims() as usize;
+        let flat = store.vectors_data();
+        let keys = store.keys();
+        let hashes = store.hashes();
+        for (i, key) in keys.iter().enumerate() {
+            nav_cache.insert(key.clone(), CacheEntry {
+                hash: hashes[i].clone(),
+                vector: flat[i * dims..(i + 1) * dims].to_vec(),
+            });
+        }
+    }
+    let nav_cache_lock = RwLock::new(nav_cache);
+
     let vectors = match resolve_embeddings(
         &files,
         ollama,
-        embedding_cache,
+        &nav_cache_lock,
         root_dir,
-        &config.ollama_embed_model,
+        &nav_cache_name,
     )
     .await
     {
@@ -115,38 +147,75 @@ pub async fn semantic_navigate(
         return Ok(lines.join("\n"));
     }
 
-    // Build hierarchical cluster tree — pass all files/vectors + a full index slice
-    let all_indices: Vec<usize> = (0..files.len()).collect();
-    let tree = build_hierarchy(
-        &files,
-        &vectors,
-        &all_indices,
-        max_clusters,
-        0,
-        max_depth,
-        ollama,
-    )
-    .await;
-    let mut root_node = tree;
-    root_node.label = "Project".to_string();
+    // Depth 0: group by directory structure (domain boundaries).
+    // Spectral clustering can't separate domains in uniform-architecture monorepos
+    // because embeddings capture code patterns, not domain identity.
+    // Directory structure IS the domain boundary — use it as the top level,
+    // then spectral clustering sub-clusters within each group at depth 1+.
+    let dir_groups = group_by_directory(&files);
 
-    let max_chars = options.max_output_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
-    let tree_text = render_cluster_tree(&root_node, 0);
-    let output = format!(
-        "Semantic Navigator: {} files organized by meaning\n\n{}",
-        files.len(),
-        tree_text
-    );
+    let mut children: Vec<ClusterNode> = Vec::new();
+    let mut large_groups: Vec<(String, Vec<usize>)> = Vec::new();
 
-    if output.len() > max_chars {
-        let truncated = crate::core::parser::truncate_to_char_boundary(&output, max_chars);
-        Ok(format!(
-            "{}\n\n[Output truncated at {} chars — use max_output_chars to adjust]",
-            truncated, max_chars
-        ))
-    } else {
-        Ok(output)
+    for (dir_label, group_indices) in &dir_groups {
+        if group_indices.len() <= MAX_FILES_PER_LEAF {
+            children.push(ClusterNode {
+                label: dir_label.clone(),
+                path_pattern: find_path_pattern(
+                    &group_indices.iter().map(|&i| files[i].relative_path.clone()).collect::<Vec<_>>()
+                ),
+                files: group_indices.iter().map(|&i| files[i].clone()).collect(),
+                children: Vec::new(),
+            });
+        } else {
+            large_groups.push((dir_label.clone(), group_indices.clone()));
+        }
     }
+
+    // Spectral-cluster large groups in parallel (depth 1+)
+    let hierarchy_futures: Vec<_> = large_groups
+        .iter()
+        .map(|(_, indices)| {
+            Box::pin(build_hierarchy(
+                &files,
+                &vectors,
+                indices,
+                max_clusters,
+                1,
+                max_depth,
+                ollama,
+            ))
+        })
+        .collect();
+
+    let hierarchy_results = futures::future::join_all(hierarchy_futures).await;
+    for ((label, _), mut node) in large_groups.into_iter().zip(hierarchy_results) {
+        node.label = label;
+        children.push(node);
+    }
+
+    // Sort by file count descending
+    children.sort_by(|a, b| count_files_in_node(b).cmp(&count_files_in_node(a)));
+
+    let root_node = ClusterNode {
+        label: "Project".to_string(),
+        path_pattern: None,
+        files: Vec::new(),
+        children,
+    };
+
+    let tree_text = render_cluster_tree(&root_node, 0);
+    let sampled_note = if sampled {
+        format!(" (sampled {} of total)", MAX_NAVIGATE_FILES)
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "Semantic Navigator: {} files{} organized by meaning\n\n{}",
+        files.len(),
+        sampled_note,
+        tree_text
+    ))
 }
 
 /// Walk the directory using shared walker infrastructure and collect source file information.
@@ -224,7 +293,11 @@ async fn resolve_embeddings(
     let mut uncached_hashes: Vec<String> = Vec::new();
 
     for (i, file) in files.iter().enumerate() {
-        let file_hash = content_hash(&file.content);
+        // Hash includes "nav3:" prefix to:
+        // 1. Separate from semantic_code_search vectors (different embed format)
+        // 2. Invalidate old navigate vectors (pre-path-weighting)
+        // Bump the version number when the embed text format changes.
+        let file_hash = content_hash(&format!("nav3:{}{}", file.relative_path, file.content));
         if let Some(entry) = cache_read.get(&file.relative_path) {
             if entry.hash == file_hash {
                 // Cache hit: content unchanged
@@ -233,9 +306,14 @@ async fn resolve_embeddings(
                 // Cache stale: content changed, need re-embed
                 result_vectors.push(None);
                 uncached_indices.push(i);
+                // Path-weighted embed text: repeat path 3x to boost domain signal.
+                // Code embeddings capture structural patterns (imports, patterns),
+                // path captures domain identity (billing vs scheduling vs IAM).
                 uncached_texts.push(format!(
-                    "{} {} {}",
-                    file.header, file.relative_path, file.content
+                    "{p} {p} {p} {h} {c}",
+                    p = file.relative_path,
+                    h = file.header,
+                    c = file.content
                 ));
                 uncached_hashes.push(file_hash);
             }
@@ -257,39 +335,42 @@ async fn resolve_embeddings(
         return Ok(result_vectors.into_iter().map(|v| v.unwrap()).collect());
     }
 
-    // Embed only the uncached/stale files
-    let mut new_vectors = ollama.embed(&uncached_texts).await?;
-
-    // Store new vectors in cache, then drop lock BEFORE disk I/O.
-    // Use std::mem::take to move vectors out of new_vectors without cloning.
-    let store_to_save = {
-        let mut cache_write = embedding_cache.write().await;
-        for (j, &file_idx) in uncached_indices.iter().enumerate() {
-            if j < new_vectors.len() {
-                let vec = std::mem::take(&mut new_vectors[j]);
-                cache_write.insert(
-                    files[file_idx].relative_path.clone(),
-                    CacheEntry {
-                        hash: uncached_hashes[j].clone(),
-                        vector: vec.clone(),
-                    },
-                );
-                result_vectors[file_idx] = Some(vec);
-            }
-        }
-
-        // Build store while we hold the lock, but save AFTER releasing it
-        VectorStore::from_cache(&cache_write)
-        // cache_write lock drops here
-    };
-
-    // Persist to disk outside the lock — disk I/O can take 50-200ms,
-    // holding the write lock during that time blocks all concurrent readers.
+    // Embed uncached/stale files in chunks, saving progress after each batch.
+    // This prevents losing all work if the MCP connection times out mid-run.
     let embed_cache_name = crate::server::cache_name("embeddings", embed_model);
-    if let Some(store) = store_to_save
-        && let Err(e) = rkyv_store::save_vector_store(root_dir, &embed_cache_name, &store)
-    {
-        tracing::warn!("Failed to save embedding cache to disk: {e}");
+    let chunk_size = ollama.batch_size();
+
+    for chunk_start in (0..uncached_indices.len()).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size).min(uncached_indices.len());
+        let chunk_texts = &uncached_texts[chunk_start..chunk_end];
+
+        let mut chunk_vectors = ollama.embed(chunk_texts).await?;
+
+        // Store this chunk's vectors in cache, then drop lock BEFORE disk I/O.
+        let store_to_save = {
+            let mut cache_write = embedding_cache.write().await;
+            for (local_j, &file_idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
+                if local_j < chunk_vectors.len() {
+                    let vec = std::mem::take(&mut chunk_vectors[local_j]);
+                    cache_write.insert(
+                        files[file_idx].relative_path.clone(),
+                        CacheEntry {
+                            hash: uncached_hashes[chunk_start + local_j].clone(),
+                            vector: vec.clone(),
+                        },
+                    );
+                    result_vectors[file_idx] = Some(vec);
+                }
+            }
+            VectorStore::from_cache(&cache_write)
+        };
+
+        // Persist after each chunk so progress survives a timeout on the next batch.
+        if let Some(store) = store_to_save
+            && let Err(e) = rkyv_store::save_vector_store(root_dir, &embed_cache_name, &store)
+        {
+            tracing::warn!("Failed to save embedding cache to disk: {e}");
+        }
     }
 
     Ok(result_vectors
@@ -323,32 +404,22 @@ fn extract_header(content: &str) -> String {
 }
 
 /// Label files using Ollama chat for small sets.
-async fn label_files(files: &[FileInfo], ollama: &OllamaClient) -> Vec<String> {
-    let file_list = files
-        .iter()
-        .map(|f| format!("{}: {}", f.relative_path, f.header))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "For each file below, produce a 3-7 word description. Return ONLY a JSON array of strings.\n\n{}",
-        file_list
-    );
-
-    match ollama.chat(&prompt).await {
-        Ok(response) => {
-            if let Some(json_match) = extract_json_array(&response)
-                && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_match)
-            {
-                return labels;
-            }
-            files.iter().map(|f| f.header.clone()).collect()
+async fn label_files(files: &[FileInfo], _ollama: &OllamaClient) -> Vec<String> {
+    // For small file sets (≤ MAX_FILES_PER_LEAF), headers are descriptive enough.
+    // Skip LLM call entirely — saves ~6s per invocation.
+    files.iter().map(|f| {
+        if f.header.is_empty() {
+            f.relative_path.split('/').next_back().unwrap_or(&f.relative_path).to_string()
+        } else {
+            f.header.clone()
         }
-        Err(_) => files.iter().map(|f| f.header.clone()).collect(),
-    }
+    }).collect()
 }
 
-/// Label sibling clusters using Ollama chat.
+/// Label sibling clusters using path patterns first, Ollama chat only for unlabeled clusters.
+///
+/// Optimization: if every cluster has a path_pattern, skip LLM entirely (~6s saved per call).
+/// For mixed cases, only send unlabeled clusters to the LLM in a single batched call.
 async fn label_sibling_clusters(
     clusters: &[(Vec<&FileInfo>, Option<String>)],
     ollama: &OllamaClient,
@@ -356,29 +427,51 @@ async fn label_sibling_clusters(
     if clusters.is_empty() {
         return Vec::new();
     }
-    if clusters.len() == 1 {
-        if let Some(ref pp) = clusters[0].1 {
-            return vec![pp.clone()];
-        }
-        let names: Vec<&str> = clusters[0]
-            .0
-            .iter()
-            .filter_map(|f| f.relative_path.split('/').next_back())
-            .collect();
-        let joined = names.join(", ");
-        return vec![if joined.len() > 40 {
-            crate::core::parser::truncate_to_char_boundary(&joined, 40).to_string()
-        } else {
-            joined
-        }];
+
+    // Build initial labels from path patterns or file names
+    let mut labels: Vec<Option<String>> = clusters
+        .iter()
+        .map(|(files, pattern)| {
+            if let Some(pp) = pattern {
+                Some(pp.clone())
+            } else if files.len() <= 3 {
+                // Small cluster: just use file names
+                let names: Vec<&str> = files
+                    .iter()
+                    .filter_map(|f| f.relative_path.split('/').next_back())
+                    .collect();
+                let joined = names.join(", ");
+                Some(if joined.len() > 40 {
+                    crate::core::parser::truncate_to_char_boundary(&joined, 40).to_string()
+                } else {
+                    joined
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // If all clusters are already labeled, skip LLM entirely
+    if labels.iter().all(|l| l.is_some()) {
+        return labels.into_iter().map(|l| l.unwrap()).collect();
     }
 
-    const MAX_FILES_PER_LABEL: usize = 15;
-
-    let descriptions: Vec<String> = clusters
+    // Collect indices of unlabeled clusters for batched LLM call
+    let unlabeled: Vec<usize> = labels
         .iter()
         .enumerate()
-        .map(|(i, (files, pattern))| {
+        .filter(|(_, l)| l.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    const MAX_FILES_PER_LABEL: usize = 10;
+
+    let descriptions: Vec<String> = unlabeled
+        .iter()
+        .enumerate()
+        .map(|(desc_idx, &cluster_idx)| {
+            let (files, _) = &clusters[cluster_idx];
             let sample_files = if files.len() > MAX_FILES_PER_LABEL {
                 &files[..MAX_FILES_PER_LABEL]
             } else {
@@ -396,69 +489,191 @@ async fn label_sibling_clusters(
                 })
                 .collect::<Vec<_>>()
                 .join("\n  ");
-            let pp = pattern
-                .as_ref()
-                .map(|p| format!(" (pattern: {})", p))
-                .unwrap_or_default();
-            let count_note = if files.len() > MAX_FILES_PER_LABEL {
-                format!(
-                    " ({} files total, showing {})",
-                    files.len(),
-                    MAX_FILES_PER_LABEL
-                )
-            } else {
-                format!(" ({} files)", files.len())
-            };
-            format!("Cluster {}{}{}:\n  {}", i + 1, pp, count_note, file_list)
+            format!(
+                "Cluster {} ({} files):\n  {}",
+                desc_idx + 1,
+                files.len(),
+                file_list
+            )
         })
         .collect();
 
     let prompt = format!(
-        r#"You are labeling clusters of code files. For each cluster below, produce EXACTLY one JSON array of objects, each with:
-- "overarchingTheme": a sentence about the cluster's theme
-- "distinguishingFeature": what makes this cluster unique vs siblings
-- "label": EXACTLY 2 words describing the cluster
-
-{}
-
-Respond with ONLY a JSON array of {} objects. No other text."#,
+        "Label each cluster with EXACTLY 2 words. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
         descriptions.join("\n\n"),
-        clusters.len()
+        unlabeled.len()
     );
 
-    match ollama.chat(&prompt).await {
-        Ok(response) => {
-            if let Some(json_str) = extract_json_array(&response) {
-                #[derive(Deserialize)]
-                struct ClusterLabel {
-                    label: Option<String>,
-                }
-                if let Ok(labels) = serde_json::from_str::<Vec<ClusterLabel>>(&json_str) {
-                    return labels
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            let base = l.label.unwrap_or_else(|| format!("Cluster {}", i + 1));
-                            if let Some(ref pp) = clusters[i].1 {
-                                format!("{} ({})", base, pp)
-                            } else {
-                                base
-                            }
-                        })
-                        .collect();
+    if let Ok(response) = ollama.chat(&prompt).await {
+        if let Some(json_str) = extract_json_array(&response) {
+            if let Ok(llm_labels) = serde_json::from_str::<Vec<String>>(&json_str) {
+                for (j, &cluster_idx) in unlabeled.iter().enumerate() {
+                    if let Some(label) = llm_labels.get(j) {
+                        labels[cluster_idx] = Some(label.clone());
+                    }
                 }
             }
-            clusters
-                .iter()
-                .enumerate()
-                .map(|(i, (_, pp))| pp.clone().unwrap_or_else(|| format!("Cluster {}", i + 1)))
-                .collect()
         }
-        Err(_) => clusters
-            .iter()
-            .enumerate()
-            .map(|(i, (_, pp))| pp.clone().unwrap_or_else(|| format!("Cluster {}", i + 1)))
-            .collect(),
+    }
+
+    // Fill any remaining unlabeled with a smart fallback:
+    // Find the deepest directory segment that distinguishes this cluster.
+    // In monorepos, parts[0] is always "packages" — useless. We want
+    // "domains/billing" or "platform/auth" or "frontend/hooks".
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            l.unwrap_or_else(|| {
+                let (files, _) = &clusters[i];
+                derive_cluster_label(files)
+                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+            })
+        })
+        .collect()
+}
+
+/// Derive a human-readable label for a cluster from its file paths.
+///
+/// Finds the deepest common path prefix, then picks the last 1-2 meaningful
+/// segments. In a monorepo where everything is under `packages/`, this yields
+/// labels like "domains/billing" or "platform/auth" instead of "packages".
+fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<Vec<&str>> = files
+        .iter()
+        .map(|f| f.relative_path.split('/').collect::<Vec<_>>())
+        .collect();
+
+    let min_depth = paths.iter().map(|p| p.len()).min().unwrap_or(0);
+    if min_depth < 2 {
+        return None;
+    }
+
+    // Find how deep the common prefix goes (excluding the filename)
+    let mut common_depth = 0;
+    for d in 0..min_depth.saturating_sub(1) {
+        if paths.iter().all(|p| p[d] == paths[0][d]) {
+            common_depth = d + 1;
+        } else {
+            break;
+        }
+    }
+
+    if common_depth == 0 {
+        // No common prefix — count the most frequent segment at depth 1
+        // (skip depth 0 which is often "packages" or "apps" in monorepos)
+        let mut seg_counts: HashMap<&str, usize> = HashMap::new();
+        for p in &paths {
+            let depth = if p.len() > 2 { 1 } else { 0 };
+            *seg_counts.entry(p[depth]).or_default() += 1;
+        }
+        return seg_counts
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .filter(|(_, c)| *c > files.len() / 3)
+            .map(|(seg, _)| seg.to_string());
+    }
+
+    // Use last 1-2 segments of the common prefix for the label.
+    // E.g., common prefix ["packages", "domains", "billing"] → "domains/billing"
+    let start = if common_depth >= 2 { common_depth - 2 } else { 0 };
+    let label_parts: Vec<&str> = (start..common_depth).map(|d| paths[0][d]).collect();
+    let label = label_parts.join("/");
+
+    // Skip labels that are just generic top-level dirs
+    if label == "packages" || label == "apps" || label == "src" || label == "lib" {
+        // Try one level deeper: find the most common next segment
+        if common_depth < min_depth.saturating_sub(1) {
+            let mut next_counts: HashMap<&str, usize> = HashMap::new();
+            for p in &paths {
+                *next_counts.entry(p[common_depth]).or_default() += 1;
+            }
+            return next_counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .filter(|(_, c)| *c > files.len() / 3)
+                .map(|(seg, _)| format!("{}/{}", label, seg));
+        }
+        return None;
+    }
+
+    Some(label)
+}
+
+/// Group files by meaningful directory structure for top-level clustering.
+///
+/// In a monorepo like `packages/domains/{billing,scheduling,...}`, groups by the
+/// deepest "interesting" directory level. Generic prefixes like `packages/` are
+/// skipped to find the actual domain boundary.
+///
+/// Returns `(label, indices)` pairs sorted by directory name.
+fn group_by_directory(files: &[FileInfo]) -> Vec<(String, Vec<usize>)> {
+    let generic_dirs: HashSet<&str> = ["packages", "src", "lib", "apps", "internal", "cmd"]
+        .iter()
+        .copied()
+        .collect();
+
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for (i, file) in files.iter().enumerate() {
+        let parts: Vec<&str> = file.relative_path.split('/').collect();
+
+        // Find the first "interesting" directory (skip generic prefixes)
+        // For "packages/domains/billing/service/index.ts" → "domains/billing"
+        // For "apps/emr-api/src/app.ts" → "emr-api"
+        // For "scripts/migration/run.ts" → "scripts"
+        let label = if parts.len() >= 3 {
+            // Try to find 2-level label skipping generics
+            let mut start = 0;
+            while start < parts.len().saturating_sub(2) && generic_dirs.contains(parts[start]) {
+                start += 1;
+            }
+            if start + 1 < parts.len().saturating_sub(1) {
+                format!("{}/{}", parts[start], parts[start + 1])
+            } else if start < parts.len().saturating_sub(1) {
+                parts[start].to_string()
+            } else {
+                parts[0].to_string()
+            }
+        } else if parts.len() == 2 {
+            parts[0].to_string()
+        } else {
+            "root".to_string()
+        };
+
+        groups.entry(label).or_default().push(i);
+    }
+
+    // Merge tiny groups (< 5 files) into an "other" bucket
+    let mut result: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut other: Vec<usize> = Vec::new();
+
+    for (label, indices) in groups {
+        if indices.len() < 5 {
+            other.extend(indices);
+        } else {
+            result.push((label, indices));
+        }
+    }
+
+    if !other.is_empty() {
+        result.push(("other".to_string(), other));
+    }
+
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Count total files in a cluster node (including all children recursively).
+fn count_files_in_node(node: &ClusterNode) -> usize {
+    if node.children.is_empty() {
+        node.files.len()
+    } else {
+        node.children.iter().map(count_files_in_node).sum()
     }
 }
 
@@ -500,7 +715,7 @@ async fn build_hierarchy(
 
     // Build local vectors slice for clustering (indices into all_vectors)
     let local_vectors: Vec<Vec<f32>> = indices.iter().map(|&i| all_vectors[i].clone()).collect();
-    let cluster_results = spectral_cluster(&local_vectors, max_clusters);
+    let cluster_results = spectral_cluster_with_min(&local_vectors, max_clusters, 2);
 
     if cluster_results.len() <= 1 {
         return ClusterNode {
@@ -534,27 +749,41 @@ async fn build_hierarchy(
             (file_refs, pattern.clone())
         })
         .collect();
+
+    // Label siblings FIRST (sequential) — Ollama serializes requests, so parallel
+    // labeling across depths causes queueing and timeouts. Labels at higher depths
+    // are more important (bigger clusters, less path info), so they go first.
     let labels = label_sibling_clusters(&label_input, ollama).await;
 
-    // Recurse into children
-    let mut children = Vec::new();
-    for (i, (child_indices, _pattern)) in child_index_groups.into_iter().enumerate() {
-        let mut child = Box::pin(build_hierarchy(
-            all_files,
-            all_vectors,
-            &child_indices,
-            max_clusters,
-            depth + 1,
-            max_depth,
-            ollama,
-        ))
-        .await;
-        child.label = labels
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("Cluster {}", i + 1));
-        children.push(child);
-    }
+    // Then recurse into children concurrently (no LLM calls in clustering itself).
+    let child_futures: Vec<_> = child_index_groups
+        .iter()
+        .map(|(child_indices, _pattern)| {
+            Box::pin(build_hierarchy(
+                all_files,
+                all_vectors,
+                child_indices,
+                max_clusters,
+                depth + 1,
+                max_depth,
+                ollama,
+            ))
+        })
+        .collect();
+
+    let child_results = futures::future::join_all(child_futures).await;
+
+    let children: Vec<ClusterNode> = child_results
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut child)| {
+            child.label = labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("Cluster {}", i + 1));
+            child
+        })
+        .collect();
 
     ClusterNode {
         label: String::new(),
@@ -1259,7 +1488,6 @@ mod tests {
             root_dir: "/tmp".to_string(),
             max_depth: None,
             max_clusters: None,
-            max_output_chars: None,
         };
         assert_eq!(opts.root_dir, "/tmp");
         assert!(opts.max_depth.is_none());
@@ -1272,7 +1500,6 @@ mod tests {
             root_dir: "/project".to_string(),
             max_depth: Some(5),
             max_clusters: Some(10),
-            max_output_chars: None,
         };
         assert_eq!(opts.max_depth, Some(5));
         assert_eq!(opts.max_clusters, Some(10));
@@ -1488,7 +1715,7 @@ mod tests {
     fn make_cache_entry(path: &str, vector: Vec<f32>) -> CacheEntry {
         let file = make_test_file(path);
         CacheEntry {
-            hash: content_hash(&file.content),
+            hash: content_hash(&format!("nav3:{}{}", file.relative_path, file.content)),
             vector,
         }
     }
@@ -1573,7 +1800,7 @@ mod tests {
         let r = cache.read().await;
         let entry = r.get("src/uncached.rs").unwrap();
         assert_eq!(entry.vector, vec![7.0, 8.0, 9.0]);
-        assert_eq!(entry.hash, content_hash("content of src/uncached.rs"));
+        assert_eq!(entry.hash, content_hash("nav3:src/uncached.rscontent of src/uncached.rs"));
     }
 
     #[tokio::test]
@@ -1672,6 +1899,6 @@ mod tests {
         let r = cache.read().await;
         let entry = r.get("src/changed.rs").unwrap();
         assert_eq!(entry.vector, vec![9.0, 9.0, 9.0]);
-        assert_eq!(entry.hash, content_hash("content of src/changed.rs"));
+        assert_eq!(entry.hash, content_hash("nav3:src/changed.rscontent of src/changed.rs"));
     }
 }

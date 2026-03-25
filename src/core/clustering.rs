@@ -8,7 +8,11 @@ use rayon::prelude::*;
 
 /// Matrices larger than this use randomized SVD instead of full eigendecomposition.
 /// Below this threshold, full `SymmetricEigen` is used (more accurate, still fast enough).
-const RANDOM_SVD_THRESHOLD: usize = 500;
+/// Disabled: randomized SVD produces incorrect eigenvalues for code embedding
+/// matrices (all values ~1.0 instead of true spectrum). Full eigendecomposition
+/// takes ~2s for n=1500 which is acceptable.
+/// TODO: debug the randomized_eigen implementation before re-enabling.
+const RANDOM_SVD_THRESHOLD: usize = usize::MAX;
 
 /// Result of clustering: each entry contains indices of files in that cluster.
 #[derive(Debug, Clone)]
@@ -195,27 +199,51 @@ fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     (eigenvalues, eigenvectors)
 }
 
-/// Use eigengap heuristic to find optimal k: largest gap in sorted eigenvalues.
+/// Use eigengap heuristic to find optimal k: largest relative gap in sorted eigenvalues.
 /// Eigenvalues are expected to already be sorted ascending (both full_eigen and
 /// randomized_eigen guarantee this), so we skip the redundant sort.
+///
+/// Key insight: eigenvalue[0] ≈ 0 is trivial for any connected graph (the constant
+/// eigenvector). The gap between eigenvalue[0] and eigenvalue[1] (the Fiedler gap)
+/// is always the largest absolute gap, which causes naive eigengap to always pick k=2.
+///
+/// Fix: use relative gaps (gap / eigenvalue_position) starting from k=3, and only
+/// fall back to k=2 if the k=2 gap is dramatically larger than all others.
 fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
-    // eigenvalues are pre-sorted ascending by our callers — no need to sort again
     if eigenvalues.len() <= 2 {
         return eigenvalues.len().min(2);
     }
 
     let limit = max_k.min(eigenvalues.len() - 1);
-    let mut best_gap = 0.0_f64;
-    let mut best_k = 2_usize;
 
-    for k in 2..=limit {
-        let gap = eigenvalues[k] - eigenvalues[k - 1];
-        if gap > best_gap {
-            best_gap = gap;
-            best_k = k;
-        }
+    // Compute all gaps
+    let gaps: Vec<(usize, f64)> = (2..=limit)
+        .map(|k| (k, eigenvalues[k] - eigenvalues[k - 1]))
+        .collect();
+
+    if gaps.is_empty() {
+        return 2;
     }
-    best_k
+
+    // Find the largest gap at k >= 3 (skipping the Fiedler gap at k=2)
+    let best_k3_plus = gaps.iter()
+        .filter(|(k, _)| *k >= 3)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Compare against k=2 gap
+    let gap_k2 = gaps[0].1; // gaps[0] is always k=2
+
+    if let Some(&(best_k, best_gap)) = best_k3_plus {
+        // Only use k=2 if its gap is overwhelmingly larger (5x) than the best k>=3 gap.
+        // This accounts for the Fiedler gap inflation in connected graphs.
+        if gap_k2 > best_gap * 5.0 {
+            2
+        } else {
+            best_k
+        }
+    } else {
+        2
+    }
 }
 
 /// K-means++ initialization + Lloyd's algorithm on the eigenvector embedding.
@@ -324,6 +352,16 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
 /// For matrices larger than `RANDOM_SVD_THRESHOLD`, uses randomized SVD (Halko-Martinsson-Tropp)
 /// which computes only the needed eigenvectors in O(n*k^2) instead of O(n^3).
 pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<ClusterResult> {
+    spectral_cluster_with_min(vectors, max_clusters, 2)
+}
+
+/// Spectral clustering with a configurable minimum cluster count.
+/// `min_clusters` forces at least this many clusters (capped by max_clusters and n).
+pub fn spectral_cluster_with_min(
+    vectors: &[Vec<f32>],
+    max_clusters: usize,
+    min_clusters: usize,
+) -> Vec<ClusterResult> {
     let n = vectors.len();
     if n <= 1 {
         return vec![ClusterResult {
@@ -339,6 +377,33 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
     }
 
     let affinity = build_affinity_matrix(vectors);
+
+    // Debug: affinity matrix statistics — if similarities are too uniform, clustering fails
+    {
+        let n_aff = affinity.nrows();
+        let mut sum = 0.0_f64;
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut count = 0_u64;
+        for i in 0..n_aff {
+            for j in (i + 1)..n_aff {
+                let v = affinity[(i, j)];
+                sum += v;
+                if v < min_val { min_val = v; }
+                if v > max_val { max_val = v; }
+                count += 1;
+            }
+        }
+        let mean = sum / count as f64;
+        tracing::info!(
+            n = n_aff,
+            mean_similarity = format!("{:.4}", mean),
+            min_similarity = format!("{:.4}", min_val),
+            max_similarity = format!("{:.4}", max_val),
+            "affinity matrix stats"
+        );
+    }
+
     let laplacian = normalized_laplacian(&affinity);
 
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
@@ -352,7 +417,22 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
         full_eigen(laplacian)
     };
 
-    let k = find_optimal_k(&eigenvalues, max_k);
+    // Debug: log eigenvalue spectrum to understand cluster selection
+    if eigenvalues.len() >= 2 {
+        let gaps: Vec<(usize, f64)> = (2..eigenvalues.len().min(max_k + 1))
+            .map(|k| (k, eigenvalues[k] - eigenvalues[k - 1]))
+            .collect();
+        tracing::info!(
+            n = n,
+            max_k = max_k,
+            eigenvalues_first_10 = ?&eigenvalues[..eigenvalues.len().min(10)],
+            gaps = ?gaps,
+            "spectral_cluster eigenvalue spectrum"
+        );
+    }
+
+    let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
+    tracing::info!(k = k, min_clusters = min_clusters, "spectral_cluster chose k");
 
     // Build embedding: rows of first k eigenvectors, row-normalized.
     // Eigenvalues/eigenvectors are already sorted ascending by full_eigen/randomized_eigen,
@@ -799,11 +879,9 @@ mod tests {
 
     #[test]
     fn threshold_selects_correct_path() {
-        // Verify RANDOM_SVD_THRESHOLD is reasonable (compile-time check)
-        const {
-            assert!(RANDOM_SVD_THRESHOLD >= 100);
-            assert!(RANDOM_SVD_THRESHOLD <= 1000);
-        }
+        // Randomized SVD is disabled (threshold = usize::MAX) because it produces
+        // incorrect eigenvalues for code embedding matrices. Full eigen is used instead.
+        assert_eq!(RANDOM_SVD_THRESHOLD, usize::MAX);
     }
 
     #[test]
