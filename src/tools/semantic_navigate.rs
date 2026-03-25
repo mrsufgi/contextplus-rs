@@ -232,7 +232,8 @@ pub async fn semantic_navigate(
         let descriptions: Vec<String> = llm_batch
             .iter()
             .enumerate()
-            .map(|(desc_idx, (_, _, file_refs))| {
+            .map(|(desc_idx, (gi, _, file_refs))| {
+                let parent_label = &pending_groups[*gi].label;
                 let sample = if file_refs.len() > MAX_FILES_PER_LABEL {
                     &file_refs[..MAX_FILES_PER_LABEL]
                 } else {
@@ -246,7 +247,7 @@ pub async fn semantic_navigate(
                     })
                     .collect::<Vec<_>>()
                     .join("\n  ");
-                format!("Cluster {} ({} files):\n  {}", desc_idx + 1, file_refs.len(), file_list)
+                format!("Cluster {} ({} files, within \"{}\"):\n  {}", desc_idx + 1, file_refs.len(), parent_label, file_list)
             })
             .collect();
 
@@ -281,6 +282,7 @@ pub async fn semantic_navigate(
             continue;
         }
 
+        let group_label = group.label.clone();
         let mut sub_children: Vec<ClusterNode> = Vec::new();
         for (ci, cluster) in group.cluster_results.iter().enumerate() {
             let global_indices: Vec<usize> = cluster.indices.iter().map(|&li| group.indices[li]).collect();
@@ -299,17 +301,31 @@ pub async fn semantic_navigate(
                     find_label_disambiguator(&refs)
                         .filter(|d| !label_matches_parent(d, &group.label))
                         .unwrap_or_else(|| {
-                            // Last resort: use the most common filename suffix
-                            let exts: Vec<&str> = refs.iter()
-                                .filter_map(|f| f.relative_path.split('.').last())
+                            // Last resort: most common directory segment after common prefix
+                            let refs2: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
+                            let paths: Vec<Vec<&str>> = refs2.iter()
+                                .map(|f| f.relative_path.split('/').collect::<Vec<_>>())
                                 .collect();
-                            let mut ext_counts: HashMap<&str, usize> = HashMap::new();
-                            for e in &exts { *ext_counts.entry(e).or_default() += 1; }
-                            let dominant_ext = ext_counts.into_iter()
-                                .max_by_key(|(_, c)| *c)
-                                .map(|(e, _)| e)
-                                .unwrap_or("files");
-                            format!("{} {} files", global_indices.len(), dominant_ext)
+                            let min_depth = paths.iter().map(|p| p.len()).min().unwrap_or(0);
+                            let mut common = 0;
+                            for d in 0..min_depth.saturating_sub(1) {
+                                if paths.iter().all(|p| p[d] == paths[0][d]) { common = d + 1; } else { break; }
+                            }
+                            if common < min_depth.saturating_sub(1) {
+                                let mut seg_counts: HashMap<&str, usize> = HashMap::new();
+                                for p in &paths {
+                                    if common < p.len().saturating_sub(1) {
+                                        *seg_counts.entry(p[common]).or_default() += 1;
+                                    }
+                                }
+                                if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
+                                    format!("{}", seg)
+                                } else {
+                                    format!("{} files", global_indices.len())
+                                }
+                            } else {
+                                format!("{} files", global_indices.len())
+                            }
                         })
                 }
             };
@@ -332,10 +348,36 @@ pub async fn semantic_navigate(
                         let raw_d2 = derive_cluster_label(&refs)
                             .or_else(|| find_label_disambiguator(&refs));
                         let d2_label = match raw_d2 {
-                            Some(l) if !label_matches_parent(&l, &label) => l,
+                            Some(l) if !label_matches_parent(&l, &label) && !label_matches_parent(&l, &group_label) => l,
                             _ => find_label_disambiguator(&refs)
-                                .filter(|d| !label_matches_parent(d, &label))
-                                .unwrap_or_else(|| format!("{} ts files", d2_indices.len())),
+                                .filter(|d| !label_matches_parent(d, &label) && !label_matches_parent(d, &group_label))
+                                .unwrap_or_else(|| {
+                                    // Last resort: most common directory segment after common prefix
+                                    let refs2: Vec<&FileInfo> = d2_indices.iter().map(|&i| &files[i]).collect();
+                                    let paths: Vec<Vec<&str>> = refs2.iter()
+                                        .map(|f| f.relative_path.split('/').collect::<Vec<_>>())
+                                        .collect();
+                                    let min_depth = paths.iter().map(|p| p.len()).min().unwrap_or(0);
+                                    let mut common = 0;
+                                    for d in 0..min_depth.saturating_sub(1) {
+                                        if paths.iter().all(|p| p[d] == paths[0][d]) { common = d + 1; } else { break; }
+                                    }
+                                    if common < min_depth.saturating_sub(1) {
+                                        let mut seg_counts: HashMap<&str, usize> = HashMap::new();
+                                        for p in &paths {
+                                            if common < p.len().saturating_sub(1) {
+                                                *seg_counts.entry(p[common]).or_default() += 1;
+                                            }
+                                        }
+                                        if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
+                                            format!("{}", seg)
+                                        } else {
+                                            format!("{} files", d2_indices.len())
+                                        }
+                                    } else {
+                                        format!("{} files", d2_indices.len())
+                                    }
+                                }),
                         };
                         depth2_children.push(ClusterNode {
                             label: d2_label,
@@ -952,6 +994,8 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             "package:", "package", "@generated", "generated",
             "description", "header", "index", "module",
             "todo", "fixme", "note", "hack",
+            "parameter", "file", "long_type_string", "generate_dependencies",
+            "syntax", "proto3", "tslint:disable", "protobuf-ts", "protobuf",
         ];
         let mut word_counts: HashMap<&str, usize> = HashMap::new();
         for f in files {
