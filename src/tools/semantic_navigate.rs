@@ -295,7 +295,7 @@ async fn resolve_embeddings(
     let mut uncached_hashes: Vec<String> = Vec::new();
 
     for (i, file) in files.iter().enumerate() {
-        // Hash includes "nav3:" prefix to:
+        // Hash includes version prefix (NAV_HASH_VERSION) to:
         // 1. Separate from semantic_code_search vectors (different embed format)
         // 2. Invalidate old navigate vectors (pre-path-weighting)
         // Bump the version number when the embed text format changes.
@@ -1907,7 +1907,7 @@ mod tests {
         let r = cache.read().await;
         let entry = r.get("src/changed.rs").unwrap();
         assert_eq!(entry.vector, vec![9.0, 9.0, 9.0]);
-        assert_eq!(entry.hash, content_hash("nav3:src/changed.rscontent of src/changed.rs"));
+        assert_eq!(entry.hash, nav_content_hash("src/changed.rs", "content of src/changed.rs"));
     }
 
     // ── group_by_directory tests ─────────────────────────────────────

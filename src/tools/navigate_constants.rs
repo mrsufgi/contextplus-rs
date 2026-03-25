@@ -26,7 +26,8 @@ pub const MAX_HEADER_LEN: usize = 200;
 
 /// Cache hash version prefix. Bump when embed text format changes
 /// to invalidate old cached vectors.
-const NAV_HASH_VERSION: &str = "nav3:";
+/// Bumped to nav4 for FNV-1a 64-bit hash (was djb2 32-bit in nav3).
+const NAV_HASH_VERSION: &str = "nav4:";
 
 /// Extensions accepted for semantic navigation (without leading dot).
 pub const NAVIGATE_EXTENSIONS: &[&str] = &[

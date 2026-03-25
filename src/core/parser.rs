@@ -3,41 +3,20 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// Java-style string hash, ported exactly from TypeScript.
-/// `hash = ((hash << 5) - hash) + charCode | 0` then base-36 encode.
+/// FNV-1a 64-bit hash for cache invalidation.
+/// Zero dependencies, ~2 ops per byte, 50% collision probability at ~4 billion entries.
+/// Replaces the original 32-bit JS djb2 hash which had collision risk at ~77K entries.
+/// Output is hex-encoded for compact, URL-safe cache keys.
 pub fn hash_content(text: &str) -> String {
-    let mut h: i32 = 0;
-    for byte in text.encode_utf16() {
-        h = h.wrapping_shl(5).wrapping_sub(h).wrapping_add(byte as i32);
-        // `| 0` in JS forces 32-bit signed integer — wrapping arithmetic does this in Rust
-    }
-    if h == 0 {
-        return "0".to_string();
-    }
-    // JS Number.prototype.toString(36) for negative numbers produces "-" + abs.toString(36)
-    if h < 0 {
-        format!("-{}", radix36(h.unsigned_abs()))
-    } else {
-        radix36(h as u32)
-    }
-}
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
 
-fn radix36(mut n: u32) -> String {
-    if n == 0 {
-        return "0".to_string();
+    let mut hash = FNV_OFFSET;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
-    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    // A u32 in base 36 needs at most 7 digits (36^7 > 2^32), use stack buffer.
-    let mut buf = [0u8; 7];
-    let mut len = 0usize;
-    while n > 0 {
-        buf[len] = DIGITS[(n % 36) as usize];
-        n /= 36;
-        len += 1;
-    }
-    buf[..len].reverse();
-    // SAFETY: buf contains only ASCII digits/lowercase letters from DIGITS.
-    unsafe { String::from_utf8_unchecked(buf[..len].to_vec()) }
+    format!("{:016x}", hash)
 }
 
 /// Truncate a string to at most `max_bytes` bytes, but never split a UTF-8 codepoint.
@@ -321,33 +300,31 @@ pub fn parse_with_regex_fallback(content: &str) -> Vec<CodeSymbol> {
 mod tests {
     use super::*;
 
-    // Cross-language hash verification: values computed from the TypeScript reference
+    // FNV-1a 64-bit hash tests — property-based (not cross-language reference values)
     #[test]
-    fn hash_content_hello() {
-        assert_eq!(hash_content("hello"), "1n1e4y");
+    fn hash_content_deterministic() {
+        assert_eq!(hash_content("hello"), hash_content("hello"));
+        assert_eq!(hash_content(""), hash_content(""));
     }
 
     #[test]
-    fn hash_content_empty() {
-        assert_eq!(hash_content(""), "0");
+    fn hash_content_different_inputs_differ() {
+        assert_ne!(hash_content("hello"), hash_content("world"));
+        assert_ne!(hash_content("abc"), hash_content("abd"));
+        assert_ne!(hash_content(""), hash_content("a"));
     }
 
     #[test]
-    fn hash_content_abc() {
-        assert_eq!(hash_content("abc"), "22ci");
+    fn hash_content_is_16_hex_chars() {
+        let h = hash_content("test");
+        assert_eq!(h.len(), 16, "FNV-1a 64-bit should produce 16 hex chars, got: {}", h);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in: {}", h);
     }
 
     #[test]
-    fn hash_content_unicode() {
-        assert_eq!(hash_content("Hello World!"), "-g0z65f");
-    }
-
-    #[test]
-    fn hash_content_long_string() {
-        assert_eq!(
-            hash_content("the quick brown fox jumps over the lazy dog"),
-            "-yg2171"
-        );
+    fn hash_content_empty_is_fnv_offset() {
+        // FNV-1a of empty input is the offset basis: 0xcbf29ce484222325
+        assert_eq!(hash_content(""), "cbf29ce484222325");
     }
 
     #[test]

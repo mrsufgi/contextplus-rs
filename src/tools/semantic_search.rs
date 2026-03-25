@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_hash_content_empty() {
-        assert_eq!(hash_content(""), "0");
+        assert_eq!(hash_content(""), "cbf29ce484222325");
     }
 
     #[test]
