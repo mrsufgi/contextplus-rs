@@ -778,11 +778,12 @@ async fn build_hierarchy(
         })
         .collect();
 
-    // Run labeling and child recursion concurrently.
-    // Labeling sends one batched LLM call while children do clustering (CPU-bound).
-    // Safe because Ollama serializes requests and each call is small (one group's siblings).
-    let label_future = label_sibling_clusters(&label_input, ollama);
+    // Label FIRST, then recurse. Sequential to avoid Ollama contention.
+    // Each LLM call takes ~11s on CPU. Concurrent labeling at multiple depths
+    // queues 10+ calls, causing 110s+ waits and timeouts.
+    let labels = label_sibling_clusters(&label_input, ollama).await;
 
+    // Then recurse into children (their labeling calls will run after ours complete)
     let child_futures: Vec<_> = child_index_groups
         .iter()
         .map(|(child_indices, _pattern)| {
@@ -798,11 +799,7 @@ async fn build_hierarchy(
         })
         .collect();
 
-    let (labels, child_results) = futures::future::join(
-        label_future,
-        futures::future::join_all(child_futures),
-    )
-    .await;
+    let child_results = futures::future::join_all(child_futures).await;
 
     let children: Vec<ClusterNode> = child_results
         .into_iter()
