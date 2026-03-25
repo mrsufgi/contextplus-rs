@@ -284,24 +284,34 @@ pub async fn semantic_navigate(
         let mut sub_children: Vec<ClusterNode> = Vec::new();
         for (ci, cluster) in group.cluster_results.iter().enumerate() {
             let global_indices: Vec<usize> = cluster.indices.iter().map(|&li| group.indices[li]).collect();
-            let label = llm_label_map.get(&(gi, ci))
-                .cloned()
-                .unwrap_or_else(|| {
-                    let refs: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
-                    derive_cluster_label(&refs)
-                        .or_else(|| find_label_disambiguator(&refs))
-                        .unwrap_or_else(|| format!("group {}", ci + 1))
-                });
-            // Don't repeat the parent group label as a child label
-            let label = if label.to_lowercase() == group.label.to_lowercase()
-                || group.label.to_lowercase().contains(&label.to_lowercase())
-                || label.to_lowercase().contains(&group.label.to_lowercase())
-            {
-                let refs: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
-                find_label_disambiguator(&refs)
-                    .unwrap_or_else(|| format!("group {}", ci + 1))
-            } else {
-                label
+            let refs: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
+
+            // Try multiple label sources in order of quality
+            let raw_label = llm_label_map.get(&(gi, ci)).cloned()
+                .or_else(|| derive_cluster_label(&refs))
+                .or_else(|| find_label_disambiguator(&refs));
+
+            // Check if the label duplicates the parent group name
+            let label = match raw_label {
+                Some(l) if !label_matches_parent(&l, &group.label) => l,
+                _ => {
+                    // Label matches parent or is None — use disambiguator
+                    find_label_disambiguator(&refs)
+                        .filter(|d| !label_matches_parent(d, &group.label))
+                        .unwrap_or_else(|| {
+                            // Last resort: use the most common filename suffix
+                            let exts: Vec<&str> = refs.iter()
+                                .filter_map(|f| f.relative_path.split('.').last())
+                                .collect();
+                            let mut ext_counts: HashMap<&str, usize> = HashMap::new();
+                            for e in &exts { *ext_counts.entry(e).or_default() += 1; }
+                            let dominant_ext = ext_counts.into_iter()
+                                .max_by_key(|(_, c)| *c)
+                                .map(|(e, _)| e)
+                                .unwrap_or("files");
+                            format!("{} {} files", global_indices.len(), dominant_ext)
+                        })
+                }
             };
 
             // Depth 2: for large sub-clusters, do one more round of spectral clustering
@@ -319,9 +329,14 @@ pub async fn semantic_navigate(
                     for sub_cluster in &sub_results {
                         let d2_indices: Vec<usize> = sub_cluster.indices.iter().map(|&li| global_indices[li]).collect();
                         let refs: Vec<&FileInfo> = d2_indices.iter().map(|&i| &files[i]).collect();
-                        let d2_label = derive_cluster_label(&refs)
-                            .or_else(|| find_label_disambiguator(&refs))
-                            .unwrap_or_else(|| format!("group {}", depth2_children.len() + 1));
+                        let raw_d2 = derive_cluster_label(&refs)
+                            .or_else(|| find_label_disambiguator(&refs));
+                        let d2_label = match raw_d2 {
+                            Some(l) if !label_matches_parent(&l, &label) => l,
+                            _ => find_label_disambiguator(&refs)
+                                .filter(|d| !label_matches_parent(d, &label))
+                                .unwrap_or_else(|| format!("{} ts files", d2_indices.len())),
+                        };
                         depth2_children.push(ClusterNode {
                             label: d2_label,
                             files: d2_indices.iter().map(|&i| files[i].clone()).collect(),
@@ -588,8 +603,15 @@ async fn resolve_embeddings(
         .collect())
 }
 
-/// Deduplicate sibling cluster labels by appending disambiguators.
-/// E.g., "domains/scheduling" ×3 → "domains/scheduling (tests)", "domains/scheduling (service)", "domains/scheduling #3"
+/// Check if a label is essentially the same as its parent group label.
+fn label_matches_parent(label: &str, parent: &str) -> bool {
+    let l = label.to_lowercase();
+    let p = parent.to_lowercase();
+    l == p || p.contains(&l) || l.contains(&p)
+}
+
+/// Deduplicate sibling cluster labels by REPLACING duplicates with disambiguators.
+/// E.g., "scheduling" ×3 → "tests", "service", "repository" (not "scheduling (tests)")
 fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileInfo>, Option<String>)]) {
     let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, label) in labels.iter().enumerate() {
@@ -600,24 +622,41 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
         if indices.len() <= 1 {
             continue;
         }
-        for (seq, &idx) in indices.iter().enumerate() {
-            if idx < clusters.len() {
-                let (files, _) = &clusters[idx];
-                if let Some(disambig) = find_label_disambiguator(files) {
-                    labels[idx] = format!("{} ({})", labels[idx], disambig);
+        // Collect disambiguators for all duplicates first
+        let disambigs: Vec<(usize, Option<String>)> = indices
+            .iter()
+            .map(|&idx| {
+                if idx < clusters.len() {
+                    let (files, _) = &clusters[idx];
+                    (idx, find_label_disambiguator(files))
                 } else {
-                    labels[idx] = format!("{} #{}", labels[idx], seq + 1);
+                    (idx, None)
                 }
+            })
+            .collect();
+
+        // Check if all disambiguators are the same (e.g., all "tests")
+        let unique_disambigs: HashSet<String> = disambigs.iter()
+            .filter_map(|(_, d)| d.clone())
+            .collect();
+
+        if unique_disambigs.len() >= 2 {
+            // Good — disambiguators are different. REPLACE the label entirely.
+            for (idx, disambig) in &disambigs {
+                if let Some(d) = disambig {
+                    labels[*idx] = d.clone();
+                }
+                // Leave None ones unchanged (they'll get #N in second pass)
             }
         }
+        // If all disambiguators are identical or None, skip — second pass handles it
     }
 
-    // Second pass: if disambiguators created NEW duplicates (e.g., both got "tests"),
-    // fall back to #N suffixes to guarantee uniqueness.
-    let mut still_duped: HashMap<String, usize> = HashMap::new();
+    // Second pass: guarantee uniqueness with #N for any remaining duplicates
+    let mut final_seen: HashMap<String, usize> = HashMap::new();
     for label in labels.iter_mut() {
         let key = label.to_lowercase();
-        let count = still_duped.entry(key).or_insert(0);
+        let count = final_seen.entry(key).or_insert(0);
         *count += 1;
         if *count > 1 {
             *label = format!("{} #{}", label, count);
