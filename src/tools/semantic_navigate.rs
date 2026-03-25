@@ -213,11 +213,23 @@ pub async fn semantic_navigate(
         }
     }
 
-    // ONE LLM call for ALL sub-clusters across ALL groups
+    // Batch LLM call for sub-clusters. Cap at 10 clusters per call to keep
+    // prompt size manageable (~11s for 4 clusters, ~30s for 10).
+    // Clusters beyond the cap use path-based fallbacks.
+    const MAX_LLM_CLUSTERS: usize = 10;
     let mut llm_label_map: HashMap<(usize, usize), String> = HashMap::new();
-    if !all_sublabels.is_empty() {
+
+    // Sort by file count descending — label the biggest clusters with LLM first
+    all_sublabels.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
+    let llm_batch = if all_sublabels.len() > MAX_LLM_CLUSTERS {
+        &all_sublabels[..MAX_LLM_CLUSTERS]
+    } else {
+        &all_sublabels
+    };
+
+    if !llm_batch.is_empty() {
         const MAX_FILES_PER_LABEL: usize = 5;
-        let descriptions: Vec<String> = all_sublabels
+        let descriptions: Vec<String> = llm_batch
             .iter()
             .enumerate()
             .map(|(desc_idx, (_, _, file_refs))| {
@@ -241,13 +253,13 @@ pub async fn semantic_navigate(
         let prompt = format!(
             "Label each cluster with EXACTLY 2 words. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
             descriptions.join("\n\n"),
-            all_sublabels.len()
+            llm_batch.len()
         );
 
         if let Ok(response) = ollama.chat(&prompt).await {
             if let Some(json_str) = extract_json_array(&response) {
                 if let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str) {
-                    for (j, (gi, ci, _)) in all_sublabels.iter().enumerate() {
+                    for (j, (gi, ci, _)) in llm_batch.iter().enumerate() {
                         if let Some(label) = labels.get(j) {
                             llm_label_map.insert((*gi, *ci), label.clone());
                         }
