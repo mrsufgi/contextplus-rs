@@ -1,16 +1,14 @@
 //! Warmup tool: pre-embed files with path-weighted format for semantic_navigate.
 use contextplus_rs::cache::rkyv_store;
 use contextplus_rs::config::Config;
-use contextplus_rs::core::embeddings::{CacheEntry, OllamaClient, VectorStore, content_hash};
+use contextplus_rs::core::embeddings::{CacheEntry, OllamaClient, VectorStore};
 use contextplus_rs::core::walker;
+use contextplus_rs::tools::navigate_constants::{
+    MAX_CONTENT_CHARS, MAX_NAVIGATE_FILES, NAVIGATE_EXTENSIONS,
+    nav_cache_name, nav_content_hash, nav_embed_text,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-
-const NAVIGATE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java",
-    "rb", "sh", "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
-];
-const MAX_NAVIGATE_FILES: usize = 1500;
 
 #[tokio::main]
 async fn main() {
@@ -34,8 +32,8 @@ async fn main() {
             if meta.len() > max_size { continue; }
         }
         if let Ok(content) = std::fs::read_to_string(&entry.path) {
-            let truncated = if content.len() > 500 {
-                contextplus_rs::core::parser::truncate_to_char_boundary(&content, 500).to_string()
+            let truncated = if content.len() > MAX_CONTENT_CHARS {
+                contextplus_rs::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS).to_string()
             } else { content };
             files.push((entry.relative_path, truncated));
         }
@@ -58,7 +56,7 @@ async fn main() {
     println!("Processing {} files with path-weighted embedding", files.len());
 
     // Load existing cache
-    let cache_name = format!("navigate-{}", config.ollama_embed_model);
+    let cache_name = nav_cache_name(&config.ollama_embed_model);
     let mut cache: HashMap<String, CacheEntry> = HashMap::new();
     if let Ok(Some(store)) = rkyv_store::load_vector_store(root, &cache_name) {
         let dims = store.dims() as usize;
@@ -80,13 +78,13 @@ async fn main() {
     let mut nav_hashes: Vec<String> = Vec::new();
 
     for (i, (path, content)) in files.iter().enumerate() {
-        let nav_hash = content_hash(&format!("nav3:{}{}", path, content));
+        let nav_hash = nav_content_hash(path, content);
         nav_hashes.push(nav_hash.clone());
 
         if let Some(entry) = cache.get(path) {
             if entry.hash == nav_hash { continue; }
         }
-        let embed_text = format!("{p} {p} {p} {content}", p = path);
+        let embed_text = nav_embed_text(path, "", content);
         uncached.push((i, embed_text));
     }
 

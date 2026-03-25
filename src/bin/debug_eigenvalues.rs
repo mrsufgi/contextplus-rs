@@ -2,13 +2,15 @@
 
 use contextplus_rs::cache::rkyv_store;
 use contextplus_rs::core::clustering::spectral_cluster_with_min;
+use contextplus_rs::tools::navigate_constants::{MAX_NAVIGATE_FILES, nav_cache_name};
 use std::path::Path;
 
 fn main() {
     let root = Path::new("/workspace");
-    let cache_name = "navigate-nomic-embed-text";
+    let model = std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
+    let cache_name = nav_cache_name(&model);
 
-    let store = rkyv_store::load_vector_store(root, cache_name)
+    let store = rkyv_store::load_vector_store(root, &cache_name)
         .expect("Failed to load embedding cache")
         .expect("No cache file found");
 
@@ -23,11 +25,10 @@ fn main() {
         .map(|i| flat[i * dims..(i + 1) * dims].to_vec())
         .collect();
 
-    // Sample to 1500 to match semantic_navigate behavior
-    let max_files = 1500;
-    let vectors: Vec<Vec<f32>> = if all_vectors.len() > max_files {
-        let step = all_vectors.len() as f64 / max_files as f64;
-        (0..max_files)
+    // Sample to MAX_NAVIGATE_FILES to match semantic_navigate behavior
+    let vectors: Vec<Vec<f32>> = if all_vectors.len() > MAX_NAVIGATE_FILES {
+        let step = all_vectors.len() as f64 / MAX_NAVIGATE_FILES as f64;
+        (0..MAX_NAVIGATE_FILES)
             .map(|i| {
                 let idx = (i as f64 * step).floor() as usize;
                 all_vectors[idx.min(all_vectors.len() - 1)].clone()

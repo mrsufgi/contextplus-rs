@@ -5,27 +5,14 @@ use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::core::clustering::{find_path_pattern, spectral_cluster_with_min};
 use crate::core::embeddings::VectorStore;
-use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
+use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::walker;
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
-const MAX_FILES_PER_LEAF: usize = 20;
-
-/// Maximum files to cluster. Workspaces larger than this are sampled to keep
-/// spectral clustering (O(n²) affinity matrix) and Ollama labeling tractable.
-const MAX_NAVIGATE_FILES: usize = 1500;
-
-/// Extensions accepted for semantic navigation (without leading dot).
-/// Superset of tree_sitter::get_supported_extensions — includes data formats
-/// (sql, graphql, proto, yaml, yml, toml, json) that tree-sitter doesn't parse
-/// but are useful for clustering.
-const NAVIGATE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "cpp", "h", "hpp", "cc",
-    "rb", "sh", "bash", "zsh", "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
-];
+use super::navigate_constants::*;
 
 /// Options for the semantic navigation tool.
 #[derive(Debug, Clone)]
@@ -94,7 +81,7 @@ pub async fn semantic_navigate(
     // Navigate uses its OWN embedding cache (not the shared one from semantic_code_search).
     // Navigate embeds with path-weighted text ("{path} {path} {path} {header} {content}")
     // which produces different vectors than search ("{lang} {content}").
-    let nav_cache_name = format!("navigate-{}", config.ollama_embed_model);
+    let nav_cache_name = nav_cache_name(&config.ollama_embed_model);
     let mut nav_cache: HashMap<String, CacheEntry> = HashMap::new();
     if let Ok(Some(store)) = rkyv_store::load_vector_store(root_dir, &nav_cache_name) {
         let dims = store.dims() as usize;
@@ -130,7 +117,7 @@ pub async fn semantic_navigate(
 
     if files.len() <= MAX_FILES_PER_LEAF {
         // Small project: just list files with labels
-        let file_labels = label_files(&files, ollama).await;
+        let file_labels = label_files(&files).await;
         let mut lines = vec![format!("Semantic Navigator: {} files\n", files.len())];
         for (i, file) in files.iter().enumerate() {
             let symbols = if file.symbol_preview.is_empty() {
@@ -253,8 +240,8 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
         }
         if let Ok(content) = tokio::fs::read_to_string(&entry.path).await {
             let header = extract_header(&content);
-            let truncated_content = if content.len() > 500 {
-                crate::core::parser::truncate_to_char_boundary(&content, 500).to_string()
+            let truncated_content = if content.len() > MAX_CONTENT_CHARS {
+                crate::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS).to_string()
             } else {
                 content
             };
@@ -297,7 +284,7 @@ async fn resolve_embeddings(
         // 1. Separate from semantic_code_search vectors (different embed format)
         // 2. Invalidate old navigate vectors (pre-path-weighting)
         // Bump the version number when the embed text format changes.
-        let file_hash = content_hash(&format!("nav3:{}{}", file.relative_path, file.content));
+        let file_hash = nav_content_hash(&file.relative_path, &file.content);
         if let Some(entry) = cache_read.get(&file.relative_path) {
             if entry.hash == file_hash {
                 // Cache hit: content unchanged
@@ -309,22 +296,14 @@ async fn resolve_embeddings(
                 // Path-weighted embed text: repeat path 3x to boost domain signal.
                 // Code embeddings capture structural patterns (imports, patterns),
                 // path captures domain identity (billing vs scheduling vs IAM).
-                uncached_texts.push(format!(
-                    "{p} {p} {p} {h} {c}",
-                    p = file.relative_path,
-                    h = file.header,
-                    c = file.content
-                ));
+                uncached_texts.push(nav_embed_text(&file.relative_path, &file.header, &file.content));
                 uncached_hashes.push(file_hash);
             }
         } else {
             // Cache miss: never seen this file
             result_vectors.push(None);
             uncached_indices.push(i);
-            uncached_texts.push(format!(
-                "{} {} {}",
-                file.header, file.relative_path, file.content
-            ));
+            uncached_texts.push(nav_embed_text(&file.relative_path, &file.header, &file.content));
             uncached_hashes.push(file_hash);
         }
     }
@@ -380,9 +359,9 @@ async fn resolve_embeddings(
 }
 
 /// Extract a header comment from the first few lines of a file.
-fn extract_header(content: &str) -> String {
+pub fn extract_header(content: &str) -> String {
     let mut header_lines = Vec::new();
-    for line in content.lines().take(5) {
+    for line in content.lines().take(MAX_HEADER_LINES) {
         let trimmed = line.trim();
         if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("--") {
             let cleaned = trimmed
@@ -396,15 +375,15 @@ fn extract_header(content: &str) -> String {
         }
     }
     let joined = header_lines.join(" ");
-    if joined.len() > 200 {
-        crate::core::parser::truncate_to_char_boundary(&joined, 200).to_string()
+    if joined.len() > MAX_HEADER_LEN {
+        crate::core::parser::truncate_to_char_boundary(&joined, MAX_HEADER_LEN).to_string()
     } else {
         joined
     }
 }
 
 /// Label files using Ollama chat for small sets.
-async fn label_files(files: &[FileInfo], _ollama: &OllamaClient) -> Vec<String> {
+async fn label_files(files: &[FileInfo]) -> Vec<String> {
     // For small file sets (≤ MAX_FILES_PER_LEAF), headers are descriptive enough.
     // Skip LLM call entirely — saves ~6s per invocation.
     files.iter().map(|f| {
@@ -648,12 +627,12 @@ fn group_by_directory(files: &[FileInfo]) -> Vec<(String, Vec<usize>)> {
         groups.entry(label).or_default().push(i);
     }
 
-    // Merge tiny groups (< 5 files) into an "other" bucket
+    // Merge tiny groups (< 15 files) into an "other" bucket
     let mut result: Vec<(String, Vec<usize>)> = Vec::new();
     let mut other: Vec<usize> = Vec::new();
 
     for (label, indices) in groups {
-        if indices.len() < 5 {
+        if indices.len() < MIN_DIR_GROUP_SIZE {
             other.extend(indices);
         } else {
             result.push((label, indices));
@@ -726,7 +705,25 @@ async fn build_hierarchy(
         };
     }
 
-    // Map cluster result indices (into local_vectors) back to global indices
+    // Find the parent's common prefix to suppress redundant path_patterns.
+    // Within a directory group, all files share e.g. "packages/domains/billing/",
+    // so find_path_pattern always returns "packages/domains/billing/*" — useless.
+    // Only keep path_pattern if it's MORE specific than the parent prefix.
+    let parent_prefix = {
+        let parts: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect::<Vec<_>>()).collect();
+        let min_depth = parts.iter().map(|p| p.len()).min().unwrap_or(0);
+        let mut prefix_depth = 0;
+        for d in 0..min_depth.saturating_sub(1) {
+            if parts.iter().all(|p| p[d] == parts[0][d]) {
+                prefix_depth = d + 1;
+            } else {
+                break;
+            }
+        }
+        prefix_depth
+    };
+
+    // Map cluster result indices back to global indices
     let child_index_groups: Vec<(Vec<usize>, Option<String>)> = cluster_results
         .iter()
         .map(|cluster| {
@@ -737,7 +734,13 @@ async fn build_hierarchy(
                 .map(|&gi| all_files[gi].relative_path.clone())
                 .collect();
             let pattern = find_path_pattern(&child_paths);
-            (global_indices, pattern)
+            // Suppress pattern if it's just the parent prefix + "*"
+            // (e.g., "packages/domains/billing/*" when parent is "packages/domains/billing/")
+            let useful_pattern = pattern.filter(|p| {
+                let p_depth = p.split('/').count();
+                p_depth > parent_prefix + 1
+            });
+            (global_indices, useful_pattern)
         })
         .collect();
 
@@ -750,12 +753,11 @@ async fn build_hierarchy(
         })
         .collect();
 
-    // Label siblings FIRST (sequential) — Ollama serializes requests, so parallel
-    // labeling across depths causes queueing and timeouts. Labels at higher depths
-    // are more important (bigger clusters, less path info), so they go first.
-    let labels = label_sibling_clusters(&label_input, ollama).await;
+    // Run labeling and child recursion concurrently.
+    // Labeling sends one batched LLM call while children do clustering (CPU-bound).
+    // Safe because Ollama serializes requests and each call is small (one group's siblings).
+    let label_future = label_sibling_clusters(&label_input, ollama);
 
-    // Then recurse into children concurrently (no LLM calls in clustering itself).
     let child_futures: Vec<_> = child_index_groups
         .iter()
         .map(|(child_indices, _pattern)| {
@@ -771,7 +773,11 @@ async fn build_hierarchy(
         })
         .collect();
 
-    let child_results = futures::future::join_all(child_futures).await;
+    let (labels, child_results) = futures::future::join(
+        label_future,
+        futures::future::join_all(child_futures),
+    )
+    .await;
 
     let children: Vec<ClusterNode> = child_results
         .into_iter()
@@ -798,8 +804,20 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
     let pad = "  ".repeat(indent);
     let mut result = String::new();
 
-    if !node.label.is_empty() {
-        result.push_str(&format!("{}[{}]\n", pad, node.label));
+    if !node.label.is_empty() || node.path_pattern.is_some() {
+        let count = count_files_in_node(node);
+        let display_label = match (&node.label, &node.path_pattern) {
+            (label, Some(pattern)) if label.is_empty() => {
+                format!("{}[{}] ({} files)\n", pad, pattern, count)
+            }
+            (label, Some(pattern)) => {
+                format!("{}[{} ({})] ({} files)\n", pad, label, pattern, count)
+            }
+            (label, None) => {
+                format!("{}[{}] ({} files)\n", pad, label, count)
+            }
+        };
+        result.push_str(&display_label);
     }
 
     if !node.children.is_empty() {
@@ -807,7 +825,8 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
             result.push_str(&render_cluster_tree(child, indent + 1));
         }
     } else {
-        for file in &node.files {
+        let show_count = node.files.len().min(MAX_FILES_PER_LEAF_DISPLAY);
+        for file in node.files.iter().take(show_count) {
             let label = if file.header.is_empty() {
                 String::new()
             } else {
@@ -823,6 +842,13 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
                 pad, file.relative_path, label, symbols
             ));
         }
+        if node.files.len() > MAX_FILES_PER_LEAF_DISPLAY {
+            result.push_str(&format!(
+                "{}  (+{} more files)\n",
+                pad,
+                node.files.len() - MAX_FILES_PER_LEAF_DISPLAY
+            ));
+        }
     }
 
     result
@@ -831,6 +857,7 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::embeddings::content_hash;
 
     #[test]
     fn extract_header_comment_slashes() {
@@ -1715,7 +1742,7 @@ mod tests {
     fn make_cache_entry(path: &str, vector: Vec<f32>) -> CacheEntry {
         let file = make_test_file(path);
         CacheEntry {
-            hash: content_hash(&format!("nav3:{}{}", file.relative_path, file.content)),
+            hash: nav_content_hash(&file.relative_path, &file.content),
             vector,
         }
     }
@@ -1800,7 +1827,7 @@ mod tests {
         let r = cache.read().await;
         let entry = r.get("src/uncached.rs").unwrap();
         assert_eq!(entry.vector, vec![7.0, 8.0, 9.0]);
-        assert_eq!(entry.hash, content_hash("nav3:src/uncached.rscontent of src/uncached.rs"));
+        assert_eq!(entry.hash, nav_content_hash("src/uncached.rs", "content of src/uncached.rs"));
     }
 
     #[tokio::test]
@@ -1900,5 +1927,143 @@ mod tests {
         let entry = r.get("src/changed.rs").unwrap();
         assert_eq!(entry.vector, vec![9.0, 9.0, 9.0]);
         assert_eq!(entry.hash, content_hash("nav3:src/changed.rscontent of src/changed.rs"));
+    }
+
+    // ── group_by_directory tests ─────────────────────────────────────
+
+    #[test]
+    fn group_by_directory_monorepo_domains() {
+        let mut files = Vec::new();
+        // Need >= MIN_DIR_GROUP_SIZE (15) files per group to avoid merging into "other"
+        for i in 0..16 {
+            files.push(make_test_file(&format!("packages/domains/billing/file{}.ts", i)));
+        }
+        for i in 0..16 {
+            files.push(make_test_file(&format!("packages/domains/scheduling/file{}.ts", i)));
+        }
+        let groups = group_by_directory(&files);
+        let labels: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
+        assert!(labels.contains(&"domains/billing"), "Expected 'domains/billing', got {:?}", labels);
+        assert!(labels.contains(&"domains/scheduling"), "Expected 'domains/scheduling', got {:?}", labels);
+    }
+
+    #[test]
+    fn group_by_directory_root_files() {
+        let files = vec![
+            make_test_file("main.rs"),
+            make_test_file("Cargo.toml"),
+        ];
+        let groups = group_by_directory(&files);
+        // Both are single-component paths → "root" label, but < MIN_DIR_GROUP_SIZE → merged to "other"
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "other");
+        assert_eq!(groups[0].1.len(), 2);
+    }
+
+    #[test]
+    fn group_by_directory_empty() {
+        let groups = group_by_directory(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_by_directory_merges_tiny_groups() {
+        // Create two groups each with < MIN_DIR_GROUP_SIZE files
+        let mut files = Vec::new();
+        for i in 0..3 {
+            files.push(make_test_file(&format!("alpha/deep/file{}.ts", i)));
+        }
+        for i in 0..3 {
+            files.push(make_test_file(&format!("beta/deep/file{}.ts", i)));
+        }
+        let groups = group_by_directory(&files);
+        // Both groups have 3 files (< 15), so all should merge into "other"
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "other");
+        assert_eq!(groups[0].1.len(), 6);
+    }
+
+    // ── derive_cluster_label tests ───────────────────────────────────
+
+    #[test]
+    fn derive_cluster_label_deep_common_prefix() {
+        let files: Vec<FileInfo> = (0..5)
+            .map(|i| make_test_file(&format!("packages/domains/billing/file{}.ts", i)))
+            .collect();
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert!(label.is_some());
+        let l = label.unwrap();
+        assert!(l.contains("billing"), "Expected 'billing' in label, got '{}'", l);
+    }
+
+    #[test]
+    fn derive_cluster_label_generic_prefix_fallback() {
+        let files: Vec<FileInfo> = vec![
+            make_test_file("src/controllers/auth.ts"),
+            make_test_file("src/controllers/user.ts"),
+            make_test_file("src/controllers/billing.ts"),
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        // "src" is generic → should look deeper → "src/controllers"
+        assert!(label.is_some());
+        let l = label.unwrap();
+        assert!(l.contains("controllers"), "Expected 'controllers' in label, got '{}'", l);
+    }
+
+    #[test]
+    fn derive_cluster_label_empty() {
+        let label = derive_cluster_label(&[]);
+        assert_eq!(label, None);
+    }
+
+    #[test]
+    fn derive_cluster_label_no_common_prefix() {
+        let files: Vec<FileInfo> = vec![
+            make_test_file("alpha/foo.ts"),
+            make_test_file("beta/bar.ts"),
+            make_test_file("gamma/baz.ts"),
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        // No common prefix, no dominant segment → None
+        assert_eq!(label, None);
+    }
+
+    // ── count_files_in_node tests ────────────────────────────────────
+
+    #[test]
+    fn count_files_leaf_node() {
+        let node = ClusterNode {
+            label: "test".to_string(),
+            path_pattern: None,
+            files: vec![make_test_file("a.rs"), make_test_file("b.rs")],
+            children: Vec::new(),
+        };
+        assert_eq!(count_files_in_node(&node), 2);
+    }
+
+    #[test]
+    fn count_files_nested_children() {
+        let child1 = ClusterNode {
+            label: "c1".to_string(),
+            path_pattern: None,
+            files: vec![make_test_file("a.rs"), make_test_file("b.rs"), make_test_file("c.rs")],
+            children: Vec::new(),
+        };
+        let child2 = ClusterNode {
+            label: "c2".to_string(),
+            path_pattern: None,
+            files: vec![make_test_file("d.rs"), make_test_file("e.rs")],
+            children: Vec::new(),
+        };
+        let parent = ClusterNode {
+            label: "parent".to_string(),
+            path_pattern: None,
+            files: Vec::new(),
+            children: vec![child1, child2],
+        };
+        assert_eq!(count_files_in_node(&parent), 5);
     }
 }
