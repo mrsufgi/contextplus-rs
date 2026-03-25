@@ -289,8 +289,20 @@ pub async fn semantic_navigate(
                 .unwrap_or_else(|| {
                     let refs: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
                     derive_cluster_label(&refs)
-                        .unwrap_or_else(|| format!("Cluster {}", ci + 1))
+                        .or_else(|| find_label_disambiguator(&refs))
+                        .unwrap_or_else(|| format!("group {}", ci + 1))
                 });
+            // Don't repeat the parent group label as a child label
+            let label = if label.to_lowercase() == group.label.to_lowercase()
+                || group.label.to_lowercase().contains(&label.to_lowercase())
+                || label.to_lowercase().contains(&group.label.to_lowercase())
+            {
+                let refs: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
+                find_label_disambiguator(&refs)
+                    .unwrap_or_else(|| format!("group {}", ci + 1))
+            } else {
+                label
+            };
 
             // Depth 2: for large sub-clusters, do one more round of spectral clustering
             if global_indices.len() > MAX_FILES_PER_LEAF && max_depth > 2 {
@@ -308,7 +320,8 @@ pub async fn semantic_navigate(
                         let d2_indices: Vec<usize> = sub_cluster.indices.iter().map(|&li| global_indices[li]).collect();
                         let refs: Vec<&FileInfo> = d2_indices.iter().map(|&i| &files[i]).collect();
                         let d2_label = derive_cluster_label(&refs)
-                            .unwrap_or_else(|| format!("Cluster {}", depth2_children.len() + 1));
+                            .or_else(|| find_label_disambiguator(&refs))
+                            .unwrap_or_else(|| format!("group {}", depth2_children.len() + 1));
                         depth2_children.push(ClusterNode {
                             label: d2_label,
                             files: d2_indices.iter().map(|&i| files[i].clone()).collect(),
@@ -598,6 +611,18 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
             }
         }
     }
+
+    // Second pass: if disambiguators created NEW duplicates (e.g., both got "tests"),
+    // fall back to #N suffixes to guarantee uniqueness.
+    let mut still_duped: HashMap<String, usize> = HashMap::new();
+    for label in labels.iter_mut() {
+        let key = label.to_lowercase();
+        let count = still_duped.entry(key).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            *label = format!("{} #{}", label, count);
+        }
+    }
 }
 
 /// Find a disambiguator for a cluster — checks for test files, architecture layers, etc.
@@ -883,10 +908,16 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
 
     // Last resort: use the most common header keyword
     {
+        const LABEL_BLOCKLIST: &[&str] = &[
+            "no", "the", "for", "and", "from", "with", "this", "that",
+            "package:", "package", "@generated", "generated",
+            "description", "header", "index", "module",
+            "todo", "fixme", "note", "hack",
+        ];
         let mut word_counts: HashMap<&str, usize> = HashMap::new();
         for f in files {
             for word in f.header.split_whitespace() {
-                if word.len() >= 4 {
+                if word.len() >= 4 && !LABEL_BLOCKLIST.contains(&word.to_lowercase().as_str()) {
                     *word_counts.entry(word).or_default() += 1;
                 }
             }
@@ -2452,6 +2483,42 @@ mod tests {
         // Should either return "useC" (full prefix) or fall through to another heuristic
         if let Some(l) = &label {
             assert_ne!(l, "use", "Should not return 'use' (too short after camelCase trim)");
+        }
+    }
+
+    #[test]
+    fn deduplicate_labels_same_disambiguator_gets_numbered() {
+        // Both clusters are test files, both get disambiguator "tests"
+        // Should end up as different labels, not "tests (tests)" x2
+        let test_files1: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "pkg/a.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/b.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let test_files2: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "pkg/c.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/d.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
+            (test_files1.iter().collect(), None),
+            (test_files2.iter().collect(), None),
+        ];
+        let mut labels = vec!["tests".to_string(), "tests".to_string()];
+        deduplicate_sibling_labels(&mut labels, &clusters);
+        assert_ne!(labels[0], labels[1], "Labels should differ after dedup: {:?}", labels);
+    }
+
+    #[test]
+    fn derive_cluster_label_header_blocklist() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "gen/a.ts".into(), header: "@generated by protobuf-ts".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "gen/b.ts".into(), header: "@generated by protobuf-ts".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "gen/c.ts".into(), header: "@generated by protobuf-ts".into(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        if let Some(l) = &label {
+            assert!(!l.to_lowercase().contains("@generated"), "Should not use @generated as label: {}", l);
+            assert!(l != "generated", "Should not use 'generated' as label");
         }
     }
 }
