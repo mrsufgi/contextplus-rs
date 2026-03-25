@@ -422,14 +422,14 @@ async fn label_sibling_clusters(
         return Vec::new();
     }
 
-    // Build initial labels from path patterns or file names
+    // Always try LLM labels first. Path patterns and derive_cluster_label are
+    // fallbacks only when LLM fails. This ensures meaningful semantic labels
+    // like "API endpoints" instead of repeated directory names.
     let mut labels: Vec<Option<String>> = clusters
         .iter()
-        .map(|(files, pattern)| {
-            if let Some(pp) = pattern {
-                Some(pp.clone())
-            } else if files.len() <= 3 {
-                // Small cluster: just use file names
+        .map(|(files, _pattern)| {
+            if files.len() <= 3 {
+                // Small cluster: just use file names (not worth an LLM call)
                 let names: Vec<&str> = files
                     .iter()
                     .filter_map(|f| f.relative_path.split('/').next_back())
@@ -441,12 +441,12 @@ async fn label_sibling_clusters(
                     joined
                 })
             } else {
-                None
+                None // Send to LLM
             }
         })
         .collect();
 
-    // If all clusters are already labeled, skip LLM entirely
+    // If all clusters are tiny (<=3 files each), skip LLM
     if labels.iter().all(|l| l.is_some()) {
         return labels.into_iter().map(|l| l.unwrap()).collect();
     }
@@ -498,15 +498,27 @@ async fn label_sibling_clusters(
         unlabeled.len()
     );
 
-    if let Ok(response) = ollama.chat(&prompt).await {
-        if let Some(json_str) = extract_json_array(&response) {
-            if let Ok(llm_labels) = serde_json::from_str::<Vec<String>>(&json_str) {
-                for (j, &cluster_idx) in unlabeled.iter().enumerate() {
-                    if let Some(label) = llm_labels.get(j) {
-                        labels[cluster_idx] = Some(label.clone());
+    match ollama.chat(&prompt).await {
+        Ok(response) => {
+            if let Some(json_str) = extract_json_array(&response) {
+                match serde_json::from_str::<Vec<String>>(&json_str) {
+                    Ok(llm_labels) => {
+                        for (j, &cluster_idx) in unlabeled.iter().enumerate() {
+                            if let Some(label) = llm_labels.get(j) {
+                                labels[cluster_idx] = Some(label.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "LLM returned invalid JSON for cluster labels");
                     }
                 }
+            } else {
+                tracing::warn!(response_len = response.len(), "LLM response contained no JSON array");
             }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, unlabeled = unlabeled.len(), "LLM labeling failed — using fallbacks");
         }
     }
 
@@ -529,9 +541,9 @@ async fn label_sibling_clusters(
 
 /// Derive a human-readable label for a cluster from its file paths.
 ///
-/// Finds the deepest common path prefix, then picks the last 1-2 meaningful
-/// segments. In a monorepo where everything is under `packages/`, this yields
-/// labels like "domains/billing" or "platform/auth" instead of "packages".
+/// Looks for the most common DISTINGUISHING directory segment — the first
+/// segment after the common prefix where files diverge. This prevents
+/// returning the parent directory name when all files share it.
 fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
     if files.is_empty() {
         return None;
@@ -557,45 +569,44 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
         }
     }
 
-    if common_depth == 0 {
-        // No common prefix — count the most frequent segment at depth 1
-        // (skip depth 0 which is often "packages" or "apps" in monorepos)
+    // Look at the FIRST segment after the common prefix — that's where
+    // this cluster differs from siblings. Find the most common value.
+    if common_depth < min_depth.saturating_sub(1) {
         let mut seg_counts: HashMap<&str, usize> = HashMap::new();
         for p in &paths {
-            let depth = if p.len() > 2 { 1 } else { 0 };
-            *seg_counts.entry(p[depth]).or_default() += 1;
-        }
-        return seg_counts
-            .into_iter()
-            .max_by_key(|(_, c)| *c)
-            .filter(|(_, c)| *c > files.len() / 3)
-            .map(|(seg, _)| seg.to_string());
-    }
-
-    // Use last 1-2 segments of the common prefix for the label.
-    // E.g., common prefix ["packages", "domains", "billing"] → "domains/billing"
-    let start = if common_depth >= 2 { common_depth - 2 } else { 0 };
-    let label_parts: Vec<&str> = (start..common_depth).map(|d| paths[0][d]).collect();
-    let label = label_parts.join("/");
-
-    // Skip labels that are just generic top-level dirs
-    if label == "packages" || label == "apps" || label == "src" || label == "lib" {
-        // Try one level deeper: find the most common next segment
-        if common_depth < min_depth.saturating_sub(1) {
-            let mut next_counts: HashMap<&str, usize> = HashMap::new();
-            for p in &paths {
-                *next_counts.entry(p[common_depth]).or_default() += 1;
+            if common_depth < p.len().saturating_sub(1) {
+                *seg_counts.entry(p[common_depth]).or_default() += 1;
             }
-            return next_counts
-                .into_iter()
-                .max_by_key(|(_, c)| *c)
-                .filter(|(_, c)| *c > files.len() / 3)
-                .map(|(seg, _)| format!("{}/{}", label, seg));
         }
-        return None;
+        if let Some((seg, count)) = seg_counts.iter().max_by_key(|(_, c)| **c) {
+            if *count > files.len() / 3 {
+                // If there's a second-level distinguisher too, use it
+                let mut sub_counts: HashMap<&str, usize> = HashMap::new();
+                for p in &paths {
+                    if common_depth + 1 < p.len().saturating_sub(1) && p[common_depth] == *seg {
+                        *sub_counts.entry(p[common_depth + 1]).or_default() += 1;
+                    }
+                }
+                if let Some((sub_seg, sub_count)) = sub_counts.iter().max_by_key(|(_, c)| **c) {
+                    if *sub_count > files.len() / 3 {
+                        return Some(format!("{}/{}", seg, sub_seg));
+                    }
+                }
+                return Some(seg.to_string());
+            }
+        }
     }
 
-    Some(label)
+    // No distinguishing segment — fall back to last 1-2 segments of common prefix
+    if common_depth >= 2 {
+        let label = format!("{}/{}", paths[0][common_depth - 2], paths[0][common_depth - 1]);
+        let generic = ["packages", "apps", "src", "lib", "internal"];
+        if !generic.contains(&label.as_str()) {
+            return Some(label);
+        }
+    }
+
+    None
 }
 
 /// Group files by meaningful directory structure for top-level clustering.
