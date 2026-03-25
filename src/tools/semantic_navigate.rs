@@ -811,6 +811,10 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
     // Look at the FIRST segment after the common prefix — that's where
     // this cluster differs from siblings. Find the most common value.
     if common_depth < min_depth.saturating_sub(1) {
+        const GENERIC_SEGMENTS: &[&str] = &[
+            "src", "lib", "dist", "build", "utils", "helpers", "common", "shared",
+            "core", "types", "config", "internal", "cmd", "pkg",
+        ];
         let mut seg_counts: HashMap<&str, usize> = HashMap::new();
         for p in &paths {
             if common_depth < p.len().saturating_sub(1) {
@@ -818,7 +822,7 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             }
         }
         if let Some((seg, count)) = seg_counts.iter().max_by_key(|(_, c)| **c) {
-            if *count > files.len() / 3 {
+            if *count > files.len() / 3 && !GENERIC_SEGMENTS.contains(seg) {
                 // If there's a second-level distinguisher too, use it
                 let mut sub_counts: HashMap<&str, usize> = HashMap::new();
                 for p in &paths {
@@ -827,7 +831,7 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                     }
                 }
                 if let Some((sub_seg, sub_count)) = sub_counts.iter().max_by_key(|(_, c)| **c) {
-                    if *sub_count > files.len() / 3 {
+                    if *sub_count > files.len() / 3 && !GENERIC_SEGMENTS.contains(sub_seg) {
                         return Some(format!("{}/{}", seg, sub_seg));
                     }
                 }
@@ -865,9 +869,13 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                 // Trim to last uppercase boundary for camelCase
                 if let Some(last_upper) = prefix.rfind(|c: char| c.is_uppercase()) {
                     if last_upper > 0 {
-                        return Some(prefix[..last_upper].to_string());
+                        let trimmed = &prefix[..last_upper];
+                        if trimmed.len() >= 4 {
+                            return Some(trimmed.to_string());
+                        }
                     }
                 }
+                // Only return full prefix if it's still >= 4 chars
                 return Some(prefix.to_string());
             }
         }
@@ -2358,5 +2366,92 @@ mod tests {
             "got: {}",
             rendered
         );
+    }
+
+    #[test]
+    fn deduplicate_labels_with_test_disambiguator() {
+        let test_files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "pkg/service/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/service/user.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/service/billing.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let impl_files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "pkg/service/auth.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/service/user.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let test_refs: Vec<&FileInfo> = test_files.iter().collect();
+        let impl_refs: Vec<&FileInfo> = impl_files.iter().collect();
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
+            (test_refs, None),
+            (impl_refs, None),
+        ];
+        let mut labels = vec!["service".to_string(), "service".to_string()];
+        deduplicate_sibling_labels(&mut labels, &clusters);
+        assert_ne!(labels[0], labels[1], "Labels should be disambiguated");
+        assert!(labels[0].contains("test") || labels[1].contains("test"), "One should mention tests: {:?}", labels);
+    }
+
+    #[test]
+    fn deduplicate_labels_no_dups_unchanged() {
+        let f1: Vec<FileInfo> = vec![make_test_file("a.ts")];
+        let f2: Vec<FileInfo> = vec![make_test_file("b.ts")];
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
+            (f1.iter().collect(), None),
+            (f2.iter().collect(), None),
+        ];
+        let mut labels = vec!["alpha".to_string(), "beta".to_string()];
+        deduplicate_sibling_labels(&mut labels, &clusters);
+        assert_eq!(labels, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn find_disambiguator_detects_tests() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "pkg/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/user.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "pkg/billing.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let result = find_label_disambiguator(&refs);
+        assert_eq!(result, Some("tests".to_string()));
+    }
+
+    #[test]
+    fn find_disambiguator_returns_none_for_mixed() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "alpha/foo.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "beta/bar.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        assert_eq!(find_label_disambiguator(&refs), None);
+    }
+
+    #[test]
+    fn derive_cluster_label_filename_prefix_camelcase() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "app/components/SoapTranscription.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "app/components/SoapDiagnosis.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "app/components/SoapHistory.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert!(label.is_some());
+        assert_eq!(label.unwrap(), "Soap");
+    }
+
+    #[test]
+    fn derive_cluster_label_filename_prefix_too_short_after_trim() {
+        // "useCallback" + "useContext" → common prefix "useC" → camelCase trim → "use" (3 chars, too short)
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "hooks/useCallback.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "hooks/useContext.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        // Should NOT return "use" (too short after camelCase trim)
+        // Should either return "useC" (full prefix) or fall through to another heuristic
+        if let Some(l) = &label {
+            assert_ne!(l, "use", "Should not return 'use' (too short after camelCase trim)");
+        }
     }
 }
