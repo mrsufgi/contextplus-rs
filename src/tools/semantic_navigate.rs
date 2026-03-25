@@ -156,23 +156,143 @@ pub async fn semantic_navigate(
         }
     }
 
-    // Spectral-cluster large groups sequentially.
-    // Each group's build_hierarchy calls ollama.chat for labeling (~11s per call on CPU).
-    // Running groups in parallel fires 20+ concurrent LLM calls that queue for 220s+.
-    // Sequential ensures each group's labels complete before the next starts.
-    for (dir_label, group_indices) in large_groups {
-        let mut node = build_hierarchy(
-            &files,
-            &vectors,
-            &group_indices,
-            max_clusters,
-            1,
-            max_depth,
-            ollama,
-        )
-        .await;
-        node.label = dir_label;
-        children.push(node);
+    // Phase 1: Cluster all groups concurrently (CPU-bound, no LLM).
+    // Phase 2: Label all groups' sub-clusters in ONE batched LLM call.
+    // This avoids both sequential slowness and concurrent LLM queue explosion.
+
+    // First, cluster all groups to find their sub-clusters
+    let cluster_futures: Vec<_> = large_groups
+        .iter()
+        .map(|(_, indices)| {
+            let local_vecs: Vec<Vec<f32>> = indices.iter().map(|&i| vectors[i].clone()).collect();
+            let mc = max_clusters;
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    spectral_cluster_with_min(&local_vecs, mc, 2)
+                })
+                .await
+                .unwrap_or_else(|_| vec![])
+            }
+        })
+        .collect();
+
+    let all_cluster_results = futures::future::join_all(cluster_futures).await;
+
+    // Now collect ALL unlabeled sub-clusters from ALL groups into one batch
+    // and make a single LLM call to label them all
+    struct PendingGroup {
+        label: String,
+        indices: Vec<usize>,
+        cluster_results: Vec<crate::core::clustering::ClusterResult>,
+    }
+
+    let pending_groups: Vec<PendingGroup> = large_groups
+        .into_iter()
+        .zip(all_cluster_results)
+        .map(|((label, indices), clusters)| PendingGroup {
+            label,
+            indices,
+            cluster_results: clusters,
+        })
+        .collect();
+
+    // Collect all sub-cluster file lists for one batched LLM call
+    let mut all_sublabels: Vec<(usize, usize, Vec<&FileInfo>)> = Vec::new(); // (group_idx, cluster_idx, files)
+    for (gi, group) in pending_groups.iter().enumerate() {
+        if group.cluster_results.len() <= 1 {
+            continue;
+        }
+        for (ci, cluster) in group.cluster_results.iter().enumerate() {
+            let file_refs: Vec<&FileInfo> = cluster.indices
+                .iter()
+                .map(|&li| &files[group.indices[li]])
+                .collect();
+            if file_refs.len() > 3 {
+                all_sublabels.push((gi, ci, file_refs));
+            }
+        }
+    }
+
+    // ONE LLM call for ALL sub-clusters across ALL groups
+    let mut llm_label_map: HashMap<(usize, usize), String> = HashMap::new();
+    if !all_sublabels.is_empty() {
+        const MAX_FILES_PER_LABEL: usize = 5;
+        let descriptions: Vec<String> = all_sublabels
+            .iter()
+            .enumerate()
+            .map(|(desc_idx, (_, _, file_refs))| {
+                let sample = if file_refs.len() > MAX_FILES_PER_LABEL {
+                    &file_refs[..MAX_FILES_PER_LABEL]
+                } else {
+                    file_refs
+                };
+                let file_list = sample
+                    .iter()
+                    .map(|f| {
+                        let desc = if f.header.is_empty() { "no description" } else { &f.header };
+                        format!("{}: {}", f.relative_path, desc)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                format!("Cluster {} ({} files):\n  {}", desc_idx + 1, file_refs.len(), file_list)
+            })
+            .collect();
+
+        let prompt = format!(
+            "Label each cluster with EXACTLY 2 words. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
+            descriptions.join("\n\n"),
+            all_sublabels.len()
+        );
+
+        if let Ok(response) = ollama.chat(&prompt).await {
+            if let Some(json_str) = extract_json_array(&response) {
+                if let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str) {
+                    for (j, (gi, ci, _)) in all_sublabels.iter().enumerate() {
+                        if let Some(label) = labels.get(j) {
+                            llm_label_map.insert((*gi, *ci), label.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build the final tree using LLM labels where available, fallbacks otherwise
+    for (gi, group) in pending_groups.into_iter().enumerate() {
+        if group.cluster_results.len() <= 1 {
+            // Single cluster or no split — leaf node
+            children.push(ClusterNode {
+                label: group.label,
+                files: group.indices.iter().map(|&i| files[i].clone()).collect(),
+                children: Vec::new(),
+            });
+            continue;
+        }
+
+        let mut sub_children: Vec<ClusterNode> = Vec::new();
+        for (ci, cluster) in group.cluster_results.iter().enumerate() {
+            let global_indices: Vec<usize> = cluster.indices.iter().map(|&li| group.indices[li]).collect();
+            let label = llm_label_map.get(&(gi, ci))
+                .cloned()
+                .unwrap_or_else(|| {
+                    let refs: Vec<&FileInfo> = global_indices.iter().map(|&i| &files[i]).collect();
+                    derive_cluster_label(&refs)
+                        .unwrap_or_else(|| format!("Cluster {}", ci + 1))
+                });
+
+            // For depth 2+, just make leaf nodes (no further LLM calls)
+            sub_children.push(ClusterNode {
+                label,
+                files: global_indices.iter().map(|&i| files[i].clone()).collect(),
+                children: Vec::new(),
+            });
+        }
+
+        children.push(ClusterNode {
+            label: group.label,
+            files: Vec::new(),
+            children: sub_children,
+        });
     }
 
     // Sort by file count descending
@@ -419,14 +539,14 @@ async fn label_sibling_clusters(
         return Vec::new();
     }
 
-    // Always try LLM labels first. Path patterns and derive_cluster_label are
-    // fallbacks only when LLM fails. This ensures meaningful semantic labels
-    // like "API endpoints" instead of repeated directory names.
+    // Use path-based labels with smart fallbacks. LLM labeling is too slow
+    // on CPU (~11s per call) and causes MCP timeouts when there are 10+ clusters.
+    // derive_cluster_label finds the distinguishing directory segments.
     let mut labels: Vec<Option<String>> = clusters
         .iter()
         .map(|(files, _pattern)| {
             if files.len() <= 3 {
-                // Small cluster: just use file names (not worth an LLM call)
+                // Small cluster: just use file names
                 let names: Vec<&str> = files
                     .iter()
                     .filter_map(|f| f.relative_path.split('/').next_back())
@@ -515,14 +635,11 @@ async fn label_sibling_clusters(
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, unlabeled = unlabeled.len(), "LLM labeling failed — using fallbacks");
+            tracing::warn!(error = %e, unlabeled = unlabeled.len(), "LLM labeling failed");
         }
     }
 
-    // Fill any remaining unlabeled with a smart fallback:
-    // Find the deepest directory segment that distinguishes this cluster.
-    // In monorepos, parts[0] is always "packages" — useless. We want
-    // "domains/billing" or "platform/auth" or "frontend/hooks".
+    // Fill any remaining unlabeled with path-based fallbacks
     labels
         .into_iter()
         .enumerate()
@@ -594,7 +711,61 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
         }
     }
 
-    // No distinguishing segment — fall back to last 1-2 segments of common prefix
+    // No distinguishing segment — try to find a common keyword from file names
+    // E.g., files like "SoapTranscription.tsx", "SoapDiagnosis.tsx" → "Soap"
+    // or "useSideBarActions.ts", "useSideBarBulk.ts" → "SideBar"
+    {
+        let filenames: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.relative_path.split('/').next_back())
+            .filter_map(|name| name.split('.').next()) // strip extension
+            .collect();
+        if filenames.len() >= 2 {
+            // Find the longest common prefix of filenames
+            let first = filenames[0].as_bytes();
+            let mut prefix_len = first.len();
+            for name in &filenames[1..] {
+                let bytes = name.as_bytes();
+                prefix_len = prefix_len.min(bytes.len());
+                for i in 0..prefix_len {
+                    if first[i] != bytes[i] {
+                        prefix_len = i;
+                        break;
+                    }
+                }
+            }
+            // Use prefix if it's a meaningful word (3+ chars, not just "use" or "get")
+            if prefix_len >= 4 {
+                let prefix = &filenames[0][..prefix_len];
+                // Trim to last uppercase boundary for camelCase
+                if let Some(last_upper) = prefix.rfind(|c: char| c.is_uppercase()) {
+                    if last_upper > 0 {
+                        return Some(prefix[..last_upper].to_string());
+                    }
+                }
+                return Some(prefix.to_string());
+            }
+        }
+    }
+
+    // Last resort: use the most common header keyword
+    {
+        let mut word_counts: HashMap<&str, usize> = HashMap::new();
+        for f in files {
+            for word in f.header.split_whitespace() {
+                if word.len() >= 4 {
+                    *word_counts.entry(word).or_default() += 1;
+                }
+            }
+        }
+        if let Some((word, count)) = word_counts.iter().max_by_key(|(_, c)| **c) {
+            if *count > files.len() / 3 {
+                return Some(word.to_string());
+            }
+        }
+    }
+
+    // Fall back to last 1-2 segments of common prefix
     if common_depth >= 2 {
         let label = format!("{}/{}", paths[0][common_depth - 2], paths[0][common_depth - 1]);
         let generic = ["packages", "apps", "src", "lib", "internal"];
@@ -1973,29 +2144,34 @@ mod tests {
 
     #[test]
     fn derive_cluster_label_deep_common_prefix() {
-        let files: Vec<FileInfo> = (0..5)
-            .map(|i| make_test_file(&format!("packages/domains/billing/file{}.ts", i)))
-            .collect();
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/billing/service.ts".into(), header: "Billing service".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/repo.ts".into(), header: "Billing repository".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/handler.ts".into(), header: "Billing handler".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/types.ts".into(), header: "Billing types".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/billing/index.ts".into(), header: "Billing exports".into(), content: String::new(), symbol_preview: vec![] },
+        ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
-        assert!(label.is_some());
+        assert!(label.is_some(), "Expected Some label for billing files");
+        // Should contain "Billing" (from header keyword) or "billing" (from path)
         let l = label.unwrap();
-        assert!(l.contains("billing"), "Expected 'billing' in label, got '{}'", l);
+        assert!(l.to_lowercase().contains("billing"), "Expected 'billing' in label, got '{}'", l);
     }
 
     #[test]
     fn derive_cluster_label_generic_prefix_fallback() {
         let files: Vec<FileInfo> = vec![
-            make_test_file("src/controllers/auth.ts"),
-            make_test_file("src/controllers/user.ts"),
-            make_test_file("src/controllers/billing.ts"),
+            FileInfo { relative_path: "src/controllers/auth.ts".into(), header: "Auth controller".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "src/controllers/user.ts".into(), header: "User controller".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "src/controllers/billing.ts".into(), header: "Billing controller".into(), content: String::new(), symbol_preview: vec![] },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
-        // "src" is generic → should look deeper → "src/controllers"
         assert!(label.is_some());
         let l = label.unwrap();
-        assert!(l.contains("controllers"), "Expected 'controllers' in label, got '{}'", l);
+        // Should find "controllers" from path or "controller" from header keyword
+        assert!(l.to_lowercase().contains("controller"), "Expected 'controller' in label, got '{}'", l);
     }
 
     #[test]
@@ -2007,13 +2183,13 @@ mod tests {
     #[test]
     fn derive_cluster_label_no_common_prefix() {
         let files: Vec<FileInfo> = vec![
-            make_test_file("alpha/foo.ts"),
-            make_test_file("beta/bar.ts"),
-            make_test_file("gamma/baz.ts"),
+            FileInfo { relative_path: "alpha/foo.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "beta/bar.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "gamma/baz.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
-        // No common prefix, no dominant segment → None
+        // No common prefix, no dominant segment, no common filename prefix, no headers → None
         assert_eq!(label, None);
     }
 
