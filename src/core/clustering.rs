@@ -765,4 +765,26 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].indices.is_empty());
     }
+
+    #[test]
+    fn kmeans_k_larger_than_n() {
+        let data = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let assignments = kmeans(&data, 5);
+        // Should not panic, all points assigned
+        assert_eq!(assignments.len(), 2);
+    }
+
+    #[test]
+    fn spectral_cluster_identical_vectors() {
+        let vectors: Vec<Vec<f32>> = (0..10).map(|_| vec![1.0, 0.0, 0.0]).collect();
+        // Should not panic even with degenerate affinity matrix
+        let result = spectral_cluster(&vectors, 3);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn find_optimal_k_single_eigenvalue() {
+        let k = find_optimal_k(&[0.5], 5);
+        assert_eq!(k, 1);
+    }
 }

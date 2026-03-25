@@ -8,8 +8,10 @@ use crate::core::embeddings::VectorStore;
 use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::walker;
 use crate::error::Result;
+use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 
 use super::navigate_constants::*;
@@ -211,43 +213,62 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
             .await
             .unwrap_or_default();
 
-    // Filter to supported extensions and non-directories, then read content
+    // Filter to supported extensions and non-directories
     let max_file_size = config.max_embed_file_size as u64;
-    let mut files = Vec::new();
-    for entry in entries {
-        if entry.is_directory {
-            continue;
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| {
+            if entry.is_directory {
+                return false;
+            }
+            let ext = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            allowed_extensions.contains(ext)
+        })
+        .collect();
+
+    // Read files concurrently with buffer_unordered(64)
+    let file_futures = filtered.into_iter().map(|entry| async move {
+        let meta = tokio::fs::metadata(&entry.path).await.ok()?;
+        if meta.len() > max_file_size {
+            return None;
         }
 
-        let ext = entry
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if !allowed_extensions.contains(ext) {
-            continue;
-        }
-        if let Ok(meta) = tokio::fs::metadata(&entry.path).await
-            && meta.len() > max_file_size
-        {
-            continue;
-        }
-        if let Ok(content) = tokio::fs::read_to_string(&entry.path).await {
-            let header = extract_header(&content);
-            let truncated_content = if content.len() > MAX_CONTENT_CHARS {
-                crate::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS).to_string()
-            } else {
-                content
-            };
+        let content = if meta.len() > 2048 {
+            // Large file: read only first 2KB to avoid wasting memory
+            let mut f = tokio::fs::File::open(&entry.path).await.ok()?;
+            let mut buf = vec![0u8; 2048];
+            let n = f.read(&mut buf).await.unwrap_or(0);
+            buf.truncate(n);
+            String::from_utf8_lossy(&buf).to_string()
+        } else {
+            // Small file: read entirely
+            tokio::fs::read_to_string(&entry.path).await.ok()?
+        };
 
-            files.push(FileInfo {
-                relative_path: entry.relative_path,
-                header,
-                content: truncated_content,
-                symbol_preview: Vec::new(),
-            });
-        }
-    }
+        let header = extract_header(&content);
+        let truncated_content = if content.len() > MAX_CONTENT_CHARS {
+            crate::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS).to_string()
+        } else {
+            content
+        };
+
+        Some(FileInfo {
+            relative_path: entry.relative_path,
+            header,
+            content: truncated_content,
+            symbol_preview: Vec::new(),
+        })
+    });
+
+    let files: Vec<FileInfo> = stream::iter(file_futures)
+        .buffer_unordered(64)
+        .filter_map(|opt| async { opt })
+        .collect()
+        .await;
 
     Ok(files)
 }
@@ -2021,5 +2042,57 @@ mod tests {
             children: vec![child1, child2],
         };
         assert_eq!(count_files_in_node(&parent), 5);
+    }
+
+    #[tokio::test]
+    async fn label_files_returns_headers() {
+        let files = vec![
+            make_test_file("src/auth.rs"), // has header "header for src/auth.rs"
+            FileInfo {
+                relative_path: "src/empty.rs".to_string(),
+                header: String::new(),
+                content: "fn main() {}".to_string(),
+                symbol_preview: vec![],
+            },
+        ];
+        let labels = label_files(&files).await;
+        assert_eq!(labels[0], "header for src/auth.rs");
+        assert_eq!(labels[1], "empty.rs"); // filename fallback
+    }
+
+    #[test]
+    fn render_cluster_tree_truncates_large_leaves() {
+        let files: Vec<FileInfo> = (0..15)
+            .map(|i| make_test_file(&format!("src/file{}.rs", i)))
+            .collect();
+        let node = ClusterNode {
+            label: "big leaf".to_string(),
+            files,
+            children: Vec::new(),
+        };
+        let rendered = render_cluster_tree(&node, 0);
+        assert!(rendered.contains("[big leaf]"));
+        assert!(rendered.contains("(+5 more files)"));
+        // Should show exactly MAX_FILES_PER_LEAF_DISPLAY file lines
+        let file_lines = rendered
+            .lines()
+            .filter(|l| l.contains("src/file"))
+            .count();
+        assert_eq!(file_lines, 10); // MAX_FILES_PER_LEAF_DISPLAY
+    }
+
+    #[test]
+    fn render_cluster_tree_shows_file_count() {
+        let node = ClusterNode {
+            label: "test".to_string(),
+            files: vec![make_test_file("a.rs"), make_test_file("b.rs")],
+            children: Vec::new(),
+        };
+        let rendered = render_cluster_tree(&node, 0);
+        assert!(
+            rendered.contains("[test] (2 files)"),
+            "got: {}",
+            rendered
+        );
     }
 }
