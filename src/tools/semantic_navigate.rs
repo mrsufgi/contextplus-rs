@@ -346,6 +346,31 @@ pub async fn semantic_navigate(
             }
         }
 
+        // Deduplicate depth-1 sibling labels
+        let mut d1_labels: Vec<String> = sub_children.iter().map(|c| c.label.clone()).collect();
+        let d1_input: Vec<(Vec<&FileInfo>, Option<String>)> = sub_children.iter()
+            .map(|c| {
+                let refs: Vec<&FileInfo> = if c.children.is_empty() {
+                    c.files.iter().collect()
+                } else {
+                    // For nodes with children, collect all descendant files
+                    fn collect_files(node: &ClusterNode) -> Vec<&FileInfo> {
+                        if node.children.is_empty() {
+                            node.files.iter().collect()
+                        } else {
+                            node.children.iter().flat_map(collect_files).collect()
+                        }
+                    }
+                    collect_files(c)
+                };
+                (refs, None)
+            })
+            .collect();
+        deduplicate_sibling_labels(&mut d1_labels, &d1_input);
+        for (i, child) in sub_children.iter_mut().enumerate() {
+            child.label = d1_labels[i].clone();
+        }
+
         children.push(ClusterNode {
             label: group.label,
             files: Vec::new(),
@@ -506,7 +531,9 @@ async fn resolve_embeddings(
 
     // Embed uncached/stale files in chunks, saving progress after each batch.
     // This prevents losing all work if the MCP connection times out mid-run.
-    let embed_cache_name = crate::server::cache_name("embeddings", embed_model);
+    // embed_model here is actually the full cache name (e.g., "navigate-nomic-embed-text")
+    // passed by the caller — don't wrap it again with cache_name()
+    let embed_cache_name = embed_model.to_string();
     let chunk_size = ollama.batch_size();
 
     for chunk_start in (0..uncached_indices.len()).step_by(chunk_size) {
