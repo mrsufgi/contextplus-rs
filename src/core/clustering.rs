@@ -26,7 +26,7 @@ pub struct ClusterResult {
 /// Build a symmetric affinity matrix from embedding vectors using SIMD cosine similarity.
 /// Diagonal is zero (no self-affinity). Negative similarities are clamped to 0.
 /// Uses rayon to parallelize the outer loop for large matrices.
-fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
+pub fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
     let n = vectors.len();
 
     // Compute upper triangle in parallel — each row's (i, j>i) pairs are independent
@@ -55,7 +55,7 @@ fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
 }
 
 /// Compute normalized symmetric Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
-fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
+pub fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
     let n = affinity.nrows();
 
     // Compute degree per row using nalgebra row sums (diagonal subtracted)
@@ -92,7 +92,7 @@ fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
 }
 
 /// Full eigendecomposition, returning (eigenvalues, eigenvectors) sorted ascending.
-fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
+pub fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     let eigen = SymmetricEigen::new(matrix);
 
     let mut indexed_evals: Vec<(usize, f64)> =
@@ -122,7 +122,7 @@ fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
 ///
 /// Fix: use relative gaps (gap / eigenvalue_position) starting from k=3, and only
 /// fall back to k=2 if the k=2 gap is dramatically larger than all others.
-fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
+pub fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
     if eigenvalues.len() <= 2 {
         return eigenvalues.len().min(2);
     }

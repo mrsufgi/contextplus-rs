@@ -33,10 +33,8 @@ struct FileInfo {
 
 /// A hierarchical cluster node.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ClusterNode {
     label: String,
-    path_pattern: Option<String>,
     files: Vec<FileInfo>,
     children: Vec<ClusterNode>,
 }
@@ -148,9 +146,6 @@ pub async fn semantic_navigate(
         if group_indices.len() <= MAX_FILES_PER_LEAF {
             children.push(ClusterNode {
                 label: dir_label.clone(),
-                path_pattern: find_path_pattern(
-                    &group_indices.iter().map(|&i| files[i].relative_path.clone()).collect::<Vec<_>>()
-                ),
                 files: group_indices.iter().map(|&i| files[i].clone()).collect(),
                 children: Vec::new(),
             });
@@ -186,7 +181,6 @@ pub async fn semantic_navigate(
 
     let root_node = ClusterNode {
         label: "Project".to_string(),
-        path_pattern: None,
         files: Vec::new(),
         children,
     };
@@ -678,28 +672,27 @@ async fn build_hierarchy(
     max_depth: usize,
     ollama: &OllamaClient,
 ) -> ClusterNode {
-    let paths: Vec<String> = indices
-        .iter()
-        .map(|&i| all_files[i].relative_path.clone())
-        .collect();
-
     if indices.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
         return ClusterNode {
             label: String::new(),
-            path_pattern: find_path_pattern(&paths),
             files: indices.iter().map(|&i| all_files[i].clone()).collect(),
             children: Vec::new(),
         };
     }
 
-    // Build local vectors slice for clustering (indices into all_vectors)
+    // Build local vectors slice for clustering — moved into spawn_blocking
+    // to avoid blocking the tokio executor during O(n^3) eigendecomposition.
     let local_vectors: Vec<Vec<f32>> = indices.iter().map(|&i| all_vectors[i].clone()).collect();
-    let cluster_results = spectral_cluster_with_min(&local_vectors, max_clusters, 2);
+    let mc = max_clusters;
+    let cluster_results = tokio::task::spawn_blocking(move || {
+        spectral_cluster_with_min(&local_vectors, mc, 2)
+    })
+    .await
+    .unwrap_or_else(|_| vec![]);
 
     if cluster_results.len() <= 1 {
         return ClusterNode {
             label: String::new(),
-            path_pattern: find_path_pattern(&paths),
             files: indices.iter().map(|&i| all_files[i].clone()).collect(),
             children: Vec::new(),
         };
@@ -710,7 +703,7 @@ async fn build_hierarchy(
     // so find_path_pattern always returns "packages/domains/billing/*" — useless.
     // Only keep path_pattern if it's MORE specific than the parent prefix.
     let parent_prefix = {
-        let parts: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect::<Vec<_>>()).collect();
+        let parts: Vec<Vec<&str>> = indices.iter().map(|&i| all_files[i].relative_path.split('/').collect::<Vec<_>>()).collect();
         let min_depth = parts.iter().map(|p| p.len()).min().unwrap_or(0);
         let mut prefix_depth = 0;
         for d in 0..min_depth.saturating_sub(1) {
@@ -793,7 +786,6 @@ async fn build_hierarchy(
 
     ClusterNode {
         label: String::new(),
-        path_pattern: find_path_pattern(&paths),
         files: Vec::new(),
         children,
     }
@@ -804,20 +796,9 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
     let pad = "  ".repeat(indent);
     let mut result = String::new();
 
-    if !node.label.is_empty() || node.path_pattern.is_some() {
+    if !node.label.is_empty() {
         let count = count_files_in_node(node);
-        let display_label = match (&node.label, &node.path_pattern) {
-            (label, Some(pattern)) if label.is_empty() => {
-                format!("{}[{}] ({} files)\n", pad, pattern, count)
-            }
-            (label, Some(pattern)) => {
-                format!("{}[{} ({})] ({} files)\n", pad, label, pattern, count)
-            }
-            (label, None) => {
-                format!("{}[{}] ({} files)\n", pad, label, count)
-            }
-        };
-        result.push_str(&display_label);
+        result.push_str(&format!("{}[{}] ({} files)\n", pad, node.label, count));
     }
 
     if !node.children.is_empty() {
@@ -903,7 +884,6 @@ mod tests {
     fn render_cluster_tree_leaf() {
         let node = ClusterNode {
             label: "Test".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "src/main.rs".to_string(),
                 header: "entry point".to_string(),
@@ -921,7 +901,6 @@ mod tests {
     fn render_cluster_tree_nested() {
         let child = ClusterNode {
             label: "Child".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "a.rs".to_string(),
                 header: String::new(),
@@ -932,7 +911,6 @@ mod tests {
         };
         let parent = ClusterNode {
             label: "Parent".to_string(),
-            path_pattern: None,
             files: Vec::new(),
             children: vec![child],
         };
@@ -1146,7 +1124,6 @@ mod tests {
     fn render_cluster_tree_empty_label_no_bracket_line() {
         let node = ClusterNode {
             label: String::new(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "foo.rs".to_string(),
                 header: "a file".to_string(),
@@ -1165,7 +1142,6 @@ mod tests {
     fn render_cluster_tree_file_no_header_no_symbols() {
         let node = ClusterNode {
             label: "Leaf".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "bare.ts".to_string(),
                 header: String::new(),
@@ -1186,7 +1162,6 @@ mod tests {
     fn render_cluster_tree_multiple_files_in_leaf() {
         let node = ClusterNode {
             label: "Group".to_string(),
-            path_pattern: None,
             files: vec![
                 FileInfo {
                     relative_path: "a.rs".to_string(),
@@ -1219,7 +1194,6 @@ mod tests {
     fn render_cluster_tree_with_initial_indent() {
         let node = ClusterNode {
             label: "Deep".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "x.py".to_string(),
                 header: String::new(),
@@ -1239,7 +1213,6 @@ mod tests {
     fn render_cluster_tree_deeply_nested_three_levels() {
         let grandchild = ClusterNode {
             label: "Grandchild".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "gc.rs".to_string(),
                 header: "deep file".to_string(),
@@ -1250,13 +1223,11 @@ mod tests {
         };
         let child = ClusterNode {
             label: "Child".to_string(),
-            path_pattern: None,
             files: Vec::new(),
             children: vec![grandchild],
         };
         let root = ClusterNode {
             label: "Root".to_string(),
-            path_pattern: None,
             files: Vec::new(),
             children: vec![child],
         };
@@ -1271,7 +1242,6 @@ mod tests {
     fn render_cluster_tree_multiple_children() {
         let child_a = ClusterNode {
             label: "A".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "a.rs".to_string(),
                 header: String::new(),
@@ -1282,7 +1252,6 @@ mod tests {
         };
         let child_b = ClusterNode {
             label: "B".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "b.rs".to_string(),
                 header: String::new(),
@@ -1293,7 +1262,6 @@ mod tests {
         };
         let parent = ClusterNode {
             label: "Parent".to_string(),
-            path_pattern: None,
             files: Vec::new(),
             children: vec![child_a, child_b],
         };
@@ -1310,7 +1278,6 @@ mod tests {
         // Node with no label, no files, no children produces empty string
         let node = ClusterNode {
             label: String::new(),
-            path_pattern: None,
             files: Vec::new(),
             children: Vec::new(),
         };
@@ -1323,7 +1290,6 @@ mod tests {
         // When a node has both children and files, only children are rendered
         let child = ClusterNode {
             label: "Child".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "child.rs".to_string(),
                 header: String::new(),
@@ -1334,7 +1300,6 @@ mod tests {
         };
         let parent = ClusterNode {
             label: "Parent".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "parent_file.rs".to_string(),
                 header: "should not appear".to_string(),
@@ -1575,7 +1540,6 @@ mod tests {
     fn cluster_node_clone() {
         let node = ClusterNode {
             label: "Test".to_string(),
-            path_pattern: Some("src/*".to_string()),
             files: vec![FileInfo {
                 relative_path: "src/a.rs".to_string(),
                 header: String::new(),
@@ -1586,7 +1550,6 @@ mod tests {
         };
         let cloned = node.clone();
         assert_eq!(cloned.label, node.label);
-        assert_eq!(cloned.path_pattern, node.path_pattern);
         assert_eq!(cloned.files.len(), 1);
     }
 
@@ -1594,7 +1557,6 @@ mod tests {
     fn cluster_node_debug() {
         let node = ClusterNode {
             label: "Debug test".to_string(),
-            path_pattern: None,
             files: Vec::new(),
             children: Vec::new(),
         };
@@ -1665,7 +1627,6 @@ mod tests {
     fn render_cluster_tree_file_with_symbols_no_header() {
         let node = ClusterNode {
             label: "Syms".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "lib.rs".to_string(),
                 header: String::new(),
@@ -1684,7 +1645,6 @@ mod tests {
     fn render_cluster_tree_file_with_header_and_symbols() {
         let node = ClusterNode {
             label: "Full".to_string(),
-            path_pattern: None,
             files: vec![FileInfo {
                 relative_path: "main.go".to_string(),
                 header: "entry".to_string(),
@@ -2037,7 +1997,6 @@ mod tests {
     fn count_files_leaf_node() {
         let node = ClusterNode {
             label: "test".to_string(),
-            path_pattern: None,
             files: vec![make_test_file("a.rs"), make_test_file("b.rs")],
             children: Vec::new(),
         };
@@ -2048,19 +2007,16 @@ mod tests {
     fn count_files_nested_children() {
         let child1 = ClusterNode {
             label: "c1".to_string(),
-            path_pattern: None,
             files: vec![make_test_file("a.rs"), make_test_file("b.rs"), make_test_file("c.rs")],
             children: Vec::new(),
         };
         let child2 = ClusterNode {
             label: "c2".to_string(),
-            path_pattern: None,
             files: vec![make_test_file("d.rs"), make_test_file("e.rs")],
             children: Vec::new(),
         };
         let parent = ClusterNode {
             label: "parent".to_string(),
-            path_pattern: None,
             files: Vec::new(),
             children: vec![child1, child2],
         };

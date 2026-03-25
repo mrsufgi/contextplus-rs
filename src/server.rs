@@ -933,8 +933,6 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         self.ensure_tracker_started();
-        // query is optional in TS version — accepted but unused for clustering
-        let _query = Self::get_str(&args, "query");
         let root = self.resolve_root(&args);
 
         let options = crate::tools::semantic_navigate::SemanticNavigateOptions {
