@@ -227,6 +227,26 @@ pub async fn semantic_navigate(
         &all_sublabels
     };
 
+    tracing::info!(
+        total_sublabels = all_sublabels.len(),
+        llm_batch_size = llm_batch.len(),
+        max_llm_clusters = MAX_LLM_CLUSTERS,
+        "semantic_navigate: sub-cluster LLM batching — {} of {} clusters will get LLM labels",
+        llm_batch.len(),
+        all_sublabels.len()
+    );
+    for (idx, (gi, ci, file_refs)) in all_sublabels.iter().enumerate() {
+        let in_batch = idx < llm_batch.len();
+        tracing::info!(
+            group_idx = gi,
+            cluster_idx = ci,
+            file_count = file_refs.len(),
+            in_llm_batch = in_batch,
+            "semantic_navigate: sub-cluster [{}, {}] has {} files, in_llm_batch={}",
+            gi, ci, file_refs.len(), in_batch
+        );
+    }
+
     if !llm_batch.is_empty() {
         const MAX_FILES_PER_LABEL: usize = 5;
         let descriptions: Vec<String> = llm_batch
@@ -325,6 +345,12 @@ pub async fn semantic_navigate(
         if let Ok(response) = ollama.chat(&prompt).await {
             if let Some(json_str) = extract_json_array(&response) {
                 if let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str) {
+                    tracing::info!(
+                        label_count = labels.len(),
+                        batch_size = llm_batch.len(),
+                        "semantic_navigate: LLM returned {} labels for {} clusters",
+                        labels.len(), llm_batch.len()
+                    );
                     for (j, (gi, ci, file_refs)) in llm_batch.iter().enumerate() {
                         if let Some(label) = labels.get(j) {
                             let clean_label = label.trim();
@@ -334,19 +360,44 @@ pub async fn semantic_navigate(
                                 || clean_label.contains('.')
                                 || clean_label.contains('/')
                             {
+                                tracing::info!(
+                                    group_idx = gi,
+                                    cluster_idx = ci,
+                                    label = clean_label,
+                                    "semantic_navigate: rejected LLM label (garbage format) for [{}, {}]: {:?}",
+                                    gi, ci, clean_label
+                                );
                                 continue;
                             }
                             // Post-processing: reject labels that name a minority feature.
                             // If the label words match a specific subdirectory that holds <20%
                             // of the cluster's files, the LLM was misled by a prominent filename.
                             if !validate_label_against_cluster(clean_label, file_refs) {
+                                tracing::info!(
+                                    group_idx = gi,
+                                    cluster_idx = ci,
+                                    label = clean_label,
+                                    file_count = file_refs.len(),
+                                    "semantic_navigate: rejected LLM label (validation failed) for [{}, {}]: {:?} ({} files)",
+                                    gi, ci, clean_label, file_refs.len()
+                                );
                                 continue;
                             }
+                            tracing::info!(
+                                group_idx = gi,
+                                cluster_idx = ci,
+                                label = clean_label,
+                                file_count = file_refs.len(),
+                                "semantic_navigate: accepted LLM label for [{}, {}]: {:?} ({} files)",
+                                gi, ci, clean_label, file_refs.len()
+                            );
                             llm_label_map.insert((*gi, *ci), clean_label.to_string());
                         }
                     }
                 }
             }
+        } else {
+            tracing::info!("semantic_navigate: LLM chat call failed for sub-cluster labeling");
         }
     }
 
@@ -759,6 +810,11 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
             // All suffixes are distinct — use them
             for (idx, suffix) in &suffixes {
                 let base = labels[*idx].split(" #").next().unwrap_or(&labels[*idx]).to_string();
+                // Skip redundant "(N files)" if label already starts with a count
+                let label_has_count = base.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                if label_has_count && suffix.contains("files") {
+                    continue;
+                }
                 labels[*idx] = format!("{} ({})", base, suffix);
             }
         } else {
@@ -779,7 +835,8 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
 /// Tries in order:
 /// 1. Most common directory segment unique to this cluster (not shared by siblings)
 /// 2. Dominant file extension/type if different from siblings
-/// 3. File count as last resort
+/// 3. Dominant API domain from generated filenames (e.g., "scheduling API types")
+/// 4. File count as last resort
 fn describe_cluster_uniqueness(
     files: &[&FileInfo],
     clusters: &[(Vec<&FileInfo>, Option<String>)],
@@ -791,6 +848,9 @@ fn describe_cluster_uniqueness(
     }
     if let Some(ftype) = find_unique_file_type(files, clusters, sibling_indices, my_idx) {
         return ftype;
+    }
+    if let Some(domain) = find_unique_api_domain(files, clusters, sibling_indices, my_idx) {
+        return domain;
     }
     format!("{} files", files.len())
 }
@@ -904,6 +964,77 @@ fn dominant_file_type(files: &[&FileInfo]) -> Option<String> {
         .map(|(cat, _)| cat.to_string())
 }
 
+/// Extract the API domain from a generated type filename.
+///
+/// Matches patterns like `getApiV1SchedulingServices200.ts` → `"scheduling"`,
+/// `postApiV1AuthLogin200.ts` → `"auth"`, `patchApiV1OrganizationsMembers.ts` → `"organizations"`.
+fn extract_api_domain_from_filename(filename: &str) -> Option<String> {
+    let lower = filename.to_lowercase();
+    let pos = lower.find("apiv1")?;
+    let after = &filename[pos + 5..];
+    if after.is_empty() {
+        return None;
+    }
+    // The domain name starts right after "ApiV1" in PascalCase.
+    // Find where the domain word ends: the next uppercase letter after the
+    // initial run. E.g., "SchedulingServices200.ts" → "Scheduling".
+    let bytes = after.as_bytes();
+    let mut end = 1; // skip first char (always uppercase start of domain)
+    while end < bytes.len() {
+        let c = bytes[end] as char;
+        if c.is_uppercase() || c.is_ascii_digit() || c == '.' {
+            break;
+        }
+        end += 1;
+    }
+    let domain = &after[..end];
+    if domain.len() >= 3 {
+        Some(domain.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Find the dominant API domain in a cluster's filenames (>50% must share it).
+fn dominant_api_domain(files: &[&FileInfo]) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for f in files {
+        let fname = f.relative_path.split('/').next_back().unwrap_or("");
+        if let Some(domain) = extract_api_domain_from_filename(fname) {
+            *counts.entry(domain).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .filter(|(_, c)| *c > files.len() / 2)
+        .map(|(domain, _)| format!("{} API types", domain))
+}
+
+/// Find a unique API domain label for this cluster that siblings don't share.
+fn find_unique_api_domain(
+    files: &[&FileInfo],
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    sibling_indices: &[usize],
+    my_idx: usize,
+) -> Option<String> {
+    let my_domain = dominant_api_domain(files)?;
+
+    for &idx in sibling_indices {
+        if idx == my_idx || idx >= clusters.len() {
+            continue;
+        }
+        let (other_files, _) = &clusters[idx];
+        if let Some(other_domain) = dominant_api_domain(other_files) {
+            if other_domain == my_domain {
+                return None;
+            }
+        }
+    }
+
+    Some(my_domain)
+}
+
 /// Find a disambiguator for a cluster — checks for test files, architecture layers, etc.
 fn find_label_disambiguator(files: &[&FileInfo]) -> Option<String> {
     // Test files
@@ -976,8 +1107,26 @@ fn describe_file_group(refs: &[&FileInfo]) -> String {
             }
         }
         if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
-            if !GENERIC_SEGMENTS.contains(&seg) {
+            if !GENERIC_SEGMENTS.contains(&seg) && !is_nextjs_route_param(seg) {
                 return seg.to_string();
+            }
+        }
+    }
+
+    // Strategy 1.5: If files span multiple subdirectories, list the top 2-3
+    {
+        let mut subdir_counts: HashMap<&str, usize> = HashMap::new();
+        for p in &paths {
+            if common < p.len().saturating_sub(1) {
+                *subdir_counts.entry(p[common]).or_default() += 1;
+            }
+        }
+        if subdir_counts.len() >= 2 {
+            let mut sorted: Vec<_> = subdir_counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<&str> = sorted.iter().take(3).map(|(name, _)| *name).filter(|n| !is_nextjs_route_param(n)).collect();
+            if !top.is_empty() {
+                return top.join(" + ");
             }
         }
     }
@@ -997,7 +1146,9 @@ fn describe_file_group(refs: &[&FileInfo]) -> String {
             }
         }
         if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
-            return format!("{} {} modules", n, seg);
+            if !is_nextjs_route_param(seg) {
+                return format!("{} {} modules", n, seg);
+            }
         }
     }
 
@@ -1146,6 +1297,35 @@ fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo]) -> bool 
         return true;
     }
 
+    // Technology/framework terms describe code nature, not specific subdirectories.
+    // These words commonly appear in LLM labels but rarely in file paths, causing
+    // false rejections when a few paths happen to contain "components/" or "api/".
+    const TECHNOLOGY_TERMS: &[&str] = &[
+        "react", "vue", "angular", "svelte", "next", "nuxt",
+        "node", "express", "fastify", "nest",
+        "components", "hooks", "pages", "layouts", "views", "widgets",
+        "api", "rest", "graphql", "grpc", "proto",
+        "template", "templates", "config", "configs", "configuration",
+        "server", "client", "frontend", "backend",
+        "typescript", "javascript", "python", "golang", "rust",
+        "source", "modules", "packages", "library",
+        "form", "forms", "modal", "modals", "dialog", "dialogs",
+        "page", "route", "routes", "routing", "navigation",
+        "auth", "authentication", "authorization",
+        "state", "store", "redux", "zustand", "context",
+        "style", "styles", "styled", "css", "scss",
+        "test", "tests", "spec", "specs", "testing",
+        "util", "utils", "utility", "utilities", "helper", "helpers",
+        "service", "services", "handler", "handlers",
+        "model", "models", "entity", "entities", "schema", "schemas",
+        "feature", "features", "domain", "domains",
+        "shared", "common", "core", "base", "internal",
+        "medical", "clinical", "patient", "health", "healthcare",
+        "scheduling", "appointment", "billing", "insurance",
+        "dashboard", "admin", "portal", "management",
+        "prior", "authorization", "workflow", "workflows",
+    ];
+
     let label_lower = label.to_lowercase();
     let label_words: Vec<&str> = label_lower
         .split_whitespace()
@@ -1156,28 +1336,67 @@ fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo]) -> bool 
         return true;
     }
 
-    // Count how many files have paths matching ANY label word
+    // Filter out technology terms — only use path-specific words for validation
+    let path_specific_words: Vec<&&str> = label_words
+        .iter()
+        .filter(|w| !TECHNOLOGY_TERMS.contains(w))
+        .collect();
+
+    // If ALL label words are technology terms (e.g. "React Form Components"),
+    // the label is conceptual, not path-derived — always accept it.
+    if path_specific_words.is_empty() {
+        tracing::info!(
+            label = label,
+            "semantic_navigate: validate_label — all words are technology terms, accepting: {:?}",
+            label
+        );
+        return true;
+    }
+
+    // Count how many files have paths matching any PATH-SPECIFIC label word
     let matching_files = file_refs
         .iter()
         .filter(|f| {
             let path_lower = f.relative_path.to_lowercase();
-            label_words.iter().any(|w| path_lower.contains(w))
+            path_specific_words.iter().any(|w| path_lower.contains(**w))
         })
         .count();
 
     let match_ratio = matching_files as f64 / file_refs.len() as f64;
 
-    // If fewer than 20% of files match the label words in their paths,
+    // If fewer than 20% of files match the path-specific label words,
     // the LLM likely named the cluster after a minority feature.
-    // Exception: generic labels like "UI Components" won't match paths at all,
-    // so we only reject when there ARE some matches (meaning the label IS
-    // path-specific) but they're a small minority.
+    // Exception: labels with zero matches are conceptual (not path-derived) — accept them.
     if matching_files > 0 && match_ratio < 0.20 {
+        tracing::info!(
+            label = label,
+            matching_files = matching_files,
+            total_files = file_refs.len(),
+            match_ratio = format!("{:.2}", match_ratio).as_str(),
+            path_specific_words = format!("{:?}", path_specific_words).as_str(),
+            "semantic_navigate: validate_label — rejecting {:?} (match_ratio={:.2}, path_words={:?})",
+            label, match_ratio, path_specific_words
+        );
         return false;
     }
 
+    tracing::info!(
+        label = label,
+        matching_files = matching_files,
+        total_files = file_refs.len(),
+        match_ratio = format!("{:.2}", match_ratio).as_str(),
+        "semantic_navigate: validate_label — accepting {:?} (match_ratio={:.2}, {} of {} files)",
+        label, match_ratio, matching_files, file_refs.len()
+    );
     true
 }
+
+/// Returns true if a directory segment is a Next.js dynamic route parameter
+/// (e.g., `[templateId]`, `[...nextauth]`, `[patientId]`, `[[...slug]]`).
+fn is_nextjs_route_param(seg: &str) -> bool {
+    seg.starts_with('[') || seg.ends_with(']')
+}
+
 
 /// Looks for the most common DISTINGUISHING directory segment — the first
 /// segment after the common prefix where files diverge. This prevents
@@ -1331,7 +1550,7 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             }
         }
         if let Some((seg, count)) = seg_counts.iter().max_by_key(|(_, c)| **c) {
-            if *count > files.len() / 3 && !GENERIC_SEGMENTS.contains(seg) {
+            if *count > files.len() / 3 && !GENERIC_SEGMENTS.contains(seg) && !is_nextjs_route_param(seg) {
                 // If there's a second-level distinguisher too, use it
                 let mut sub_counts: HashMap<&str, usize> = HashMap::new();
                 for p in &paths {
@@ -1340,7 +1559,7 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                     }
                 }
                 if let Some((sub_seg, sub_count)) = sub_counts.iter().max_by_key(|(_, c)| **c) {
-                    if *sub_count > files.len() / 3 && !GENERIC_SEGMENTS.contains(sub_seg) {
+                    if *sub_count > files.len() / 3 && !GENERIC_SEGMENTS.contains(sub_seg) && !is_nextjs_route_param(sub_seg) {
                         let raw = format!("{}/{}", seg, sub_seg);
                         let descriptive = map_path_to_description(&raw);
                         return Some(descriptive.to_string());
@@ -1412,6 +1631,12 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                     | "async" | "await" | "return" | "string" | "number" | "boolean"
                     | "undefined" | "null" | "void" | "true" | "false"
                     | "todo" | "fixme" | "note" | "hack"
+                    // Generic code constants/markers that appear in file headers
+                    | "section" | "default" | "config" | "options" | "settings"
+                    | "props" | "state" | "action" | "reducer" | "store"
+                    | "error" | "event" | "handler" | "callback" | "listener"
+                    | "item" | "items" | "list" | "array" | "object"
+                    | "value" | "result" | "response" | "request"
                 )
         }
 
@@ -1435,7 +1660,8 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
     if common_depth >= 2 {
         let label = format!("{}/{}", paths[0][common_depth - 2], paths[0][common_depth - 1]);
         let generic = ["packages", "apps", "src", "lib", "internal"];
-        if !generic.contains(&label.as_str()) {
+        let segs_clean = !is_nextjs_route_param(paths[0][common_depth - 2]) && !is_nextjs_route_param(paths[0][common_depth - 1]);
+        if segs_clean && !generic.contains(&label.as_str()) {
             return Some(label);
         }
     }
@@ -1555,7 +1781,13 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
 
     if !node.label.is_empty() {
         let count = count_files_in_node(node);
-        result.push_str(&format!("{}[{}] ({} files)\n", pad, node.label, count));
+        // Don't add "(N files)" if label already starts with a number (e.g., "6 source files")
+        let label_starts_with_count = node.label.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        if label_starts_with_count {
+            result.push_str(&format!("{}[{}]\n", pad, node.label));
+        } else {
+            result.push_str(&format!("{}[{}] ({} files)\n", pad, node.label, count));
+        }
     }
 
     if !node.children.is_empty() {
@@ -3135,6 +3367,89 @@ mod tests {
         );
     }
 
+    // --- derive_cluster_label Next.js route param tests ---
+
+    #[test]
+    fn derive_cluster_label_skips_nextjs_route_params() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo {
+                relative_path: "app/templates/[templateId]/page.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/templates/[templateId]/layout.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        if let Some(l) = &label {
+            assert!(
+                !l.contains("templateId"),
+                "Should not use Next.js route param as label: {}",
+                l
+            );
+        }
+    }
+
+    #[test]
+    fn derive_cluster_label_skips_patient_route_param() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo {
+                relative_path: "app/people/[patientId]/overview.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/people/[patientId]/history.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        if let Some(l) = &label {
+            assert!(
+                !l.contains("patientId"),
+                "Should not use Next.js route param as label: {}",
+                l
+            );
+        }
+    }
+
+    #[test]
+    fn derive_cluster_label_skips_catch_all_route_param() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo {
+                relative_path: "app/api/auth/[...nextauth]/route.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/api/auth/[...nextauth]/config.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        if let Some(l) = &label {
+            assert!(
+                !l.contains("nextauth") && !l.contains("..."),
+                "Should not use Next.js catch-all route param as label: {}",
+                l
+            );
+        }
+    }
+
     // --- deduplicate_sibling_labels additional tests ---
 
     #[test]
@@ -3169,5 +3484,98 @@ mod tests {
             "Expected 'tests' label: {:?}",
             labels
         );
+    }
+
+    // --- extract_api_domain_from_filename tests ---
+
+    #[test]
+    fn extract_api_domain_scheduling() {
+        assert_eq!(
+            extract_api_domain_from_filename("getApiV1SchedulingServices200.ts"),
+            Some("scheduling".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_api_domain_auth() {
+        assert_eq!(
+            extract_api_domain_from_filename("postApiV1AuthLogin200.ts"),
+            Some("auth".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_api_domain_organizations() {
+        assert_eq!(
+            extract_api_domain_from_filename("patchApiV1OrganizationsMembers.ts"),
+            Some("organizations".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_api_domain_no_match() {
+        assert_eq!(extract_api_domain_from_filename("index.ts"), None);
+        assert_eq!(extract_api_domain_from_filename("utils.ts"), None);
+    }
+
+    #[test]
+    fn extract_api_domain_short_domain() {
+        assert_eq!(extract_api_domain_from_filename("getApiV1AbTest.ts"), None);
+    }
+
+    // --- find_unique_api_domain / describe_cluster_uniqueness tests ---
+
+    #[test]
+    fn describe_cluster_uniqueness_api_domains() {
+        let scheduling_files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/libs/types/generated/getApiV1SchedulingServices200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/libs/types/generated/getApiV1SchedulingAppointments200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/libs/types/generated/postApiV1SchedulingSlots200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let auth_files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/libs/types/generated/postApiV1AuthLogin200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/libs/types/generated/postApiV1AuthRegister200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/libs/types/generated/getApiV1AuthSession200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
+            (scheduling_files.iter().collect(), None),
+            (auth_files.iter().collect(), None),
+        ];
+        let sibling_indices = vec![0usize, 1usize];
+
+        let suffix0 = describe_cluster_uniqueness(
+            &clusters[0].0, &clusters, &sibling_indices, 0,
+        );
+        let suffix1 = describe_cluster_uniqueness(
+            &clusters[1].0, &clusters, &sibling_indices, 1,
+        );
+
+        assert_eq!(suffix0, "scheduling API types");
+        assert_eq!(suffix1, "auth API types");
+    }
+
+    #[test]
+    fn describe_cluster_uniqueness_same_api_domain_falls_back() {
+        let files_a: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "gen/getApiV1SchedulingA.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "gen/getApiV1SchedulingB.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let files_b: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "gen/postApiV1SchedulingC.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "gen/postApiV1SchedulingD.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "gen/postApiV1SchedulingE.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
+            (files_a.iter().collect(), None),
+            (files_b.iter().collect(), None),
+        ];
+        let sibling_indices = vec![0usize, 1usize];
+
+        let suffix0 = describe_cluster_uniqueness(
+            &clusters[0].0, &clusters, &sibling_indices, 0,
+        );
+        assert_eq!(suffix0, "2 files");
     }
 }
