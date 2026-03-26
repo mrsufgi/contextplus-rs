@@ -270,15 +270,10 @@ async fn build_labeled_tree(
     let mut large_groups: Vec<(String, Vec<usize>)> = Vec::new();
 
     for (dir_label, group_indices) in &dir_groups {
-        if group_indices.len() <= MAX_FILES_PER_LEAF {
-            children.push(ClusterNode {
-                label: dir_label.clone(),
-                files: group_indices.iter().map(|&i| files[i].clone()).collect(),
-                children: Vec::new(),
-            });
-        } else {
-            large_groups.push((dir_label.clone(), group_indices.clone()));
-        }
+        // Always attempt spectral clustering on every group.
+        // Even small groups (6-15 files) benefit from semantic splitting
+        // (e.g., separating tests from implementation within service/).
+        large_groups.push((dir_label.clone(), group_indices.clone()));
     }
 
     // Phase 1: Cluster all groups concurrently (CPU-bound, no LLM).
@@ -2570,8 +2565,8 @@ mod tests {
     // --- MAX_FILES_PER_LEAF constant test ---
 
     #[test]
-    fn max_files_per_leaf_is_20() {
-        assert_eq!(MAX_FILES_PER_LEAF, 20);
+    fn max_files_per_leaf_is_10() {
+        assert_eq!(MAX_FILES_PER_LEAF, 10);
     }
 
     // --- describe_file_group tests ---
