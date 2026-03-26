@@ -305,14 +305,19 @@ pub async fn semantic_navigate(
                     .collect::<Vec<_>>()
                     .join("\n  ");
                 format!(
-                    "Cluster {} ({} files, within \"{}\"):\n  Subdirectories: {}\n  Sample files:\n  {}",
+                    "Cluster {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
                     desc_idx + 1, file_refs.len(), parent_label, subdir_summary, file_list
                 )
             })
             .collect();
 
         let prompt = format!(
-            "Label each cluster based on its OVERALL structure and subdirectory distribution, not individual filenames. Return EXACTLY 2 words per label. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
+            "Label each cluster based on the MAJORITY of its files, using the subdirectory distribution as the primary signal.\n\
+            Do NOT name a cluster after a single file or minority feature — name it after what MOST files do.\n\
+            A cluster with 80 component files and 1 validation file should be \"UI Components\", not \"Validation\".\n\
+            A cluster with 15 scheduling pages and 1 microphone util should be \"Scheduling Pages\", not \"Microphone Utils\".\n\
+            Look at the file counts per subdirectory — the subdirectory with the MOST files determines the label.\n\
+            Return EXACTLY 2-5 words per label. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
             descriptions.join("\n\n"),
             llm_batch.len()
         );
@@ -320,9 +325,24 @@ pub async fn semantic_navigate(
         if let Ok(response) = ollama.chat(&prompt).await {
             if let Some(json_str) = extract_json_array(&response) {
                 if let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str) {
-                    for (j, (gi, ci, _)) in llm_batch.iter().enumerate() {
+                    for (j, (gi, ci, file_refs)) in llm_batch.iter().enumerate() {
                         if let Some(label) = labels.get(j) {
-                            llm_label_map.insert((*gi, *ci), label.clone());
+                            let clean_label = label.trim();
+                            // Post-processing: reject garbage labels
+                            if clean_label.is_empty()
+                                || clean_label.len() > 50
+                                || clean_label.contains('.')
+                                || clean_label.contains('/')
+                            {
+                                continue;
+                            }
+                            // Post-processing: reject labels that name a minority feature.
+                            // If the label words match a specific subdirectory that holds <20%
+                            // of the cluster's files, the LLM was misled by a prominent filename.
+                            if !validate_label_against_cluster(clean_label, file_refs) {
+                                continue;
+                            }
+                            llm_label_map.insert((*gi, *ci), clean_label.to_string());
                         }
                     }
                 }
@@ -710,16 +730,178 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
         // If all disambiguators are identical or None, skip — second pass handles it
     }
 
-    // Second pass: guarantee uniqueness with #N for any remaining duplicates
-    let mut final_seen: HashMap<String, usize> = HashMap::new();
-    for label in labels.iter_mut() {
-        let key = label.to_lowercase();
-        let count = final_seen.entry(key).or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            *label = format!("{} #{}", label, count);
+    // Second pass: for remaining duplicates, find what makes each unique
+    let mut final_seen: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, label) in labels.iter().enumerate() {
+        final_seen.entry(label.to_lowercase()).or_default().push(i);
+    }
+    for (_key, indices) in &final_seen {
+        if indices.len() <= 1 {
+            continue;
+        }
+
+        // Compute a distinguishing suffix for each duplicate cluster
+        let suffixes: Vec<(usize, String)> = indices
+            .iter()
+            .filter_map(|&idx| {
+                if idx >= clusters.len() {
+                    return None;
+                }
+                let (files, _) = &clusters[idx];
+                let suffix = describe_cluster_uniqueness(files, clusters, indices, idx);
+                Some((idx, suffix))
+            })
+            .collect();
+
+        // Check if the computed suffixes are actually unique across siblings
+        let unique_suffixes: HashSet<&str> = suffixes.iter().map(|(_, s)| s.as_str()).collect();
+        if unique_suffixes.len() == suffixes.len() {
+            // All suffixes are distinct — use them
+            for (idx, suffix) in &suffixes {
+                let base = labels[*idx].split(" #").next().unwrap_or(&labels[*idx]).to_string();
+                labels[*idx] = format!("{} ({})", base, suffix);
+            }
+        } else {
+            // Suffixes collided — fall back to numbering
+            let mut counter = 0usize;
+            for &idx in indices {
+                counter += 1;
+                if counter > 1 {
+                    labels[idx] = format!("{} #{}", labels[idx], counter);
+                }
+            }
         }
     }
+}
+
+/// Describe what makes THIS cluster unique compared to its duplicate siblings.
+///
+/// Tries in order:
+/// 1. Most common directory segment unique to this cluster (not shared by siblings)
+/// 2. Dominant file extension/type if different from siblings
+/// 3. File count as last resort
+fn describe_cluster_uniqueness(
+    files: &[&FileInfo],
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    sibling_indices: &[usize],
+    my_idx: usize,
+) -> String {
+    if let Some(dir) = find_unique_dominant_directory(files, clusters, sibling_indices, my_idx) {
+        return dir;
+    }
+    if let Some(ftype) = find_unique_file_type(files, clusters, sibling_indices, my_idx) {
+        return ftype;
+    }
+    format!("{} files", files.len())
+}
+
+/// Find the most common directory segment in this cluster that other sibling clusters don't share.
+fn find_unique_dominant_directory(
+    files: &[&FileInfo],
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    sibling_indices: &[usize],
+    my_idx: usize,
+) -> Option<String> {
+    let my_segments = count_directory_segments(files);
+
+    let mut other_segments: HashMap<String, usize> = HashMap::new();
+    for &idx in sibling_indices {
+        if idx == my_idx || idx >= clusters.len() {
+            continue;
+        }
+        let (other_files, _) = &clusters[idx];
+        for (seg, count) in count_directory_segments(other_files) {
+            *other_segments.entry(seg).or_default() += count;
+        }
+    }
+
+    let mut best: Option<(String, usize)> = None;
+    for (seg, count) in &my_segments {
+        let other_count = other_segments.get(seg).copied().unwrap_or(0);
+        if *count > files.len() / 3 && other_count == 0 {
+            if best.as_ref().map_or(true, |(_, bc)| count > bc) {
+                best = Some((seg.clone(), *count));
+            }
+        }
+    }
+
+    best.map(|(seg, _)| seg)
+}
+
+/// Count occurrences of each meaningful directory segment in file paths.
+fn count_directory_segments(files: &[&FileInfo]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for f in files {
+        for segment in f.relative_path.split('/') {
+            if segment.contains('.') || segment.len() < 2 {
+                continue;
+            }
+            *counts.entry(segment.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Find the dominant file type of this cluster if it differs from all siblings.
+fn find_unique_file_type(
+    files: &[&FileInfo],
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    sibling_indices: &[usize],
+    my_idx: usize,
+) -> Option<String> {
+    let my_type = dominant_file_type(files)?;
+
+    for &idx in sibling_indices {
+        if idx == my_idx || idx >= clusters.len() {
+            continue;
+        }
+        let (other_files, _) = &clusters[idx];
+        if let Some(other_type) = dominant_file_type(other_files) {
+            if other_type == my_type {
+                return None;
+            }
+        }
+    }
+
+    Some(my_type)
+}
+
+/// Return the dominant file type category for a cluster, if >50% of files share it.
+fn dominant_file_type(files: &[&FileInfo]) -> Option<String> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in files {
+        let path = &f.relative_path;
+        let cat = if path.ends_with(".test.ts")
+            || path.ends_with(".test.tsx")
+            || path.ends_with(".spec.ts")
+            || path.ends_with(".spec.tsx")
+            || path.ends_with("_test.go")
+            || path.ends_with("_test.rs")
+        {
+            "tests"
+        } else if path.ends_with(".tsx") {
+            "components"
+        } else if path.ends_with(".proto") {
+            "proto"
+        } else if path.ends_with(".sql") {
+            "SQL"
+        } else if path.ends_with(".go") {
+            "Go"
+        } else if path.ends_with(".rs") {
+            "Rust"
+        } else if path.ends_with(".ts") || path.ends_with(".js") {
+            "implementation"
+        } else {
+            "files"
+        };
+        *counts.entry(cat).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .filter(|(_, c)| *c > files.len() / 2)
+        .map(|(cat, _)| cat.to_string())
 }
 
 /// Find a disambiguator for a cluster — checks for test files, architecture layers, etc.
@@ -767,7 +949,12 @@ fn describe_file_group(refs: &[&FileInfo]) -> String {
         return "empty cluster".to_string();
     }
 
-    // Strategy 1: most common parent directory after common prefix
+    const GENERIC_SEGMENTS: &[&str] = &[
+        "src", "lib", "dist", "build", "utils", "helpers", "common", "shared",
+        "core", "types", "config", "internal", "cmd", "pkg",
+    ];
+
+    // Strategy 1: most common parent directory after common prefix (skip generic segments)
     let paths: Vec<Vec<&str>> = refs
         .iter()
         .map(|f| f.relative_path.split('/').collect::<Vec<_>>())
@@ -789,18 +976,38 @@ fn describe_file_group(refs: &[&FileInfo]) -> String {
             }
         }
         if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
-            return seg.to_string();
+            if !GENERIC_SEGMENTS.contains(&seg) {
+                return seg.to_string();
+            }
         }
     }
 
-    // Strategy 2 & 3: describe by dominant file type
-    file_type_label(refs)
+    // Strategy 2: describe by dominant file type (skips overly generic labels)
+    if let Some(label) = file_type_label(refs) {
+        return label;
+    }
+
+    // Strategy 3: fallback — use directory name (even generic) with count, never bare "N files"
+    let n = refs.len();
+    if common < min_depth.saturating_sub(1) {
+        let mut seg_counts: HashMap<&str, usize> = HashMap::new();
+        for p in &paths {
+            if common < p.len().saturating_sub(1) {
+                *seg_counts.entry(p[common]).or_default() += 1;
+            }
+        }
+        if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
+            return format!("{} {} modules", n, seg);
+        }
+    }
+
+    format!("{} source files", n)
 }
 
 /// Classify a group of files by their dominant extension/suffix pattern.
 ///
-/// Returns a descriptive string like "React components" or "8 test files".
-fn file_type_label(refs: &[&FileInfo]) -> String {
+/// Returns `None` for overly generic labels (e.g. "TypeScript modules" in a TS project).
+fn file_type_label(refs: &[&FileInfo]) -> Option<String> {
     let n = refs.len();
 
     // Count files by type category
@@ -828,7 +1035,8 @@ fn file_type_label(refs: &[&FileInfo]) -> String {
         } else if path.ends_with(".rs") {
             "Rust source"
         } else if path.ends_with(".ts") || path.ends_with(".js") {
-            "TypeScript modules"
+            // Too generic for TS-dominant projects — caller will use directory name instead
+            "too_generic"
         } else if path.ends_with(".json") {
             "JSON configs"
         } else if path.ends_with(".yml") || path.ends_with(".yaml") {
@@ -841,15 +1049,15 @@ fn file_type_label(refs: &[&FileInfo]) -> String {
         *category_counts.entry(cat).or_default() += 1;
     }
 
-    // Find dominant category (>50% of files)
+    // Find dominant category (>50% of files), but skip overly generic labels
     if let Some((cat, count)) = category_counts.iter().max_by_key(|(_, c)| **c) {
-        if *count > n / 2 {
-            return format!("{} {}", n, cat);
+        if *count > n / 2 && *cat != "too_generic" && *cat != "files" {
+            return Some(format!("{} {}", n, cat));
         }
     }
 
-    // No dominant type — just count with "files"
-    format!("{} files", n)
+    // No useful dominant type — let caller try directory-based fallback
+    None
 }
 
 /// Extract a header comment from the first few lines of a file.
@@ -922,6 +1130,53 @@ fn map_path_to_description(path_label: &str) -> &str {
 
     // No mapping found — return the original path label as-is
     path_label
+}
+
+/// Validate that an LLM-generated label actually represents the cluster content.
+///
+/// Returns `false` if the label appears to name a minority feature — e.g. when
+/// one prominent file skews the LLM into labeling an 81-file cluster after a
+/// single file's concern. We check by tokenizing the label into words and seeing
+/// if those words appear predominantly in only a small fraction of the cluster's
+/// file paths. If the label words match a specific subdirectory holding <20% of
+/// files (and don't match the majority), the label is rejected.
+fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo]) -> bool {
+    if file_refs.len() < 5 {
+        // Too small to have a mislabeling problem
+        return true;
+    }
+
+    let label_lower = label.to_lowercase();
+    let label_words: Vec<&str> = label_lower
+        .split_whitespace()
+        .filter(|w| w.len() > 2) // skip short words like "of", "and"
+        .collect();
+
+    if label_words.is_empty() {
+        return true;
+    }
+
+    // Count how many files have paths matching ANY label word
+    let matching_files = file_refs
+        .iter()
+        .filter(|f| {
+            let path_lower = f.relative_path.to_lowercase();
+            label_words.iter().any(|w| path_lower.contains(w))
+        })
+        .count();
+
+    let match_ratio = matching_files as f64 / file_refs.len() as f64;
+
+    // If fewer than 20% of files match the label words in their paths,
+    // the LLM likely named the cluster after a minority feature.
+    // Exception: generic labels like "UI Components" won't match paths at all,
+    // so we only reject when there ARE some matches (meaning the label IS
+    // path-specific) but they're a small minority.
+    if matching_files > 0 && match_ratio < 0.20 {
+        return false;
+    }
+
+    true
 }
 
 /// Looks for the most common DISTINGUISHING directory segment — the first
