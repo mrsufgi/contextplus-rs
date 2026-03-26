@@ -940,6 +940,7 @@ impl ContextPlusServer {
             max_depth: Self::get_usize(&args, "max_depth"),
             max_clusters: Self::get_usize(&args, "max_clusters"),
             min_clusters: Self::get_usize(&args, "min_clusters"),
+            mode: Self::get_str(&args, "mode"),
         };
 
         let result = crate::tools::semantic_navigate::semantic_navigate(

@@ -23,6 +23,12 @@ pub struct SemanticNavigateOptions {
     pub max_depth: Option<usize>,
     pub max_clusters: Option<usize>,
     pub min_clusters: Option<usize>,
+    /// Clustering mode:
+    /// - "hybrid" (default): directory-based top-level grouping + spectral sub-clustering.
+    ///   Best for CPU (fewer LLM calls, directory boundaries as domain boundaries).
+    /// - "semantic": pure spectral clustering from the top, like the original contextplus.
+    ///   Best with GPU (fast LLM labels at every level, true semantic grouping).
+    pub mode: Option<String>,
 }
 
 /// Information about a source file for clustering.
@@ -214,32 +220,48 @@ pub async fn semantic_navigate(
         return Ok(lines.join("\n"));
     }
 
-    // Depth 0: group by directory structure (domain boundaries).
-    // Spectral clustering can't separate domains in uniform-architecture monorepos
-    // because embeddings capture code patterns, not domain identity.
-    // Directory structure IS the domain boundary — use it as the top level,
-    // then spectral clustering sub-clusters within each group at depth 1+.
-    let dir_groups = group_by_directory(&files);
+    let use_semantic_mode = options.mode.as_deref() == Some("semantic");
 
-    // Cluster directory groups, label sub-clusters with LLM, and build the tree.
-    let mut children = build_labeled_tree(
-        &files,
-        &vectors,
-        dir_groups,
-        max_clusters,
-        min_clusters,
-        max_depth,
-        ollama,
-    )
-    .await;
+    let root_node = if use_semantic_mode {
+        // SEMANTIC MODE: Pure spectral clustering from the top, like the original contextplus.
+        // Best with GPU (fast LLM labels at every level). Recursively splits by embedding
+        // similarity — no directory-based grouping.
+        let all_indices: Vec<usize> = (0..files.len()).collect();
+        let mut tree = build_semantic_hierarchy(
+            &files,
+            &vectors,
+            &all_indices,
+            max_clusters,
+            min_clusters,
+            0,
+            max_depth,
+            ollama,
+        )
+        .await;
+        tree.label = "Project".to_string();
+        tree
+    } else {
+        // HYBRID MODE (default): Directory-based top-level grouping + spectral sub-clustering.
+        // Best for CPU (fewer LLM calls, directory boundaries as domain boundaries).
+        let dir_groups = group_by_directory(&files);
+        let mut children = build_labeled_tree(
+            &files,
+            &vectors,
+            dir_groups,
+            max_clusters,
+            min_clusters,
+            max_depth,
+            ollama,
+        )
+        .await;
 
-    // Sort by file count descending
-    children.sort_by(|a, b| count_files_in_node(b).cmp(&count_files_in_node(a)));
+        children.sort_by(|a, b| count_files_in_node(b).cmp(&count_files_in_node(a)));
 
-    let root_node = ClusterNode {
-        label: "Project".to_string(),
-        files: Vec::new(),
-        children,
+        ClusterNode {
+            label: "Project".to_string(),
+            files: Vec::new(),
+            children,
+        }
     };
 
     let tree_text = render_cluster_tree(&root_node, 0);
@@ -254,6 +276,161 @@ pub async fn semantic_navigate(
         sampled_note,
         tree_text
     ))
+}
+
+/// SEMANTIC MODE: Recursively build cluster hierarchy using pure spectral clustering.
+/// Like the original contextplus — no directory-based grouping, LLM labels at every level.
+async fn build_semantic_hierarchy(
+    all_files: &[FileInfo],
+    all_vectors: &[Vec<f32>],
+    indices: &[usize],
+    max_clusters: usize,
+    min_clusters: usize,
+    depth: usize,
+    max_depth: usize,
+    ollama: &OllamaClient,
+) -> ClusterNode {
+    if indices.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
+        return ClusterNode {
+            label: String::new(),
+            files: indices.iter().map(|&i| all_files[i].clone()).collect(),
+            children: Vec::new(),
+        };
+    }
+
+    // Spectral clustering on this group's vectors
+    let local_vectors: Vec<Vec<f32>> = indices.iter().map(|&i| all_vectors[i].clone()).collect();
+    let mc = max_clusters;
+    let mn = min_clusters;
+    let cluster_results = tokio::task::spawn_blocking(move || {
+        spectral_cluster_with_min(&local_vectors, mc, mn)
+    })
+    .await
+    .unwrap_or_else(|_| vec![]);
+
+    if cluster_results.len() <= 1 {
+        return ClusterNode {
+            label: String::new(),
+            files: indices.iter().map(|&i| all_files[i].clone()).collect(),
+            children: Vec::new(),
+        };
+    }
+
+    // Map back to global indices
+    let child_groups: Vec<Vec<usize>> = cluster_results
+        .iter()
+        .map(|c| c.indices.iter().map(|&li| indices[li]).collect())
+        .collect();
+
+    // Label sibling clusters with LLM (single batched call)
+    let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_groups
+        .iter()
+        .map(|idxs| {
+            let refs: Vec<&FileInfo> = idxs.iter().map(|&i| &all_files[i]).collect();
+            (refs, None)
+        })
+        .collect();
+
+    let mut labels = label_clusters_for_semantic_mode(&label_input, ollama).await;
+
+    // Deduplicate sibling labels
+    deduplicate_sibling_labels(&mut labels, &label_input);
+
+    // Recurse into children sequentially (to avoid Ollama contention)
+    let mut children: Vec<ClusterNode> = Vec::new();
+    for (i, child_indices) in child_groups.iter().enumerate() {
+        let mut child = Box::pin(build_semantic_hierarchy(
+            all_files,
+            all_vectors,
+            child_indices,
+            max_clusters,
+            min_clusters,
+            depth + 1,
+            max_depth,
+            ollama,
+        ))
+        .await;
+        child.label = labels.get(i).cloned().unwrap_or_else(|| format!("Cluster {}", i + 1));
+        children.push(child);
+    }
+
+    ClusterNode {
+        label: String::new(),
+        files: Vec::new(),
+        children,
+    }
+}
+
+/// Label clusters using LLM with the original contextplus prompt style.
+/// Returns overarchingTheme-based labels or path-based fallbacks.
+async fn label_clusters_for_semantic_mode(
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    ollama: &OllamaClient,
+) -> Vec<String> {
+    if clusters.is_empty() {
+        return Vec::new();
+    }
+
+    // Build LLM prompt — original contextplus asked for overarchingTheme + distinguishingFeature + label
+    let descriptions: Vec<String> = clusters
+        .iter()
+        .enumerate()
+        .map(|(i, (files, _))| {
+            let sample: Vec<String> = files.iter().take(10).map(|f| {
+                let desc = if f.header.is_empty() { "no description" } else { &f.header };
+                format!("{}: {}", f.relative_path, desc)
+            }).collect();
+            format!("Cluster {} ({} files):\n  {}", i + 1, files.len(), sample.join("\n  "))
+        })
+        .collect();
+
+    let prompt = format!(
+        "You are labeling clusters of code files in a software project.\n\
+         For each cluster, produce a JSON array of objects with:\n\
+         - \"overarchingTheme\": a sentence about the cluster's theme\n\
+         - \"distinguishingFeature\": what makes this cluster unique vs siblings\n\
+         - \"label\": 2-4 words describing the cluster\n\n\
+         {}\n\n\
+         Respond with ONLY a JSON array of {} objects. No other text.",
+        descriptions.join("\n\n"),
+        clusters.len()
+    );
+
+    match ollama.chat(&prompt).await {
+        Ok(response) => {
+            // Try to parse the rich response format
+            if let Some(json_str) = extract_json_array(&response) {
+                // Try rich format first: [{overarchingTheme, distinguishingFeature, label}]
+                if let Ok(rich) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                    let labels: Vec<String> = rich.iter().enumerate().map(|(i, v)| {
+                        v.get("label")
+                            .and_then(|l| l.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                // Fallback: try as plain string array
+                                v.as_str().map(|s| s.to_string())
+                                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+                            })
+                    }).collect();
+                    if labels.len() == clusters.len() {
+                        return labels;
+                    }
+                }
+            }
+            // LLM response unparseable — use path-based fallbacks
+            clusters.iter().enumerate().map(|(i, (files, _))| {
+                derive_cluster_label(files)
+                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+            }).collect()
+        }
+        Err(_) => {
+            // LLM failed — use path-based fallbacks
+            clusters.iter().enumerate().map(|(i, (files, _))| {
+                derive_cluster_label(files)
+                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+            }).collect()
+        }
+    }
 }
 
 /// Cluster directory groups, label sub-clusters with LLM, and build the tree.
@@ -2550,11 +2727,13 @@ mod tests {
             max_depth: None,
             max_clusters: None,
             min_clusters: None,
+            mode: None,
         };
         assert_eq!(opts.root_dir, "/tmp");
         assert!(opts.max_depth.is_none());
         assert!(opts.max_clusters.is_none());
         assert!(opts.min_clusters.is_none());
+        assert!(opts.mode.is_none());
     }
 
     #[test]
@@ -2564,6 +2743,7 @@ mod tests {
             max_depth: Some(5),
             max_clusters: Some(10),
             min_clusters: Some(3),
+            mode: Some("semantic".to_string()),
         };
         assert_eq!(opts.max_depth, Some(5));
         assert_eq!(opts.max_clusters, Some(10));
