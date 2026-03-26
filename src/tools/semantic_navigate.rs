@@ -1115,6 +1115,29 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
                 if label_has_count && suffix.contains("files") {
                     continue;
                 }
+                // Don't append disambiguator if base label already contains it
+                if base.to_lowercase().contains(&suffix.to_lowercase()) {
+                    // Use file names instead of the redundant disambiguator
+                    if *idx < clusters.len() {
+                        let (cluster_files, _) = &clusters[*idx];
+                        let names: Vec<&str> = cluster_files
+                            .iter()
+                            .filter_map(|f| f.relative_path.split('/').next_back())
+                            .filter_map(|n| {
+                                n.strip_suffix(".ts")
+                                    .or_else(|| n.strip_suffix(".tsx"))
+                                    .or_else(|| n.strip_suffix(".go"))
+                                    .or_else(|| n.strip_suffix(".rs"))
+                            })
+                            .filter(|n| *n != "index" && *n != "mod")
+                            .take(3)
+                            .collect();
+                        if !names.is_empty() {
+                            labels[*idx] = format!("{} ({})", base, names.join(" + "));
+                            continue;
+                        }
+                    }
+                }
                 labels[*idx] = format!("{} ({})", base, suffix);
             }
         } else {
@@ -1372,6 +1395,29 @@ fn find_label_disambiguator(files: &[&FileInfo]) -> Option<String> {
         .filter(|f| is_test_file(&f.relative_path))
         .count();
     if test_count > files.len() / 2 {
+        // Try to name what's being tested
+        let tested_modules: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.relative_path.split('/').next_back())
+            .filter_map(|name| {
+                name.strip_suffix(".test.ts")
+                    .or_else(|| name.strip_suffix(".test.tsx"))
+                    .or_else(|| name.strip_suffix(".spec.ts"))
+                    .or_else(|| name.strip_suffix(".spec.tsx"))
+                    .or_else(|| name.strip_suffix("_test.go"))
+                    .or_else(|| name.strip_suffix("_test.rs"))
+            })
+            .collect();
+        if !tested_modules.is_empty() {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for m in &tested_modules {
+                *counts.entry(m).or_default() += 1;
+            }
+            let mut sorted: Vec<_> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let top: Vec<&str> = sorted.iter().take(3).map(|(n, _)| *n).collect();
+            return Some(format!("{} tests", top.join(" + ")));
+        }
         return Some("tests".to_string());
     }
 
@@ -1447,7 +1493,7 @@ fn describe_file_group(refs: &[&FileInfo]) -> String {
         }
         if subdir_counts.len() >= 2 {
             let mut sorted: Vec<_> = subdir_counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let top: Vec<&str> = sorted.iter().take(3).map(|(name, _)| *name).filter(|n| !is_nextjs_route_param(n)).collect();
             if !top.is_empty() {
                 return top.join(" + ");
@@ -1707,13 +1753,36 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
     // We scan ALL directory segments (including common prefix) because the
     // architecture layer name may be part of the shared prefix itself.
 
-    // 1. Test file detection: if >50% of files are test files, label as "tests"
+    // 1. Test file detection: if >50% of files are test files, label with tested modules
     {
         let test_count = files
             .iter()
             .filter(|f| is_test_file(&f.relative_path))
             .count();
         if test_count > files.len() / 2 {
+            // Find what's being tested — look at filenames without test suffixes
+            let tested_modules: Vec<&str> = files
+                .iter()
+                .filter_map(|f| f.relative_path.split('/').next_back())
+                .filter_map(|name| {
+                    name.strip_suffix(".test.ts")
+                        .or_else(|| name.strip_suffix(".test.tsx"))
+                        .or_else(|| name.strip_suffix(".spec.ts"))
+                        .or_else(|| name.strip_suffix(".spec.tsx"))
+                        .or_else(|| name.strip_suffix("_test.go"))
+                        .or_else(|| name.strip_suffix("_test.rs"))
+                })
+                .collect();
+            if !tested_modules.is_empty() {
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for m in &tested_modules {
+                    *counts.entry(m).or_default() += 1;
+                }
+                let mut sorted: Vec<_> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let top: Vec<&str> = sorted.iter().take(3).map(|(n, _)| *n).collect();
+                return Some(format!("{} tests", top.join(" + ")));
+            }
             return Some("tests".to_string());
         }
     }
@@ -1771,6 +1840,38 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
 
         if let Some((label, count)) = layer_counts.iter().max_by_key(|(_, c)| **c) {
             if *count > files.len() / 2 {
+                // For generic labels like "business logic", try to describe WHICH logic
+                if *label == "business logic" || *label == "service" {
+                    let names: Vec<&str> = files
+                        .iter()
+                        .filter_map(|f| f.relative_path.split('/').next_back())
+                        .filter_map(|n| {
+                            n.strip_suffix(".ts")
+                                .or_else(|| n.strip_suffix(".tsx"))
+                                .or_else(|| n.strip_suffix(".go"))
+                                .or_else(|| n.strip_suffix(".rs"))
+                        })
+                        .filter(|n| {
+                            !n.contains("test")
+                                && !n.contains("spec")
+                                && *n != "index"
+                                && *n != "mod"
+                                && !n.contains("error")
+                        })
+                        .collect();
+                    if !names.is_empty() {
+                        // Deduplicate and take top names
+                        let mut name_counts: HashMap<&str, usize> = HashMap::new();
+                        for n in &names {
+                            *name_counts.entry(n).or_default() += 1;
+                        }
+                        let mut sorted: Vec<_> = name_counts.into_iter().collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                        let top: Vec<&str> =
+                            sorted.iter().take(3).map(|(n, _)| *n).collect();
+                        return Some(format!("{} logic", top.join(" + ")));
+                    }
+                }
                 return Some(label.to_string());
             }
         }
@@ -3035,7 +3136,7 @@ mod tests {
 
     #[test]
     fn derive_cluster_label_picks_test_files() {
-        // Majority test files -> should label as "tests"
+        // Majority test files -> should label with tested module names
         let files: Vec<FileInfo> = vec![
             FileInfo { relative_path: "pkg/auth/service/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
             FileInfo { relative_path: "pkg/auth/service/login.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
@@ -3043,7 +3144,7 @@ mod tests {
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = derive_cluster_label(&refs);
-        assert_eq!(result, Some("tests".to_string()));
+        assert_eq!(result, Some("auth + login tests".to_string()));
     }
 
     #[test]
@@ -3497,7 +3598,7 @@ mod tests {
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
-        assert_eq!(label, Some("tests".to_string()));
+        assert_eq!(label, Some("appointment + availability + date-range tests".to_string()));
     }
 
     #[test]
@@ -3521,7 +3622,7 @@ mod tests {
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
-        assert_eq!(label, Some("business logic".to_string()));
+        assert_eq!(label, Some("invoice + payment + refund logic".to_string()));
     }
 
     #[test]
@@ -3701,7 +3802,7 @@ mod tests {
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = find_label_disambiguator(&refs);
-        assert_eq!(result, Some("tests".to_string()));
+        assert_eq!(result, Some("auth + user tests".to_string()));
     }
 
     #[test]
