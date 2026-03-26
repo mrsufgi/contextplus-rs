@@ -164,3 +164,7 @@ path = "src/bin/debug_eigenvalues.rs"
 [[bin]]
 name = "warmup_identifiers"
 path = "src/bin/warmup_identifiers.rs"
+
+[[bin]]
+name = "warmup_labels"
+path = "src/bin/warmup_labels.rs"

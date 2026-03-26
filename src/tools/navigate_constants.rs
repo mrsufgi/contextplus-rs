@@ -60,6 +60,9 @@ pub fn nav_content_hash(path: &str, content: &str) -> String {
     content_hash(&format!("{}{}{}", NAV_HASH_VERSION, path, content))
 }
 
+/// File name for cached cluster labels (LLM-generated).
+pub const LABEL_CACHE_FILE: &str = "navigate-labels.json";
+
 /// Build the navigate cache file name for a given embedding model.
 pub fn nav_cache_name(model: &str) -> String {
     format!("navigate-{}", model)
