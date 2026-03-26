@@ -22,6 +22,7 @@ pub struct SemanticNavigateOptions {
     pub root_dir: String,
     pub max_depth: Option<usize>,
     pub max_clusters: Option<usize>,
+    pub min_clusters: Option<usize>,
 }
 
 /// Information about a source file for clustering.
@@ -127,7 +128,12 @@ pub async fn semantic_navigate(
     _embedding_cache: &RwLock<HashMap<String, CacheEntry>>,
     root_dir: &Path,
 ) -> Result<String> {
+    // max_clusters controls spectral clustering at depth 1+.
+    // Depth 0 uses directory-based grouping which creates one group per
+    // meaningful directory (not limited by max_clusters). This is intentional
+    // because directory boundaries are the natural domain boundaries.
     let max_clusters = options.max_clusters.unwrap_or(20);
+    let min_clusters = options.min_clusters.unwrap_or(2);
     let max_depth = options.max_depth.unwrap_or(3);
     let root = PathBuf::from(&options.root_dir);
 
@@ -221,6 +227,7 @@ pub async fn semantic_navigate(
         &vectors,
         dir_groups,
         max_clusters,
+        min_clusters,
         max_depth,
         ollama,
     )
@@ -255,6 +262,7 @@ async fn build_labeled_tree(
     vectors: &[Vec<f32>],
     dir_groups: Vec<(String, Vec<usize>)>,
     max_clusters: usize,
+    min_clusters: usize,
     max_depth: usize,
     ollama: &OllamaClient,
 ) -> Vec<ClusterNode> {
@@ -283,9 +291,10 @@ async fn build_labeled_tree(
         .map(|(_, indices)| {
             let local_vecs: Vec<Vec<f32>> = indices.iter().map(|&i| vectors[i].clone()).collect();
             let mc = max_clusters;
+            let mn = min_clusters;
             async move {
                 tokio::task::spawn_blocking(move || {
-                    spectral_cluster_with_min(&local_vecs, mc, 2)
+                    spectral_cluster_with_min(&local_vecs, mc, mn)
                 })
                 .await
                 .unwrap_or_else(|_| vec![])
@@ -352,8 +361,9 @@ async fn build_labeled_tree(
             if global_indices.len() > MAX_FILES_PER_LEAF && max_depth > 2 {
                 let sub_vecs: Vec<Vec<f32>> = global_indices.iter().map(|&i| vectors[i].clone()).collect();
                 let mc = max_clusters;
+                let mn = min_clusters;
                 let sub_results = tokio::task::spawn_blocking(move || {
-                    spectral_cluster_with_min(&sub_vecs, mc, 2)
+                    spectral_cluster_with_min(&sub_vecs, mc, mn)
                 })
                 .await
                 .unwrap_or_else(|_| vec![]);
@@ -957,6 +967,9 @@ fn describe_cluster_uniqueness(
     if let Some(domain) = find_unique_api_domain(files, clusters, sibling_indices, my_idx) {
         return domain;
     }
+    if let Some(subdir) = find_distinctive_subdirectory(files, clusters, sibling_indices, my_idx) {
+        return subdir;
+    }
     format!("{} files", files.len())
 }
 
@@ -1115,6 +1128,55 @@ fn find_unique_api_domain(
     }
 
     Some(my_domain)
+}
+
+/// Find the most distinctive subdirectory (parent dir of files) for this cluster
+/// compared to its siblings. Useful when clusters share the same grandparent directory
+/// but contain files from different subdirectories within it.
+fn find_distinctive_subdirectory(
+    files: &[&FileInfo],
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    sibling_indices: &[usize],
+    my_idx: usize,
+) -> Option<String> {
+    let my_subdirs = count_subdirectories(files);
+
+    // Count subdirectories across all sibling clusters
+    let mut sibling_subdirs: HashMap<String, usize> = HashMap::new();
+    for &idx in sibling_indices {
+        if idx == my_idx || idx >= clusters.len() {
+            continue;
+        }
+        let (sib_files, _) = &clusters[idx];
+        for (dir, count) in count_subdirectories(sib_files) {
+            *sibling_subdirs.entry(dir).or_default() += count;
+        }
+    }
+
+    // Find subdirectory that's most common in THIS cluster but rare in siblings
+    my_subdirs
+        .into_iter()
+        .filter(|(_, count)| *count >= 3)
+        .max_by_key(|(dir, my_count)| {
+            let sib_count = sibling_subdirs.get(dir).copied().unwrap_or(0);
+            *my_count as i64 - sib_count as i64
+        })
+        .map(|(dir, _)| dir)
+}
+
+/// Count occurrences of the parent directory (2nd-to-last path segment) for each file.
+fn count_subdirectories(files: &[&FileInfo]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for f in files {
+        let parts: Vec<&str> = f.relative_path.split('/').collect();
+        if parts.len() >= 2 {
+            let parent = parts[parts.len() - 2];
+            if !is_nextjs_route_param(parent) {
+                *counts.entry(parent.to_string()).or_default() += 1;
+            }
+        }
+    }
+    counts
 }
 
 /// Find a disambiguator for a cluster — checks for test files, architecture layers, etc.
@@ -2484,10 +2546,12 @@ mod tests {
             root_dir: "/tmp".to_string(),
             max_depth: None,
             max_clusters: None,
+            min_clusters: None,
         };
         assert_eq!(opts.root_dir, "/tmp");
         assert!(opts.max_depth.is_none());
         assert!(opts.max_clusters.is_none());
+        assert!(opts.min_clusters.is_none());
     }
 
     #[test]
@@ -2496,9 +2560,11 @@ mod tests {
             root_dir: "/project".to_string(),
             max_depth: Some(5),
             max_clusters: Some(10),
+            min_clusters: Some(3),
         };
         assert_eq!(opts.max_depth, Some(5));
         assert_eq!(opts.max_clusters, Some(10));
+        assert_eq!(opts.min_clusters, Some(3));
     }
 
     // --- MAX_FILES_PER_LEAF constant test ---

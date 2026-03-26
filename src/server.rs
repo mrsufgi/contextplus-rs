@@ -939,6 +939,7 @@ impl ContextPlusServer {
             root_dir: root.to_string_lossy().into(),
             max_depth: Self::get_usize(&args, "max_depth"),
             max_clusters: Self::get_usize(&args, "max_clusters"),
+            min_clusters: Self::get_usize(&args, "min_clusters"),
         };
 
         let result = crate::tools::semantic_navigate::semantic_navigate(
