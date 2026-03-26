@@ -16,7 +16,7 @@ pub const MAX_FILES_PER_LEAF: usize = 20;
 pub const MAX_FILES_PER_LEAF_DISPLAY: usize = 10;
 
 /// Minimum files in a directory group before it gets merged into "other".
-pub const MIN_DIR_GROUP_SIZE: usize = 15;
+pub const MIN_DIR_GROUP_SIZE: usize = 5;
 
 /// Maximum characters of file content used for embedding.
 pub const MAX_CONTENT_CHARS: usize = 500;
