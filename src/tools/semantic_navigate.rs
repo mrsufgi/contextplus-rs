@@ -270,10 +270,18 @@ async fn build_labeled_tree(
     let mut large_groups: Vec<(String, Vec<usize>)> = Vec::new();
 
     for (dir_label, group_indices) in &dir_groups {
-        // Always attempt spectral clustering on every group.
-        // Even small groups (6-15 files) benefit from semantic splitting
-        // (e.g., separating tests from implementation within service/).
-        large_groups.push((dir_label.clone(), group_indices.clone()));
+        if group_indices.len() <= MAX_FILES_PER_LEAF {
+            // Small group — flat leaf node. Spectral clustering on <10 files
+            // produces noisy singletons with #2/#3 suffixes.
+            children.push(ClusterNode {
+                label: dir_label.clone(),
+                files: group_indices.iter().map(|&i| files[i].clone()).collect(),
+                children: Vec::new(),
+            });
+        } else {
+            // 10+ files — spectral clustering produces meaningful sub-clusters
+            large_groups.push((dir_label.clone(), group_indices.clone()));
+        }
     }
 
     // Phase 1: Cluster all groups concurrently (CPU-bound, no LLM).
