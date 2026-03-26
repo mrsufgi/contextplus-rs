@@ -1,14 +1,21 @@
 // Spectral clustering with eigengap heuristic for tuning-free cluster counts.
 // Builds affinity matrix, normalized Laplacian, k-means on eigenvectors.
-// Uses randomized SVD (Halko-Martinsson-Tropp) for large matrices to avoid O(n^3) full eigen.
 
 use nalgebra::{DMatrix, SymmetricEigen};
-use rand::Rng;
 use rayon::prelude::*;
 
-/// Matrices larger than this use randomized SVD instead of full eigendecomposition.
-/// Below this threshold, full `SymmetricEigen` is used (more accurate, still fast enough).
-const RANDOM_SVD_THRESHOLD: usize = 500;
+/// Maximum iterations for Lloyd's k-means algorithm.
+const KMEANS_MAX_ITERATIONS: usize = 50;
+
+/// Values below this threshold are treated as zero (avoids division by near-zero).
+const ZERO_THRESHOLD: f64 = 1e-10;
+
+/// Multiplier for comparing the Fiedler gap (k=2) against the best k>=3 gap.
+/// If the Fiedler gap exceeds the best higher-k gap by this factor, we pick k=2.
+/// Set to 5.0 because the Fiedler gap is structurally inflated in connected graphs
+/// (it measures the fundamental graph bipartition), so a high bar prevents it from
+/// dominating unless the graph truly has only 2 communities.
+const FIEDLER_GAP_MULTIPLIER: f64 = 5.0;
 
 /// Result of clustering: each entry contains indices of files in that cluster.
 #[derive(Debug, Clone)]
@@ -19,7 +26,7 @@ pub struct ClusterResult {
 /// Build a symmetric affinity matrix from embedding vectors using SIMD cosine similarity.
 /// Diagonal is zero (no self-affinity). Negative similarities are clamped to 0.
 /// Uses rayon to parallelize the outer loop for large matrices.
-fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
+pub fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
     let n = vectors.len();
 
     // Compute upper triangle in parallel — each row's (i, j>i) pairs are independent
@@ -48,14 +55,14 @@ fn build_affinity_matrix(vectors: &[Vec<f32>]) -> DMatrix<f64> {
 }
 
 /// Compute normalized symmetric Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
-fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
+pub fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
     let n = affinity.nrows();
 
     // Compute degree per row using nalgebra row sums (diagonal subtracted)
     let d_inv_sqrt: Vec<f64> = (0..n)
         .map(|i| {
             let row_sum: f64 = affinity.row(i).iter().sum::<f64>() - affinity[(i, i)];
-            if row_sum > 1e-10 {
+            if row_sum > ZERO_THRESHOLD {
                 1.0 / row_sum.sqrt()
             } else {
                 0.0
@@ -84,98 +91,8 @@ fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
     laplacian
 }
 
-/// Generate a pair of standard normal random numbers using Box-Muller transform.
-/// Avoids dependency on `rand_distr` -- only needs uniform `[0, 1)` from `rand`.
-fn box_muller(rng: &mut impl Rng) -> (f64, f64) {
-    loop {
-        let u1: f64 = rng.r#gen();
-        let u2: f64 = rng.r#gen();
-        // Reject u1 == 0 to avoid log(0)
-        if u1 > 1e-15 {
-            let r = (-2.0 * u1.ln()).sqrt();
-            let theta = std::f64::consts::TAU * u2;
-            return (r * theta.cos(), r * theta.sin());
-        }
-    }
-}
-
-/// Generate an n x p matrix of standard normal random entries.
-fn random_gaussian_matrix(n: usize, p: usize, rng: &mut impl Rng) -> DMatrix<f64> {
-    let mut data = Vec::with_capacity(n * p);
-    let pairs_needed = (n * p).div_ceil(2);
-    for _ in 0..pairs_needed {
-        let (a, b) = box_muller(rng);
-        data.push(a);
-        data.push(b);
-    }
-    data.truncate(n * p);
-    // nalgebra DMatrix::from_vec is column-major, but for a random Gaussian matrix
-    // the distribution is invariant to transposition, so column-major is fine.
-    DMatrix::from_vec(n, p, data)
-}
-
-/// Randomized eigendecomposition for symmetric PSD matrices (Halko-Martinsson-Tropp).
-///
-/// Computes approximate smallest eigenvalues/eigenvectors of a symmetric matrix using
-/// randomized range finding + projected eigendecomposition. Cost: O(n * k^2) vs O(n^3).
-///
-/// Returns `(eigenvalues, eigenvectors)` where eigenvalues are sorted ascending and
-/// eigenvector columns correspond to those eigenvalues. Only `k` components are returned.
-fn randomized_eigen(
-    matrix: &DMatrix<f64>,
-    k: usize,
-    oversampling: usize,
-) -> (Vec<f64>, DMatrix<f64>) {
-    let n = matrix.nrows();
-    let p = (k + oversampling).min(n);
-
-    let mut rng = rand::thread_rng();
-    let omega = random_gaussian_matrix(n, p, &mut rng);
-
-    // Y = A * Omega  (n x p)
-    let y = matrix * &omega;
-
-    // QR decomposition of Y to get orthonormal basis Q (n x p)
-    let qr = y.qr();
-    let q = qr.q(); // n x min(n,p) orthonormal columns
-
-    // Project: B = Q^T * A * Q  (p x p -- small symmetric matrix)
-    let b = q.transpose() * matrix * &q;
-
-    // Full eigendecomposition of the small p x p matrix
-    let eigen_small = SymmetricEigen::new(b);
-
-    // Sort eigenvalues ascending
-    let mut indexed_evals: Vec<(usize, f64)> = eigen_small
-        .eigenvalues
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
-    indexed_evals.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Take the first k
-    let take = k.min(indexed_evals.len());
-    let eigenvalues: Vec<f64> = indexed_evals[..take].iter().map(|(_, v)| *v).collect();
-
-    // Map eigenvectors back to original space: U = Q * V_small
-    let v_small = &eigen_small.eigenvectors;
-    let full_eigenvectors = &q * v_small;
-
-    // Reorder columns to match sorted eigenvalues.
-    // Use column-copy via nalgebra's column view API — single memcpy per column
-    // rather than element-by-element indexing.
-    let mut eigenvectors = DMatrix::zeros(n, take);
-    for (new_col, &(orig_col, _)) in indexed_evals[..take].iter().enumerate() {
-        let src = full_eigenvectors.column(orig_col);
-        eigenvectors.column_mut(new_col).copy_from(&src);
-    }
-
-    (eigenvalues, eigenvectors)
-}
-
 /// Full eigendecomposition, returning (eigenvalues, eigenvectors) sorted ascending.
-fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
+pub fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     let eigen = SymmetricEigen::new(matrix);
 
     let mut indexed_evals: Vec<(usize, f64)> =
@@ -195,30 +112,54 @@ fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     (eigenvalues, eigenvectors)
 }
 
-/// Use eigengap heuristic to find optimal k: largest gap in sorted eigenvalues.
-/// Eigenvalues are expected to already be sorted ascending (both full_eigen and
-/// randomized_eigen guarantee this), so we skip the redundant sort.
-fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
-    // eigenvalues are pre-sorted ascending by our callers — no need to sort again
+/// Use eigengap heuristic to find optimal k: largest relative gap in sorted eigenvalues.
+/// Eigenvalues are expected to already be sorted ascending (full_eigen guarantees this),
+/// so we skip the redundant sort.
+///
+/// Key insight: eigenvalue[0] ≈ 0 is trivial for any connected graph (the constant
+/// eigenvector). The gap between eigenvalue[0] and eigenvalue[1] (the Fiedler gap)
+/// is always the largest absolute gap, which causes naive eigengap to always pick k=2.
+///
+/// Fix: use relative gaps (gap / eigenvalue_position) starting from k=3, and only
+/// fall back to k=2 if the k=2 gap is dramatically larger than all others.
+pub fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
     if eigenvalues.len() <= 2 {
         return eigenvalues.len().min(2);
     }
 
     let limit = max_k.min(eigenvalues.len() - 1);
-    let mut best_gap = 0.0_f64;
-    let mut best_k = 2_usize;
 
-    for k in 2..=limit {
-        let gap = eigenvalues[k] - eigenvalues[k - 1];
-        if gap > best_gap {
-            best_gap = gap;
-            best_k = k;
-        }
+    // Compute all gaps
+    let gaps: Vec<(usize, f64)> = (2..=limit)
+        .map(|k| (k, eigenvalues[k] - eigenvalues[k - 1]))
+        .collect();
+
+    if gaps.is_empty() {
+        return 2;
     }
-    best_k
+
+    // Find the largest gap at k >= 3 (skipping the Fiedler gap at k=2)
+    let best_k3_plus = gaps.iter()
+        .filter(|(k, _)| *k >= 3)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Compare against k=2 gap
+    let gap_k2 = gaps[0].1; // gaps[0] is always k=2
+
+    if let Some(&(best_k, best_gap)) = best_k3_plus {
+        // Only use k=2 if its gap is overwhelmingly larger (5x) than the best k>=3 gap.
+        // This accounts for the Fiedler gap inflation in connected graphs.
+        if gap_k2 > best_gap * FIEDLER_GAP_MULTIPLIER {
+            2
+        } else {
+            best_k
+        }
+    } else {
+        2
+    }
 }
 
-/// K-means++ initialization + Lloyd's algorithm on the eigenvector embedding.
+/// Farthest-point initialization (greedy K-means variant) + Lloyd's algorithm on the eigenvector embedding.
 /// Uses flat Vec<f64> buffers with stride indexing for cache-friendly access.
 fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     let n = data.len();
@@ -232,7 +173,7 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     let mut centroids = vec![0.0_f64; k * dim];
     let mut used = std::collections::HashSet::new();
 
-    // K-means++ initialization: seed first centroid from first data point
+    // Farthest-point initialization (greedy K-means variant): seed first centroid from first data point
     centroids[..dim].copy_from_slice(&data[0]);
     used.insert(0);
 
@@ -264,7 +205,7 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     let mut assignments = vec![0_usize; n];
 
     // Lloyd's iterations (assignment step parallelized with rayon)
-    for _ in 0..50 {
+    for _ in 0..KMEANS_MAX_ITERATIONS {
         let new_assignments: Vec<usize> = data
             .par_iter()
             .map(|row| {
@@ -320,10 +261,17 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
 ///
 /// Returns a list of clusters, each containing the indices of vectors in that cluster.
 /// Uses eigengap heuristic to automatically determine the number of clusters.
-///
-/// For matrices larger than `RANDOM_SVD_THRESHOLD`, uses randomized SVD (Halko-Martinsson-Tropp)
-/// which computes only the needed eigenvectors in O(n*k^2) instead of O(n^3).
 pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<ClusterResult> {
+    spectral_cluster_with_min(vectors, max_clusters, 2)
+}
+
+/// Spectral clustering with a configurable minimum cluster count.
+/// `min_clusters` forces at least this many clusters (capped by max_clusters and n).
+pub fn spectral_cluster_with_min(
+    vectors: &[Vec<f32>],
+    max_clusters: usize,
+    min_clusters: usize,
+) -> Vec<ClusterResult> {
     let n = vectors.len();
     if n <= 1 {
         return vec![ClusterResult {
@@ -339,23 +287,58 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
     }
 
     let affinity = build_affinity_matrix(vectors);
+
+    // Debug: affinity matrix statistics — if similarities are too uniform, clustering fails
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let n_aff = affinity.nrows();
+        let mut sum = 0.0_f64;
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut count = 0_u64;
+        for i in 0..n_aff {
+            for j in (i + 1)..n_aff {
+                let v = affinity[(i, j)];
+                sum += v;
+                if v < min_val { min_val = v; }
+                if v > max_val { max_val = v; }
+                count += 1;
+            }
+        }
+        let mean = sum / count as f64;
+        tracing::debug!(
+            n = n_aff,
+            mean_similarity = format!("{:.4}", mean),
+            min_similarity = format!("{:.4}", min_val),
+            max_similarity = format!("{:.4}", max_val),
+            "affinity matrix stats"
+        );
+    }
+
     let laplacian = normalized_laplacian(&affinity);
 
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
 
-    // Choose eigendecomposition strategy based on matrix size.
-    // Randomized SVD is O(n*k^2) vs O(n^3) for full eigen -- ~100x faster for n=2000, k=20.
-    let (eigenvalues, eigenvectors) = if n > RANDOM_SVD_THRESHOLD {
-        let oversampling = 10;
-        randomized_eigen(&laplacian, max_k + oversampling, oversampling)
-    } else {
-        full_eigen(laplacian)
-    };
+    let (eigenvalues, eigenvectors) = full_eigen(laplacian);
 
-    let k = find_optimal_k(&eigenvalues, max_k);
+    // Debug: log eigenvalue spectrum to understand cluster selection
+    if tracing::enabled!(tracing::Level::DEBUG) && eigenvalues.len() >= 2 {
+        let gaps: Vec<(usize, f64)> = (2..eigenvalues.len().min(max_k + 1))
+            .map(|k| (k, eigenvalues[k] - eigenvalues[k - 1]))
+            .collect();
+        tracing::debug!(
+            n = n,
+            max_k = max_k,
+            eigenvalues_first_10 = ?&eigenvalues[..eigenvalues.len().min(10)],
+            gaps = ?gaps,
+            "spectral_cluster eigenvalue spectrum"
+        );
+    }
+
+    let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
+    tracing::info!(k = k, min_clusters = min_clusters, "spectral_cluster chose k");
 
     // Build embedding: rows of first k eigenvectors, row-normalized.
-    // Eigenvalues/eigenvectors are already sorted ascending by full_eigen/randomized_eigen,
+    // Eigenvalues/eigenvectors are already sorted ascending by full_eigen,
     // so columns 0..k are the k smallest eigenvalues.
     let mut embedding: Vec<Vec<f64>> = Vec::with_capacity(n);
     for i in 0..n {
@@ -364,7 +347,7 @@ pub fn spectral_cluster(vectors: &[Vec<f32>], max_clusters: usize) -> Vec<Cluste
             row.push(eigenvectors[(i, j)]);
         }
         let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if norm > 1e-10 {
+        if norm > ZERO_THRESHOLD {
             for v in &mut row {
                 *v /= norm;
             }
@@ -674,36 +657,6 @@ mod tests {
         assert_eq!(pattern, None);
     }
 
-    // --- Randomized SVD tests ---
-
-    #[test]
-    fn box_muller_produces_finite_values() {
-        let mut rng = rand::thread_rng();
-        for _ in 0..100 {
-            let (a, b) = box_muller(&mut rng);
-            assert!(a.is_finite(), "Box-Muller produced non-finite: {}", a);
-            assert!(b.is_finite(), "Box-Muller produced non-finite: {}", b);
-        }
-    }
-
-    #[test]
-    fn random_gaussian_matrix_correct_shape() {
-        let mut rng = rand::thread_rng();
-        let mat = random_gaussian_matrix(10, 5, &mut rng);
-        assert_eq!(mat.nrows(), 10);
-        assert_eq!(mat.ncols(), 5);
-    }
-
-    #[test]
-    fn random_gaussian_matrix_has_variance() {
-        // A 100x10 Gaussian matrix should not have all identical values
-        let mut rng = rand::thread_rng();
-        let mat = random_gaussian_matrix(100, 10, &mut rng);
-        let first = mat[(0, 0)];
-        let has_variation = mat.iter().any(|&v| (v - first).abs() > 0.01);
-        assert!(has_variation, "Random matrix should have variation");
-    }
-
     #[test]
     fn full_eigen_returns_sorted_eigenvalues() {
         // Simple 3x3 diagonal matrix: eigenvalues are 1, 2, 3
@@ -723,87 +676,6 @@ mod tests {
         assert!((eigenvalues[0] - 1.0).abs() < 1e-6);
         assert!((eigenvalues[1] - 2.0).abs() < 1e-6);
         assert!((eigenvalues[2] - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn randomized_eigen_approximates_smallest_eigenvalues() {
-        // Build a symmetric matrix with known, evenly-spaced eigenvalues: 1..=10.
-        // Request the 4 smallest with generous oversampling so the random projection
-        // captures the full subspace.
-        let n = 10;
-        let mat = DMatrix::from_fn(n, n, |i, j| if i == j { (i + 1) as f64 } else { 0.0 });
-
-        let k = 4;
-        // Use oversampling = n - k so p = n (captures full space for this small matrix)
-        let oversampling = n - k;
-        let (eigenvalues, eigenvectors) = randomized_eigen(&mat, k, oversampling);
-
-        assert_eq!(eigenvalues.len(), k);
-        assert_eq!(eigenvectors.nrows(), n);
-        assert_eq!(eigenvectors.ncols(), k);
-
-        // The 4 smallest eigenvalues should be approximately 1, 2, 3, 4
-        for (i, expected) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
-            assert!(
-                (eigenvalues[i] - expected).abs() < 0.5,
-                "Eigenvalue {}: {} should be near {}",
-                i,
-                eigenvalues[i],
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn randomized_eigen_sorted_ascending() {
-        let n = 20;
-        let mat = DMatrix::from_fn(n, n, |i, j| if i == j { (i + 1) as f64 } else { 0.0 });
-        let (eigenvalues, _) = randomized_eigen(&mat, 5, 5);
-        for w in eigenvalues.windows(2) {
-            assert!(
-                w[0] <= w[1] + 1e-6,
-                "Eigenvalues not sorted ascending: {:?}",
-                eigenvalues
-            );
-        }
-    }
-
-    #[test]
-    fn full_and_randomized_agree_on_small_matrix() {
-        // For a small matrix, both should find the same eigenvalues
-        let n = 8;
-        // Build a symmetric matrix
-        let mut mat = DMatrix::zeros(n, n);
-        for i in 0..n {
-            mat[(i, i)] = (i + 1) as f64;
-            if i + 1 < n {
-                mat[(i, i + 1)] = 0.1;
-                mat[(i + 1, i)] = 0.1;
-            }
-        }
-
-        let (full_evals, _) = full_eigen(mat.clone());
-        let (rand_evals, _) = randomized_eigen(&mat, 4, 4);
-
-        // First 4 eigenvalues should be close
-        for i in 0..4 {
-            assert!(
-                (full_evals[i] - rand_evals[i]).abs() < 0.3,
-                "Eigenvalue {}: full={} vs randomized={}",
-                i,
-                full_evals[i],
-                rand_evals[i]
-            );
-        }
-    }
-
-    #[test]
-    fn threshold_selects_correct_path() {
-        // Verify RANDOM_SVD_THRESHOLD is reasonable (compile-time check)
-        const {
-            assert!(RANDOM_SVD_THRESHOLD >= 100);
-            assert!(RANDOM_SVD_THRESHOLD <= 1000);
-        }
     }
 
     #[test]
@@ -843,25 +715,76 @@ mod tests {
         }
     }
 
+
     #[test]
-    fn randomized_eigen_with_repeated_eigenvalues() {
-        // Matrix with repeated eigenvalues: diag(1, 1, 1, 5, 5, 10)
-        let n = 6;
-        let diag_vals = [1.0, 1.0, 1.0, 5.0, 5.0, 10.0];
-        let mat = DMatrix::from_fn(n, n, |i, j| if i == j { diag_vals[i] } else { 0.0 });
+    fn find_optimal_k_all_equal_eigenvalues() {
+        let eigenvalues = vec![0.5, 0.5, 0.5, 0.5, 0.5];
+        let k = find_optimal_k(&eigenvalues, 4);
+        assert!(k >= 2);
+    }
 
-        let (eigenvalues, eigenvectors) = randomized_eigen(&mat, 3, 3);
+    #[test]
+    fn find_optimal_k_max_k_is_2() {
+        let eigenvalues = vec![0.0, 0.01, 0.5, 0.51];
+        let k = find_optimal_k(&eigenvalues, 2);
+        assert_eq!(k, 2);
+    }
 
-        assert_eq!(eigenvalues.len(), 3);
-        assert_eq!(eigenvectors.nrows(), n);
-        // First 3 eigenvalues should all be near 1.0
-        for (i, &ev) in eigenvalues.iter().enumerate() {
-            assert!(
-                (ev - 1.0).abs() < 0.3,
-                "Eigenvalue {} = {} should be near 1.0",
-                i,
-                ev
-            );
+    #[test]
+    fn find_optimal_k_fiedler_gap_suppression() {
+        let eigenvalues = vec![0.0, 0.9, 0.96, 0.97, 0.98, 0.99];
+        let k = find_optimal_k(&eigenvalues, 5);
+        assert_eq!(k, 2);
+    }
+
+    #[test]
+    fn find_optimal_k_fiedler_gap_not_dominant() {
+        let eigenvalues = vec![0.0, 0.01, 0.02, 0.8, 0.9, 1.0];
+        let k = find_optimal_k(&eigenvalues, 5);
+        assert_eq!(k, 3);
+    }
+
+    // ── spectral_cluster_with_min tests ──────────────────────────────
+
+    #[test]
+    fn spectral_cluster_with_min_forces_higher_k() {
+        let mut vectors = Vec::new();
+        for _ in 0..8 {
+            vectors.push(vec![1.0_f32, 0.0, 0.0]);
         }
+        for _ in 0..8 {
+            vectors.push(vec![0.0_f32, 1.0, 0.0]);
+        }
+        let result = spectral_cluster_with_min(&vectors, 5, 3);
+        assert!(result.len() >= 3, "Expected at least 3 clusters, got {}", result.len());
+    }
+
+    #[test]
+    fn spectral_cluster_empty_input() {
+        let result = spectral_cluster(&[], 5);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].indices.is_empty());
+    }
+
+    #[test]
+    fn kmeans_k_larger_than_n() {
+        let data = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let assignments = kmeans(&data, 5);
+        // Should not panic, all points assigned
+        assert_eq!(assignments.len(), 2);
+    }
+
+    #[test]
+    fn spectral_cluster_identical_vectors() {
+        let vectors: Vec<Vec<f32>> = (0..10).map(|_| vec![1.0, 0.0, 0.0]).collect();
+        // Should not panic even with degenerate affinity matrix
+        let result = spectral_cluster(&vectors, 3);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn find_optimal_k_single_eigenvalue() {
+        let k = find_optimal_k(&[0.5], 5);
+        assert_eq!(k, 1);
     }
 }

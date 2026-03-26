@@ -178,8 +178,14 @@ fn build_tool_definitions() -> Vec<Tool> {
         ),
         make_tool(
             "semantic_navigate",
-            "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation.",
+            "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation. Pass rootDir to scope to a subdirectory.",
             &[
+                (
+                    "rootDir",
+                    "string",
+                    false,
+                    "Directory to navigate (default: workspace root). Must be within the workspace.",
+                ),
                 (
                     "max_depth",
                     "integer",
@@ -190,7 +196,13 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "max_clusters",
                     "integer",
                     false,
-                    "Maximum sub-clusters per level (default 20)",
+                    "Maximum sub-clusters per group at depth 1+ (default 20). Top-level groups are based on directory structure and not limited by this parameter.",
+                ),
+                (
+                    "min_clusters",
+                    "integer",
+                    false,
+                    "Minimum sub-clusters per group (default 2). Increase to force finer-grained splitting.",
                 ),
             ],
         ),

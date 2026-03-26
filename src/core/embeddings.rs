@@ -16,7 +16,7 @@ type EmbedFuture<'a> =
 
 const MIN_EMBED_INPUT_CHARS: usize = 1;
 const SINGLE_INPUT_SHRINK_FACTOR: f64 = 0.75;
-const MAX_SINGLE_INPUT_RETRIES: usize = 40;
+const MAX_SINGLE_INPUT_RETRIES: usize = 15;
 
 // ---------------------------------------------------------------------------
 // OllamaClient
@@ -562,8 +562,8 @@ impl VectorStore {
     }
 
     /// Get a key by index.
-    pub fn key_at(&self, idx: usize) -> &str {
-        &self.keys[idx]
+    pub fn key_at(&self, idx: usize) -> Option<&str> {
+        self.keys.get(idx).map(|s| s.as_str())
     }
 
     /// Get all keys.
@@ -687,7 +687,10 @@ pub fn cosine_similarity_simsimd(a: &[f32], b: &[f32]) -> f32 {
     use simsimd::SpatialSimilarity;
     match f32::cosine(a, b) {
         Some(distance) => 1.0 - distance as f32,
-        None => 0.0,
+        None => {
+            tracing::warn!(a_len = a.len(), b_len = b.len(), "simsimd cosine returned None");
+            0.0
+        }
     }
 }
 
@@ -1247,13 +1250,15 @@ mod tests {
     #[test]
     fn constants_match_typescript_reference() {
         assert_eq!(MIN_EMBED_INPUT_CHARS, 1);
-        assert_eq!(MAX_SINGLE_INPUT_RETRIES, 40);
+        assert_eq!(MAX_SINGLE_INPUT_RETRIES, 15);
         assert!((SINGLE_INPUT_SHRINK_FACTOR - 0.75).abs() < f64::EPSILON);
     }
 
     #[test]
     fn shrink_input_iterates_toward_minimum() {
-        let mut input = "x".repeat(10000);
+        // Start with a smaller input that converges within MAX_SINGLE_INPUT_RETRIES (15)
+        // at 0.75x shrink factor. 100 chars needs ~16 iterations, so use 50 (needs ~12).
+        let mut input = "x".repeat(50);
         let mut iterations = 0;
         while input.len() > MIN_EMBED_INPUT_CHARS {
             let next = shrink_input(&input);

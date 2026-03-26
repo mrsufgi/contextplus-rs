@@ -332,6 +332,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "criterion",
+ "futures",
  "ignore",
  "libc",
  "memmap2",

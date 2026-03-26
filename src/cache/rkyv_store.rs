@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rkyv::{Archive, Deserialize, Serialize};
@@ -100,8 +101,11 @@ impl CacheData {
 // Save / Load with rkyv
 // ---------------------------------------------------------------------------
 
+/// Per-process monotonic counter to ensure unique temp file names across threads.
+static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Save a CacheData to disk using rkyv serialization.
-/// Uses atomic write: write to temp file then rename.
+/// Uses atomic write: write to a unique temp file then rename.
 pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     ensure_cache_dir(root_dir)?;
 
@@ -109,7 +113,12 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
         .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
 
     let path = cache_path(root_dir, name);
-    let tmp_path = path.with_extension("rkyv.tmp");
+    let tmp_path = cache_dir(root_dir).join(format!(
+        "{}.rkyv.{}.{}.tmp",
+        name,
+        std::process::id(),
+        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
 
     // Write: 16-byte aligned header (version + padding) + rkyv data
     let mut buf = Vec::with_capacity(HEADER_SIZE + bytes.len());
@@ -117,8 +126,14 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     buf[0] = CACHE_VERSION;
     buf.extend_from_slice(&bytes);
 
-    fs::write(&tmp_path, &buf)?;
-    fs::rename(&tmp_path, &path)?;
+    if let Err(e) = fs::write(&tmp_path, &buf) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
 
     Ok(())
 }
@@ -458,9 +473,14 @@ mod tests {
         let loaded = load_cache(dir.path(), "atomic").unwrap().unwrap();
         assert_eq!(loaded.keys, data.keys);
 
-        // Temp file should not linger
-        let tmp_path = cache_path(dir.path(), "atomic").with_extension("rkyv.tmp");
-        assert!(!tmp_path.exists());
+        // No temp files should linger in the cache directory
+        let cache = cache_dir(dir.path());
+        let lingering: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "tmp"))
+            .collect();
+        assert!(lingering.is_empty(), "temp files should not linger: {:?}", lingering);
     }
 
     // -- mmap_vector_store tests (zero-copy) --

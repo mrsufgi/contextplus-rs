@@ -136,7 +136,7 @@ impl ContextPlusServer {
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
 
         // Load embedding cache from disk if available (cross-restart persistence)
-        let initial_cache = match rkyv_store::load_vector_store(&root_dir, &embed_cache_name) {
+        let initial_cache = match rkyv_store::mmap_vector_store(&root_dir, &embed_cache_name) {
             Ok(Some(store)) => {
                 let cache_map = store.to_cache();
                 tracing::info!(
@@ -590,30 +590,36 @@ impl ContextPlusServer {
             "Identifier embedding cache hit/miss"
         );
 
-        // Embed only uncached identifiers
+        // Embed only uncached identifiers, in chunks to survive MCP connection timeouts.
         if !uncached_texts.is_empty() {
-            let new_vectors = self.state.ollama.embed(&uncached_texts).await?;
-            for (j, &idx) in uncached_indices.iter().enumerate() {
-                if j < new_vectors.len() {
-                    result_vectors[idx] = Some(new_vectors[j].clone());
-                }
-            }
+            let chunk_size = self.state.ollama.batch_size();
+            for chunk_start in (0..uncached_indices.len()).step_by(chunk_size) {
+                let chunk_end = (chunk_start + chunk_size).min(uncached_indices.len());
+                let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
-            // Persist updated identifier embedding cache to disk
-            let all_vecs: Vec<Vec<f32>> = result_vectors.iter().filter_map(|v| v.clone()).collect();
-            if all_vecs.len() == n_identifiers {
-                let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
-                let keys: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
-                let hashes: Vec<String> = keys
-                    .iter()
-                    .map(|k| crate::core::parser::hash_content(k))
-                    .collect();
-                let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
-                let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
-                if let Err(e) =
-                    rkyv_store::save_vector_store(&self.state.root_dir, &id_cache_name, &store)
-                {
-                    tracing::warn!("Failed to save identifier embedding cache: {e}");
+                let chunk_vectors = self.state.ollama.embed(chunk_texts).await?;
+                for (local_j, &idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
+                    if local_j < chunk_vectors.len() {
+                        result_vectors[idx] = Some(chunk_vectors[local_j].clone());
+                    }
+                }
+
+                // Persist after each chunk so progress survives a timeout on the next batch.
+                let all_vecs: Vec<Vec<f32>> = result_vectors.iter().filter_map(|v| v.clone()).collect();
+                if all_vecs.len() == n_identifiers {
+                    let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
+                    let keys: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
+                    let hashes: Vec<String> = keys
+                        .iter()
+                        .map(|k| crate::core::parser::hash_content(k))
+                        .collect();
+                    let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
+                    let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
+                    if let Err(e) =
+                        rkyv_store::save_vector_store(&self.state.root_dir, &id_cache_name, &store)
+                    {
+                        tracing::warn!("Failed to save identifier embedding cache: {e}");
+                    }
                 }
             }
         }
@@ -927,15 +933,13 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         self.ensure_tracker_started();
-        // query is optional in TS version — accepted but unused for clustering
-        let _query = Self::get_str(&args, "query");
         let root = self.resolve_root(&args);
 
         let options = crate::tools::semantic_navigate::SemanticNavigateOptions {
             root_dir: root.to_string_lossy().into(),
             max_depth: Self::get_usize(&args, "max_depth"),
             max_clusters: Self::get_usize(&args, "max_clusters"),
-            max_output_chars: Self::get_usize(&args, "max_output_chars"),
+            min_clusters: Self::get_usize(&args, "min_clusters"),
         };
 
         let result = crate::tools::semantic_navigate::semantic_navigate(
