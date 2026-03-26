@@ -776,12 +776,17 @@ async fn label_subclusters_with_llm(
             .collect();
 
         let prompt = format!(
-            "Label each cluster based on the MAJORITY of its files, using the subdirectory distribution as the primary signal.\n\
-            Do NOT name a cluster after a single file or minority feature — name it after what MOST files do.\n\
-            A cluster with 80 component files and 1 validation file should be \"UI Components\", not \"Validation\".\n\
-            A cluster with 15 scheduling pages and 1 microphone util should be \"Scheduling Pages\", not \"Microphone Utils\".\n\
-            Look at the file counts per subdirectory — the subdirectory with the MOST files determines the label.\n\
-            Return EXACTLY 2-5 words per label. Return ONLY a JSON array of strings, one per cluster.\n\n{}\n\nJSON array of {} strings:",
+            "You are labeling clusters of source code files in a software project.\n\
+            For each cluster, think about:\n\
+            - What is the overarching THEME of these files? (not the directory name)\n\
+            - What DISTINGUISHES this cluster from its siblings?\n\
+            Give each cluster a descriptive label of 2-5 words that captures its PURPOSE.\n\n\
+            Good labels: \"Appointment Core Logic\", \"Auth Middleware\", \"Patient Data Access\", \"Webhook Event Handlers\"\n\
+            Bad labels: \"service\", \"delivery/http\", \"repository/pg\", \"files\", \"source\"\n\n\
+            Do NOT echo directory names as labels — describe what the code DOES.\n\
+            Do NOT name after a single file — name after the MAJORITY.\n\n\
+            {}\n\n\
+            Return ONLY a JSON array of {} strings, one per cluster.",
             descriptions.join("\n\n"),
             llm_batch.len()
         );
