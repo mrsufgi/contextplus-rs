@@ -1115,27 +1115,32 @@ fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileIn
                 if label_has_count && suffix.contains("files") {
                     continue;
                 }
-                // Don't append disambiguator if base label already contains it
-                if base.to_lowercase().contains(&suffix.to_lowercase()) {
-                    // Use file names instead of the redundant disambiguator
-                    if *idx < clusters.len() {
-                        let (cluster_files, _) = &clusters[*idx];
-                        let names: Vec<&str> = cluster_files
-                            .iter()
-                            .filter_map(|f| f.relative_path.split('/').next_back())
-                            .filter_map(|n| {
-                                n.strip_suffix(".ts")
-                                    .or_else(|| n.strip_suffix(".tsx"))
-                                    .or_else(|| n.strip_suffix(".go"))
-                                    .or_else(|| n.strip_suffix(".rs"))
-                            })
-                            .filter(|n| *n != "index" && *n != "mod")
-                            .take(3)
-                            .collect();
-                        if !names.is_empty() {
-                            labels[*idx] = format!("{} ({})", base, names.join(" + "));
-                            continue;
-                        }
+                // Use file names instead of suffix when:
+                // 1. Suffix is already in the base label (redundant)
+                // 2. Suffix is a generic/technical term (node, src, lib, etc.)
+                // 3. Suffix is just a file count ("N files")
+                let suffix_is_weak = base.to_lowercase().contains(&suffix.to_lowercase())
+                    || GENERIC_SEGMENTS.contains(&suffix.to_lowercase().as_str())
+                    || suffix.contains("files")
+                    || suffix == "node" || suffix == "src" || suffix == "lib";
+
+                if suffix_is_weak && *idx < clusters.len() {
+                    let (cluster_files, _) = &clusters[*idx];
+                    let names: Vec<&str> = cluster_files
+                        .iter()
+                        .filter_map(|f| f.relative_path.split('/').next_back())
+                        .filter_map(|n| {
+                            n.strip_suffix(".ts")
+                                .or_else(|| n.strip_suffix(".tsx"))
+                                .or_else(|| n.strip_suffix(".go"))
+                                .or_else(|| n.strip_suffix(".rs"))
+                        })
+                        .filter(|n| *n != "index" && *n != "mod")
+                        .take(3)
+                        .collect();
+                    if !names.is_empty() {
+                        labels[*idx] = format!("{} ({})", base, names.join(" + "));
+                        continue;
                     }
                 }
                 labels[*idx] = format!("{} ({})", base, suffix);
