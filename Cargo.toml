@@ -160,3 +160,7 @@ opt-level = 1
 [[bin]]
 name = "debug-eigenvalues"
 path = "src/bin/debug_eigenvalues.rs"
+
+[[bin]]
+name = "warmup_identifiers"
+path = "src/bin/warmup_identifiers.rs"
