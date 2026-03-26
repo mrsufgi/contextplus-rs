@@ -178,8 +178,14 @@ fn build_tool_definitions() -> Vec<Tool> {
         ),
         make_tool(
             "semantic_navigate",
-            "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation.",
+            "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation. Pass rootDir to scope to a subdirectory.",
             &[
+                (
+                    "rootDir",
+                    "string",
+                    false,
+                    "Directory to navigate (default: workspace root). Must be within the workspace.",
+                ),
                 (
                     "max_depth",
                     "integer",

@@ -3,8 +3,11 @@
 
 use crate::core::embeddings::content_hash;
 
-/// Maximum files to cluster. Workspaces larger than this are sampled.
-pub const MAX_NAVIGATE_FILES: usize = 1500;
+/// Maximum files to cluster. Set to usize::MAX to disable sampling.
+/// With directory-based grouping at depth 0, spectral clustering only
+/// runs on individual groups (50-400 files each), not the full file set.
+/// The O(n³) eigen is bounded by group size, not total files.
+pub const MAX_NAVIGATE_FILES: usize = usize::MAX;
 
 /// Maximum files in a leaf cluster before it gets sub-clustered.
 pub const MAX_FILES_PER_LEAF: usize = 20;
