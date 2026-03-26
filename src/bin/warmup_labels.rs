@@ -18,17 +18,20 @@ async fn main() {
 
     let config = Config::from_env();
     let ollama = OllamaClient::new(&config);
-    let root = Path::new("/workspace");
+    let root_arg = std::env::args().nth(1).unwrap_or_else(|| "/workspace".to_string());
+    let root = Path::new(&root_arg);
 
     println!("Warming up LLM label cache for semantic_navigate...");
     println!("Root: {}", root.display());
 
+    // Use semantic mode for warmup — it generates LLM labels at EVERY level,
+    // not just for large clusters. This populates the cache more aggressively.
     let options = SemanticNavigateOptions {
         root_dir: root.to_string_lossy().to_string(),
         max_depth: Some(3),
         max_clusters: Some(10),
-        min_clusters: None,
-        mode: Some("hybrid".to_string()),
+        min_clusters: Some(3),
+        mode: Some("semantic".to_string()),
     };
 
     let embedding_cache = RwLock::new(HashMap::new());
