@@ -988,20 +988,34 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
     }
 
     // Last resort: use the most common header keyword
+    // Only accept words that look like real English/code identifiers:
+    // alphabetic, 4+ chars, no punctuation/special chars, not a stopword.
     {
-        const LABEL_BLOCKLIST: &[&str] = &[
-            "no", "the", "for", "and", "from", "with", "this", "that",
-            "package:", "package", "@generated", "generated",
-            "description", "header", "index", "module",
-            "todo", "fixme", "note", "hack",
-            "parameter", "file", "long_type_string", "generate_dependencies",
-            "syntax", "proto3", "tslint:disable", "protobuf-ts", "protobuf",
-        ];
+        fn is_valid_label_word(word: &str) -> bool {
+            word.len() >= 4
+                && word.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                && word.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+                && !matches!(
+                    word.to_lowercase().as_str(),
+                    "from" | "with" | "this" | "that" | "have" | "been" | "will"
+                    | "each" | "then" | "than" | "some" | "only" | "also" | "into"
+                    | "more" | "most" | "such" | "used" | "uses" | "using"
+                    | "file" | "files" | "type" | "types" | "data" | "code"
+                    | "package" | "generated" | "module" | "index" | "export"
+                    | "header" | "description" | "param" | "parameter" | "syntax"
+                    | "import" | "const" | "function" | "interface" | "class"
+                    | "async" | "await" | "return" | "string" | "number" | "boolean"
+                    | "undefined" | "null" | "void" | "true" | "false"
+                    | "todo" | "fixme" | "note" | "hack"
+                )
+        }
+
         let mut word_counts: HashMap<&str, usize> = HashMap::new();
         for f in files {
             for word in f.header.split_whitespace() {
-                if word.len() >= 4 && !LABEL_BLOCKLIST.contains(&word.to_lowercase().as_str()) {
-                    *word_counts.entry(word).or_default() += 1;
+                let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+                if is_valid_label_word(clean) {
+                    *word_counts.entry(clean).or_default() += 1;
                 }
             }
         }
