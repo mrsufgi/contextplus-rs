@@ -32,6 +32,12 @@ pub const MAX_HEADER_LEN: usize = 200;
 /// Bumped to nav4 for FNV-1a 64-bit hash (was djb2 32-bit in nav3).
 const NAV_HASH_VERSION: &str = "nav4:";
 
+/// Directory segments too generic to use as cluster labels.
+pub const GENERIC_SEGMENTS: &[&str] = &[
+    "src", "lib", "dist", "build", "utils", "helpers", "common", "shared",
+    "core", "types", "config", "internal", "cmd", "pkg",
+];
+
 /// Extensions accepted for semantic navigation (without leading dot).
 pub const NAVIGATE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java",
