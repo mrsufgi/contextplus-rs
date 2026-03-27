@@ -2054,12 +2054,62 @@ fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             }
         }
         if index_count > files.len() / 2 {
-            return Some("barrel exports".to_string());
+            // Find the most common domain directory (2-3 levels up from index files)
+            // e.g., "packages/domains/scheduling/service/index.ts" → "scheduling"
+            let domain_name = {
+                let mut dir_counts: HashMap<&str, usize> = HashMap::new();
+                for f in files {
+                    let segs: Vec<&str> = f.relative_path.split('/').collect();
+                    // Walk segments backwards (skip filename), pick the first
+                    // non-generic segment that isn't the immediate parent
+                    // (immediate parent is often "service", "repository", etc.)
+                    let len = segs.len();
+                    if len >= 3 {
+                        // Check segments from 2 levels up to 3 levels up
+                        for i in (0..len.saturating_sub(2)).rev().take(3) {
+                            let seg = segs[i];
+                            if !GENERIC_SEGMENTS.contains(&seg)
+                                && !matches!(seg, "packages" | "domains" | "apps" | "src" | "lib" | "internal" | "cmd" | "pkg")
+                                && !is_nextjs_route_param(seg)
+                            {
+                                *dir_counts.entry(seg).or_default() += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                dir_counts
+                    .into_iter()
+                    .max_by_key(|(_, c)| *c)
+                    .map(|(name, _)| name.to_string())
+            };
+            return Some(match domain_name {
+                Some(name) => format!("{} exports", name),
+                None => "barrel exports".to_string(),
+            });
         }
         if let Some((ext, count)) = ext_counts.iter().max_by_key(|(_, c)| **c) {
             if *count > files.len() / 2 {
                 match *ext {
-                    "proto" => return Some("proto definitions".to_string()),
+                    "proto" => {
+                        // Extract domain from proto paths: "contracts/proto/billing/v1/..." → "billing"
+                        let mut domain_counts: HashMap<&str, usize> = HashMap::new();
+                        for f in files {
+                            let parts: Vec<&str> = f.relative_path.split('/').collect();
+                            for (i, part) in parts.iter().enumerate() {
+                                if *part == "proto" && i + 1 < parts.len() {
+                                    *domain_counts.entry(parts[i + 1]).or_default() += 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some((domain, _)) = domain_counts.iter().max_by_key(|(_, c)| **c) {
+                            if !domain.contains('.') {
+                                return Some(format!("{} proto", domain));
+                            }
+                        }
+                        return Some("proto definitions".to_string());
+                    }
                     "sql" => return Some("migrations".to_string()),
                     _ => {}
                 }
@@ -3837,6 +3887,32 @@ mod tests {
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("billing proto".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_proto_files_different_domains() {
+        // When proto files span multiple domains, pick the most frequent
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "contracts/proto/iam/v1/auth.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "contracts/proto/iam/v1/roles.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "contracts/proto/billing/v1/invoice.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("iam proto".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_proto_files_flat_structure() {
+        // Proto files directly under proto/ with no domain subdirectory — filenames have dots
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "proto/service.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "proto/messages.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        // Next segment after "proto" is the filename (contains '.'), so falls back
         assert_eq!(label, Some("proto definitions".to_string()));
     }
 
@@ -3849,7 +3925,42 @@ mod tests {
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("billing exports".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_barrel_exports_no_domain() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "src/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "lib/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
         assert_eq!(label, Some("barrel exports".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_barrel_exports_different_domains() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/scheduling/service/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/scheduling/repository/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/scheduling/domain/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("scheduling exports".to_string()));
+    }
+
+    #[test]
+    fn derive_cluster_label_barrel_exports_iam_domain() {
+        let files: Vec<FileInfo> = vec![
+            FileInfo { relative_path: "packages/domains/iam/delivery/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo { relative_path: "packages/domains/iam/service/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = derive_cluster_label(&refs);
+        assert_eq!(label, Some("iam exports".to_string()));
     }
 
     #[test]
