@@ -18,29 +18,35 @@ use super::navigate_constants::*;
 
 /// Load cached LLM labels from disk. Returns a map of cluster_hash -> label.
 /// Find the .mcp_data directory by walking up from the given path.
-/// Falls back to creating .mcp_data in the given path if not found.
-fn find_mcp_data_dir(start: &Path) -> PathBuf {
+/// Only returns an EXISTING .mcp_data directory — never creates one.
+/// Falls back to None if no .mcp_data is found in any ancestor.
+fn find_mcp_data_dir(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         let candidate = dir.join(".mcp_data");
         if candidate.is_dir() {
-            return candidate;
+            return Some(candidate);
         }
         if !dir.pop() {
-            break;
+            return None;
         }
     }
-    // Fallback: create .mcp_data in the start directory
-    let fallback = start.join(".mcp_data");
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
+}
+
+/// Get the .mcp_data directory for label caching.
+/// Walks up to find an existing one, or creates in `start` as fallback.
+fn get_label_cache_dir(start: &Path) -> PathBuf {
+    find_mcp_data_dir(start).unwrap_or_else(|| {
+        let fallback = start.join(".mcp_data");
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    })
 }
 
 /// Load label cache from disk. Uses the SERVER root (not scoped rootDir)
 /// so cached labels are shared across all scoped navigate calls.
 fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
-    // Walk up to find the .mcp_data directory at the workspace root
-    let cache_dir = find_mcp_data_dir(root_dir);
+    let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
     if let Ok(data) = std::fs::read_to_string(&cache_path) {
         serde_json::from_str(&data).unwrap_or_default()
@@ -51,7 +57,7 @@ fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
 
 /// Save LLM label cache to disk. Uses the workspace root's .mcp_data.
 fn save_label_cache(root_dir: &Path, cache: &HashMap<String, String>) {
-    let cache_dir = find_mcp_data_dir(root_dir);
+    let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
     if let Ok(json) = serde_json::to_string_pretty(cache) {
         let _ = std::fs::write(&cache_path, json);
