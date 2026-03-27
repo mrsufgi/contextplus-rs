@@ -10,7 +10,9 @@ use crate::core::embeddings::content_hash;
 pub const MAX_NAVIGATE_FILES: usize = usize::MAX;
 
 /// Maximum files in a leaf cluster before it gets sub-clustered.
-pub const MAX_FILES_PER_LEAF: usize = 20;
+/// Lowered from 20 to 10 to force semantic splitting on medium groups
+/// (e.g., a 15-file service/ directory gets split into business logic vs tests).
+pub const MAX_FILES_PER_LEAF: usize = 10;
 
 /// Maximum files to display per leaf cluster in rendered output.
 pub const MAX_FILES_PER_LEAF_DISPLAY: usize = 10;
@@ -57,6 +59,9 @@ pub fn nav_embed_text(path: &str, header: &str, content: &str) -> String {
 pub fn nav_content_hash(path: &str, content: &str) -> String {
     content_hash(&format!("{}{}{}", NAV_HASH_VERSION, path, content))
 }
+
+/// File name for cached cluster labels (LLM-generated).
+pub const LABEL_CACHE_FILE: &str = "navigate-labels.json";
 
 /// Build the navigate cache file name for a given embedding model.
 pub fn nav_cache_name(model: &str) -> String {

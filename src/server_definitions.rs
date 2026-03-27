@@ -204,6 +204,12 @@ fn build_tool_definitions() -> Vec<Tool> {
                     false,
                     "Minimum sub-clusters per group (default 2). Increase to force finer-grained splitting.",
                 ),
+                (
+                    "mode",
+                    "string",
+                    false,
+                    "Clustering mode: 'hybrid' (default, directory-based + spectral, best for CPU) or 'semantic' (pure spectral clustering like original contextplus, best with GPU).",
+                ),
             ],
         ),
         make_tool(
