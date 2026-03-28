@@ -3,9 +3,14 @@
 
 use crate::cache::rkyv_store;
 use crate::config::Config;
-use crate::core::clustering::{spectral_cluster_with_min, ClusterResult};
+use crate::core::clustering::{
+    build_affinity_matrix, build_import_adjacency, blend_affinity_matrices,
+    spectral_cluster_with_affinity, spectral_cluster_with_min, ClusterResult,
+};
 use crate::core::embeddings::VectorStore;
 use crate::core::embeddings::{CacheEntry, OllamaClient};
+use crate::core::import_resolver::resolve_import;
+use crate::core::tree_sitter::extract_imports;
 use crate::core::walker;
 use crate::error::Result;
 use futures::stream::{self, StreamExt};
@@ -89,6 +94,8 @@ pub struct SemanticNavigateOptions {
     ///   Best for CPU (fewer LLM calls, directory boundaries as domain boundaries).
     /// - "semantic": pure spectral clustering from the top, like the original contextplus.
     ///   Best with GPU (fast LLM labels at every level, true semantic grouping).
+    /// - "imports": blends embedding similarity with import-graph adjacency for
+    ///   structure-aware semantic clustering. Uses 70% embedding + 30% import graph.
     pub mode: Option<String>,
 }
 
@@ -114,6 +121,40 @@ struct PendingGroup {
     label: String,
     indices: Vec<usize>,
     cluster_results: Vec<ClusterResult>,
+}
+
+/// Extract import edges for all files. Returns (source_idx, target_idx) pairs
+/// where source imports target. Used by the "imports" clustering mode.
+fn extract_all_import_edges(files: &[FileInfo], root: &Path) -> Vec<(usize, usize)> {
+    // Build a path → index lookup for resolving imports to file indices
+    let path_to_idx: HashMap<PathBuf, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (root.join(&f.relative_path), i))
+        .collect();
+
+    let mut edges = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        let file_path = root.join(&file.relative_path);
+        let raw_imports = extract_imports(&file_path);
+        for raw in &raw_imports {
+            if let Some(resolved) = resolve_import(raw, &file_path) {
+                // Try canonicalized path to match the lookup
+                if let Ok(canonical) = resolved.canonicalize() {
+                    if let Some(&j) = path_to_idx.get(&canonical) {
+                        edges.push((i, j));
+                        continue; // Found via canonical — skip fallback
+                    }
+                }
+                // Also try the resolved path directly (for relative paths that
+                // may not exist on disk yet or match without canonicalization)
+                if let Some(&j) = path_to_idx.get(&resolved) {
+                    edges.push((i, j));
+                }
+            }
+        }
+    }
+    edges
 }
 
 /// Check if a file path looks like a test file.
@@ -282,8 +323,108 @@ pub async fn semantic_navigate(
     }
 
     let use_semantic_mode = options.mode.as_deref() == Some("semantic");
+    let use_imports_mode = options.mode.as_deref() == Some("imports");
 
-    let root_node = if use_semantic_mode {
+    let root_node = if use_imports_mode {
+        // IMPORTS MODE: Blend embedding similarity with import graph
+        // for structure-aware semantic clustering.
+        let all_indices: Vec<usize> = (0..files.len()).collect();
+
+        // Step 1: Extract imports from all files
+        let import_edges = extract_all_import_edges(&files, &root);
+
+        // Step 2: Build blended affinity matrix (embedding similarity + import adjacency)
+        let local_vectors: Vec<Vec<f32>> = all_indices.iter().map(|&i| vectors[i].clone()).collect();
+        let n = files.len();
+        let mc = max_clusters;
+        let mn = min_clusters;
+        let cluster_results = tokio::task::spawn_blocking(move || {
+            let embed_affinity = build_affinity_matrix(&local_vectors);
+            let import_adj = build_import_adjacency(n, &import_edges);
+            // Blend: 70% embedding + 30% import graph
+            let blended = blend_affinity_matrices(&embed_affinity, &import_adj, 0.7);
+            // Step 3: Cluster using blended affinity
+            spectral_cluster_with_affinity(blended, mc, mn)
+        })
+        .await
+        .unwrap_or_else(|_| vec![]);
+
+        if cluster_results.len() <= 1 {
+            // Single cluster or failure — return flat list
+            ClusterNode {
+                label: "Project".to_string(),
+                files: files.iter().cloned().collect(),
+                children: Vec::new(),
+            }
+        } else {
+            // Step 4: Label clusters and build tree (reuse existing labeling infrastructure)
+            let child_groups: Vec<Vec<usize>> = cluster_results
+                .iter()
+                .map(|c| c.indices.clone())
+                .collect();
+
+            let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_groups
+                .iter()
+                .map(|idxs| {
+                    let refs: Vec<&FileInfo> = idxs.iter().map(|&i| &files[i]).collect();
+                    (refs, None)
+                })
+                .collect();
+
+            // Check label cache before calling LLM
+            let label_cache = load_label_cache(root_dir);
+            let mut labels: Vec<String> = Vec::with_capacity(label_input.len());
+            let mut uncached_indices: Vec<usize> = Vec::new();
+            let mut cache_keys: Vec<String> = Vec::new();
+
+            for (i, (cluster_files, _)) in label_input.iter().enumerate() {
+                let paths: Vec<&str> = cluster_files.iter().map(|f| f.relative_path.as_str()).collect();
+                let key = cluster_cache_key(&paths);
+                cache_keys.push(key.clone());
+                if let Some(cached_label) = label_cache.get(&key) {
+                    labels.push(cached_label.clone());
+                } else {
+                    uncached_indices.push(i);
+                    labels.push(String::new()); // placeholder
+                }
+            }
+
+            if !uncached_indices.is_empty() {
+                let uncached_input: Vec<(Vec<&FileInfo>, Option<String>)> = uncached_indices
+                    .iter()
+                    .map(|&i| label_input[i].clone())
+                    .collect();
+                let llm_labels = label_clusters_for_semantic_mode(&uncached_input, ollama).await;
+
+                let mut updated_cache = label_cache;
+                for (j, &orig_idx) in uncached_indices.iter().enumerate() {
+                    if let Some(label) = llm_labels.get(j) {
+                        labels[orig_idx] = label.clone();
+                        updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                    }
+                }
+                save_label_cache(root_dir, &updated_cache);
+            }
+
+            deduplicate_sibling_labels(&mut labels, &label_input);
+
+            let children: Vec<ClusterNode> = child_groups
+                .iter()
+                .enumerate()
+                .map(|(i, idxs)| ClusterNode {
+                    label: labels.get(i).cloned().unwrap_or_else(|| format!("Cluster {}", i + 1)),
+                    files: idxs.iter().map(|&idx| files[idx].clone()).collect(),
+                    children: Vec::new(),
+                })
+                .collect();
+
+            ClusterNode {
+                label: "Project".to_string(),
+                files: Vec::new(),
+                children,
+            }
+        }
+    } else if use_semantic_mode {
         // SEMANTIC MODE: Pure spectral clustering from the top, like the original contextplus.
         // Best with GPU (fast LLM labels at every level). Recursively splits by embedding
         // similarity — no directory-based grouping.
