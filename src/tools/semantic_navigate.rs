@@ -666,9 +666,14 @@ async fn label_clusters_for_semantic_mode(
                             .and_then(|l| l.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| {
-                                // Fallback: try as plain string array
                                 v.as_str().map(|s| s.to_string())
-                                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+                                    .unwrap_or_else(|| {
+                                        // Never return "Cluster N" — use smart fallback
+                                        let (files, _) = &clusters[i.min(clusters.len() - 1)];
+                                        derive_cluster_label(files)
+                                            .or_else(|| find_label_disambiguator(files))
+                                            .unwrap_or_else(|| describe_file_group(files))
+                                    })
                             })
                     }).collect();
                     if labels.len() == clusters.len() {
