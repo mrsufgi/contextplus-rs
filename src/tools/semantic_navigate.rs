@@ -404,8 +404,11 @@ pub async fn semantic_navigate(
                 let mut updated_cache = label_cache;
                 for (j, &orig_idx) in uncached_indices.iter().enumerate() {
                     if let Some(label) = llm_labels.get(j) {
-                        labels[orig_idx] = label.clone();
-                        updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                        // Reject labels the LLM echoed from the prompt ("Cluster 1", etc.)
+                        if !label.starts_with("Cluster ") && !label.starts_with("Group ") && !label.is_empty() {
+                            labels[orig_idx] = label.clone();
+                            updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                        }
                     }
                 }
                 save_label_cache(root_dir, &updated_cache);
@@ -579,8 +582,11 @@ async fn build_semantic_hierarchy(
         let mut updated_cache = label_cache;
         for (j, &orig_idx) in uncached_indices.iter().enumerate() {
             if let Some(label) = llm_labels.get(j) {
-                labels[orig_idx] = label.clone();
-                updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                // Reject labels the LLM echoed from the prompt ("Cluster 1", etc.)
+                if !label.starts_with("Cluster ") && !label.starts_with("Group ") && !label.is_empty() {
+                    labels[orig_idx] = label.clone();
+                    updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                }
             }
         }
         save_label_cache(root_dir, &updated_cache);
@@ -639,18 +645,23 @@ async fn label_clusters_for_semantic_mode(
                 let desc = if f.header.is_empty() { "no description" } else { &f.header };
                 format!("{}: {}", f.relative_path, desc)
             }).collect();
-            format!("Cluster {} ({} files):\n  {}", i + 1, files.len(), sample.join("\n  "))
+            // Use letters (A, B, C) instead of "Cluster N" to prevent LLM echoing
+            let letter = (b'A' + (i as u8 % 26)) as char;
+            format!("Group {} ({} files):\n  {}", letter, files.len(), sample.join("\n  "))
         })
         .collect();
 
     let prompt = format!(
-        "You are labeling clusters of code files in a software project.\n\
-         For each cluster, produce a JSON array of objects with:\n\
-         - \"overarchingTheme\": a sentence about the cluster's theme\n\
-         - \"distinguishingFeature\": what makes this cluster unique vs siblings\n\
-         - \"label\": 2-4 words describing the cluster\n\n\
+        "You are labeling clusters of source code files.\n\
+         For each group below, give a descriptive label (2-4 words) based on what the code DOES.\n\
+         Do NOT use the group letter (A, B, C) as the label.\n\
+         Do NOT say 'Cluster' or 'Group' in the label.\n\
+         Good labels: 'Patient Data Access', 'Auth Middleware', 'Temporal Workflows'\n\
+         Bad labels: 'Group A', 'Cluster 1', 'Files', 'Source Code'\n\n\
+         Return a JSON array of {} strings, one per group.\n\n\
          {}\n\n\
-         Respond with ONLY a JSON array of {} objects. No other text.",
+         JSON array of {} strings:",
+        clusters.len(),
         descriptions.join("\n\n"),
         clusters.len()
     );
@@ -662,19 +673,20 @@ async fn label_clusters_for_semantic_mode(
                 // Try rich format first: [{overarchingTheme, distinguishingFeature, label}]
                 if let Ok(rich) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                     let labels: Vec<String> = rich.iter().enumerate().map(|(i, v)| {
-                        v.get("label")
+                        let raw = v.get("label")
                             .and_then(|l| l.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
-                                v.as_str().map(|s| s.to_string())
-                                    .unwrap_or_else(|| {
-                                        // Never return "Cluster N" — use smart fallback
-                                        let (files, _) = &clusters[i.min(clusters.len() - 1)];
-                                        derive_cluster_label(files)
-                                            .or_else(|| find_label_disambiguator(files))
-                                            .unwrap_or_else(|| describe_file_group(files))
-                                    })
-                            })
+                            .or_else(|| v.as_str())
+                            .map(|s| s.to_string());
+                        // Reject LLM-echoed prompt labels ("Cluster 1", "Group A", etc.)
+                        match raw {
+                            Some(s) if !s.starts_with("Cluster ") && !s.starts_with("Group ") && !s.is_empty() => s,
+                            _ => {
+                                let (files, _) = &clusters[i.min(clusters.len() - 1)];
+                                derive_cluster_label(files)
+                                    .or_else(|| find_label_disambiguator(files))
+                                    .unwrap_or_else(|| describe_file_group(files))
+                            }
+                        }
                     }).collect();
                     if labels.len() == clusters.len() {
                         return labels;
@@ -1050,10 +1062,13 @@ async fn label_subclusters_with_llm(
                         })
                         .collect::<Vec<_>>()
                         .join("\n  ");
-                    format!(
-                        "Cluster {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
-                        desc_idx + 1, file_refs.len(), parent_label, subdir_summary, file_list
-                    )
+                    {
+                        let letter = (b'A' + (desc_idx as u8 % 26)) as char;
+                        format!(
+                            "Group {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
+                            letter, file_refs.len(), parent_label, subdir_summary, file_list
+                        )
+                    }
                 })
                 .collect();
 
