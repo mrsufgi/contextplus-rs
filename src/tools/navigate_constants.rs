@@ -63,6 +63,16 @@ pub fn nav_content_hash(path: &str, content: &str) -> String {
 /// File name for cached cluster labels (LLM-generated).
 pub const LABEL_CACHE_FILE: &str = "navigate-labels.json";
 
+/// Maximum clusters to send to LLM in a single batch (avoids timeout).
+pub const LLM_BATCH_SIZE: usize = 10;
+
+/// Maximum files to sample per cluster when building LLM label prompts.
+pub const MAX_FILES_PER_LABEL: usize = 5;
+
+/// Blend ratio for embedding vs import-graph affinity (1.0 = pure embedding, 0.0 = pure imports).
+/// 0.9 means 90% embedding + 10% import adjacency for gentle structural nudging.
+pub const IMPORT_BLEND_ALPHA: f64 = 0.9;
+
 /// Build the navigate cache file name for a given embedding model.
 /// Uses server::sanitize_model_name for filesystem safety
 /// (e.g., "unclemusclez/jina-embeddings-v2-base-code" → "navigate-unclemusclez-jina-embeddings-v2-base-code")
