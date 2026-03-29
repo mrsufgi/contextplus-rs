@@ -39,15 +39,11 @@ pub fn resolve_import(import_path: &str, importing_file: &Path) -> Option<PathBu
 }
 
 /// Resolve all imports for a file, returning (importing_file, imported_file) pairs.
-pub fn resolve_file_imports(
-    file_path: &Path,
-    raw_imports: &[String],
-) -> Vec<(PathBuf, PathBuf)> {
+pub fn resolve_file_imports(file_path: &Path, raw_imports: &[String]) -> Vec<(PathBuf, PathBuf)> {
     raw_imports
         .iter()
         .filter_map(|import| {
-            resolve_import(import, file_path)
-                .map(|resolved| (file_path.to_path_buf(), resolved))
+            resolve_import(import, file_path).map(|resolved| (file_path.to_path_buf(), resolved))
         })
         .collect()
 }
@@ -84,19 +80,19 @@ mod tests {
 
     #[test]
     fn skip_external_import() {
-        let result = resolve_import("stripe", &Path::new("/workspace/src/app.ts"));
+        let result = resolve_import("stripe", Path::new("/workspace/src/app.ts"));
         assert!(result.is_none());
     }
 
     #[test]
     fn skip_scoped_package_import() {
-        let result = resolve_import("@berries/lib-context", &Path::new("/workspace/src/app.ts"));
+        let result = resolve_import("@berries/lib-context", Path::new("/workspace/src/app.ts"));
         assert!(result.is_none());
     }
 
     #[test]
     fn skip_node_builtin_import() {
-        let result = resolve_import("fs/promises", &Path::new("/workspace/src/app.ts"));
+        let result = resolve_import("fs/promises", Path::new("/workspace/src/app.ts"));
         assert!(result.is_none());
     }
 

@@ -4,7 +4,7 @@
 use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::core::clustering::{
-    build_affinity_matrix, build_import_adjacency, blend_affinity_matrices,
+    blend_affinity_matrices, build_affinity_matrix, build_import_adjacency,
     spectral_cluster_with_affinity,
 };
 use crate::core::embeddings::VectorStore;
@@ -18,6 +18,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 
 use super::labels::*;
+use super::modes::ClusterParams;
 use super::modes::hybrid::{build_labeled_tree, group_by_directory};
 use super::modes::imports::extract_all_import_edges;
 use super::modes::semantic::build_semantic_hierarchy;
@@ -118,7 +119,6 @@ pub struct ClusterNode {
     pub children: Vec<ClusterNode>,
 }
 
-
 /// Perform semantic navigation: embed files, cluster, label, return tree.
 ///
 /// Uses `embedding_cache` to avoid re-embedding files that haven't changed.
@@ -135,9 +135,11 @@ pub async fn semantic_navigate(
     // Depth 0 uses directory-based grouping which creates one group per
     // meaningful directory (not limited by max_clusters). This is intentional
     // because directory boundaries are the natural domain boundaries.
-    let max_clusters = options.max_clusters.unwrap_or(20);
-    let min_clusters = options.min_clusters.unwrap_or(2);
-    let max_depth = options.max_depth.unwrap_or(3);
+    let cluster_params = ClusterParams {
+        max_clusters: options.max_clusters.unwrap_or(20),
+        min_clusters: options.min_clusters.unwrap_or(2),
+        max_depth: options.max_depth.unwrap_or(3),
+    };
     let root = PathBuf::from(&options.root_dir);
 
     // Walk directory for source files using shared walker infrastructure
@@ -148,6 +150,8 @@ pub async fn semantic_navigate(
 
     // Cap file count to keep spectral clustering tractable.
     // Sample evenly across the sorted file list to preserve directory diversity.
+    // MAX_NAVIGATE_FILES may be usize::MAX (no limit) — allow the always-false comparison.
+    #[allow(clippy::absurd_extreme_comparisons)]
     let sampled = files.len() > MAX_NAVIGATE_FILES;
     if sampled {
         let total = files.len();
@@ -167,15 +171,18 @@ pub async fn semantic_navigate(
     let nav_cache_name = nav_cache_name(&config.ollama_embed_model);
     let mut nav_cache: HashMap<String, CacheEntry> = HashMap::new();
     if let Ok(Some(store)) = rkyv_store::mmap_vector_store(root_dir, &nav_cache_name) {
-        let dims = store.dims() as usize;
+        let dims = store.dims();
         let flat = store.vectors_data();
         let keys = store.keys();
         let hashes = store.hashes();
         for (i, key) in keys.iter().enumerate() {
-            nav_cache.insert(key.clone(), CacheEntry {
-                hash: hashes[i].clone(),
-                vector: flat[i * dims..(i + 1) * dims].to_vec(),
-            });
+            nav_cache.insert(
+                key.clone(),
+                CacheEntry {
+                    hash: hashes[i].clone(),
+                    vector: flat[i * dims..(i + 1) * dims].to_vec(),
+                },
+            );
         }
     }
     let nav_cache_lock = RwLock::new(nav_cache);
@@ -229,10 +236,11 @@ pub async fn semantic_navigate(
         let import_edges = extract_all_import_edges(&files, &root);
 
         // Step 2: Build blended affinity matrix (embedding similarity + import adjacency)
-        let local_vectors: Vec<Vec<f32>> = all_indices.iter().map(|&i| vectors[i].clone()).collect();
+        let local_vectors: Vec<Vec<f32>> =
+            all_indices.iter().map(|&i| vectors[i].clone()).collect();
         let n = files.len();
-        let mc = max_clusters;
-        let mn = min_clusters;
+        let mc = cluster_params.max_clusters;
+        let mn = cluster_params.min_clusters;
         let cluster_results = tokio::task::spawn_blocking(move || {
             let embed_affinity = build_affinity_matrix(&local_vectors);
             let raw_import_adj = build_import_adjacency(n, &import_edges);
@@ -242,7 +250,8 @@ pub async fn semantic_navigate(
             // Also apply decay: direct imports get full weight, but we don't want
             // transitive chains (A→B→C) to collapse everything into one cluster.
             // Use 90% embedding + 10% import for gentle structural nudging.
-            let blended = blend_affinity_matrices(&embed_affinity, &raw_import_adj, IMPORT_BLEND_ALPHA);
+            let blended =
+                blend_affinity_matrices(&embed_affinity, &raw_import_adj, IMPORT_BLEND_ALPHA);
             // Step 3: Cluster using blended affinity
             spectral_cluster_with_affinity(blended, mc, mn)
         })
@@ -253,15 +262,13 @@ pub async fn semantic_navigate(
             // Single cluster or failure — return flat list
             ClusterNode {
                 label: "Project".to_string(),
-                files: files.iter().cloned().collect(),
+                files: files.to_vec(),
                 children: Vec::new(),
             }
         } else {
             // Step 4: Label clusters and build tree (reuse existing labeling infrastructure)
-            let child_groups: Vec<Vec<usize>> = cluster_results
-                .iter()
-                .map(|c| c.indices.clone())
-                .collect();
+            let child_groups: Vec<Vec<usize>> =
+                cluster_results.iter().map(|c| c.indices.clone()).collect();
 
             let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_groups
                 .iter()
@@ -304,10 +311,8 @@ pub async fn semantic_navigate(
             &files,
             &vectors,
             &all_indices,
-            max_clusters,
-            min_clusters,
             0,
-            max_depth,
+            &cluster_params,
             ollama,
             root_dir,
         )
@@ -322,15 +327,13 @@ pub async fn semantic_navigate(
             &files,
             &vectors,
             dir_groups,
-            max_clusters,
-            min_clusters,
-            max_depth,
+            &cluster_params,
             ollama,
             root_dir,
         )
         .await;
 
-        children.sort_by(|a, b| count_files_in_node(b).cmp(&count_files_in_node(a)));
+        children.sort_by_key(|b| std::cmp::Reverse(count_files_in_node(b)));
 
         ClusterNode {
             label: "Project".to_string(),
@@ -367,7 +370,10 @@ pub(crate) async fn label_clusters_with_cache(
     let mut cache_keys: Vec<String> = Vec::new();
 
     for (i, (cluster_files, _)) in label_input.iter().enumerate() {
-        let paths: Vec<&str> = cluster_files.iter().map(|f| f.relative_path.as_str()).collect();
+        let paths: Vec<&str> = cluster_files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
         let key = cluster_cache_key(&paths);
         cache_keys.push(key.clone());
         if let Some(cached_label) = label_cache.get(&key) {
@@ -383,15 +389,16 @@ pub(crate) async fn label_clusters_with_cache(
             .iter()
             .map(|&i| label_input[i].clone())
             .collect();
-        let llm_labels = super::modes::semantic::label_clusters_for_semantic_mode(&uncached_input, ollama).await;
+        let llm_labels =
+            super::modes::semantic::label_clusters_for_semantic_mode(&uncached_input, ollama).await;
 
         let mut updated_cache = label_cache;
         for (j, &orig_idx) in uncached_indices.iter().enumerate() {
-            if let Some(label) = llm_labels.get(j) {
-                if !label.is_empty() {
-                    labels[orig_idx] = label.clone();
-                    updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
-                }
+            if let Some(label) = llm_labels.get(j)
+                && !label.is_empty()
+            {
+                labels[orig_idx] = label.clone();
+                updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
             }
         }
         save_label_cache(root_dir, &updated_cache);
@@ -511,14 +518,22 @@ async fn resolve_embeddings(
                 // Path-weighted embed text: repeat path 3x to boost domain signal.
                 // Code embeddings capture structural patterns (imports, patterns),
                 // path captures domain identity (billing vs scheduling vs IAM).
-                uncached_texts.push(nav_embed_text(&file.relative_path, &file.header, &file.content));
+                uncached_texts.push(nav_embed_text(
+                    &file.relative_path,
+                    &file.header,
+                    &file.content,
+                ));
                 uncached_hashes.push(file_hash);
             }
         } else {
             // Cache miss: never seen this file
             result_vectors.push(None);
             uncached_indices.push(i);
-            uncached_texts.push(nav_embed_text(&file.relative_path, &file.header, &file.content));
+            uncached_texts.push(nav_embed_text(
+                &file.relative_path,
+                &file.header,
+                &file.content,
+            ));
             uncached_hashes.push(file_hash);
         }
     }
@@ -545,7 +560,8 @@ async fn resolve_embeddings(
         // Store this chunk's vectors in cache, then drop lock BEFORE disk I/O.
         let store_to_save = {
             let mut cache_write = embedding_cache.write().await;
-            for (local_j, &file_idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
+            for (local_j, &file_idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate()
+            {
                 if local_j < chunk_vectors.len() {
                     let vec = std::mem::take(&mut chunk_vectors[local_j]);
                     cache_write.insert(
@@ -607,8 +623,6 @@ pub fn extract_header(content: &str) -> String {
     }
 }
 
-
-
 /// Count total files in a cluster node (including all children recursively).
 fn count_files_in_node(node: &ClusterNode) -> usize {
     if node.children.is_empty() {
@@ -629,7 +643,6 @@ pub(crate) fn extract_json_array(text: &str) -> Option<String> {
     }
 }
 
-
 /// Render a cluster tree as indented text.
 fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
     let pad = "  ".repeat(indent);
@@ -638,7 +651,12 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
     if !node.label.is_empty() {
         let count = count_files_in_node(node);
         // Don't add "(N files)" if label already starts with a number (e.g., "6 source files")
-        let label_starts_with_count = node.label.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        let label_starts_with_count = node
+            .label
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
         if label_starts_with_count {
             result.push_str(&format!("{}[{}]\n", pad, node.label));
         } else {
@@ -1577,7 +1595,10 @@ mod tests {
         let r = cache.read().await;
         let entry = r.get("src/uncached.rs").unwrap();
         assert_eq!(entry.vector, vec![7.0, 8.0, 9.0]);
-        assert_eq!(entry.hash, nav_content_hash("src/uncached.rs", "content of src/uncached.rs"));
+        assert_eq!(
+            entry.hash,
+            nav_content_hash("src/uncached.rs", "content of src/uncached.rs")
+        );
     }
 
     #[tokio::test]
@@ -1676,7 +1697,10 @@ mod tests {
         let r = cache.read().await;
         let entry = r.get("src/changed.rs").unwrap();
         assert_eq!(entry.vector, vec![9.0, 9.0, 9.0]);
-        assert_eq!(entry.hash, nav_content_hash("src/changed.rs", "content of src/changed.rs"));
+        assert_eq!(
+            entry.hash,
+            nav_content_hash("src/changed.rs", "content of src/changed.rs")
+        );
     }
 
     // ── group_by_directory tests ─────────────────────────────────────
@@ -1686,23 +1710,34 @@ mod tests {
         let mut files = Vec::new();
         // Need >= MIN_DIR_GROUP_SIZE (5) files per group to avoid merging into "other"
         for i in 0..16 {
-            files.push(make_test_file(&format!("packages/domains/billing/file{}.ts", i)));
+            files.push(make_test_file(&format!(
+                "packages/domains/billing/file{}.ts",
+                i
+            )));
         }
         for i in 0..16 {
-            files.push(make_test_file(&format!("packages/domains/scheduling/file{}.ts", i)));
+            files.push(make_test_file(&format!(
+                "packages/domains/scheduling/file{}.ts",
+                i
+            )));
         }
         let groups = group_by_directory(&files);
         let labels: Vec<&str> = groups.iter().map(|g| g.0.as_str()).collect();
-        assert!(labels.contains(&"domains/billing"), "Expected 'domains/billing', got {:?}", labels);
-        assert!(labels.contains(&"domains/scheduling"), "Expected 'domains/scheduling', got {:?}", labels);
+        assert!(
+            labels.contains(&"domains/billing"),
+            "Expected 'domains/billing', got {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"domains/scheduling"),
+            "Expected 'domains/scheduling', got {:?}",
+            labels
+        );
     }
 
     #[test]
     fn group_by_directory_root_files() {
-        let files = vec![
-            make_test_file("main.rs"),
-            make_test_file("Cargo.toml"),
-        ];
+        let files = vec![make_test_file("main.rs"), make_test_file("Cargo.toml")];
         let groups = group_by_directory(&files);
         // Both are single-component paths → "root" label, but < MIN_DIR_GROUP_SIZE (5) → merged to "other"
         assert_eq!(groups.len(), 1);
@@ -1732,11 +1767,11 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert!(
             groups[0].0 == "alpha + beta" || groups[0].0 == "beta + alpha",
-            "Expected descriptive label for other bucket, got '{}'", groups[0].0
+            "Expected descriptive label for other bucket, got '{}'",
+            groups[0].0
         );
         assert_eq!(groups[0].1.len(), 6);
     }
-
 
     // ── count_files_in_node tests ────────────────────────────────────
 
@@ -1754,7 +1789,11 @@ mod tests {
     fn count_files_nested_children() {
         let child1 = ClusterNode {
             label: "c1".to_string(),
-            files: vec![make_test_file("a.rs"), make_test_file("b.rs"), make_test_file("c.rs")],
+            files: vec![
+                make_test_file("a.rs"),
+                make_test_file("b.rs"),
+                make_test_file("c.rs"),
+            ],
             children: Vec::new(),
         };
         let child2 = ClusterNode {
@@ -1784,10 +1823,7 @@ mod tests {
         assert!(rendered.contains("[big leaf]"));
         assert!(rendered.contains("(+5 more files)"));
         // Should show exactly MAX_FILES_PER_LEAF_DISPLAY file lines
-        let file_lines = rendered
-            .lines()
-            .filter(|l| l.contains("src/file"))
-            .count();
+        let file_lines = rendered.lines().filter(|l| l.contains("src/file")).count();
         assert_eq!(file_lines, 10); // MAX_FILES_PER_LEAF_DISPLAY
     }
 
@@ -1799,11 +1835,7 @@ mod tests {
             children: Vec::new(),
         };
         let rendered = render_cluster_tree(&node, 0);
-        assert!(
-            rendered.contains("[test] (2 files)"),
-            "got: {}",
-            rendered
-        );
+        assert!(rendered.contains("[test] (2 files)"), "got: {}", rendered);
     }
 
     // --- group_by_directory tests ---
@@ -1828,5 +1860,4 @@ mod tests {
             labels
         );
     }
-
 }

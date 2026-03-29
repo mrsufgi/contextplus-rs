@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -478,9 +478,13 @@ mod tests {
         let lingering: Vec<_> = fs::read_dir(&cache)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "tmp"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
             .collect();
-        assert!(lingering.is_empty(), "temp files should not linger: {:?}", lingering);
+        assert!(
+            lingering.is_empty(),
+            "temp files should not linger: {:?}",
+            lingering
+        );
     }
 
     // -- mmap_vector_store tests (zero-copy) --

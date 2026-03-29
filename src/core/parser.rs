@@ -317,8 +317,17 @@ mod tests {
     #[test]
     fn hash_content_is_16_hex_chars() {
         let h = hash_content("test");
-        assert_eq!(h.len(), 16, "FNV-1a 64-bit should produce 16 hex chars, got: {}", h);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in: {}", h);
+        assert_eq!(
+            h.len(),
+            16,
+            "FNV-1a 64-bit should produce 16 hex chars, got: {}",
+            h
+        );
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit()),
+            "non-hex char in: {}",
+            h
+        );
     }
 
     #[test]

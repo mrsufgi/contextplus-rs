@@ -22,11 +22,11 @@ pub(crate) fn extract_all_import_edges(files: &[FileInfo], root: &Path) -> Vec<(
         for raw in &raw_imports {
             if let Some(resolved) = resolve_import(raw, &file_path) {
                 // Try canonicalized path to match the lookup
-                if let Ok(canonical) = resolved.canonicalize() {
-                    if let Some(&j) = path_to_idx.get(&canonical) {
-                        edges.push((i, j));
-                        continue; // Found via canonical — skip fallback
-                    }
+                if let Ok(canonical) = resolved.canonicalize()
+                    && let Some(&j) = path_to_idx.get(&canonical)
+                {
+                    edges.push((i, j));
+                    continue; // Found via canonical — skip fallback
                 }
                 // Also try the resolved path directly (for relative paths that
                 // may not exist on disk yet or match without canonicalization)

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use super::super::navigate_constants::*;
 use super::super::semantic_navigate::{ClusterNode, FileInfo, fallback_label};
+use super::ClusterParams;
 
 /// SEMANTIC MODE: Recursively build cluster hierarchy using pure spectral clustering.
 /// Like the original contextplus — no directory-based grouping, LLM labels at every level.
@@ -11,14 +12,12 @@ pub(crate) async fn build_semantic_hierarchy(
     all_files: &[FileInfo],
     all_vectors: &[Vec<f32>],
     indices: &[usize],
-    max_clusters: usize,
-    min_clusters: usize,
     depth: usize,
-    max_depth: usize,
+    params: &ClusterParams,
     ollama: &OllamaClient,
     root_dir: &Path,
 ) -> ClusterNode {
-    if indices.len() <= MAX_FILES_PER_LEAF || depth >= max_depth {
+    if indices.len() <= MAX_FILES_PER_LEAF || depth >= params.max_depth {
         return ClusterNode {
             label: String::new(),
             files: indices.iter().map(|&i| all_files[i].clone()).collect(),
@@ -28,13 +27,12 @@ pub(crate) async fn build_semantic_hierarchy(
 
     // Spectral clustering on this group's vectors
     let local_vectors: Vec<Vec<f32>> = indices.iter().map(|&i| all_vectors[i].clone()).collect();
-    let mc = max_clusters;
-    let mn = min_clusters;
-    let cluster_results = tokio::task::spawn_blocking(move || {
-        spectral_cluster_with_min(&local_vectors, mc, mn)
-    })
-    .await
-    .unwrap_or_else(|_| vec![]);
+    let mc = params.max_clusters;
+    let mn = params.min_clusters;
+    let cluster_results =
+        tokio::task::spawn_blocking(move || spectral_cluster_with_min(&local_vectors, mc, mn))
+            .await
+            .unwrap_or_else(|_| vec![]);
 
     if cluster_results.len() <= 1 {
         return ClusterNode {
@@ -59,7 +57,9 @@ pub(crate) async fn build_semantic_hierarchy(
         })
         .collect();
 
-    let labels = super::super::semantic_navigate::label_clusters_with_cache(&label_input, ollama, root_dir).await;
+    let labels =
+        super::super::semantic_navigate::label_clusters_with_cache(&label_input, ollama, root_dir)
+            .await;
 
     // Recurse into children sequentially (to avoid Ollama contention)
     let mut children: Vec<ClusterNode> = Vec::new();
@@ -68,10 +68,8 @@ pub(crate) async fn build_semantic_hierarchy(
             all_files,
             all_vectors,
             child_indices,
-            max_clusters,
-            min_clusters,
             depth + 1,
-            max_depth,
+            params,
             ollama,
             root_dir,
         ))
@@ -104,13 +102,26 @@ pub(crate) async fn label_clusters_for_semantic_mode(
         .iter()
         .enumerate()
         .map(|(i, (files, _))| {
-            let sample: Vec<String> = files.iter().take(10).map(|f| {
-                let desc = if f.header.is_empty() { "no description" } else { &f.header };
-                format!("{}: {}", f.relative_path, desc)
-            }).collect();
+            let sample: Vec<String> = files
+                .iter()
+                .take(10)
+                .map(|f| {
+                    let desc = if f.header.is_empty() {
+                        "no description"
+                    } else {
+                        &f.header
+                    };
+                    format!("{}: {}", f.relative_path, desc)
+                })
+                .collect();
             // Use letters (A, B, C) instead of "Cluster N" to prevent LLM echoing
             let letter = (b'A' + (i as u8 % 26)) as char;
-            format!("Group {} ({} files):\n  {}", letter, files.len(), sample.join("\n  "))
+            format!(
+                "Group {} ({} files):\n  {}",
+                letter,
+                files.len(),
+                sample.join("\n  ")
+            )
         })
         .collect();
 
@@ -134,32 +145,41 @@ pub(crate) async fn label_clusters_for_semantic_mode(
             if let Some(json_str) = super::super::semantic_navigate::extract_json_array(&response) {
                 // Try rich format first: [{overarchingTheme, distinguishingFeature, label}]
                 if let Ok(rich) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    let labels: Vec<String> = rich.iter().enumerate().map(|(i, v)| {
-                        let raw = v.get("label")
-                            .and_then(|l| l.as_str())
-                            .or_else(|| v.as_str())
-                            .map(|s| s.to_string());
-                        match raw {
-                            Some(s) if !s.is_empty() => s,
-                            _ => {
-                                let (files, _) = &clusters[i.min(clusters.len() - 1)];
-                                fallback_label(files)
+                    let labels: Vec<String> = rich
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let raw = v
+                                .get("label")
+                                .and_then(|l| l.as_str())
+                                .or_else(|| v.as_str())
+                                .map(|s| s.to_string());
+                            match raw {
+                                Some(s) if !s.is_empty() => s,
+                                _ => {
+                                    let (files, _) = &clusters[i.min(clusters.len() - 1)];
+                                    fallback_label(files)
+                                }
                             }
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     if labels.len() == clusters.len() {
                         return labels;
                     }
                 }
             }
             // LLM response unparseable — use path-based fallbacks
-            clusters.iter().map(|(files, _)| fallback_label(files)).collect()
+            clusters
+                .iter()
+                .map(|(files, _)| fallback_label(files))
+                .collect()
         }
         Err(_) => {
             // LLM failed — use path-based fallbacks
-            clusters.iter().map(|(files, _)| {
-                fallback_label(files)
-            }).collect()
+            clusters
+                .iter()
+                .map(|(files, _)| fallback_label(files))
+                .collect()
         }
     }
 }

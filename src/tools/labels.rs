@@ -118,8 +118,14 @@ pub(crate) fn map_path_to_description(path_label: &str) -> &str {
 /// Check if a word is a valid label word (not a stopword, not too short, etc.)
 pub(crate) fn is_valid_label_word(word: &str) -> bool {
     word.len() >= 4
-        && word.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        && word.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        && word
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic())
+            .unwrap_or(false)
         && !matches!(
             word.to_lowercase().as_str(),
             "from" | "with" | "this" | "that" | "have" | "been" | "will"
@@ -203,7 +209,7 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                     *counts.entry(m).or_default() += 1;
                 }
                 let mut sorted: Vec<_> = counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
                 let top: Vec<&str> = sorted.iter().take(3).map(|(n, _)| *n).collect();
                 return Some(format!("{} tests", top.join(" + ")));
             }
@@ -262,54 +268,54 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             }
         }
 
-        if let Some((label, count)) = layer_counts.iter().max_by_key(|(_, c)| **c) {
-            if *count > files.len() / 2 {
-                // For generic labels like "business logic", try to describe WHICH logic
-                if *label == "business logic" || *label == "service" {
-                    let names: Vec<&str> = files
-                        .iter()
-                        .filter_map(|f| f.relative_path.split('/').next_back())
-                        .filter_map(|n| {
-                            n.strip_suffix(".ts")
-                                .or_else(|| n.strip_suffix(".tsx"))
-                                .or_else(|| n.strip_suffix(".go"))
-                                .or_else(|| n.strip_suffix(".rs"))
-                        })
-                        .filter(|n| {
-                            !n.contains("test")
-                                && !n.contains("spec")
-                                && *n != "index"
-                                && *n != "mod"
-                                && !n.contains("error")
-                        })
-                        .collect();
-                    if !names.is_empty() {
-                        // Deduplicate and take top names
-                        let mut name_counts: HashMap<&str, usize> = HashMap::new();
-                        for n in &names {
-                            *name_counts.entry(n).or_default() += 1;
-                        }
-                        let mut sorted: Vec<_> = name_counts.into_iter().collect();
-                        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                        let top: Vec<&str> =
-                            sorted.iter().take(3).map(|(n, _)| *n).collect();
-                        return Some(format!("{} logic", top.join(" + ")));
+        if let Some((label, count)) = layer_counts.iter().max_by_key(|(_, c)| **c)
+            && *count > files.len() / 2
+        {
+            // For generic labels like "business logic", try to describe WHICH logic
+            if *label == "business logic" || *label == "service" {
+                let names: Vec<&str> = files
+                    .iter()
+                    .filter_map(|f| f.relative_path.split('/').next_back())
+                    .filter_map(|n| {
+                        n.strip_suffix(".ts")
+                            .or_else(|| n.strip_suffix(".tsx"))
+                            .or_else(|| n.strip_suffix(".go"))
+                            .or_else(|| n.strip_suffix(".rs"))
+                    })
+                    .filter(|n| {
+                        !n.contains("test")
+                            && !n.contains("spec")
+                            && *n != "index"
+                            && *n != "mod"
+                            && !n.contains("error")
+                    })
+                    .collect();
+                if !names.is_empty() {
+                    // Deduplicate and take top names
+                    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+                    for n in &names {
+                        *name_counts.entry(n).or_default() += 1;
                     }
+                    let mut sorted: Vec<_> = name_counts.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let top: Vec<&str> = sorted.iter().take(3).map(|(n, _)| *n).collect();
+                    return Some(format!("{} logic", top.join(" + ")));
                 }
-                // For "domain models" / "domain entities", enhance with file names
-                if label.starts_with("domain") {
-                    let names: Vec<&str> = files.iter()
-                        .filter_map(|f| f.relative_path.split('/').next_back())
-                        .filter_map(|n| n.strip_suffix(".ts"))
-                        .filter(|n| *n != "index" && !n.contains("test"))
-                        .take(3)
-                        .collect();
-                    if !names.is_empty() {
-                        return Some(format!("{} models", names.join(" + ")));
-                    }
-                }
-                return Some(label.to_string());
             }
+            // For "domain models" / "domain entities", enhance with file names
+            if label.starts_with("domain") {
+                let names: Vec<&str> = files
+                    .iter()
+                    .filter_map(|f| f.relative_path.split('/').next_back())
+                    .filter_map(|n| n.strip_suffix(".ts"))
+                    .filter(|n| *n != "index" && !n.contains("test"))
+                    .take(3)
+                    .collect();
+                if !names.is_empty() {
+                    return Some(format!("{} models", names.join(" + ")));
+                }
+            }
+            return Some(label.to_string());
         }
     }
 
@@ -319,7 +325,11 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
         let mut index_count: usize = 0;
         for f in files {
             let fname = f.relative_path.split('/').next_back().unwrap_or("");
-            if fname == "index.ts" || fname == "index.js" || fname == "index.tsx" || fname == "mod.rs" {
+            if fname == "index.ts"
+                || fname == "index.js"
+                || fname == "index.tsx"
+                || fname == "mod.rs"
+            {
                 index_count += 1;
             }
             if let Some(ext) = fname.rsplit('.').next() {
@@ -342,7 +352,17 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                         for i in (0..len.saturating_sub(2)).rev().take(3) {
                             let seg = segs[i];
                             if !GENERIC_SEGMENTS.contains(&seg)
-                                && !matches!(seg, "packages" | "domains" | "apps" | "src" | "lib" | "internal" | "cmd" | "pkg")
+                                && !matches!(
+                                    seg,
+                                    "packages"
+                                        | "domains"
+                                        | "apps"
+                                        | "src"
+                                        | "lib"
+                                        | "internal"
+                                        | "cmd"
+                                        | "pkg"
+                                )
                                 && !is_nextjs_route_param(seg)
                             {
                                 *dir_counts.entry(seg).or_default() += 1;
@@ -361,31 +381,31 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                 None => "barrel exports".to_string(),
             });
         }
-        if let Some((ext, count)) = ext_counts.iter().max_by_key(|(_, c)| **c) {
-            if *count > files.len() / 2 {
-                match *ext {
-                    "proto" => {
-                        // Extract domain from proto paths: "contracts/proto/billing/v1/..." → "billing"
-                        let mut domain_counts: HashMap<&str, usize> = HashMap::new();
-                        for f in files {
-                            let parts: Vec<&str> = f.relative_path.split('/').collect();
-                            for (i, part) in parts.iter().enumerate() {
-                                if *part == "proto" && i + 1 < parts.len() {
-                                    *domain_counts.entry(parts[i + 1]).or_default() += 1;
-                                    break;
-                                }
+        if let Some((ext, count)) = ext_counts.iter().max_by_key(|(_, c)| **c)
+            && *count > files.len() / 2
+        {
+            match *ext {
+                "proto" => {
+                    // Extract domain from proto paths: "contracts/proto/billing/v1/..." → "billing"
+                    let mut domain_counts: HashMap<&str, usize> = HashMap::new();
+                    for f in files {
+                        let parts: Vec<&str> = f.relative_path.split('/').collect();
+                        for (i, part) in parts.iter().enumerate() {
+                            if *part == "proto" && i + 1 < parts.len() {
+                                *domain_counts.entry(parts[i + 1]).or_default() += 1;
+                                break;
                             }
                         }
-                        if let Some((domain, _)) = domain_counts.iter().max_by_key(|(_, c)| **c) {
-                            if !domain.contains('.') {
-                                return Some(format!("{} proto", domain));
-                            }
-                        }
-                        return Some("proto definitions".to_string());
                     }
-                    "sql" => return Some("migrations".to_string()),
-                    _ => {}
+                    if let Some((domain, _)) = domain_counts.iter().max_by_key(|(_, c)| **c)
+                        && !domain.contains('.')
+                    {
+                        return Some(format!("{} proto", domain));
+                    }
+                    return Some("proto definitions".to_string());
                 }
+                "sql" => return Some("migrations".to_string()),
+                _ => {}
             }
         }
     }
@@ -399,24 +419,28 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                 *seg_counts.entry(p[common_depth]).or_default() += 1;
             }
         }
-        if let Some((seg, count)) = seg_counts.iter().max_by_key(|(_, c)| **c) {
-            if *count > files.len() / 3 && !GENERIC_SEGMENTS.contains(seg) && !is_nextjs_route_param(seg) {
-                // If there's a second-level distinguisher too, use it
-                let mut sub_counts: HashMap<&str, usize> = HashMap::new();
-                for p in &paths {
-                    if common_depth + 1 < p.len().saturating_sub(1) && p[common_depth] == *seg {
-                        *sub_counts.entry(p[common_depth + 1]).or_default() += 1;
-                    }
+        if let Some((seg, count)) = seg_counts.iter().max_by_key(|(_, c)| **c)
+            && *count > files.len() / 3
+            && !GENERIC_SEGMENTS.contains(seg)
+            && !is_nextjs_route_param(seg)
+        {
+            // If there's a second-level distinguisher too, use it
+            let mut sub_counts: HashMap<&str, usize> = HashMap::new();
+            for p in &paths {
+                if common_depth + 1 < p.len().saturating_sub(1) && p[common_depth] == *seg {
+                    *sub_counts.entry(p[common_depth + 1]).or_default() += 1;
                 }
-                if let Some((sub_seg, sub_count)) = sub_counts.iter().max_by_key(|(_, c)| **c) {
-                    if *sub_count > files.len() / 3 && !GENERIC_SEGMENTS.contains(sub_seg) && !is_nextjs_route_param(sub_seg) {
-                        let raw = format!("{}/{}", seg, sub_seg);
-                        let descriptive = map_path_to_description(&raw);
-                        return Some(descriptive.to_string());
-                    }
-                }
-                return Some(map_path_to_description(seg).to_string());
             }
+            if let Some((sub_seg, sub_count)) = sub_counts.iter().max_by_key(|(_, c)| **c)
+                && *sub_count > files.len() / 3
+                && !GENERIC_SEGMENTS.contains(sub_seg)
+                && !is_nextjs_route_param(sub_seg)
+            {
+                let raw = format!("{}/{}", seg, sub_seg);
+                let descriptive = map_path_to_description(&raw);
+                return Some(descriptive.to_string());
+            }
+            return Some(map_path_to_description(seg).to_string());
         }
     }
 
@@ -447,12 +471,12 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             if prefix_len >= 4 {
                 let prefix = &filenames[0][..prefix_len];
                 // Trim to last uppercase boundary for camelCase
-                if let Some(last_upper) = prefix.rfind(|c: char| c.is_uppercase()) {
-                    if last_upper > 0 {
-                        let trimmed = &prefix[..last_upper];
-                        if trimmed.len() >= 4 {
-                            return Some(trimmed.to_string());
-                        }
+                if let Some(last_upper) = prefix.rfind(|c: char| c.is_uppercase())
+                    && last_upper > 0
+                {
+                    let trimmed = &prefix[..last_upper];
+                    if trimmed.len() >= 4 {
+                        return Some(trimmed.to_string());
                     }
                 }
                 // Only return full prefix if it's still >= 4 chars
@@ -468,24 +492,30 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
         let mut word_counts: HashMap<&str, usize> = HashMap::new();
         for f in files {
             for word in f.header.split_whitespace() {
-                let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+                let clean =
+                    word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
                 if is_valid_label_word(clean) {
                     *word_counts.entry(clean).or_default() += 1;
                 }
             }
         }
-        if let Some((word, count)) = word_counts.iter().max_by_key(|(_, c)| **c) {
-            if *count > files.len() / 3 {
-                return Some(word.to_string());
-            }
+        if let Some((word, count)) = word_counts.iter().max_by_key(|(_, c)| **c)
+            && *count > files.len() / 3
+        {
+            return Some(word.to_string());
         }
     }
 
     // Fall back to last 1-2 segments of common prefix
     if common_depth >= 2 {
-        let label = format!("{}/{}", paths[0][common_depth - 2], paths[0][common_depth - 1]);
+        let label = format!(
+            "{}/{}",
+            paths[0][common_depth - 2],
+            paths[0][common_depth - 1]
+        );
         let generic = ["packages", "apps", "src", "lib", "internal"];
-        let segs_clean = !is_nextjs_route_param(paths[0][common_depth - 2]) && !is_nextjs_route_param(paths[0][common_depth - 1]);
+        let segs_clean = !is_nextjs_route_param(paths[0][common_depth - 2])
+            && !is_nextjs_route_param(paths[0][common_depth - 1]);
         if segs_clean && !generic.contains(&label.as_str()) {
             return Some(label);
         }
@@ -521,7 +551,7 @@ pub(crate) fn find_label_disambiguator(files: &[&FileInfo]) -> Option<String> {
                 *counts.entry(m).or_default() += 1;
             }
             let mut sorted: Vec<_> = counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
             let top: Vec<&str> = sorted.iter().take(3).map(|(n, _)| *n).collect();
             return Some(format!("{} tests", top.join(" + ")));
         }
@@ -530,8 +560,12 @@ pub(crate) fn find_label_disambiguator(files: &[&FileInfo]) -> Option<String> {
 
     // Architecture layers
     let layers = [
-        ("service", "service"), ("repository", "repository"), ("repo", "repository"),
-        ("delivery", "delivery"), ("domain", "domain"), ("http", "http"),
+        ("service", "service"),
+        ("repository", "repository"),
+        ("repo", "repository"),
+        ("delivery", "delivery"),
+        ("domain", "domain"),
+        ("http", "http"),
         ("temporal", "temporal"),
     ];
     let mut layer_counts: HashMap<&str, usize> = HashMap::new();
@@ -542,10 +576,10 @@ pub(crate) fn find_label_disambiguator(files: &[&FileInfo]) -> Option<String> {
             }
         }
     }
-    if let Some((layer, count)) = layer_counts.iter().max_by_key(|(_, c)| **c) {
-        if *count > files.len() / 3 {
-            return Some(layer.to_string());
-        }
+    if let Some((layer, count)) = layer_counts.iter().max_by_key(|(_, c)| **c)
+        && *count > files.len() / 3
+    {
+        return Some(layer.to_string());
     }
 
     None
@@ -583,10 +617,11 @@ pub(crate) fn describe_file_group(refs: &[&FileInfo]) -> String {
                 *seg_counts.entry(p[common]).or_default() += 1;
             }
         }
-        if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
-            if !GENERIC_SEGMENTS.contains(&seg) && !is_nextjs_route_param(seg) {
-                return seg.to_string();
-            }
+        if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c)
+            && !GENERIC_SEGMENTS.contains(&seg)
+            && !is_nextjs_route_param(seg)
+        {
+            return seg.to_string();
         }
     }
 
@@ -600,8 +635,13 @@ pub(crate) fn describe_file_group(refs: &[&FileInfo]) -> String {
         }
         if subdir_counts.len() >= 2 {
             let mut sorted: Vec<_> = subdir_counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let top: Vec<&str> = sorted.iter().take(3).map(|(name, _)| *name).filter(|n| !is_nextjs_route_param(n)).collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let top: Vec<&str> = sorted
+                .iter()
+                .take(3)
+                .map(|(name, _)| *name)
+                .filter(|n| !is_nextjs_route_param(n))
+                .collect();
             if !top.is_empty() {
                 return top.join(" + ");
             }
@@ -622,17 +662,22 @@ pub(crate) fn describe_file_group(refs: &[&FileInfo]) -> String {
                 *seg_counts.entry(p[common]).or_default() += 1;
             }
         }
-        if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c) {
-            if !is_nextjs_route_param(seg) {
-                return format!("{} {} modules", n, seg);
-            }
+        if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c)
+            && !is_nextjs_route_param(seg)
+        {
+            return format!("{} {} modules", n, seg);
         }
     }
 
     // Use file names instead of bare count
-    let names: Vec<&str> = refs.iter()
+    let names: Vec<&str> = refs
+        .iter()
         .filter_map(|f| f.relative_path.split('/').next_back())
-        .filter_map(|n| n.strip_suffix(".ts").or_else(|| n.strip_suffix(".tsx")).or_else(|| n.strip_suffix(".go")))
+        .filter_map(|n| {
+            n.strip_suffix(".ts")
+                .or_else(|| n.strip_suffix(".tsx"))
+                .or_else(|| n.strip_suffix(".go"))
+        })
         .filter(|n| *n != "index" && *n != "mod")
         .collect();
     let deduped: Vec<&str> = names.iter().take(3).cloned().collect();
@@ -656,24 +701,34 @@ pub(crate) fn file_type_label(refs: &[&FileInfo]) -> Option<String> {
 pub(crate) async fn label_files(files: &[FileInfo]) -> Vec<String> {
     // For small file sets (≤ MAX_FILES_PER_LEAF), headers are descriptive enough.
     // Skip LLM call entirely — saves ~6s per invocation.
-    files.iter().map(|f| {
-        if f.header.is_empty() {
-            f.relative_path.split('/').next_back().unwrap_or(&f.relative_path).to_string()
-        } else {
-            f.header.clone()
-        }
-    }).collect()
+    files
+        .iter()
+        .map(|f| {
+            if f.header.is_empty() {
+                f.relative_path
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(&f.relative_path)
+                    .to_string()
+            } else {
+                f.header.clone()
+            }
+        })
+        .collect()
 }
 
 /// Deduplicate sibling cluster labels by REPLACING duplicates with disambiguators.
 /// E.g., "scheduling" ×3 → "tests", "service", "repository" (not "scheduling (tests)")
-pub(crate) fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(Vec<&FileInfo>, Option<String>)]) {
+pub(crate) fn deduplicate_sibling_labels(
+    labels: &mut [String],
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+) {
     let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, label) in labels.iter().enumerate() {
         seen.entry(label.to_lowercase()).or_default().push(i);
     }
 
-    for (_key, indices) in &seen {
+    for indices in seen.values() {
         if indices.len() <= 1 {
             continue;
         }
@@ -691,9 +746,8 @@ pub(crate) fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(
             .collect();
 
         // Check if all disambiguators are the same (e.g., all "tests")
-        let unique_disambigs: HashSet<String> = disambigs.iter()
-            .filter_map(|(_, d)| d.clone())
-            .collect();
+        let unique_disambigs: HashSet<String> =
+            disambigs.iter().filter_map(|(_, d)| d.clone()).collect();
 
         if unique_disambigs.len() >= 2 {
             // Good — disambiguators are different. REPLACE the label entirely.
@@ -712,7 +766,7 @@ pub(crate) fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(
     for (i, label) in labels.iter().enumerate() {
         final_seen.entry(label.to_lowercase()).or_default().push(i);
     }
-    for (_key, indices) in &final_seen {
+    for indices in final_seen.values() {
         if indices.len() <= 1 {
             continue;
         }
@@ -735,9 +789,17 @@ pub(crate) fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(
         if unique_suffixes.len() == suffixes.len() {
             // All suffixes are distinct — use them
             for (idx, suffix) in &suffixes {
-                let base = labels[*idx].split(" #").next().unwrap_or(&labels[*idx]).to_string();
+                let base = labels[*idx]
+                    .split(" #")
+                    .next()
+                    .unwrap_or(&labels[*idx])
+                    .to_string();
                 // Skip redundant "(N files)" if label already starts with a count
-                let label_has_count = base.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+                let label_has_count = base
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false);
                 if label_has_count && suffix.contains("files") {
                     continue;
                 }
@@ -748,7 +810,9 @@ pub(crate) fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(
                 let suffix_is_weak = base.to_lowercase().contains(&suffix.to_lowercase())
                     || GENERIC_SEGMENTS.contains(&suffix.to_lowercase().as_str())
                     || suffix.contains("files")
-                    || suffix == "node" || suffix == "src" || suffix == "lib";
+                    || suffix == "node"
+                    || suffix == "src"
+                    || suffix == "lib";
 
                 if suffix_is_weak && *idx < clusters.len() {
                     let (cluster_files, _) = &clusters[*idx];
@@ -788,11 +852,17 @@ pub(crate) fn deduplicate_sibling_labels(labels: &mut Vec<String>, clusters: &[(
 pub(crate) fn label_matches_parent(label: &str, parent: &str) -> bool {
     let l = label.to_lowercase();
     let p = parent.to_lowercase();
-    if l == p { return true; }
+    if l == p {
+        return true;
+    }
     // Parent contains label as a complete segment
-    if p.split('/').any(|seg| seg == l) { return true; }
+    if p.split('/').any(|seg| seg == l) {
+        return true;
+    }
     // Label equals a segment of the parent path
-    if l.split('/').any(|seg| p.split('/').any(|ps| ps == seg)) { return true; }
+    if l.split('/').any(|seg| p.split('/').any(|ps| ps == seg)) {
+        return true;
+    }
     false
 }
 
@@ -849,10 +919,11 @@ pub(crate) fn find_unique_dominant_directory(
     let mut best: Option<(String, usize)> = None;
     for (seg, count) in &my_segments {
         let other_count = other_segments.get(seg).copied().unwrap_or(0);
-        if *count > files.len() / 3 && other_count == 0 {
-            if best.as_ref().map_or(true, |(_, bc)| count > bc) {
-                best = Some((seg.clone(), *count));
-            }
+        if *count > files.len() / 3
+            && other_count == 0
+            && best.as_ref().is_none_or(|(_, bc)| count > bc)
+        {
+            best = Some((seg.clone(), *count));
         }
     }
 
@@ -873,10 +944,10 @@ pub(crate) fn find_unique_file_type(
             continue;
         }
         let (other_files, _) = &clusters[idx];
-        if let Some(other_type) = dominant_file_type(other_files) {
-            if other_type == my_type {
-                return None;
-            }
+        if let Some(other_type) = dominant_file_type(other_files)
+            && other_type == my_type
+        {
+            return None;
         }
     }
 
@@ -897,10 +968,10 @@ pub(crate) fn find_unique_api_domain(
             continue;
         }
         let (other_files, _) = &clusters[idx];
-        if let Some(other_domain) = dominant_api_domain(other_files) {
-            if other_domain == my_domain {
-                return None;
-            }
+        if let Some(other_domain) = dominant_api_domain(other_files)
+            && other_domain == my_domain
+        {
+            return None;
         }
     }
 
@@ -1038,27 +1109,104 @@ pub(crate) fn extract_api_domain_from_filename(filename: &str) -> Option<String>
 /// These words commonly appear in LLM labels but rarely in file paths, causing
 /// false rejections when a few paths happen to contain "components/" or "api/".
 pub(crate) const LABEL_ALLOWLIST: &[&str] = &[
-    "react", "vue", "angular", "svelte", "next", "nuxt",
-    "node", "express", "fastify", "nest",
-    "components", "hooks", "pages", "layouts", "views", "widgets",
-    "api", "rest", "graphql", "grpc", "proto",
-    "template", "templates", "config", "configs", "configuration",
-    "server", "client", "frontend", "backend",
-    "typescript", "javascript", "python", "golang", "rust",
-    "source", "modules", "packages", "library",
-    "form", "forms", "modal", "modals", "dialog", "dialogs",
-    "page", "route", "routes", "routing", "navigation",
-    "auth", "authentication",
-    "state", "store", "redux", "zustand", "context",
-    "style", "styles", "styled", "css", "scss",
-    "test", "tests", "spec", "specs", "testing",
-    "util", "utils", "utility", "utilities", "helper", "helpers",
-    "service", "services", "handler", "handlers",
-    "model", "models", "entity", "entities", "schema", "schemas",
-    "feature", "features", "domain", "domains",
-    "shared", "common", "core", "base", "internal",
-    "dashboard", "admin", "portal", "management",
-    "workflow", "workflows",
+    "react",
+    "vue",
+    "angular",
+    "svelte",
+    "next",
+    "nuxt",
+    "node",
+    "express",
+    "fastify",
+    "nest",
+    "components",
+    "hooks",
+    "pages",
+    "layouts",
+    "views",
+    "widgets",
+    "api",
+    "rest",
+    "graphql",
+    "grpc",
+    "proto",
+    "template",
+    "templates",
+    "config",
+    "configs",
+    "configuration",
+    "server",
+    "client",
+    "frontend",
+    "backend",
+    "typescript",
+    "javascript",
+    "python",
+    "golang",
+    "rust",
+    "source",
+    "modules",
+    "packages",
+    "library",
+    "form",
+    "forms",
+    "modal",
+    "modals",
+    "dialog",
+    "dialogs",
+    "page",
+    "route",
+    "routes",
+    "routing",
+    "navigation",
+    "auth",
+    "authentication",
+    "state",
+    "store",
+    "redux",
+    "zustand",
+    "context",
+    "style",
+    "styles",
+    "styled",
+    "css",
+    "scss",
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "testing",
+    "util",
+    "utils",
+    "utility",
+    "utilities",
+    "helper",
+    "helpers",
+    "service",
+    "services",
+    "handler",
+    "handlers",
+    "model",
+    "models",
+    "entity",
+    "entities",
+    "schema",
+    "schemas",
+    "feature",
+    "features",
+    "domain",
+    "domains",
+    "shared",
+    "common",
+    "core",
+    "base",
+    "internal",
+    "dashboard",
+    "admin",
+    "portal",
+    "management",
+    "workflow",
+    "workflows",
 ];
 
 /// Validate that an LLM-generated label actually represents the cluster content.
@@ -1124,7 +1272,9 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
             match_ratio = format!("{:.2}", match_ratio).as_str(),
             path_specific_words = format!("{:?}", path_specific_words).as_str(),
             "semantic_navigate: validate_label — rejecting {:?} (match_ratio={:.2}, path_words={:?})",
-            label, match_ratio, path_specific_words
+            label,
+            match_ratio,
+            path_specific_words
         );
         return false;
     }
@@ -1135,7 +1285,10 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
         total_files = file_refs.len(),
         match_ratio = format!("{:.2}", match_ratio).as_str(),
         "semantic_navigate: validate_label — accepting {:?} (match_ratio={:.2}, {} of {} files)",
-        label, match_ratio, matching_files, file_refs.len()
+        label,
+        match_ratio,
+        matching_files,
+        file_refs.len()
     );
     true
 }
@@ -1220,33 +1373,86 @@ mod tests {
     #[test]
     fn describe_file_group_spanning_three_generic_subdirs() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "project/src/foo.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "project/lib/bar.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "project/utils/baz.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "project/src/foo.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "project/lib/bar.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "project/utils/baz.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = describe_file_group(&refs);
-        assert!(result.contains(" + "), "Expected 'A + B + C' format, got: {}", result);
+        assert!(
+            result.contains(" + "),
+            "Expected 'A + B + C' format, got: {}",
+            result
+        );
     }
 
     #[test]
     fn describe_file_group_all_in_one_subdir_tsx() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/components/Header.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/components/Footer.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/components/Sidebar.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/components/Header.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/components/Footer.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/components/Sidebar.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = describe_file_group(&refs);
-        assert!(result.contains("React components"), "Expected React components label, got: {}", result);
+        assert!(
+            result.contains("React components"),
+            "Expected React components label, got: {}",
+            result
+        );
     }
 
     #[test]
     fn describe_file_group_single_non_generic_subdir() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/billing/invoice.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/billing/payment.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/scheduling/calendar.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/billing/invoice.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/billing/payment.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/scheduling/calendar.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = describe_file_group(&refs);
@@ -1258,9 +1464,24 @@ mod tests {
     #[test]
     fn file_type_label_all_tsx_returns_react_components() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/Header.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/Footer.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/Nav.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/Header.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/Footer.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/Nav.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = file_type_label(&refs);
@@ -1270,8 +1491,18 @@ mod tests {
     #[test]
     fn file_type_label_all_test_ts_returns_test_files() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "src/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "src/billing.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "src/auth.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "src/billing.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = file_type_label(&refs);
@@ -1281,8 +1512,18 @@ mod tests {
     #[test]
     fn file_type_label_all_ts_returns_none() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "src/auth.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "src/billing.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "src/auth.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "src/billing.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         assert_eq!(file_type_label(&refs), None);
@@ -1291,10 +1532,30 @@ mod tests {
     #[test]
     fn file_type_label_mixed_returns_none() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "a.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "b.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "c.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "d.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "a.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "b.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "c.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "d.sql".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         assert_eq!(file_type_label(&refs), None);
@@ -1307,11 +1568,16 @@ mod tests {
         let files: Vec<FileInfo> = (0..10)
             .map(|i| FileInfo {
                 relative_path: format!("pkg/module{}.ts", i),
-                header: String::new(), content: String::new(), symbol_preview: vec![],
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
             })
             .collect();
         let refs: Vec<&FileInfo> = files.iter().collect();
-        assert!(validate_label_against_cluster("React Form Components", &refs));
+        assert!(validate_label_against_cluster(
+            "React Form Components",
+            &refs
+        ));
     }
 
     #[test]
@@ -1319,12 +1585,16 @@ mod tests {
         let mut files: Vec<FileInfo> = (0..9)
             .map(|i| FileInfo {
                 relative_path: format!("pkg/module{}.ts", i),
-                header: String::new(), content: String::new(), symbol_preview: vec![],
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
             })
             .collect();
         files.push(FileInfo {
             relative_path: "pkg/zebra/special.ts".into(),
-            header: String::new(), content: String::new(), symbol_preview: vec![],
+            header: String::new(),
+            content: String::new(),
+            symbol_preview: vec![],
         });
         let refs: Vec<&FileInfo> = files.iter().collect();
         assert!(!validate_label_against_cluster("Zebra Handler", &refs));
@@ -1335,7 +1605,9 @@ mod tests {
         let files: Vec<FileInfo> = (0..10)
             .map(|i| FileInfo {
                 relative_path: format!("pkg/module{}.ts", i),
-                header: String::new(), content: String::new(), symbol_preview: vec![],
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
             })
             .collect();
         let refs: Vec<&FileInfo> = files.iter().collect();
@@ -1345,11 +1617,24 @@ mod tests {
     #[test]
     fn validate_label_small_cluster_always_true() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "a.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "b.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "a.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "b.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
-        assert!(validate_label_against_cluster("Completely Wrong Label XYZ", &refs));
+        assert!(validate_label_against_cluster(
+            "Completely Wrong Label XYZ",
+            &refs
+        ));
     }
 
     // --- dominant_file_type tests ---
@@ -1357,21 +1642,56 @@ mod tests {
     #[test]
     fn dominant_file_type_all_test_files() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "src/a.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "src/b.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "src/c.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "src/a.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "src/b.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "src/c.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
-        assert_eq!(dominant_file_type(&refs).as_deref(), Some("tests"));
+        assert_eq!(dominant_file_type(&refs), Some("tests"));
     }
 
     #[test]
     fn dominant_file_type_mixed_no_majority() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "a.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "b.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "c.go".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "d.rs".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "a.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "b.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "c.go".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "d.rs".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         assert_eq!(dominant_file_type(&refs), None);
@@ -1380,11 +1700,21 @@ mod tests {
     #[test]
     fn dominant_file_type_all_tsx() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "Header.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "Footer.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "Header.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "Footer.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
-        assert_eq!(dominant_file_type(&refs).as_deref(), Some("components"));
+        assert_eq!(dominant_file_type(&refs), Some("components"));
     }
 
     // --- derive_cluster_label tests ---
@@ -1392,9 +1722,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_picks_architecture_layer() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/scheduling/delivery/http/handler.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/scheduling/delivery/http/routes.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/scheduling/delivery/http/middleware.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/scheduling/delivery/http/handler.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/scheduling/delivery/http/routes.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/scheduling/delivery/http/middleware.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = derive_cluster_label(&refs);
@@ -1404,9 +1749,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_picks_test_files() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/auth/service/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/auth/service/login.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/auth/service/token.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/auth/service/auth.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/auth/service/login.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/auth/service/token.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = derive_cluster_label(&refs);
@@ -1415,9 +1775,12 @@ mod tests {
 
     #[test]
     fn derive_cluster_label_returns_none_for_shallow_paths() {
-        let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "main.rs".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-        ];
+        let files: Vec<FileInfo> = vec![FileInfo {
+            relative_path: "main.rs".into(),
+            header: String::new(),
+            content: String::new(),
+            symbol_preview: vec![],
+        }];
         let refs: Vec<&FileInfo> = files.iter().collect();
         assert_eq!(derive_cluster_label(&refs), None);
     }
@@ -1425,31 +1788,79 @@ mod tests {
     #[test]
     fn derive_cluster_label_deep_common_prefix() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/billing/service.ts".into(), header: "Billing service".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/repo.ts".into(), header: "Billing repository".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/handler.ts".into(), header: "Billing handler".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/types.ts".into(), header: "Billing types".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/index.ts".into(), header: "Billing exports".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/billing/service.ts".into(),
+                header: "Billing service".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/repo.ts".into(),
+                header: "Billing repository".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/handler.ts".into(),
+                header: "Billing handler".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/types.ts".into(),
+                header: "Billing types".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/index.ts".into(),
+                header: "Billing exports".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         assert!(label.is_some(), "Expected Some label for billing files");
         let l = label.unwrap();
-        assert!(l.to_lowercase().contains("billing"), "Expected 'billing' in label, got '{}'", l);
+        assert!(
+            l.to_lowercase().contains("billing"),
+            "Expected 'billing' in label, got '{}'",
+            l
+        );
     }
 
     #[test]
     fn derive_cluster_label_generic_prefix_fallback() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "src/controllers/auth.ts".into(), header: "Auth controller".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "src/controllers/user.ts".into(), header: "User controller".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "src/controllers/billing.ts".into(), header: "Billing controller".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "src/controllers/auth.ts".into(),
+                header: "Auth controller".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "src/controllers/user.ts".into(),
+                header: "User controller".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "src/controllers/billing.ts".into(),
+                header: "Billing controller".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         assert!(label.is_some());
         let l = label.unwrap();
-        assert!(l.to_lowercase().contains("controller"), "Expected 'controller' in label, got '{}'", l);
+        assert!(
+            l.to_lowercase().contains("controller"),
+            "Expected 'controller' in label, got '{}'",
+            l
+        );
     }
 
     #[test]
@@ -1461,9 +1872,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_no_common_prefix() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "alpha/foo.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "beta/bar.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "gamma/baz.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "alpha/foo.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "beta/bar.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "gamma/baz.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1473,21 +1899,54 @@ mod tests {
     #[test]
     fn derive_cluster_label_test_files() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/scheduling/service/appointment.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/scheduling/service/availability.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/scheduling/domain/date-range.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/service/appointment.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/service/availability.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/domain/date-range.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
-        assert_eq!(label, Some("appointment + availability + date-range tests".to_string()));
+        assert_eq!(
+            label,
+            Some("appointment + availability + date-range tests".to_string())
+        );
     }
 
     #[test]
     fn derive_cluster_label_repository_layer() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/scheduling/repository/pg/appointment.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/scheduling/repository/pg/service.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/scheduling/repository/pg/availability.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/repository/pg/appointment.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/repository/pg/service.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/repository/pg/availability.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1497,9 +1956,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_service_layer() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/billing/service/invoice.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/service/payment.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/service/refund.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/billing/service/invoice.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/service/payment.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/service/refund.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1509,9 +1983,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_http_routes() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/billing/delivery/http/invoice-handler.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/delivery/http/payment-handler.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/delivery/http/routes.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/billing/delivery/http/invoice-handler.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/delivery/http/payment-handler.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/delivery/http/routes.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1521,9 +2010,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_proto_files() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/proto/billing/invoice.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/proto/billing/payment.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/proto/billing/refund.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/proto/billing/invoice.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/proto/billing/payment.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/proto/billing/refund.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1533,9 +2037,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_proto_files_different_domains() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "contracts/proto/iam/v1/auth.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "contracts/proto/iam/v1/roles.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "contracts/proto/billing/v1/invoice.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "contracts/proto/iam/v1/auth.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "contracts/proto/iam/v1/roles.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "contracts/proto/billing/v1/invoice.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1545,8 +2064,18 @@ mod tests {
     #[test]
     fn derive_cluster_label_proto_files_flat_structure() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "proto/service.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "proto/messages.proto".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "proto/service.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "proto/messages.proto".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1556,9 +2085,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_barrel_exports() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/billing/service/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/repository/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/billing/domain/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/billing/service/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/repository/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/billing/domain/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1568,9 +2112,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_barrel_exports_no_domain() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "src/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "lib/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "src/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "lib/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1580,9 +2139,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_barrel_exports_different_domains() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/scheduling/service/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/scheduling/repository/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/scheduling/domain/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/service/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/repository/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/scheduling/domain/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1592,8 +2166,18 @@ mod tests {
     #[test]
     fn derive_cluster_label_barrel_exports_iam_domain() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/domains/iam/delivery/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/domains/iam/service/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/domains/iam/delivery/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/domains/iam/service/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1603,9 +2187,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_sql_migrations() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/db/migrations/001_create_users.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/db/migrations/002_create_orgs.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/db/migrations/003_add_billing.sql".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/db/migrations/001_create_users.sql".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/db/migrations/002_create_orgs.sql".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/db/migrations/003_add_billing.sql".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1615,9 +2214,24 @@ mod tests {
     #[test]
     fn derive_cluster_label_filename_prefix_camelcase() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/components/SoapTranscription.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/components/SoapDiagnosis.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/components/SoapHistory.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/components/SoapTranscription.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/components/SoapDiagnosis.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/components/SoapHistory.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
@@ -1628,27 +2242,59 @@ mod tests {
     #[test]
     fn derive_cluster_label_filename_prefix_too_short_after_trim() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "hooks/useCallback.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "hooks/useContext.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "hooks/useCallback.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "hooks/useContext.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         if let Some(l) = &label {
-            assert_ne!(l, "use", "Should not return 'use' (too short after camelCase trim)");
+            assert_ne!(
+                l, "use",
+                "Should not return 'use' (too short after camelCase trim)"
+            );
         }
     }
 
     #[test]
     fn derive_cluster_label_header_blocklist() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "gen/a.ts".into(), header: "@generated by protobuf-ts".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "gen/b.ts".into(), header: "@generated by protobuf-ts".into(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "gen/c.ts".into(), header: "@generated by protobuf-ts".into(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "gen/a.ts".into(),
+                header: "@generated by protobuf-ts".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "gen/b.ts".into(),
+                header: "@generated by protobuf-ts".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "gen/c.ts".into(),
+                header: "@generated by protobuf-ts".into(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         if let Some(l) = &label {
-            assert!(!l.to_lowercase().contains("@generated"), "Should not use @generated as label: {}", l);
+            assert!(
+                !l.to_lowercase().contains("@generated"),
+                "Should not use @generated as label: {}",
+                l
+            );
             assert!(l != "generated", "Should not use 'generated' as label");
         }
     }
@@ -1656,67 +2302,147 @@ mod tests {
     #[test]
     fn derive_cluster_label_temporal_workflows() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/delivery/temporal/workflows/appointment.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/delivery/temporal/workflows/membership.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/delivery/temporal/activities/node/scheduling.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/delivery/temporal/workflows/appointment.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/delivery/temporal/workflows/membership.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/delivery/temporal/activities/node/scheduling.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         assert!(label.is_some());
         let l = label.unwrap().to_lowercase();
-        assert!(l.contains("temporal") || l.contains("workflow"), "Expected temporal-related label, got '{}'", l);
+        assert!(
+            l.contains("temporal") || l.contains("workflow"),
+            "Expected temporal-related label, got '{}'",
+            l
+        );
     }
 
     #[test]
     fn derive_cluster_label_nats_consumers() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/delivery/nats/consumer.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/delivery/nats/event-schemas.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/delivery/nats/index.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/delivery/nats/consumer.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/delivery/nats/event-schemas.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/delivery/nats/index.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         assert!(label.is_some());
         let l = label.unwrap().to_lowercase();
-        assert!(l.contains("nats") || l.contains("consumer") || l.contains("event"), "Expected nats-related label, got '{}'", l);
+        assert!(
+            l.contains("nats") || l.contains("consumer") || l.contains("event"),
+            "Expected nats-related label, got '{}'",
+            l
+        );
     }
 
     #[test]
     fn derive_cluster_label_skips_nextjs_route_params() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/templates/[templateId]/page.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/templates/[templateId]/layout.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/templates/[templateId]/page.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/templates/[templateId]/layout.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         if let Some(l) = &label {
-            assert!(!l.contains("templateId"), "Should not use Next.js route param as label: {}", l);
+            assert!(
+                !l.contains("templateId"),
+                "Should not use Next.js route param as label: {}",
+                l
+            );
         }
     }
 
     #[test]
     fn derive_cluster_label_skips_patient_route_param() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/people/[patientId]/overview.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/people/[patientId]/history.tsx".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/people/[patientId]/overview.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/people/[patientId]/history.tsx".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         if let Some(l) = &label {
-            assert!(!l.contains("patientId"), "Should not use Next.js route param as label: {}", l);
+            assert!(
+                !l.contains("patientId"),
+                "Should not use Next.js route param as label: {}",
+                l
+            );
         }
     }
 
     #[test]
     fn derive_cluster_label_skips_catch_all_route_param() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "app/api/auth/[...nextauth]/route.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "app/api/auth/[...nextauth]/config.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "app/api/auth/[...nextauth]/route.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "app/api/auth/[...nextauth]/config.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let label = derive_cluster_label(&refs);
         if let Some(l) = &label {
-            assert!(!l.contains("nextauth") && !l.contains("..."), "Should not use Next.js catch-all route param as label: {}", l);
+            assert!(
+                !l.contains("nextauth") && !l.contains("..."),
+                "Should not use Next.js catch-all route param as label: {}",
+                l
+            );
         }
     }
 
@@ -1725,34 +2451,69 @@ mod tests {
     #[test]
     fn deduplicate_labels_with_test_disambiguator() {
         let test_files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/service/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/service/user.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/service/billing.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/service/auth.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/service/user.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/service/billing.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let impl_files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/service/auth.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/service/user.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/service/auth.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/service/user.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let test_refs: Vec<&FileInfo> = test_files.iter().collect();
         let impl_refs: Vec<&FileInfo> = impl_files.iter().collect();
-        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
-            (test_refs, None),
-            (impl_refs, None),
-        ];
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> =
+            vec![(test_refs, None), (impl_refs, None)];
         let mut labels = vec!["service".to_string(), "service".to_string()];
         deduplicate_sibling_labels(&mut labels, &clusters);
         assert_ne!(labels[0], labels[1], "Labels should be disambiguated");
-        assert!(labels[0].contains("test") || labels[1].contains("test"), "One should mention tests: {:?}", labels);
+        assert!(
+            labels[0].contains("test") || labels[1].contains("test"),
+            "One should mention tests: {:?}",
+            labels
+        );
     }
 
     #[test]
     fn deduplicate_labels_no_dups_unchanged() {
-        let f1: Vec<FileInfo> = vec![FileInfo { relative_path: "a.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] }];
-        let f2: Vec<FileInfo> = vec![FileInfo { relative_path: "b.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] }];
-        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
-            (f1.iter().collect(), None),
-            (f2.iter().collect(), None),
-        ];
+        let f1: Vec<FileInfo> = vec![FileInfo {
+            relative_path: "a.ts".into(),
+            header: String::new(),
+            content: String::new(),
+            symbol_preview: vec![],
+        }];
+        let f2: Vec<FileInfo> = vec![FileInfo {
+            relative_path: "b.ts".into(),
+            header: String::new(),
+            content: String::new(),
+            symbol_preview: vec![],
+        }];
+        let clusters: Vec<(Vec<&FileInfo>, Option<String>)> =
+            vec![(f1.iter().collect(), None), (f2.iter().collect(), None)];
         let mut labels = vec!["alpha".to_string(), "beta".to_string()];
         deduplicate_sibling_labels(&mut labels, &clusters);
         assert_eq!(labels, vec!["alpha", "beta"]);
@@ -1761,12 +2522,32 @@ mod tests {
     #[test]
     fn deduplicate_labels_same_disambiguator_gets_numbered() {
         let test_files1: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/a.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/b.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/a.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/b.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let test_files2: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/c.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/d.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/c.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/d.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
             (test_files1.iter().collect(), None),
@@ -1774,7 +2555,11 @@ mod tests {
         ];
         let mut labels = vec!["tests".to_string(), "tests".to_string()];
         deduplicate_sibling_labels(&mut labels, &clusters);
-        assert_ne!(labels[0], labels[1], "Labels should differ after dedup: {:?}", labels);
+        assert_ne!(
+            labels[0], labels[1],
+            "Labels should differ after dedup: {:?}",
+            labels
+        );
     }
 
     #[test]
@@ -1782,13 +2567,17 @@ mod tests {
         let svc_files: Vec<FileInfo> = (0..5)
             .map(|i| FileInfo {
                 relative_path: format!("pkg/service/svc{}.ts", i),
-                header: String::new(), content: String::new(), symbol_preview: vec![],
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
             })
             .collect();
         let test_files: Vec<FileInfo> = (0..5)
             .map(|i| FileInfo {
                 relative_path: format!("pkg/service/svc{}.test.ts", i),
-                header: String::new(), content: String::new(), symbol_preview: vec![],
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
             })
             .collect();
         let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
@@ -1798,7 +2587,11 @@ mod tests {
         let mut labels = vec!["service".to_string(), "service".to_string()];
         deduplicate_sibling_labels(&mut labels, &clusters);
         assert_ne!(labels[0], labels[1]);
-        assert!(labels.iter().any(|l| l == "tests" || l.contains("test")), "Expected 'tests' label: {:?}", labels);
+        assert!(
+            labels.iter().any(|l| l == "tests" || l.contains("test")),
+            "Expected 'tests' label: {:?}",
+            labels
+        );
     }
 
     // --- find_label_disambiguator tests ---
@@ -1806,9 +2599,24 @@ mod tests {
     #[test]
     fn find_disambiguator_detects_tests() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "pkg/auth.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/user.test.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "pkg/billing.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "pkg/auth.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/user.test.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "pkg/billing.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         let result = find_label_disambiguator(&refs);
@@ -1818,8 +2626,18 @@ mod tests {
     #[test]
     fn find_disambiguator_returns_none_for_mixed() {
         let files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "alpha/foo.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "beta/bar.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "alpha/foo.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "beta/bar.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let refs: Vec<&FileInfo> = files.iter().collect();
         assert_eq!(find_label_disambiguator(&refs), None);
@@ -1867,14 +2685,47 @@ mod tests {
     #[test]
     fn describe_cluster_uniqueness_api_domains() {
         let scheduling_files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/libs/types/generated/getApiV1SchedulingServices200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/libs/types/generated/getApiV1SchedulingAppointments200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/libs/types/generated/postApiV1SchedulingSlots200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/libs/types/generated/getApiV1SchedulingServices200.ts"
+                    .into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/libs/types/generated/getApiV1SchedulingAppointments200.ts"
+                    .into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/libs/types/generated/postApiV1SchedulingSlots200.ts"
+                    .into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let auth_files: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "packages/libs/types/generated/postApiV1AuthLogin200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/libs/types/generated/postApiV1AuthRegister200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "packages/libs/types/generated/getApiV1AuthSession200.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "packages/libs/types/generated/postApiV1AuthLogin200.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/libs/types/generated/postApiV1AuthRegister200.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "packages/libs/types/generated/getApiV1AuthSession200.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
 
         let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
@@ -1883,12 +2734,8 @@ mod tests {
         ];
         let sibling_indices = vec![0usize, 1usize];
 
-        let suffix0 = describe_cluster_uniqueness(
-            &clusters[0].0, &clusters, &sibling_indices, 0,
-        );
-        let suffix1 = describe_cluster_uniqueness(
-            &clusters[1].0, &clusters, &sibling_indices, 1,
-        );
+        let suffix0 = describe_cluster_uniqueness(&clusters[0].0, &clusters, &sibling_indices, 0);
+        let suffix1 = describe_cluster_uniqueness(&clusters[1].0, &clusters, &sibling_indices, 1);
 
         assert_eq!(suffix0, "scheduling API types");
         assert_eq!(suffix1, "auth API types");
@@ -1897,13 +2744,38 @@ mod tests {
     #[test]
     fn describe_cluster_uniqueness_same_api_domain_falls_back() {
         let files_a: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "gen/getApiV1SchedulingA.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "gen/getApiV1SchedulingB.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "gen/getApiV1SchedulingA.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "gen/getApiV1SchedulingB.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
         let files_b: Vec<FileInfo> = vec![
-            FileInfo { relative_path: "gen/postApiV1SchedulingC.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "gen/postApiV1SchedulingD.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
-            FileInfo { relative_path: "gen/postApiV1SchedulingE.ts".into(), header: String::new(), content: String::new(), symbol_preview: vec![] },
+            FileInfo {
+                relative_path: "gen/postApiV1SchedulingC.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "gen/postApiV1SchedulingD.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
+            FileInfo {
+                relative_path: "gen/postApiV1SchedulingE.ts".into(),
+                header: String::new(),
+                content: String::new(),
+                symbol_preview: vec![],
+            },
         ];
 
         let clusters: Vec<(Vec<&FileInfo>, Option<String>)> = vec![
@@ -1912,9 +2784,7 @@ mod tests {
         ];
         let sibling_indices = vec![0usize, 1usize];
 
-        let suffix0 = describe_cluster_uniqueness(
-            &clusters[0].0, &clusters, &sibling_indices, 0,
-        );
+        let suffix0 = describe_cluster_uniqueness(&clusters[0].0, &clusters, &sibling_indices, 0);
         assert_eq!(suffix0, "2 files");
     }
 

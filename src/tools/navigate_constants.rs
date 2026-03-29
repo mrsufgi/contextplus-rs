@@ -36,16 +36,14 @@ const NAV_HASH_VERSION: &str = "nav4:";
 
 /// Directory segments too generic to use as cluster labels.
 pub const GENERIC_SEGMENTS: &[&str] = &[
-    "src", "lib", "dist", "build", "utils", "helpers", "common", "shared",
-    "core", "types", "config", "internal", "cmd", "pkg",
+    "src", "lib", "dist", "build", "utils", "helpers", "common", "shared", "core", "types",
+    "config", "internal", "cmd", "pkg",
 ];
 
 /// Extensions accepted for semantic navigation (without leading dot).
 pub const NAVIGATE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java",
-    "c", "cpp", "h", "hpp", "cc",
-    "rb", "sh", "bash", "zsh",
-    "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "cpp", "h", "hpp", "cc",
+    "rb", "sh", "bash", "zsh", "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
 ];
 
 /// Build the path-weighted embed text for a file.

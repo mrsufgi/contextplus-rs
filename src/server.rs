@@ -605,10 +605,12 @@ impl ContextPlusServer {
                 }
 
                 // Persist after each chunk so progress survives a timeout on the next batch.
-                let all_vecs: Vec<Vec<f32>> = result_vectors.iter().filter_map(|v| v.clone()).collect();
+                let all_vecs: Vec<Vec<f32>> =
+                    result_vectors.iter().filter_map(|v| v.clone()).collect();
                 if all_vecs.len() == n_identifiers {
                     let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
-                    let keys: Vec<String> = identifier_docs.iter().map(|d| d.text.clone()).collect();
+                    let keys: Vec<String> =
+                        identifier_docs.iter().map(|d| d.text.clone()).collect();
                     let hashes: Vec<String> = keys
                         .iter()
                         .map(|k| crate::core::parser::hash_content(k))

@@ -291,38 +291,39 @@ pub fn get_supported_extensions() -> &'static [&'static str] {
 }
 
 /// Recursively collect import paths from AST nodes.
-fn collect_imports_from_node(node: Node, source: &[u8], grammar_name: &str, imports: &mut Vec<String>) {
+fn collect_imports_from_node(
+    node: Node,
+    source: &[u8],
+    grammar_name: &str,
+    imports: &mut Vec<String>,
+) {
     match grammar_name {
         "typescript" | "tsx" | "javascript" => {
             // ES import/export: import ... from 'path'; export ... from 'path'
             if node.kind() == "import_statement" || node.kind() == "export_statement" {
-                if let Some(source_node) = node.child_by_field_name("source") {
-                    if let Ok(text) = source_node.utf8_text(source) {
-                        let path = text.trim_matches(|c| c == '"' || c == '\'');
-                        if !path.is_empty() {
-                            imports.push(path.to_string());
-                        }
+                if let Some(source_node) = node.child_by_field_name("source")
+                    && let Ok(text) = source_node.utf8_text(source)
+                {
+                    let path = text.trim_matches(|c| c == '"' || c == '\'');
+                    if !path.is_empty() {
+                        imports.push(path.to_string());
                     }
                 }
                 return; // Don't recurse into import/export children
             }
             // CJS require('path')
-            if node.kind() == "call_expression" {
-                if let Some(func) = node.child_by_field_name("function") {
-                    if func.kind() == "identifier" && func.utf8_text(source).unwrap_or("") == "require" {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            if let Some(first_arg) = args.named_child(0) {
-                                if first_arg.kind() == "string" {
-                                    if let Ok(text) = first_arg.utf8_text(source) {
-                                        let path = text.trim_matches(|c| c == '"' || c == '\'');
-                                        if !path.is_empty() {
-                                            imports.push(path.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if node.kind() == "call_expression"
+                && let Some(func) = node.child_by_field_name("function")
+                && func.kind() == "identifier"
+                && func.utf8_text(source).unwrap_or("") == "require"
+                && let Some(args) = node.child_by_field_name("arguments")
+                && let Some(first_arg) = args.named_child(0)
+                && first_arg.kind() == "string"
+                && let Ok(text) = first_arg.utf8_text(source)
+            {
+                let path = text.trim_matches(|c| c == '"' || c == '\'');
+                if !path.is_empty() {
+                    imports.push(path.to_string());
                 }
             }
         }
@@ -336,12 +337,11 @@ fn collect_imports_from_node(node: Node, source: &[u8], grammar_name: &str, impo
                 } else {
                     // Fallback: find dotted_name children
                     for i in 0..node.named_child_count() {
-                        if let Some(child) = node.named_child(i) {
-                            if child.kind() == "dotted_name" {
-                                if let Ok(text) = child.utf8_text(source) {
-                                    imports.push(text.to_string());
-                                }
-                            }
+                        if let Some(child) = node.named_child(i)
+                            && child.kind() == "dotted_name"
+                            && let Ok(text) = child.utf8_text(source)
+                        {
+                            imports.push(text.to_string());
                         }
                     }
                 }
@@ -349,10 +349,10 @@ fn collect_imports_from_node(node: Node, source: &[u8], grammar_name: &str, impo
             }
             // from foo import bar
             if node.kind() == "import_from_statement" {
-                if let Some(module_node) = node.child_by_field_name("module_name") {
-                    if let Ok(text) = module_node.utf8_text(source) {
-                        imports.push(text.to_string());
-                    }
+                if let Some(module_node) = node.child_by_field_name("module_name")
+                    && let Ok(text) = module_node.utf8_text(source)
+                {
+                    imports.push(text.to_string());
                 }
                 return;
             }
@@ -363,26 +363,24 @@ fn collect_imports_from_node(node: Node, source: &[u8], grammar_name: &str, impo
                 for i in 0..node.named_child_count() {
                     if let Some(child) = node.named_child(i) {
                         if child.kind() == "import_spec" {
-                            if let Some(path_node) = child.child_by_field_name("path") {
-                                if let Ok(text) = path_node.utf8_text(source) {
-                                    let path = text.trim_matches('"');
-                                    if !path.is_empty() {
-                                        imports.push(path.to_string());
-                                    }
+                            if let Some(path_node) = child.child_by_field_name("path")
+                                && let Ok(text) = path_node.utf8_text(source)
+                            {
+                                let path = text.trim_matches('"');
+                                if !path.is_empty() {
+                                    imports.push(path.to_string());
                                 }
                             }
                         } else if child.kind() == "import_spec_list" {
                             for j in 0..child.named_child_count() {
-                                if let Some(spec) = child.named_child(j) {
-                                    if spec.kind() == "import_spec" {
-                                        if let Some(path_node) = spec.child_by_field_name("path") {
-                                            if let Ok(text) = path_node.utf8_text(source) {
-                                                let path = text.trim_matches('"');
-                                                if !path.is_empty() {
-                                                    imports.push(path.to_string());
-                                                }
-                                            }
-                                        }
+                                if let Some(spec) = child.named_child(j)
+                                    && spec.kind() == "import_spec"
+                                    && let Some(path_node) = spec.child_by_field_name("path")
+                                    && let Ok(text) = path_node.utf8_text(source)
+                                {
+                                    let path = text.trim_matches('"');
+                                    if !path.is_empty() {
+                                        imports.push(path.to_string());
                                     }
                                 }
                             }
@@ -941,7 +939,11 @@ fn main() {}
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("test_imports.ts");
         let mut f = std::fs::File::create(&file_path).unwrap();
-        write!(f, "import {{ foo }} from './foo';\nimport bar from 'bar-pkg';\n").unwrap();
+        write!(
+            f,
+            "import {{ foo }} from './foo';\nimport bar from 'bar-pkg';\n"
+        )
+        .unwrap();
         drop(f);
 
         let imports = extract_imports(&file_path);
@@ -964,7 +966,7 @@ fn main() {}
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("test.svelte");
         let mut f = std::fs::File::create(&file_path).unwrap();
-        write!(f, "import {{ onMount }} from 'svelte';\n").unwrap();
+        writeln!(f, "import {{ onMount }} from 'svelte';").unwrap();
         drop(f);
 
         let imports = extract_imports(&file_path);

@@ -688,7 +688,11 @@ pub fn cosine_similarity_simsimd(a: &[f32], b: &[f32]) -> f32 {
     match f32::cosine(a, b) {
         Some(distance) => 1.0 - distance as f32,
         None => {
-            tracing::warn!(a_len = a.len(), b_len = b.len(), "simsimd cosine returned None");
+            tracing::warn!(
+                a_len = a.len(),
+                b_len = b.len(),
+                "simsimd cosine returned None"
+            );
             0.0
         }
     }

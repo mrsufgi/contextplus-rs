@@ -139,7 +139,8 @@ pub fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
     }
 
     // Find the largest gap at k >= 3 (skipping the Fiedler gap at k=2)
-    let best_k3_plus = gaps.iter()
+    let best_k3_plus = gaps
+        .iter()
         .filter(|(k, _)| *k >= 3)
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -299,8 +300,12 @@ pub fn spectral_cluster_with_min(
             for j in (i + 1)..n_aff {
                 let v = affinity[(i, j)];
                 sum += v;
-                if v < min_val { min_val = v; }
-                if v > max_val { max_val = v; }
+                if v < min_val {
+                    min_val = v;
+                }
+                if v > max_val {
+                    max_val = v;
+                }
                 count += 1;
             }
         }
@@ -335,7 +340,11 @@ pub fn spectral_cluster_with_min(
     }
 
     let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
-    tracing::info!(k = k, min_clusters = min_clusters, "spectral_cluster chose k");
+    tracing::info!(
+        k = k,
+        min_clusters = min_clusters,
+        "spectral_cluster chose k"
+    );
 
     // Build embedding: rows of first k eigenvectors, row-normalized.
     // Eigenvalues/eigenvectors are already sorted ascending by full_eigen,
@@ -432,8 +441,8 @@ pub fn blend_affinity_matrices(
     let mut blended = DMatrix::zeros(n, n);
     for i in 0..n {
         for j in 0..n {
-            blended[(i, j)] = alpha * embedding_affinity[(i, j)]
-                + (1.0 - alpha) * import_adjacency[(i, j)];
+            blended[(i, j)] =
+                alpha * embedding_affinity[(i, j)] + (1.0 - alpha) * import_adjacency[(i, j)];
         }
     }
     blended
@@ -448,7 +457,9 @@ pub fn spectral_cluster_with_affinity(
 ) -> Vec<ClusterResult> {
     let n = affinity.nrows();
     if n <= 1 {
-        return vec![ClusterResult { indices: (0..n).collect() }];
+        return vec![ClusterResult {
+            indices: (0..n).collect(),
+        }];
     }
     if n <= max_clusters {
         return (0..n).map(|i| ClusterResult { indices: vec![i] }).collect();
@@ -468,7 +479,9 @@ pub fn spectral_cluster_with_affinity(
         }
         let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
         if norm > ZERO_THRESHOLD {
-            for v in &mut row { *v /= norm; }
+            for v in &mut row {
+                *v /= norm;
+            }
         }
         embedding.push(row);
     }
@@ -478,7 +491,8 @@ pub fn spectral_cluster_with_affinity(
     for (i, &c) in assignments.iter().enumerate() {
         clusters[c].push(i);
     }
-    clusters.into_iter()
+    clusters
+        .into_iter()
         .filter(|indices| !indices.is_empty())
         .map(|indices| ClusterResult { indices })
         .collect()
@@ -794,7 +808,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn find_optimal_k_all_equal_eigenvalues() {
         let eigenvalues = vec![0.5, 0.5, 0.5, 0.5, 0.5];
@@ -835,7 +848,11 @@ mod tests {
             vectors.push(vec![0.0_f32, 1.0, 0.0]);
         }
         let result = spectral_cluster_with_min(&vectors, 5, 3);
-        assert!(result.len() >= 3, "Expected at least 3 clusters, got {}", result.len());
+        assert!(
+            result.len() >= 3,
+            "Expected at least 3 clusters, got {}",
+            result.len()
+        );
     }
 
     #[test]
@@ -889,11 +906,24 @@ mod tests {
         // Two clear groups connected by imports
         let mut affinity = DMatrix::zeros(6, 6);
         // Group 1: 0,1,2 fully connected
-        for i in 0..3 { for j in 0..3 { if i != j { affinity[(i, j)] = 0.9; } } }
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    affinity[(i, j)] = 0.9;
+                }
+            }
+        }
         // Group 2: 3,4,5 fully connected
-        for i in 3..6 { for j in 3..6 { if i != j { affinity[(i, j)] = 0.9; } } }
+        for i in 3..6 {
+            for j in 3..6 {
+                if i != j {
+                    affinity[(i, j)] = 0.9;
+                }
+            }
+        }
         // Weak cross-group connection
-        affinity[(0, 3)] = 0.1; affinity[(3, 0)] = 0.1;
+        affinity[(0, 3)] = 0.1;
+        affinity[(3, 0)] = 0.1;
 
         let result = spectral_cluster_with_affinity(affinity, 5, 2);
         assert_eq!(result.len(), 2);
