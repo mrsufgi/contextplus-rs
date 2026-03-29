@@ -340,9 +340,14 @@ pub async fn semantic_navigate(
         let mn = min_clusters;
         let cluster_results = tokio::task::spawn_blocking(move || {
             let embed_affinity = build_affinity_matrix(&local_vectors);
-            let import_adj = build_import_adjacency(n, &import_edges);
-            // Blend: 70% embedding + 30% import graph
-            let blended = blend_affinity_matrices(&embed_affinity, &import_adj, 0.7);
+            let raw_import_adj = build_import_adjacency(n, &import_edges);
+
+            // Normalize import adjacency to [0,1] range to match embedding cosine similarity.
+            // Raw adjacency is binary (0/1) while embeddings are continuous (0.0-1.0).
+            // Also apply decay: direct imports get full weight, but we don't want
+            // transitive chains (A→B→C) to collapse everything into one cluster.
+            // Use 90% embedding + 10% import for gentle structural nudging.
+            let blended = blend_affinity_matrices(&embed_affinity, &raw_import_adj, 0.9);
             // Step 3: Cluster using blended affinity
             spectral_cluster_with_affinity(blended, mc, mn)
         })
