@@ -116,8 +116,8 @@ pub fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
 /// Eigenvalues are expected to already be sorted ascending (full_eigen guarantees this),
 /// so we skip the redundant sort.
 ///
-/// Key insight: eigenvalue[0] ≈ 0 is trivial for any connected graph (the constant
-/// eigenvector). The gap between eigenvalue[0] and eigenvalue[1] (the Fiedler gap)
+/// Key insight: eigenvalue\[0\] ≈ 0 is trivial for any connected graph (the constant
+/// eigenvector). The gap between eigenvalue\[0\] and eigenvalue\[1\] (the Fiedler gap)
 /// is always the largest absolute gap, which causes naive eigengap to always pick k=2.
 ///
 /// Fix: use relative gaps (gap / eigenvalue_position) starting from k=3, and only
@@ -416,7 +416,7 @@ pub fn find_path_pattern(paths: &[String]) -> Option<String> {
 
 /// Build a symmetric import adjacency matrix from file import relationships.
 /// `edges` is a list of (source_index, target_index) pairs where source imports target.
-/// Returns a symmetric affinity matrix where A[i][j] = 1.0 if i imports j or j imports i.
+/// Returns a symmetric affinity matrix where `A[i][j] = 1.0` if i imports j or j imports i.
 pub fn build_import_adjacency(n: usize, edges: &[(usize, usize)]) -> DMatrix<f64> {
     let mut mat = DMatrix::zeros(n, n);
     for &(i, j) in edges {

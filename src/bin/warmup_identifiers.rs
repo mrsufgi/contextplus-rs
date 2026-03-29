@@ -1,8 +1,8 @@
 //! Warmup tool: pre-builds the identifier embedding cache for semantic_identifier_search.
 //! Run before first use to avoid MCP timeout on cold start.
 //!
-//! Usage: warmup_identifiers [root_dir]
-//!   root_dir: workspace root (default: current directory)
+//! Usage: `warmup_identifiers [root_dir]`
+//!   `root_dir`: workspace root (default: current directory)
 
 use contextplus_rs::cache::rkyv_store;
 use contextplus_rs::config::Config;
