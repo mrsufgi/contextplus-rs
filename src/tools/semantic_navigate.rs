@@ -416,10 +416,18 @@ pub async fn semantic_navigate(
             let children: Vec<ClusterNode> = child_groups
                 .iter()
                 .enumerate()
-                .map(|(i, idxs)| ClusterNode {
-                    label: labels.get(i).cloned().unwrap_or_else(|| format!("Cluster {}", i + 1)),
-                    files: idxs.iter().map(|&idx| files[idx].clone()).collect(),
-                    children: Vec::new(),
+                .map(|(i, idxs)| {
+                    let label = labels.get(i).cloned().unwrap_or_else(|| {
+                        let refs: Vec<&FileInfo> = idxs.iter().map(|&idx| &files[idx]).collect();
+                        derive_cluster_label(&refs)
+                            .or_else(|| find_label_disambiguator(&refs))
+                            .unwrap_or_else(|| describe_file_group(&refs))
+                    });
+                    ClusterNode {
+                        label,
+                        files: idxs.iter().map(|&idx| files[idx].clone()).collect(),
+                        children: Vec::new(),
+                    }
                 })
                 .collect();
 
@@ -596,7 +604,12 @@ async fn build_semantic_hierarchy(
             root_dir,
         ))
         .await;
-        child.label = labels.get(i).cloned().unwrap_or_else(|| format!("Cluster {}", i + 1));
+        child.label = labels.get(i).cloned().unwrap_or_else(|| {
+            let refs: Vec<&FileInfo> = child_groups[i].iter().map(|&idx| &all_files[idx]).collect();
+            derive_cluster_label(&refs)
+                .or_else(|| find_label_disambiguator(&refs))
+                .unwrap_or_else(|| describe_file_group(&refs))
+        });
         children.push(child);
     }
 
@@ -664,16 +677,18 @@ async fn label_clusters_for_semantic_mode(
                 }
             }
             // LLM response unparseable — use path-based fallbacks
-            clusters.iter().enumerate().map(|(i, (files, _))| {
+            clusters.iter().map(|(files, _)| {
                 derive_cluster_label(files)
-                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+                    .or_else(|| find_label_disambiguator(files))
+                    .unwrap_or_else(|| describe_file_group(files))
             }).collect()
         }
         Err(_) => {
             // LLM failed — use path-based fallbacks
-            clusters.iter().enumerate().map(|(i, (files, _))| {
+            clusters.iter().map(|(files, _)| {
                 derive_cluster_label(files)
-                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+                    .or_else(|| find_label_disambiguator(files))
+                    .unwrap_or_else(|| describe_file_group(files))
             }).collect()
         }
     }
