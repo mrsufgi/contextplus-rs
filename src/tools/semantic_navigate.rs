@@ -404,8 +404,7 @@ pub async fn semantic_navigate(
                 let mut updated_cache = label_cache;
                 for (j, &orig_idx) in uncached_indices.iter().enumerate() {
                     if let Some(label) = llm_labels.get(j) {
-                        // Reject labels the LLM echoed from the prompt ("Cluster 1", etc.)
-                        if !label.starts_with("Cluster ") && !label.starts_with("Group ") && !label.is_empty() {
+                        if !label.is_empty() {
                             labels[orig_idx] = label.clone();
                             updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
                         }
@@ -582,8 +581,7 @@ async fn build_semantic_hierarchy(
         let mut updated_cache = label_cache;
         for (j, &orig_idx) in uncached_indices.iter().enumerate() {
             if let Some(label) = llm_labels.get(j) {
-                // Reject labels the LLM echoed from the prompt ("Cluster 1", etc.)
-                if !label.starts_with("Cluster ") && !label.starts_with("Group ") && !label.is_empty() {
+                if !label.is_empty() {
                     labels[orig_idx] = label.clone();
                     updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
                 }
@@ -653,15 +651,14 @@ async fn label_clusters_for_semantic_mode(
 
     let prompt = format!(
         "You are labeling clusters of source code files.\n\
-         For each group below, give a descriptive label (2-4 words) based on what the code DOES.\n\
-         Do NOT use the group letter (A, B, C) as the label.\n\
-         Do NOT say 'Cluster' or 'Group' in the label.\n\
-         Good labels: 'Patient Data Access', 'Auth Middleware', 'Temporal Workflows'\n\
-         Bad labels: 'Group A', 'Cluster 1', 'Files', 'Source Code'\n\n\
-         Return a JSON array of {} strings, one per group.\n\n\
+         For each group below, give a SHORT descriptive label (2-4 words) describing the PURPOSE of the code.\n\
+         Look at the file paths and descriptions to understand what each group does.\n\n\
+         Example input:\n\
+         Group A (5 files): service/auth.ts, service/session.ts, service/user.ts...\n\
+         Group B (3 files): repository/pg/user.ts, repository/pg/session.ts...\n\
+         Example output: [\"Authentication Services\", \"User Data Access\"]\n\n\
          {}\n\n\
-         JSON array of {} strings:",
-        clusters.len(),
+         Return ONLY a JSON array of {} strings:",
         descriptions.join("\n\n"),
         clusters.len()
     );
@@ -677,9 +674,8 @@ async fn label_clusters_for_semantic_mode(
                             .and_then(|l| l.as_str())
                             .or_else(|| v.as_str())
                             .map(|s| s.to_string());
-                        // Reject LLM-echoed prompt labels ("Cluster 1", "Group A", etc.)
                         match raw {
-                            Some(s) if !s.starts_with("Cluster ") && !s.starts_with("Group ") && !s.is_empty() => s,
+                            Some(s) if !s.is_empty() => s,
                             _ => {
                                 let (files, _) = &clusters[i.min(clusters.len() - 1)];
                                 derive_cluster_label(files)
