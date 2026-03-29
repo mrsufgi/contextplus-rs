@@ -3,9 +3,14 @@
 
 use crate::cache::rkyv_store;
 use crate::config::Config;
-use crate::core::clustering::{spectral_cluster_with_min, ClusterResult};
+use crate::core::clustering::{
+    build_affinity_matrix, build_import_adjacency, blend_affinity_matrices,
+    spectral_cluster_with_affinity, spectral_cluster_with_min, ClusterResult,
+};
 use crate::core::embeddings::VectorStore;
 use crate::core::embeddings::{CacheEntry, OllamaClient};
+use crate::core::import_resolver::resolve_import;
+use crate::core::tree_sitter::extract_imports;
 use crate::core::walker;
 use crate::error::Result;
 use futures::stream::{self, StreamExt};
@@ -18,29 +23,35 @@ use super::navigate_constants::*;
 
 /// Load cached LLM labels from disk. Returns a map of cluster_hash -> label.
 /// Find the .mcp_data directory by walking up from the given path.
-/// Falls back to creating .mcp_data in the given path if not found.
-fn find_mcp_data_dir(start: &Path) -> PathBuf {
+/// Only returns an EXISTING .mcp_data directory — never creates one.
+/// Falls back to None if no .mcp_data is found in any ancestor.
+fn find_mcp_data_dir(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         let candidate = dir.join(".mcp_data");
         if candidate.is_dir() {
-            return candidate;
+            return Some(candidate);
         }
         if !dir.pop() {
-            break;
+            return None;
         }
     }
-    // Fallback: create .mcp_data in the start directory
-    let fallback = start.join(".mcp_data");
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
+}
+
+/// Get the .mcp_data directory for label caching.
+/// Walks up to find an existing one, or creates in `start` as fallback.
+fn get_label_cache_dir(start: &Path) -> PathBuf {
+    find_mcp_data_dir(start).unwrap_or_else(|| {
+        let fallback = start.join(".mcp_data");
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    })
 }
 
 /// Load label cache from disk. Uses the SERVER root (not scoped rootDir)
 /// so cached labels are shared across all scoped navigate calls.
 fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
-    // Walk up to find the .mcp_data directory at the workspace root
-    let cache_dir = find_mcp_data_dir(root_dir);
+    let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
     if let Ok(data) = std::fs::read_to_string(&cache_path) {
         serde_json::from_str(&data).unwrap_or_default()
@@ -51,7 +62,7 @@ fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
 
 /// Save LLM label cache to disk. Uses the workspace root's .mcp_data.
 fn save_label_cache(root_dir: &Path, cache: &HashMap<String, String>) {
-    let cache_dir = find_mcp_data_dir(root_dir);
+    let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
     if let Ok(json) = serde_json::to_string_pretty(cache) {
         let _ = std::fs::write(&cache_path, json);
@@ -83,6 +94,8 @@ pub struct SemanticNavigateOptions {
     ///   Best for CPU (fewer LLM calls, directory boundaries as domain boundaries).
     /// - "semantic": pure spectral clustering from the top, like the original contextplus.
     ///   Best with GPU (fast LLM labels at every level, true semantic grouping).
+    /// - "imports": blends embedding similarity with import-graph adjacency for
+    ///   structure-aware semantic clustering. Uses 70% embedding + 30% import graph.
     pub mode: Option<String>,
 }
 
@@ -108,6 +121,40 @@ struct PendingGroup {
     label: String,
     indices: Vec<usize>,
     cluster_results: Vec<ClusterResult>,
+}
+
+/// Extract import edges for all files. Returns (source_idx, target_idx) pairs
+/// where source imports target. Used by the "imports" clustering mode.
+fn extract_all_import_edges(files: &[FileInfo], root: &Path) -> Vec<(usize, usize)> {
+    // Build a path → index lookup for resolving imports to file indices
+    let path_to_idx: HashMap<PathBuf, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (root.join(&f.relative_path), i))
+        .collect();
+
+    let mut edges = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        let file_path = root.join(&file.relative_path);
+        let raw_imports = extract_imports(&file_path);
+        for raw in &raw_imports {
+            if let Some(resolved) = resolve_import(raw, &file_path) {
+                // Try canonicalized path to match the lookup
+                if let Ok(canonical) = resolved.canonicalize() {
+                    if let Some(&j) = path_to_idx.get(&canonical) {
+                        edges.push((i, j));
+                        continue; // Found via canonical — skip fallback
+                    }
+                }
+                // Also try the resolved path directly (for relative paths that
+                // may not exist on disk yet or match without canonicalization)
+                if let Some(&j) = path_to_idx.get(&resolved) {
+                    edges.push((i, j));
+                }
+            }
+        }
+    }
+    edges
 }
 
 /// Check if a file path looks like a test file.
@@ -276,8 +323,123 @@ pub async fn semantic_navigate(
     }
 
     let use_semantic_mode = options.mode.as_deref() == Some("semantic");
+    let use_imports_mode = options.mode.as_deref() == Some("imports");
 
-    let root_node = if use_semantic_mode {
+    let root_node = if use_imports_mode {
+        // IMPORTS MODE: Blend embedding similarity with import graph
+        // for structure-aware semantic clustering.
+        let all_indices: Vec<usize> = (0..files.len()).collect();
+
+        // Step 1: Extract imports from all files
+        let import_edges = extract_all_import_edges(&files, &root);
+
+        // Step 2: Build blended affinity matrix (embedding similarity + import adjacency)
+        let local_vectors: Vec<Vec<f32>> = all_indices.iter().map(|&i| vectors[i].clone()).collect();
+        let n = files.len();
+        let mc = max_clusters;
+        let mn = min_clusters;
+        let cluster_results = tokio::task::spawn_blocking(move || {
+            let embed_affinity = build_affinity_matrix(&local_vectors);
+            let raw_import_adj = build_import_adjacency(n, &import_edges);
+
+            // Normalize import adjacency to [0,1] range to match embedding cosine similarity.
+            // Raw adjacency is binary (0/1) while embeddings are continuous (0.0-1.0).
+            // Also apply decay: direct imports get full weight, but we don't want
+            // transitive chains (A→B→C) to collapse everything into one cluster.
+            // Use 90% embedding + 10% import for gentle structural nudging.
+            let blended = blend_affinity_matrices(&embed_affinity, &raw_import_adj, 0.9);
+            // Step 3: Cluster using blended affinity
+            spectral_cluster_with_affinity(blended, mc, mn)
+        })
+        .await
+        .unwrap_or_else(|_| vec![]);
+
+        if cluster_results.len() <= 1 {
+            // Single cluster or failure — return flat list
+            ClusterNode {
+                label: "Project".to_string(),
+                files: files.iter().cloned().collect(),
+                children: Vec::new(),
+            }
+        } else {
+            // Step 4: Label clusters and build tree (reuse existing labeling infrastructure)
+            let child_groups: Vec<Vec<usize>> = cluster_results
+                .iter()
+                .map(|c| c.indices.clone())
+                .collect();
+
+            let label_input: Vec<(Vec<&FileInfo>, Option<String>)> = child_groups
+                .iter()
+                .map(|idxs| {
+                    let refs: Vec<&FileInfo> = idxs.iter().map(|&i| &files[i]).collect();
+                    (refs, None)
+                })
+                .collect();
+
+            // Check label cache before calling LLM
+            let label_cache = load_label_cache(root_dir);
+            let mut labels: Vec<String> = Vec::with_capacity(label_input.len());
+            let mut uncached_indices: Vec<usize> = Vec::new();
+            let mut cache_keys: Vec<String> = Vec::new();
+
+            for (i, (cluster_files, _)) in label_input.iter().enumerate() {
+                let paths: Vec<&str> = cluster_files.iter().map(|f| f.relative_path.as_str()).collect();
+                let key = cluster_cache_key(&paths);
+                cache_keys.push(key.clone());
+                if let Some(cached_label) = label_cache.get(&key) {
+                    labels.push(cached_label.clone());
+                } else {
+                    uncached_indices.push(i);
+                    labels.push(String::new()); // placeholder
+                }
+            }
+
+            if !uncached_indices.is_empty() {
+                let uncached_input: Vec<(Vec<&FileInfo>, Option<String>)> = uncached_indices
+                    .iter()
+                    .map(|&i| label_input[i].clone())
+                    .collect();
+                let llm_labels = label_clusters_for_semantic_mode(&uncached_input, ollama).await;
+
+                let mut updated_cache = label_cache;
+                for (j, &orig_idx) in uncached_indices.iter().enumerate() {
+                    if let Some(label) = llm_labels.get(j) {
+                        if !label.is_empty() {
+                            labels[orig_idx] = label.clone();
+                            updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                        }
+                    }
+                }
+                save_label_cache(root_dir, &updated_cache);
+            }
+
+            deduplicate_sibling_labels(&mut labels, &label_input);
+
+            let children: Vec<ClusterNode> = child_groups
+                .iter()
+                .enumerate()
+                .map(|(i, idxs)| {
+                    let label = labels.get(i).cloned().unwrap_or_else(|| {
+                        let refs: Vec<&FileInfo> = idxs.iter().map(|&idx| &files[idx]).collect();
+                        derive_cluster_label(&refs)
+                            .or_else(|| find_label_disambiguator(&refs))
+                            .unwrap_or_else(|| describe_file_group(&refs))
+                    });
+                    ClusterNode {
+                        label,
+                        files: idxs.iter().map(|&idx| files[idx].clone()).collect(),
+                        children: Vec::new(),
+                    }
+                })
+                .collect();
+
+            ClusterNode {
+                label: "Project".to_string(),
+                files: Vec::new(),
+                children,
+            }
+        }
+    } else if use_semantic_mode {
         // SEMANTIC MODE: Pure spectral clustering from the top, like the original contextplus.
         // Best with GPU (fast LLM labels at every level). Recursively splits by embedding
         // similarity — no directory-based grouping.
@@ -419,8 +581,10 @@ async fn build_semantic_hierarchy(
         let mut updated_cache = label_cache;
         for (j, &orig_idx) in uncached_indices.iter().enumerate() {
             if let Some(label) = llm_labels.get(j) {
-                labels[orig_idx] = label.clone();
-                updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                if !label.is_empty() {
+                    labels[orig_idx] = label.clone();
+                    updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
+                }
             }
         }
         save_label_cache(root_dir, &updated_cache);
@@ -444,7 +608,12 @@ async fn build_semantic_hierarchy(
             root_dir,
         ))
         .await;
-        child.label = labels.get(i).cloned().unwrap_or_else(|| format!("Cluster {}", i + 1));
+        child.label = labels.get(i).cloned().unwrap_or_else(|| {
+            let refs: Vec<&FileInfo> = child_groups[i].iter().map(|&idx| &all_files[idx]).collect();
+            derive_cluster_label(&refs)
+                .or_else(|| find_label_disambiguator(&refs))
+                .unwrap_or_else(|| describe_file_group(&refs))
+        });
         children.push(child);
     }
 
@@ -474,18 +643,22 @@ async fn label_clusters_for_semantic_mode(
                 let desc = if f.header.is_empty() { "no description" } else { &f.header };
                 format!("{}: {}", f.relative_path, desc)
             }).collect();
-            format!("Cluster {} ({} files):\n  {}", i + 1, files.len(), sample.join("\n  "))
+            // Use letters (A, B, C) instead of "Cluster N" to prevent LLM echoing
+            let letter = (b'A' + (i as u8 % 26)) as char;
+            format!("Group {} ({} files):\n  {}", letter, files.len(), sample.join("\n  "))
         })
         .collect();
 
     let prompt = format!(
-        "You are labeling clusters of code files in a software project.\n\
-         For each cluster, produce a JSON array of objects with:\n\
-         - \"overarchingTheme\": a sentence about the cluster's theme\n\
-         - \"distinguishingFeature\": what makes this cluster unique vs siblings\n\
-         - \"label\": 2-4 words describing the cluster\n\n\
+        "You are labeling clusters of source code files.\n\
+         For each group below, give a SHORT descriptive label (2-4 words) describing the PURPOSE of the code.\n\
+         Look at the file paths and descriptions to understand what each group does.\n\n\
+         Example input:\n\
+         Group A (5 files): service/auth.ts, service/session.ts, service/user.ts...\n\
+         Group B (3 files): repository/pg/user.ts, repository/pg/session.ts...\n\
+         Example output: [\"Authentication Services\", \"User Data Access\"]\n\n\
          {}\n\n\
-         Respond with ONLY a JSON array of {} objects. No other text.",
+         Return ONLY a JSON array of {} strings:",
         descriptions.join("\n\n"),
         clusters.len()
     );
@@ -497,14 +670,19 @@ async fn label_clusters_for_semantic_mode(
                 // Try rich format first: [{overarchingTheme, distinguishingFeature, label}]
                 if let Ok(rich) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                     let labels: Vec<String> = rich.iter().enumerate().map(|(i, v)| {
-                        v.get("label")
+                        let raw = v.get("label")
                             .and_then(|l| l.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
-                                // Fallback: try as plain string array
-                                v.as_str().map(|s| s.to_string())
-                                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
-                            })
+                            .or_else(|| v.as_str())
+                            .map(|s| s.to_string());
+                        match raw {
+                            Some(s) if !s.is_empty() => s,
+                            _ => {
+                                let (files, _) = &clusters[i.min(clusters.len() - 1)];
+                                derive_cluster_label(files)
+                                    .or_else(|| find_label_disambiguator(files))
+                                    .unwrap_or_else(|| describe_file_group(files))
+                            }
+                        }
                     }).collect();
                     if labels.len() == clusters.len() {
                         return labels;
@@ -512,16 +690,18 @@ async fn label_clusters_for_semantic_mode(
                 }
             }
             // LLM response unparseable — use path-based fallbacks
-            clusters.iter().enumerate().map(|(i, (files, _))| {
+            clusters.iter().map(|(files, _)| {
                 derive_cluster_label(files)
-                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+                    .or_else(|| find_label_disambiguator(files))
+                    .unwrap_or_else(|| describe_file_group(files))
             }).collect()
         }
         Err(_) => {
             // LLM failed — use path-based fallbacks
-            clusters.iter().enumerate().map(|(i, (files, _))| {
+            clusters.iter().map(|(files, _)| {
                 derive_cluster_label(files)
-                    .unwrap_or_else(|| format!("Cluster {}", i + 1))
+                    .or_else(|| find_label_disambiguator(files))
+                    .unwrap_or_else(|| describe_file_group(files))
             }).collect()
         }
     }
@@ -592,7 +772,7 @@ async fn build_labeled_tree(
         .collect();
 
     // Get LLM labels for sub-clusters
-    let llm_label_map = label_subclusters_with_llm(&pending_groups, files, ollama, 10, root_dir).await;
+    let llm_label_map = label_subclusters_with_llm(&pending_groups, files, ollama, root_dir).await;
 
     // Build the final tree using LLM labels where available, fallbacks otherwise
     for (gi, group) in pending_groups.into_iter().enumerate() {
@@ -737,7 +917,6 @@ async fn label_subclusters_with_llm(
     pending_groups: &[PendingGroup],
     files: &[FileInfo],
     ollama: &OllamaClient,
-    max_llm_clusters: usize,
     root_dir: &Path,
 ) -> HashMap<(usize, usize), String> {
     let mut llm_label_map: HashMap<(usize, usize), String> = HashMap::new();
@@ -756,9 +935,7 @@ async fn label_subclusters_with_llm(
                 .iter()
                 .map(|&li| &files[group.indices[li]])
                 .collect();
-            if file_refs.len() > 3 {
-                all_sublabels.push((gi, ci, file_refs));
-            }
+            all_sublabels.push((gi, ci, file_refs));
         }
     }
 
@@ -786,191 +963,184 @@ async fn label_subclusters_with_llm(
         .filter(|(gi, ci, _)| !llm_label_map.contains_key(&(*gi, *ci)))
         .collect();
 
-    // Sort by file count descending — label the biggest clusters with LLM first
-    let mut uncached_sorted: Vec<&(usize, usize, Vec<&FileInfo>)> = uncached_sublabels;
-    uncached_sorted.sort_by(|a, b| b.2.len().cmp(&a.2.len()));
-    let llm_batch: &[&(usize, usize, Vec<&FileInfo>)] = if uncached_sorted.len() > max_llm_clusters {
-        &uncached_sorted[..max_llm_clusters]
-    } else {
-        &uncached_sorted
-    };
-
     tracing::info!(
         total_sublabels = all_sublabels.len(),
-        llm_batch_size = llm_batch.len(),
-        max_llm_clusters = max_llm_clusters,
-        "semantic_navigate: sub-cluster LLM batching — {} of {} clusters will get LLM labels",
-        llm_batch.len(),
+        uncached_count = uncached_sublabels.len(),
+        "semantic_navigate: sub-cluster LLM batching — {} uncached of {} total clusters",
+        uncached_sublabels.len(),
         all_sublabels.len()
     );
-    for (idx, (gi, ci, file_refs)) in all_sublabels.iter().enumerate() {
-        let in_batch = idx < llm_batch.len();
-        tracing::info!(
-            group_idx = gi,
-            cluster_idx = ci,
-            file_count = file_refs.len(),
-            in_llm_batch = in_batch,
-            "semantic_navigate: sub-cluster [{}, {}] has {} files, in_llm_batch={}",
-            gi, ci, file_refs.len(), in_batch
-        );
-    }
 
-    if !llm_batch.is_empty() {
+    // Send ALL uncached clusters to LLM in batches of 10 to avoid timeout
+    const LLM_BATCH_SIZE: usize = 10;
+    if !uncached_sublabels.is_empty() {
         const MAX_FILES_PER_LABEL: usize = 5;
-        let descriptions: Vec<String> = llm_batch
-            .iter()
-            .enumerate()
-            .map(|(desc_idx, (gi, _, file_refs))| {
-                let parent_label = &pending_groups[*gi].label;
 
-                // Group files by subdirectory for representative sampling
-                let mut subdir_files: HashMap<String, Vec<&FileInfo>> = HashMap::new();
-                for f in file_refs.iter() {
-                    let subdir = Path::new(&f.relative_path)
-                        .parent()
-                        .and_then(|p| {
-                            let components: Vec<_> = p.components().collect();
-                            if components.is_empty() {
-                                None
-                            } else {
-                                let depth = components.len().min(2);
-                                let sub: PathBuf = components[..depth].iter().collect();
-                                Some(sub.to_string_lossy().to_string())
+        for batch in uncached_sublabels.chunks(LLM_BATCH_SIZE) {
+            tracing::info!(
+                batch_size = batch.len(),
+                "semantic_navigate: sending batch of {} clusters to LLM",
+                batch.len()
+            );
+
+            let descriptions: Vec<String> = batch
+                .iter()
+                .enumerate()
+                .map(|(desc_idx, (gi, _, file_refs))| {
+                    let parent_label = &pending_groups[*gi].label;
+
+                    // Group files by subdirectory for representative sampling
+                    let mut subdir_files: HashMap<String, Vec<&FileInfo>> = HashMap::new();
+                    for f in file_refs.iter() {
+                        let subdir = Path::new(&f.relative_path)
+                            .parent()
+                            .and_then(|p| {
+                                let components: Vec<_> = p.components().collect();
+                                if components.is_empty() {
+                                    None
+                                } else {
+                                    let depth = components.len().min(2);
+                                    let sub: PathBuf = components[..depth].iter().collect();
+                                    Some(sub.to_string_lossy().to_string())
+                                }
+                            })
+                            .unwrap_or_else(|| ".".to_string());
+                        subdir_files.entry(subdir).or_default().push(f);
+                    }
+
+                    // Subdirectory summary sorted by count descending
+                    let mut subdir_counts: Vec<(String, usize)> = subdir_files
+                        .iter()
+                        .map(|(dir, files)| (dir.clone(), files.len()))
+                        .collect();
+                    subdir_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    let subdir_summary = subdir_counts
+                        .iter()
+                        .map(|(dir, count)| format!("{} ({})", dir, count))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    // Round-robin across subdirectories for representative sample
+                    let sample: Vec<&FileInfo> = if file_refs.len() <= MAX_FILES_PER_LABEL {
+                        file_refs.iter().copied().collect()
+                    } else {
+                        let mut sorted_dirs: Vec<(&String, &Vec<&FileInfo>)> =
+                            subdir_files.iter().collect();
+                        sorted_dirs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+                        let mut picked: Vec<&FileInfo> = Vec::with_capacity(MAX_FILES_PER_LABEL);
+                        let mut dir_indices: Vec<usize> = vec![0; sorted_dirs.len()];
+                        while picked.len() < MAX_FILES_PER_LABEL {
+                            let mut added_this_round = false;
+                            for (di, (_, files)) in sorted_dirs.iter().enumerate() {
+                                if picked.len() >= MAX_FILES_PER_LABEL {
+                                    break;
+                                }
+                                let idx = dir_indices[di];
+                                if idx < files.len() {
+                                    picked.push(files[idx]);
+                                    dir_indices[di] += 1;
+                                    added_this_round = true;
+                                }
                             }
-                        })
-                        .unwrap_or_else(|| ".".to_string());
-                    subdir_files.entry(subdir).or_default().push(f);
-                }
-
-                // Subdirectory summary sorted by count descending
-                let mut subdir_counts: Vec<(String, usize)> = subdir_files
-                    .iter()
-                    .map(|(dir, files)| (dir.clone(), files.len()))
-                    .collect();
-                subdir_counts.sort_by(|a, b| b.1.cmp(&a.1));
-                let subdir_summary = subdir_counts
-                    .iter()
-                    .map(|(dir, count)| format!("{} ({})", dir, count))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                // Round-robin across subdirectories for representative sample
-                let sample: Vec<&FileInfo> = if file_refs.len() <= MAX_FILES_PER_LABEL {
-                    file_refs.iter().copied().collect()
-                } else {
-                    let mut sorted_dirs: Vec<(&String, &Vec<&FileInfo>)> =
-                        subdir_files.iter().collect();
-                    sorted_dirs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-
-                    let mut picked: Vec<&FileInfo> = Vec::with_capacity(MAX_FILES_PER_LABEL);
-                    let mut dir_indices: Vec<usize> = vec![0; sorted_dirs.len()];
-                    while picked.len() < MAX_FILES_PER_LABEL {
-                        let mut added_this_round = false;
-                        for (di, (_, files)) in sorted_dirs.iter().enumerate() {
-                            if picked.len() >= MAX_FILES_PER_LABEL {
+                            if !added_this_round {
                                 break;
                             }
-                            let idx = dir_indices[di];
-                            if idx < files.len() {
-                                picked.push(files[idx]);
-                                dir_indices[di] += 1;
-                                added_this_round = true;
-                            }
                         }
-                        if !added_this_round {
-                            break;
-                        }
+                        picked
+                    };
+
+                    let file_list = sample
+                        .iter()
+                        .map(|f| {
+                            let desc = if f.header.is_empty() { "no description" } else { &f.header };
+                            format!("{}: {}", f.relative_path, desc)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n  ");
+                    {
+                        let letter = (b'A' + (desc_idx as u8 % 26)) as char;
+                        format!(
+                            "Group {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
+                            letter, file_refs.len(), parent_label, subdir_summary, file_list
+                        )
                     }
-                    picked
-                };
+                })
+                .collect();
 
-                let file_list = sample
-                    .iter()
-                    .map(|f| {
-                        let desc = if f.header.is_empty() { "no description" } else { &f.header };
-                        format!("{}: {}", f.relative_path, desc)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n  ");
-                format!(
-                    "Cluster {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
-                    desc_idx + 1, file_refs.len(), parent_label, subdir_summary, file_list
-                )
-            })
-            .collect();
+            let prompt = format!(
+                "You are labeling clusters of source code files in a software project.\n\
+                For each cluster, think about:\n\
+                - What is the overarching THEME of these files? (not the directory name)\n\
+                - What DISTINGUISHES this cluster from its siblings?\n\
+                Give each cluster a descriptive label of 2-5 words that captures its PURPOSE.\n\n\
+                Good labels: \"Appointment Core Logic\", \"Auth Middleware\", \"Patient Data Access\", \"Webhook Event Handlers\"\n\
+                Bad labels: \"service\", \"delivery/http\", \"repository/pg\", \"files\", \"source\"\n\n\
+                Do NOT echo directory names as labels — describe what the code DOES.\n\
+                Do NOT name after a single file — name after the MAJORITY.\n\n\
+                {}\n\n\
+                Return ONLY a JSON array of {} strings, one per cluster.",
+                descriptions.join("\n\n"),
+                batch.len()
+            );
 
-        let prompt = format!(
-            "You are labeling clusters of source code files in a software project.\n\
-            For each cluster, think about:\n\
-            - What is the overarching THEME of these files? (not the directory name)\n\
-            - What DISTINGUISHES this cluster from its siblings?\n\
-            Give each cluster a descriptive label of 2-5 words that captures its PURPOSE.\n\n\
-            Good labels: \"Appointment Core Logic\", \"Auth Middleware\", \"Patient Data Access\", \"Webhook Event Handlers\"\n\
-            Bad labels: \"service\", \"delivery/http\", \"repository/pg\", \"files\", \"source\"\n\n\
-            Do NOT echo directory names as labels — describe what the code DOES.\n\
-            Do NOT name after a single file — name after the MAJORITY.\n\n\
-            {}\n\n\
-            Return ONLY a JSON array of {} strings, one per cluster.",
-            descriptions.join("\n\n"),
-            llm_batch.len()
-        );
-
-        if let Ok(response) = ollama.chat(&prompt).await {
-            if let Some(json_str) = extract_json_array(&response) {
-                if let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str) {
-                    tracing::info!(
-                        label_count = labels.len(),
-                        batch_size = llm_batch.len(),
-                        "semantic_navigate: LLM returned {} labels for {} clusters",
-                        labels.len(), llm_batch.len()
-                    );
-                    for (j, (gi, ci, file_refs)) in llm_batch.iter().enumerate() {
-                        if let Some(label) = labels.get(j) {
-                            let clean_label = label.trim();
-                            // Post-processing: reject garbage labels
-                            if clean_label.is_empty()
-                                || clean_label.len() > 50
-                                || clean_label.contains('.')
-                                || clean_label.contains('/')
-                            {
-                                tracing::info!(
-                                    group_idx = gi,
-                                    cluster_idx = ci,
-                                    label = clean_label,
-                                    "semantic_navigate: rejected LLM label (garbage format) for [{}, {}]: {:?}",
-                                    gi, ci, clean_label
-                                );
-                                continue;
-                            }
-                            // Post-processing: reject labels that name a minority feature.
-                            // If the label words match a specific subdirectory that holds <20%
-                            // of the cluster's files, the LLM was misled by a prominent filename.
-                            if !validate_label_against_cluster(clean_label, file_refs) {
+            if let Ok(response) = ollama.chat(&prompt).await {
+                if let Some(json_str) = extract_json_array(&response) {
+                    if let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str) {
+                        tracing::info!(
+                            label_count = labels.len(),
+                            batch_size = batch.len(),
+                            "semantic_navigate: LLM returned {} labels for {} clusters",
+                            labels.len(), batch.len()
+                        );
+                        for (j, (gi, ci, file_refs)) in batch.iter().enumerate() {
+                            if let Some(label) = labels.get(j) {
+                                let clean_label = label.trim();
+                                // Post-processing: reject garbage labels
+                                if clean_label.is_empty()
+                                    || clean_label.len() > 50
+                                    || clean_label.contains('.')
+                                    || clean_label.contains('/')
+                                {
+                                    tracing::info!(
+                                        group_idx = gi,
+                                        cluster_idx = ci,
+                                        label = clean_label,
+                                        "semantic_navigate: rejected LLM label (garbage format) for [{}, {}]: {:?}",
+                                        gi, ci, clean_label
+                                    );
+                                    continue;
+                                }
+                                // Post-processing: reject labels that name a minority feature.
+                                // If the label words match a specific subdirectory that holds <20%
+                                // of the cluster's files, the LLM was misled by a prominent filename.
+                                if !validate_label_against_cluster(clean_label, file_refs) {
+                                    tracing::info!(
+                                        group_idx = gi,
+                                        cluster_idx = ci,
+                                        label = clean_label,
+                                        file_count = file_refs.len(),
+                                        "semantic_navigate: rejected LLM label (validation failed) for [{}, {}]: {:?} ({} files)",
+                                        gi, ci, clean_label, file_refs.len()
+                                    );
+                                    continue;
+                                }
                                 tracing::info!(
                                     group_idx = gi,
                                     cluster_idx = ci,
                                     label = clean_label,
                                     file_count = file_refs.len(),
-                                    "semantic_navigate: rejected LLM label (validation failed) for [{}, {}]: {:?} ({} files)",
+                                    "semantic_navigate: accepted LLM label for [{}, {}]: {:?} ({} files)",
                                     gi, ci, clean_label, file_refs.len()
                                 );
-                                continue;
+                                llm_label_map.insert((*gi, *ci), clean_label.to_string());
                             }
-                            tracing::info!(
-                                group_idx = gi,
-                                cluster_idx = ci,
-                                label = clean_label,
-                                file_count = file_refs.len(),
-                                "semantic_navigate: accepted LLM label for [{}, {}]: {:?} ({} files)",
-                                gi, ci, clean_label, file_refs.len()
-                            );
-                            llm_label_map.insert((*gi, *ci), clean_label.to_string());
                         }
                     }
                 }
+            } else {
+                tracing::info!("semantic_navigate: LLM chat call failed for sub-cluster labeling batch");
             }
-        } else {
-            tracing::info!("semantic_navigate: LLM chat call failed for sub-cluster labeling");
         }
 
         // Save newly generated LLM labels to the cache

@@ -208,7 +208,7 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "mode",
                     "string",
                     false,
-                    "Clustering mode: 'hybrid' (default, directory-based + spectral, best for CPU) or 'semantic' (pure spectral clustering like original contextplus, best with GPU).",
+                    "Clustering mode: 'hybrid' (default, directory-based + spectral, best for CPU), 'semantic' (pure spectral clustering like original contextplus, best with GPU), or 'imports' (blends embedding similarity with import-graph adjacency for structure-aware clustering).",
                 ),
             ],
         ),

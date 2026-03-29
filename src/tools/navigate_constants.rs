@@ -64,6 +64,8 @@ pub fn nav_content_hash(path: &str, content: &str) -> String {
 pub const LABEL_CACHE_FILE: &str = "navigate-labels.json";
 
 /// Build the navigate cache file name for a given embedding model.
+/// Uses server::sanitize_model_name for filesystem safety
+/// (e.g., "unclemusclez/jina-embeddings-v2-base-code" → "navigate-unclemusclez-jina-embeddings-v2-base-code")
 pub fn nav_cache_name(model: &str) -> String {
-    format!("navigate-{}", model)
+    format!("navigate-{}", crate::server::sanitize_model_name(model))
 }
