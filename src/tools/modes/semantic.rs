@@ -183,3 +183,72 @@ pub(crate) async fn label_clusters_for_semantic_mode(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn config_with_host(host: &str) -> Config {
+        let mut config = Config::from_env();
+        config.ollama_host = host.to_string();
+        config.ollama_chat_model = "test-chat-model".to_string();
+        config
+    }
+
+    fn make_file(path: &str, header: &str) -> FileInfo {
+        FileInfo {
+            relative_path: path.to_string(),
+            header: header.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn label_clusters_for_semantic_mode_parses_rich_label_objects() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "content": r#"[{"overarchingTheme":"Auth","distinguishingFeature":"Services","label":"Authentication Services"}]"#
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        let file = make_file("src/auth/login.rs", "handles login state");
+        let clusters = vec![(vec![&file], None)];
+
+        let labels = label_clusters_for_semantic_mode(&clusters, &client).await;
+
+        assert_eq!(labels, vec!["Authentication Services".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn label_clusters_for_semantic_mode_falls_back_on_unparseable_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": "not valid json" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        let file = make_file("src/auth/session.rs", "session lifecycle");
+        let clusters = vec![(vec![&file], None)];
+
+        let labels = label_clusters_for_semantic_mode(&clusters, &client).await;
+
+        assert_eq!(labels.len(), 1);
+        assert!(!labels[0].is_empty());
+        assert_ne!(labels[0], "not valid json");
+    }
+}

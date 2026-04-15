@@ -38,3 +38,34 @@ pub(crate) fn extract_all_import_edges(files: &[FileInfo], root: &Path) -> Vec<(
     }
     edges
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_file(path: &str) -> FileInfo {
+        FileInfo {
+            relative_path: path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_all_import_edges_resolves_relative_typescript_imports() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(
+            root.join("src/a.ts"),
+            "import { b } from './b';\nexport const a = b;\n",
+        )
+        .expect("write a.ts");
+        std::fs::write(root.join("src/b.ts"), "export const b = 1;\n").expect("write b.ts");
+
+        let files = vec![make_file("src/a.ts"), make_file("src/b.ts")];
+
+        let edges = extract_all_import_edges(&files, root);
+
+        assert_eq!(edges, vec![(0, 1)]);
+    }
+}

@@ -618,3 +618,96 @@ pub(crate) fn group_by_directory(files: &[FileInfo]) -> Vec<(String, Vec<usize>)
     result.sort_by(|a, b| a.0.cmp(&b.0));
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::core::clustering::ClusterResult;
+    use crate::tools::semantic_navigate;
+
+    fn config_with_host(host: &str) -> Config {
+        let mut config = Config::from_env();
+        config.ollama_host = host.to_string();
+        config.ollama_chat_model = "test-chat-model".to_string();
+        config
+    }
+
+    fn make_file(path: &str) -> FileInfo {
+        FileInfo {
+            relative_path: path.to_string(),
+            header: format!("header for {path}"),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn label_subclusters_with_llm_uses_cached_labels_without_network() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let files = vec![
+            make_file("src/auth/login.rs"),
+            make_file("src/auth/session.rs"),
+        ];
+        let pending_groups = vec![PendingGroup {
+            label: "auth".to_string(),
+            indices: vec![0, 1],
+            cluster_results: vec![
+                ClusterResult { indices: vec![0] },
+                ClusterResult { indices: vec![1] },
+            ],
+        }];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            semantic_navigate::cluster_cache_key(&["src/auth/login.rs"]),
+            "Login Flow".to_string(),
+        );
+        cache.insert(
+            semantic_navigate::cluster_cache_key(&["src/auth/session.rs"]),
+            "Session Management".to_string(),
+        );
+        semantic_navigate::save_label_cache(tempdir.path(), &cache);
+
+        let client = OllamaClient::new(&config_with_host("http://127.0.0.1:9"));
+
+        let labels =
+            label_subclusters_with_llm(&pending_groups, &files, &client, tempdir.path()).await;
+
+        assert_eq!(labels.get(&(0, 0)).map(String::as_str), Some("Login Flow"));
+        assert_eq!(
+            labels.get(&(0, 1)).map(String::as_str),
+            Some("Session Management")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_labeled_tree_keeps_small_directory_groups_flat() {
+        let files = vec![
+            make_file("src/auth/login.rs"),
+            make_file("src/auth/session.rs"),
+        ];
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let dir_groups = vec![("auth".to_string(), vec![0, 1])];
+        let params = ClusterParams {
+            max_clusters: 4,
+            min_clusters: 2,
+            max_depth: 3,
+        };
+        let client = OllamaClient::new(&config_with_host("http://127.0.0.1:9"));
+
+        let tree = build_labeled_tree(
+            &files,
+            &vectors,
+            dir_groups,
+            &params,
+            &client,
+            std::path::Path::new("."),
+        )
+        .await;
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].label, "auth");
+        assert!(tree[0].children.is_empty());
+        assert_eq!(tree[0].files.len(), 2);
+    }
+}
