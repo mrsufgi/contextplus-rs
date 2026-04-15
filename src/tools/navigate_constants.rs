@@ -36,16 +36,14 @@ const NAV_HASH_VERSION: &str = "nav4:";
 
 /// Directory segments too generic to use as cluster labels.
 pub const GENERIC_SEGMENTS: &[&str] = &[
-    "src", "lib", "dist", "build", "utils", "helpers", "common", "shared",
-    "core", "types", "config", "internal", "cmd", "pkg",
+    "src", "lib", "dist", "build", "utils", "helpers", "common", "shared", "core", "types",
+    "config", "internal", "cmd", "pkg",
 ];
 
 /// Extensions accepted for semantic navigation (without leading dot).
 pub const NAVIGATE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java",
-    "c", "cpp", "h", "hpp", "cc",
-    "rb", "sh", "bash", "zsh",
-    "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "cpp", "h", "hpp", "cc",
+    "rb", "sh", "bash", "zsh", "sql", "graphql", "proto", "yaml", "yml", "toml", "json",
 ];
 
 /// Build the path-weighted embed text for a file.
@@ -63,7 +61,19 @@ pub fn nav_content_hash(path: &str, content: &str) -> String {
 /// File name for cached cluster labels (LLM-generated).
 pub const LABEL_CACHE_FILE: &str = "navigate-labels.json";
 
+/// Maximum clusters to send to LLM in a single batch (avoids timeout).
+pub const LLM_BATCH_SIZE: usize = 10;
+
+/// Maximum files to sample per cluster when building LLM label prompts.
+pub const MAX_FILES_PER_LABEL: usize = 5;
+
+/// Blend ratio for embedding vs import-graph affinity (1.0 = pure embedding, 0.0 = pure imports).
+/// 0.9 means 90% embedding + 10% import adjacency for gentle structural nudging.
+pub const IMPORT_BLEND_ALPHA: f64 = 0.9;
+
 /// Build the navigate cache file name for a given embedding model.
+/// Uses server::sanitize_model_name for filesystem safety
+/// (e.g., "unclemusclez/jina-embeddings-v2-base-code" → "navigate-unclemusclez-jina-embeddings-v2-base-code")
 pub fn nav_cache_name(model: &str) -> String {
-    format!("navigate-{}", model)
+    format!("navigate-{}", crate::server::sanitize_model_name(model))
 }

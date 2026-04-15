@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 
+use regex::Regex;
 use tree_sitter::{Language, Node, Parser};
 
 use crate::core::parser::CodeSymbol;
@@ -286,6 +288,260 @@ pub fn get_supported_extensions() -> &'static [&'static str] {
         ".cpp", ".hpp", ".cc", ".sh", ".bash", ".zsh", ".rb", ".php", ".cs", ".kt", ".kts",
         ".html", ".htm", ".css",
     ]
+}
+
+/// Recursively collect import paths from AST nodes.
+fn collect_imports_from_node(
+    node: Node,
+    source: &[u8],
+    grammar_name: &str,
+    imports: &mut Vec<String>,
+) {
+    match grammar_name {
+        "typescript" | "tsx" | "javascript" => {
+            // ES import/export: import ... from 'path'; export ... from 'path'
+            if node.kind() == "import_statement" || node.kind() == "export_statement" {
+                if let Some(source_node) = node.child_by_field_name("source")
+                    && let Ok(text) = source_node.utf8_text(source)
+                {
+                    let path = text.trim_matches(|c| c == '"' || c == '\'');
+                    if !path.is_empty() {
+                        imports.push(path.to_string());
+                    }
+                }
+                return; // Don't recurse into import/export children
+            }
+            // CJS require('path')
+            if node.kind() == "call_expression"
+                && let Some(func) = node.child_by_field_name("function")
+                && func.kind() == "identifier"
+                && func.utf8_text(source).unwrap_or("") == "require"
+                && let Some(args) = node.child_by_field_name("arguments")
+                && let Some(first_arg) = args.named_child(0)
+                && first_arg.kind() == "string"
+                && let Ok(text) = first_arg.utf8_text(source)
+            {
+                let path = text.trim_matches(|c| c == '"' || c == '\'');
+                if !path.is_empty() {
+                    imports.push(path.to_string());
+                }
+            }
+        }
+        "python" => {
+            // import foo; import foo.bar
+            if node.kind() == "import_statement" {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        imports.push(text.to_string());
+                    }
+                } else {
+                    // Fallback: find dotted_name children
+                    for i in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(i)
+                            && child.kind() == "dotted_name"
+                            && let Ok(text) = child.utf8_text(source)
+                        {
+                            imports.push(text.to_string());
+                        }
+                    }
+                }
+                return;
+            }
+            // from foo import bar
+            if node.kind() == "import_from_statement" {
+                if let Some(module_node) = node.child_by_field_name("module_name")
+                    && let Ok(text) = module_node.utf8_text(source)
+                {
+                    imports.push(text.to_string());
+                }
+                return;
+            }
+        }
+        "go" => {
+            // import "path" or import ( "path1"; "path2" )
+            if node.kind() == "import_declaration" {
+                for i in 0..node.named_child_count() {
+                    if let Some(child) = node.named_child(i) {
+                        if child.kind() == "import_spec" {
+                            if let Some(path_node) = child.child_by_field_name("path")
+                                && let Ok(text) = path_node.utf8_text(source)
+                            {
+                                let path = text.trim_matches('"');
+                                if !path.is_empty() {
+                                    imports.push(path.to_string());
+                                }
+                            }
+                        } else if child.kind() == "import_spec_list" {
+                            for j in 0..child.named_child_count() {
+                                if let Some(spec) = child.named_child(j)
+                                    && spec.kind() == "import_spec"
+                                    && let Some(path_node) = spec.child_by_field_name("path")
+                                    && let Ok(text) = path_node.utf8_text(source)
+                                {
+                                    let path = text.trim_matches('"');
+                                    if !path.is_empty() {
+                                        imports.push(path.to_string());
+                                    }
+                                }
+                            }
+                        } else if child.kind() == "interpreted_string_literal" {
+                            // Single import without spec wrapper
+                            if let Ok(text) = child.utf8_text(source) {
+                                let path = text.trim_matches('"');
+                                if !path.is_empty() {
+                                    imports.push(path.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        "rust" => {
+            // use foo::bar::baz;
+            if node.kind() == "use_declaration" {
+                // Extract the full path text after "use " and before ";"
+                if let Ok(text) = node.utf8_text(source) {
+                    let trimmed = text.trim();
+                    let path = trimmed
+                        .strip_prefix("use ")
+                        .unwrap_or(trimmed)
+                        .trim_end_matches(';')
+                        .trim();
+                    if !path.is_empty() {
+                        imports.push(path.to_string());
+                    }
+                }
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into children
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_imports_from_node(child, source, grammar_name, imports);
+        }
+    }
+}
+
+/// Regex fallback for extracting imports when tree-sitter parsing fails.
+fn extract_imports_regex(content: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+
+    // ES imports/exports: import/export ... from 'path'
+    if let Ok(re) = Regex::new(r#"(?:import|export)\s+.*?from\s+['"]([^'"]+)['"]"#) {
+        for cap in re.captures_iter(content) {
+            imports.push(cap[1].to_string());
+        }
+    }
+
+    // CJS: require('path')
+    if let Ok(re) = Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#) {
+        for cap in re.captures_iter(content) {
+            imports.push(cap[1].to_string());
+        }
+    }
+
+    // Python: import foo / from foo import bar
+    if let Ok(re) = Regex::new(r#"^\s*import\s+([\w.]+)"#) {
+        for cap in re.captures_iter(content) {
+            imports.push(cap[1].to_string());
+        }
+    }
+    if let Ok(re) = Regex::new(r#"^\s*from\s+([\w.]+)\s+import"#) {
+        for cap in re.captures_iter(content) {
+            imports.push(cap[1].to_string());
+        }
+    }
+
+    // Go: import "path" — skipped in regex fallback due to false positive risk
+    // (quoted strings appear everywhere in Go, not just imports)
+
+    // Rust: use foo::bar;
+    if let Ok(re) = Regex::new(r#"^\s*use\s+([\w:]+(?:::\{[^}]+\})?)\s*;"#) {
+        for cap in re.captures_iter(content) {
+            imports.push(cap[1].to_string());
+        }
+    }
+
+    imports
+}
+
+/// Extract import paths from a source file using tree-sitter.
+/// Returns a list of raw import specifiers (e.g., "./billing-service", "@berries/lib-context", "fs/promises").
+pub fn extract_imports(path: &Path) -> Vec<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e))
+        .unwrap_or_default();
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let (grammar_name, language) = match grammar_for_ext(&ext) {
+        Some(g) => g,
+        None => return extract_imports_regex(&content),
+    };
+
+    let result = PARSER_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        let parser = cache.entry(grammar_name).or_insert_with(|| {
+            let mut p = Parser::new();
+            let _ = p.set_language(&language);
+            p
+        });
+        parser.reset();
+
+        parser.parse(&content, None).map(|tree| {
+            let root = tree.root_node();
+            let source = content.as_bytes();
+            let mut imports = Vec::new();
+            collect_imports_from_node(root, source, grammar_name, &mut imports);
+            imports
+        })
+    });
+
+    match result {
+        Some(imports) if !imports.is_empty() => imports,
+        _ => extract_imports_regex(&content),
+    }
+}
+
+/// Extract import paths from source code string (for testing or when content is already loaded).
+pub fn extract_imports_from_str(content: &str, ext: &str) -> Vec<String> {
+    let (grammar_name, language) = match grammar_for_ext(ext) {
+        Some(g) => g,
+        None => return extract_imports_regex(content),
+    };
+
+    let result = PARSER_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        let parser = cache.entry(grammar_name).or_insert_with(|| {
+            let mut p = Parser::new();
+            let _ = p.set_language(&language);
+            p
+        });
+        parser.reset();
+
+        parser.parse(content, None).map(|tree| {
+            let root = tree.root_node();
+            let source = content.as_bytes();
+            let mut imports = Vec::new();
+            collect_imports_from_node(root, source, grammar_name, &mut imports);
+            imports
+        })
+    });
+
+    match result {
+        Some(imports) if !imports.is_empty() => imports,
+        _ => extract_imports_regex(content),
+    }
 }
 
 #[cfg(test)]
@@ -581,5 +837,154 @@ struct Rectangle {
                 ext
             );
         }
+    }
+
+    // --- Import extraction tests ---
+
+    #[test]
+    fn extract_imports_typescript_es_imports() {
+        let code = r#"
+import { BillingService } from './billing-service';
+import * as context from '@berries/lib-context';
+import fs from 'fs/promises';
+import type { Config } from '../config';
+
+export function doStuff() {}
+"#;
+        let imports = extract_imports_from_str(code, ".ts");
+        assert!(imports.contains(&"./billing-service".to_string()));
+        assert!(imports.contains(&"@berries/lib-context".to_string()));
+        assert!(imports.contains(&"fs/promises".to_string()));
+        assert!(imports.contains(&"../config".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_typescript_require() {
+        let code = r#"
+const path = require('path');
+const { readFile } = require('fs/promises');
+"#;
+        let imports = extract_imports_from_str(code, ".js");
+        assert!(imports.contains(&"path".to_string()));
+        assert!(imports.contains(&"fs/promises".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_typescript_reexports() {
+        let code = r#"
+export { default } from './component';
+export * from './types';
+"#;
+        let imports = extract_imports_from_str(code, ".ts");
+        assert!(imports.contains(&"./component".to_string()));
+        assert!(imports.contains(&"./types".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_python() {
+        let code = r#"
+import os
+import json
+from pathlib import Path
+from collections.abc import Mapping
+
+def main():
+    pass
+"#;
+        let imports = extract_imports_from_str(code, ".py");
+        assert!(imports.contains(&"os".to_string()));
+        assert!(imports.contains(&"json".to_string()));
+        assert!(imports.contains(&"pathlib".to_string()));
+        assert!(imports.contains(&"collections.abc".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_go() {
+        let code = r#"
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "github.com/gofiber/fiber/v2"
+)
+
+func main() {}
+"#;
+        let imports = extract_imports_from_str(code, ".go");
+        assert!(imports.contains(&"fmt".to_string()));
+        assert!(imports.contains(&"net/http".to_string()));
+        assert!(imports.contains(&"github.com/gofiber/fiber/v2".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_rust() {
+        let code = r#"
+use std::collections::HashMap;
+use std::path::Path;
+use crate::core::parser::CodeSymbol;
+
+fn main() {}
+"#;
+        let imports = extract_imports_from_str(code, ".rs");
+        assert!(imports.contains(&"std::collections::HashMap".to_string()));
+        assert!(imports.contains(&"std::path::Path".to_string()));
+        assert!(imports.contains(&"crate::core::parser::CodeSymbol".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_file_based() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("contextplus_import_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test_imports.ts");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        write!(
+            f,
+            "import {{ foo }} from './foo';\nimport bar from 'bar-pkg';\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let imports = extract_imports(&file_path);
+        assert!(imports.contains(&"./foo".to_string()));
+        assert!(imports.contains(&"bar-pkg".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_imports_nonexistent_file_returns_empty() {
+        let imports = extract_imports(Path::new("/nonexistent/file.ts"));
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn extract_imports_unsupported_ext_uses_regex_fallback() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("contextplus_import_fallback_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test.svelte");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "import {{ onMount }} from 'svelte';").unwrap();
+        drop(f);
+
+        let imports = extract_imports(&file_path);
+        assert!(imports.contains(&"svelte".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_imports_empty_file_returns_empty() {
+        let imports = extract_imports_from_str("", ".ts");
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn extract_imports_no_imports_returns_empty() {
+        let code = "export function hello() { return 'world'; }\n";
+        let imports = extract_imports_from_str(code, ".ts");
+        assert!(imports.is_empty());
     }
 }

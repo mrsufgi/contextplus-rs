@@ -1,8 +1,8 @@
 //! Warmup tool: pre-builds the identifier embedding cache for semantic_identifier_search.
 //! Run before first use to avoid MCP timeout on cold start.
 //!
-//! Usage: warmup_identifiers [root_dir]
-//!   root_dir: workspace root (default: current directory)
+//! Usage: `warmup_identifiers [root_dir]`
+//!   `root_dir`: workspace root (default: current directory)
 
 use contextplus_rs::cache::rkyv_store;
 use contextplus_rs::config::Config;
@@ -54,10 +54,10 @@ async fn main() {
         if !supported.contains(ext_with_dot.as_str()) {
             continue;
         }
-        if let Ok(meta) = std::fs::metadata(&entry.path) {
-            if meta.len() > max_size {
-                continue;
-            }
+        if let Ok(meta) = std::fs::metadata(&entry.path)
+            && meta.len() > max_size
+        {
+            continue;
         }
         let content = match std::fs::read_to_string(&entry.path) {
             Ok(c) => c,
@@ -119,11 +119,11 @@ async fn main() {
     let mut uncached_texts: Vec<String> = Vec::new();
 
     for (i, doc) in identifier_docs.iter().enumerate() {
-        if let Some(ref store) = id_cache {
-            if let Some(vec) = store.get_vector(&doc.text) {
-                result_vectors.push(Some(vec.to_vec()));
-                continue;
-            }
+        if let Some(ref store) = id_cache
+            && let Some(vec) = store.get_vector(&doc.text)
+        {
+            result_vectors.push(Some(vec.to_vec()));
+            continue;
         }
         result_vectors.push(None);
         uncached_indices.push(i);
@@ -143,12 +143,9 @@ async fn main() {
 
     // Step 3: Embed in batches, saving progress after each batch
     let batch_size = config.embed_batch_size;
-    let total_batches = (uncached_indices.len() + batch_size - 1) / batch_size;
+    let total_batches = uncached_indices.len().div_ceil(batch_size);
 
-    for (batch_idx, chunk_start) in (0..uncached_indices.len())
-        .step_by(batch_size)
-        .enumerate()
-    {
+    for (batch_idx, chunk_start) in (0..uncached_indices.len()).step_by(batch_size).enumerate() {
         let chunk_end = (chunk_start + batch_size).min(uncached_indices.len());
         let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
@@ -161,10 +158,7 @@ async fn main() {
 
         match ollama.embed(chunk_texts).await {
             Ok(vectors) => {
-                for (local_j, &idx) in uncached_indices[chunk_start..chunk_end]
-                    .iter()
-                    .enumerate()
-                {
+                for (local_j, &idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
                     if local_j < vectors.len() {
                         result_vectors[idx] = Some(vectors[local_j].clone());
                     }

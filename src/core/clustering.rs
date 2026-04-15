@@ -116,8 +116,8 @@ pub fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
 /// Eigenvalues are expected to already be sorted ascending (full_eigen guarantees this),
 /// so we skip the redundant sort.
 ///
-/// Key insight: eigenvalue[0] ≈ 0 is trivial for any connected graph (the constant
-/// eigenvector). The gap between eigenvalue[0] and eigenvalue[1] (the Fiedler gap)
+/// Key insight: eigenvalue\[0\] ≈ 0 is trivial for any connected graph (the constant
+/// eigenvector). The gap between eigenvalue\[0\] and eigenvalue\[1\] (the Fiedler gap)
 /// is always the largest absolute gap, which causes naive eigengap to always pick k=2.
 ///
 /// Fix: use relative gaps (gap / eigenvalue_position) starting from k=3, and only
@@ -139,7 +139,8 @@ pub fn find_optimal_k(eigenvalues: &[f64], max_k: usize) -> usize {
     }
 
     // Find the largest gap at k >= 3 (skipping the Fiedler gap at k=2)
-    let best_k3_plus = gaps.iter()
+    let best_k3_plus = gaps
+        .iter()
         .filter(|(k, _)| *k >= 3)
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -299,8 +300,12 @@ pub fn spectral_cluster_with_min(
             for j in (i + 1)..n_aff {
                 let v = affinity[(i, j)];
                 sum += v;
-                if v < min_val { min_val = v; }
-                if v > max_val { max_val = v; }
+                if v < min_val {
+                    min_val = v;
+                }
+                if v > max_val {
+                    max_val = v;
+                }
                 count += 1;
             }
         }
@@ -335,7 +340,11 @@ pub fn spectral_cluster_with_min(
     }
 
     let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
-    tracing::info!(k = k, min_clusters = min_clusters, "spectral_cluster chose k");
+    tracing::info!(
+        k = k,
+        min_clusters = min_clusters,
+        "spectral_cluster chose k"
+    );
 
     // Build embedding: rows of first k eigenvectors, row-normalized.
     // Eigenvalues/eigenvectors are already sorted ascending by full_eigen,
@@ -403,6 +412,90 @@ pub fn find_path_pattern(paths: &[String]) -> Option<String> {
         (true, true) => Some(format!("*/{}", suffixes[0])),
         (true, false) => None,
     }
+}
+
+/// Build a symmetric import adjacency matrix from file import relationships.
+/// `edges` is a list of (source_index, target_index) pairs where source imports target.
+/// Returns a symmetric affinity matrix where `A[i][j] = 1.0` if i imports j or j imports i.
+pub fn build_import_adjacency(n: usize, edges: &[(usize, usize)]) -> DMatrix<f64> {
+    let mut mat = DMatrix::zeros(n, n);
+    for &(i, j) in edges {
+        if i < n && j < n && i != j {
+            mat[(i, j)] = 1.0;
+            mat[(j, i)] = 1.0; // symmetric
+        }
+    }
+    mat
+}
+
+/// Blend embedding affinity with import adjacency for hybrid clustering.
+/// `alpha` controls the blend: 0.0 = pure import graph, 1.0 = pure embedding.
+/// Default alpha=0.7 gives 70% embedding + 30% import signal.
+pub fn blend_affinity_matrices(
+    embedding_affinity: &DMatrix<f64>,
+    import_adjacency: &DMatrix<f64>,
+    alpha: f64,
+) -> DMatrix<f64> {
+    assert_eq!(embedding_affinity.nrows(), import_adjacency.nrows());
+    let n = embedding_affinity.nrows();
+    let mut blended = DMatrix::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            blended[(i, j)] =
+                alpha * embedding_affinity[(i, j)] + (1.0 - alpha) * import_adjacency[(i, j)];
+        }
+    }
+    blended
+}
+
+/// Spectral clustering with a pre-built affinity matrix (instead of computing from vectors).
+/// Used when blending embedding + import graph affinity.
+pub fn spectral_cluster_with_affinity(
+    affinity: DMatrix<f64>,
+    max_clusters: usize,
+    min_clusters: usize,
+) -> Vec<ClusterResult> {
+    let n = affinity.nrows();
+    if n <= 1 {
+        return vec![ClusterResult {
+            indices: (0..n).collect(),
+        }];
+    }
+    if n <= max_clusters {
+        return (0..n).map(|i| ClusterResult { indices: vec![i] }).collect();
+    }
+
+    let laplacian = normalized_laplacian(&affinity);
+    let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
+    let (eigenvalues, eigenvectors) = full_eigen(laplacian);
+    let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
+
+    // Build embedding from eigenvectors (same as spectral_cluster_with_min)
+    let mut embedding: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut row: Vec<f64> = Vec::with_capacity(k);
+        for j in 0..k {
+            row.push(eigenvectors[(i, j)]);
+        }
+        let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm > ZERO_THRESHOLD {
+            for v in &mut row {
+                *v /= norm;
+            }
+        }
+        embedding.push(row);
+    }
+
+    let assignments = kmeans(&embedding, k);
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (i, &c) in assignments.iter().enumerate() {
+        clusters[c].push(i);
+    }
+    clusters
+        .into_iter()
+        .filter(|indices| !indices.is_empty())
+        .map(|indices| ClusterResult { indices })
+        .collect()
 }
 
 #[cfg(test)]
@@ -715,7 +808,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn find_optimal_k_all_equal_eigenvalues() {
         let eigenvalues = vec![0.5, 0.5, 0.5, 0.5, 0.5];
@@ -756,7 +848,11 @@ mod tests {
             vectors.push(vec![0.0_f32, 1.0, 0.0]);
         }
         let result = spectral_cluster_with_min(&vectors, 5, 3);
-        assert!(result.len() >= 3, "Expected at least 3 clusters, got {}", result.len());
+        assert!(
+            result.len() >= 3,
+            "Expected at least 3 clusters, got {}",
+            result.len()
+        );
     }
 
     #[test]
@@ -786,5 +882,50 @@ mod tests {
     fn find_optimal_k_single_eigenvalue() {
         let k = find_optimal_k(&[0.5], 5);
         assert_eq!(k, 1);
+    }
+
+    #[test]
+    fn build_import_adjacency_basic() {
+        let adj = build_import_adjacency(4, &[(0, 1), (2, 3)]);
+        assert_eq!(adj[(0, 1)], 1.0);
+        assert_eq!(adj[(1, 0)], 1.0); // symmetric
+        assert_eq!(adj[(2, 3)], 1.0);
+        assert_eq!(adj[(0, 2)], 0.0); // no edge
+    }
+
+    #[test]
+    fn blend_affinity_matrices_pure_embedding() {
+        let embed = DMatrix::from_row_slice(2, 2, &[0.0, 0.8, 0.8, 0.0]);
+        let import = DMatrix::from_row_slice(2, 2, &[0.0, 1.0, 1.0, 0.0]);
+        let blended = blend_affinity_matrices(&embed, &import, 1.0);
+        assert_eq!(blended[(0, 1)], 0.8); // pure embedding
+    }
+
+    #[test]
+    fn spectral_cluster_with_affinity_basic() {
+        // Two clear groups connected by imports
+        let mut affinity = DMatrix::zeros(6, 6);
+        // Group 1: 0,1,2 fully connected
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    affinity[(i, j)] = 0.9;
+                }
+            }
+        }
+        // Group 2: 3,4,5 fully connected
+        for i in 3..6 {
+            for j in 3..6 {
+                if i != j {
+                    affinity[(i, j)] = 0.9;
+                }
+            }
+        }
+        // Weak cross-group connection
+        affinity[(0, 3)] = 0.1;
+        affinity[(3, 0)] = 0.1;
+
+        let result = spectral_cluster_with_affinity(affinity, 5, 2);
+        assert_eq!(result.len(), 2);
     }
 }

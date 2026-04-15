@@ -2,7 +2,7 @@
 
 use contextplus_rs::cache::rkyv_store;
 use contextplus_rs::core::clustering::{
-    build_affinity_matrix, full_eigen, find_optimal_k, normalized_laplacian,
+    build_affinity_matrix, find_optimal_k, full_eigen, normalized_laplacian,
     spectral_cluster_with_min,
 };
 use contextplus_rs::tools::navigate_constants::{MAX_NAVIGATE_FILES, nav_cache_name};
@@ -11,9 +11,7 @@ use std::time::Instant;
 
 fn main() {
     // Init tracing BEFORE anything else so early logs aren't lost
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let root: PathBuf = std::env::args()
         .nth(1)
@@ -21,7 +19,8 @@ fn main() {
         .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
     let root = root.as_path();
 
-    let model = std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
+    let model =
+        std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
     let cache_name = nav_cache_name(&model);
 
     println!("Root path: {}", root.display());
@@ -47,6 +46,7 @@ fn main() {
         .collect();
 
     // Sample to MAX_NAVIGATE_FILES to match semantic_navigate behavior
+    #[allow(clippy::absurd_extreme_comparisons)]
     let vectors: Vec<Vec<f32>> = if all_vectors.len() > MAX_NAVIGATE_FILES {
         let step = all_vectors.len() as f64 / MAX_NAVIGATE_FILES as f64;
         (0..MAX_NAVIGATE_FILES)

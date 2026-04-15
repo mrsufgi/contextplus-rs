@@ -19,7 +19,9 @@ async fn main() {
 
     let config = Config::from_env();
     let ollama = OllamaClient::new(&config);
-    let root_arg = std::env::args().nth(1).unwrap_or_else(|| "/workspace".to_string());
+    let root_arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/workspace".to_string());
     let root = Path::new(&root_arg);
 
     println!("Warming up LLM label cache for semantic_navigate...");
@@ -42,10 +44,10 @@ async fn main() {
 
     // Report
     let cache_path = root.join(".mcp_data").join("navigate-labels.json");
-    if let Ok(data) = std::fs::read_to_string(&cache_path) {
-        if let Ok(cache) = serde_json::from_str::<HashMap<String, String>>(&data) {
-            println!("\n=== Done! {} LLM labels cached ===", cache.len());
-        }
+    if let Ok(data) = std::fs::read_to_string(&cache_path)
+        && let Ok(cache) = serde_json::from_str::<HashMap<String, String>>(&data)
+    {
+        println!("\n=== Done! {} LLM labels cached ===", cache.len());
     }
 }
 
@@ -104,7 +106,9 @@ fn discover_major_subdirs(root: &Path, config: &Config) -> Vec<std::path::PathBu
     let mut final_dirs: Vec<std::path::PathBuf> = Vec::new();
     for dir in &result {
         let dominated = result.iter().any(|other| {
-            other != dir && other.starts_with(dir) && other.components().count() > dir.components().count()
+            other != dir
+                && other.starts_with(dir)
+                && other.components().count() > dir.components().count()
         });
         if !dominated {
             final_dirs.push(dir.clone());

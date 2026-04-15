@@ -4,8 +4,8 @@ use contextplus_rs::config::Config;
 use contextplus_rs::core::embeddings::{CacheEntry, OllamaClient, VectorStore};
 use contextplus_rs::core::walker;
 use contextplus_rs::tools::navigate_constants::{
-    MAX_CONTENT_CHARS, MAX_NAVIGATE_FILES, NAVIGATE_EXTENSIONS,
-    nav_cache_name, nav_content_hash, nav_embed_text,
+    MAX_CONTENT_CHARS, MAX_NAVIGATE_FILES, NAVIGATE_EXTENSIONS, nav_cache_name, nav_content_hash,
+    nav_embed_text,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -25,16 +25,29 @@ async fn main() {
     let mut files: Vec<(String, String)> = Vec::new(); // (path, content)
 
     for entry in entries {
-        if entry.is_directory { continue; }
-        let ext = entry.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !allowed.contains(ext) { continue; }
-        if let Ok(meta) = std::fs::metadata(&entry.path) {
-            if meta.len() > max_size { continue; }
+        if entry.is_directory {
+            continue;
+        }
+        let ext = entry
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !allowed.contains(ext) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&entry.path)
+            && meta.len() > max_size
+        {
+            continue;
         }
         if let Ok(content) = std::fs::read_to_string(&entry.path) {
             let truncated = if content.len() > MAX_CONTENT_CHARS {
-                contextplus_rs::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS).to_string()
-            } else { content };
+                contextplus_rs::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS)
+                    .to_string()
+            } else {
+                content
+            };
             files.push((entry.relative_path, truncated));
         }
     }
@@ -42,6 +55,7 @@ async fn main() {
     println!("Found {} files", files.len());
 
     // Sample if needed
+    #[allow(clippy::absurd_extreme_comparisons)]
     if files.len() > MAX_NAVIGATE_FILES {
         let total = files.len();
         let step = total as f64 / MAX_NAVIGATE_FILES as f64;
@@ -53,22 +67,28 @@ async fn main() {
             .collect();
     }
 
-    println!("Processing {} files with path-weighted embedding", files.len());
+    println!(
+        "Processing {} files with path-weighted embedding",
+        files.len()
+    );
 
     // Load existing cache
     let cache_name = nav_cache_name(&config.ollama_embed_model);
     let mut cache: HashMap<String, CacheEntry> = HashMap::new();
     if let Ok(Some(store)) = rkyv_store::mmap_vector_store(root, &cache_name) {
-        let dims = store.dims() as usize;
+        let dims = store.dims();
         let flat = store.vectors_data();
         let keys = store.keys();
         let hashes = store.hashes();
         for (i, key) in keys.iter().enumerate() {
             let vec = flat[i * dims..(i + 1) * dims].to_vec();
-            cache.insert(key.clone(), CacheEntry {
-                hash: hashes[i].clone(),
-                vector: vec,
-            });
+            cache.insert(
+                key.clone(),
+                CacheEntry {
+                    hash: hashes[i].clone(),
+                    vector: vec,
+                },
+            );
         }
         println!("Loaded {} existing cache entries", cache.len());
     }
@@ -81,14 +101,20 @@ async fn main() {
         let nav_hash = nav_content_hash(path, content);
         nav_hashes.push(nav_hash.clone());
 
-        if let Some(entry) = cache.get(path) {
-            if entry.hash == nav_hash { continue; }
+        if let Some(entry) = cache.get(path)
+            && entry.hash == nav_hash
+        {
+            continue;
         }
         let embed_text = nav_embed_text(path, "", content);
         uncached.push((i, embed_text));
     }
 
-    println!("{} files need re-embedding, {} cached", uncached.len(), files.len() - uncached.len());
+    println!(
+        "{} files need re-embedding, {} cached",
+        uncached.len(),
+        files.len() - uncached.len()
+    );
 
     if uncached.is_empty() {
         println!("Cache is fully warm!");
@@ -97,21 +123,29 @@ async fn main() {
 
     // Embed in batches
     let batch_size = config.embed_batch_size;
-    let total_batches = (uncached.len() + batch_size - 1) / batch_size;
+    let total_batches = uncached.len().div_ceil(batch_size);
 
     for (batch_idx, chunk) in uncached.chunks(batch_size).enumerate() {
         let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
-        print!("Batch {}/{} ({} files)... ", batch_idx + 1, total_batches, texts.len());
+        print!(
+            "Batch {}/{} ({} files)... ",
+            batch_idx + 1,
+            total_batches,
+            texts.len()
+        );
 
         match ollama.embed(&texts).await {
             Ok(vectors) => {
                 for (j, (file_idx, _)) in chunk.iter().enumerate() {
                     if j < vectors.len() {
                         let (path, _) = &files[*file_idx];
-                        cache.insert(path.clone(), CacheEntry {
-                            hash: nav_hashes[*file_idx].clone(),
-                            vector: vectors[j].clone(),
-                        });
+                        cache.insert(
+                            path.clone(),
+                            CacheEntry {
+                                hash: nav_hashes[*file_idx].clone(),
+                                vector: vectors[j].clone(),
+                            },
+                        );
                     }
                 }
                 println!("ok");
@@ -123,10 +157,10 @@ async fn main() {
 
         // Save after each batch
         let store = VectorStore::from_cache(&cache);
-        if let Some(s) = store {
-            if let Err(e) = rkyv_store::save_vector_store(root, &cache_name, &s) {
-                eprintln!("Failed to save cache: {}", e);
-            }
+        if let Some(s) = store
+            && let Err(e) = rkyv_store::save_vector_store(root, &cache_name, &s)
+        {
+            eprintln!("Failed to save cache: {}", e);
         }
     }
 
