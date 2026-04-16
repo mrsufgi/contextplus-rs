@@ -291,6 +291,12 @@ pub fn get_supported_extensions() -> &'static [&'static str] {
 }
 
 /// Recursively collect import paths from AST nodes.
+///
+/// Per-language match arms each guard on `node.kind()` via a nested `if`
+/// rather than a match-arm guard. clippy::collapsible_match would suggest
+/// folding the inner `if` into the arm — keep it explicit here so the per-
+/// language blocks share the same shape and stay easy to extend.
+#[allow(clippy::collapsible_match)]
 fn collect_imports_from_node(
     node: Node,
     source: &[u8],
