@@ -101,22 +101,7 @@ async fn main() {
     let mut cache_map: HashMap<String, CacheEntry> =
         match rkyv_store::load_cache(root, &cache_name_str) {
             Ok(Some(data)) => {
-                let dim = data.dims as usize;
-                let mut map = HashMap::with_capacity(data.keys.len());
-                for (i, key) in data.keys.iter().enumerate() {
-                    let off = i * dim;
-                    if off + dim > data.vectors.len() {
-                        continue;
-                    }
-                    let hash = data.hashes.get(i).cloned().unwrap_or_default();
-                    map.insert(
-                        key.clone(),
-                        CacheEntry {
-                            hash,
-                            vector: data.vectors[off..off + dim].to_vec(),
-                        },
-                    );
-                }
+                let map = cache_data_to_map(&data);
                 println!("Loaded {} existing cache entries", map.len());
                 map
             }
@@ -221,6 +206,37 @@ fn partition_needs_embed(
         .collect()
 }
 
+/// Convert a flat `CacheData` (parallel keys/hashes/vectors arrays) back into
+/// a `key → CacheEntry` map suitable for in-memory updates before the next
+/// `save_vector_store` call.
+///
+/// Defensive: skips any entry whose vector range would walk past the end of
+/// the flat `vectors` slice, guarding against truncated cache files. Misses
+/// in `hashes` fall back to the empty string so a malformed entry doesn't
+/// kill the load.
+fn cache_data_to_map(data: &rkyv_store::CacheData) -> HashMap<String, CacheEntry> {
+    let dim = data.dims as usize;
+    let mut map = HashMap::with_capacity(data.keys.len());
+    if dim == 0 {
+        return map;
+    }
+    for (i, key) in data.keys.iter().enumerate() {
+        let off = i * dim;
+        if off + dim > data.vectors.len() {
+            continue;
+        }
+        let hash = data.hashes.get(i).cloned().unwrap_or_default();
+        map.insert(
+            key.clone(),
+            CacheEntry {
+                hash,
+                vector: data.vectors[off..off + dim].to_vec(),
+            },
+        );
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +300,69 @@ mod tests {
         let result = partition_needs_embed(&docs, &cache);
 
         assert_eq!(result, vec![1, 2]);
+    }
+
+    // -- cache_data_to_map --
+
+    #[test]
+    fn cache_data_to_map_round_trip_basic() {
+        let data = rkyv_store::CacheData {
+            dims: 2,
+            keys: vec!["a.ts".into(), "b.ts".into()],
+            hashes: vec!["ha".into(), "hb".into()],
+            vectors: vec![0.1, 0.2, 0.3, 0.4],
+        };
+        let map = cache_data_to_map(&data);
+        assert_eq!(map.len(), 2);
+        let a = &map["a.ts"];
+        assert_eq!(a.hash, "ha");
+        assert_eq!(a.vector, vec![0.1, 0.2]);
+        let b = &map["b.ts"];
+        assert_eq!(b.hash, "hb");
+        assert_eq!(b.vector, vec![0.3, 0.4]);
+    }
+
+    #[test]
+    fn cache_data_to_map_zero_dims_returns_empty() {
+        // A degenerate cache file with dims=0 must not panic on the slice math.
+        let data = rkyv_store::CacheData {
+            dims: 0,
+            keys: vec!["a.ts".into()],
+            hashes: vec!["ha".into()],
+            vectors: vec![],
+        };
+        assert!(cache_data_to_map(&data).is_empty());
+    }
+
+    #[test]
+    fn cache_data_to_map_skips_truncated_tail_entries() {
+        // Truncated cache: 3 keys but only 2 entries' worth of vector data.
+        // The third entry must be skipped, not panic on out-of-bounds slicing.
+        let data = rkyv_store::CacheData {
+            dims: 2,
+            keys: vec!["a.ts".into(), "b.ts".into(), "c.ts".into()],
+            hashes: vec!["ha".into(), "hb".into(), "hc".into()],
+            vectors: vec![0.1, 0.2, 0.3, 0.4], // only 4 floats = 2 entries
+        };
+        let map = cache_data_to_map(&data);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("a.ts"));
+        assert!(map.contains_key("b.ts"));
+        assert!(!map.contains_key("c.ts"));
+    }
+
+    #[test]
+    fn cache_data_to_map_missing_hash_falls_back_to_empty_string() {
+        // If hashes vec is shorter than keys, fall back to "" rather than panic.
+        let data = rkyv_store::CacheData {
+            dims: 1,
+            keys: vec!["a.ts".into(), "b.ts".into()],
+            hashes: vec!["ha".into()], // missing hash for b.ts
+            vectors: vec![0.1, 0.2],
+        };
+        let map = cache_data_to_map(&data);
+        assert_eq!(map["a.ts"].hash, "ha");
+        assert_eq!(map["b.ts"].hash, "");
     }
 
     #[test]
