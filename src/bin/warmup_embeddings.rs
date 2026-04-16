@@ -19,6 +19,7 @@ use contextplus_rs::core::parser::hash_content;
 use contextplus_rs::core::tree_sitter::get_supported_extensions;
 use contextplus_rs::core::walker;
 use contextplus_rs::server::cache_name;
+use futures::future;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -121,61 +122,106 @@ async fn main() {
         return;
     }
 
-    // Step 3: embed in batches; persist after each batch so a crash mid-run
-    // doesn't lose hours of work.
+    // Step 3: embed in concurrent groups; persist after each group.
+    //
+    // CONTEXTPLUS_WARMUP_CONCURRENCY controls how many Ollama embed requests
+    // fly in parallel. Set it to match OLLAMA_NUM_PARALLEL on the host so
+    // every CPU thread stays busy:
+    //
+    //   OLLAMA_NUM_PARALLEL=4 on host  →  CONTEXTPLUS_WARMUP_CONCURRENCY=4
+    //
+    // Default is 1 (safe / sequential) to avoid overloading a shared Ollama.
+    let concurrency: usize = std::env::var("CONTEXTPLUS_WARMUP_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+
     let batch_size = config.embed_batch_size.max(1);
     let total_batches = needs_embed.len().div_ceil(batch_size);
     let mut completed = 0usize;
     let mut failed_batches = 0usize;
 
-    for (batch_idx, chunk_start) in (0..needs_embed.len()).step_by(batch_size).enumerate() {
-        let chunk_end = (chunk_start + batch_size).min(needs_embed.len());
-        let indices = &needs_embed[chunk_start..chunk_end];
-        let texts: Vec<String> = indices.iter().map(|&i| docs[i].2.clone()).collect();
+    println!(
+        "Embedding {} batches (batch_size={}, concurrency={})...",
+        total_batches, batch_size, concurrency
+    );
 
-        print!(
-            "Embedding batch {}/{} ({} files)... ",
-            batch_idx + 1,
-            total_batches,
-            texts.len()
-        );
+    // Collect all batch slice descriptors upfront.
+    let all_batches: Vec<(usize, usize, usize)> = (0..needs_embed.len())
+        .step_by(batch_size)
+        .enumerate()
+        .map(|(idx, start)| (idx, start, (start + batch_size).min(needs_embed.len())))
+        .collect();
 
-        match ollama.embed(&texts).await {
-            Ok(vectors) => {
-                let mut added = 0usize;
-                for (j, &doc_idx) in indices.iter().enumerate() {
-                    if let Some(vec) = vectors.get(j) {
-                        let (rel, hash, _) = &docs[doc_idx];
-                        cache_map.insert(
-                            rel.clone(),
-                            CacheEntry {
-                                hash: hash.clone(),
-                                vector: vec.clone(),
-                            },
-                        );
-                        added += 1;
+    // Process in groups of `concurrency`; flush once per group to reduce I/O
+    // serialization without sacrificing crash-recovery granularity too much.
+    for group in all_batches.chunks(concurrency) {
+        // Pre-collect owned texts so the async borrows below have stable data.
+        let batch_data: Vec<(usize, usize, usize, usize, Vec<String>)> = group
+            .iter()
+            .map(|&(batch_idx, chunk_start, chunk_end)| {
+                let texts: Vec<String> = needs_embed[chunk_start..chunk_end]
+                    .iter()
+                    .map(|&i| docs[i].2.clone())
+                    .collect();
+                let n = texts.len();
+                (batch_idx, chunk_start, chunk_end, n, texts)
+            })
+            .collect();
+
+        // Dispatch all batches in this group concurrently. Borrows from
+        // batch_data and ollama — both outlive the join_all await point.
+        let results = future::join_all(
+            batch_data
+                .iter()
+                .map(|(batch_idx, chunk_start, chunk_end, n, texts)| async {
+                    let r = ollama.embed(texts).await;
+                    (*batch_idx, *chunk_start, *chunk_end, *n, r)
+                }),
+        )
+        .await;
+
+        // Merge results into cache_map sequentially (no lock needed).
+        for (batch_idx, chunk_start, chunk_end, n, result) in results {
+            match result {
+                Ok(vectors) => {
+                    let mut added = 0usize;
+                    for (j, &doc_idx) in needs_embed[chunk_start..chunk_end].iter().enumerate() {
+                        if let Some(vec) = vectors.get(j) {
+                            let (rel, hash, _) = &docs[doc_idx];
+                            cache_map.insert(
+                                rel.clone(),
+                                CacheEntry {
+                                    hash: hash.clone(),
+                                    vector: vec.clone(),
+                                },
+                            );
+                            added += 1;
+                        }
                     }
+                    completed += added;
+                    println!(
+                        "Batch {}/{} ({} files): ok ({} added)",
+                        batch_idx + 1,
+                        total_batches,
+                        n,
+                        added
+                    );
                 }
-                completed += added;
-                println!("ok ({} added)", added);
-            }
-            Err(e) => {
-                failed_batches += 1;
-                println!("FAILED: {}", e);
-                continue;
+                Err(e) => {
+                    failed_batches += 1;
+                    println!("Batch {}/{}: FAILED: {}", batch_idx + 1, total_batches, e);
+                }
             }
         }
 
-        // Persist progress after each batch.
+        // Flush once per group.
         let store = VectorStore::from_cache(&cache_map);
         if let Some(s) = store
             && let Err(e) = rkyv_store::save_vector_store(root, &cache_name_str, &s)
         {
-            eprintln!(
-                "WARN: failed to flush cache after batch {}: {}",
-                batch_idx + 1,
-                e
-            );
+            eprintln!("WARN: failed to flush cache after group: {}", e);
         }
     }
 
