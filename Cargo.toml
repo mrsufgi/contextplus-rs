@@ -168,3 +168,7 @@ path = "src/bin/warmup_identifiers.rs"
 [[bin]]
 name = "warmup_labels"
 path = "src/bin/warmup_labels.rs"
+
+[[bin]]
+name = "warmup_embeddings"
+path = "src/bin/warmup_embeddings.rs"
