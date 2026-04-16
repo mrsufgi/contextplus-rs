@@ -341,7 +341,7 @@ pub(crate) async fn label_subclusters_with_llm(
                         .iter()
                         .map(|(dir, files)| (dir.clone(), files.len()))
                         .collect();
-                    subdir_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    subdir_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
                     let subdir_summary = subdir_counts
                         .iter()
                         .map(|(dir, count)| format!("{} ({})", dir, count))
@@ -354,7 +354,7 @@ pub(crate) async fn label_subclusters_with_llm(
                     } else {
                         let mut sorted_dirs: Vec<(&String, &Vec<&FileInfo>)> =
                             subdir_files.iter().collect();
-                        sorted_dirs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+                        sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
 
                         let mut picked: Vec<&FileInfo> = Vec::with_capacity(MAX_FILES_PER_LABEL);
                         let mut dir_indices: Vec<usize> = vec![0; sorted_dirs.len()];
@@ -586,7 +586,7 @@ pub(crate) fn group_by_directory(files: &[FileInfo]) -> Vec<(String, Vec<usize>)
                 }
             }
             let mut sorted: Vec<_> = subdir_counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
             let top: Vec<&str> = sorted.iter().take(3).map(|(name, _)| *name).collect();
             let label = if top.is_empty() {
                 "other".to_string()
@@ -605,7 +605,7 @@ pub(crate) fn group_by_directory(files: &[FileInfo]) -> Vec<(String, Vec<usize>)
             }
         }
         let mut sorted: Vec<_> = subdir_counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top: Vec<&str> = sorted.iter().take(3).map(|(name, _)| *name).collect();
         let label = if top.is_empty() {
             "other".to_string()
