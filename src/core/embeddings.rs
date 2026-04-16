@@ -130,6 +130,7 @@ pub struct OllamaClient {
     model: String,
     chat_model: String,
     batch_size: usize,
+    query_batch_size: usize,
     embed_options: Option<EmbedRuntimeOptions>,
     embed_chunk_chars: usize,
     cancel_token: CancellationToken,
@@ -163,6 +164,7 @@ impl OllamaClient {
             model: config.ollama_embed_model.clone(),
             chat_model: config.ollama_chat_model.clone(),
             batch_size: config.embed_batch_size,
+            query_batch_size: config.query_batch_size,
             embed_options: EmbedRuntimeOptions::from_config(config),
             embed_chunk_chars: config.embed_chunk_chars,
             cancel_token: CancellationToken::new(),
@@ -252,9 +254,14 @@ impl OllamaClient {
         Ok(results)
     }
 
-    /// Get the configured batch size.
+    /// Get the configured batch size (used for warmup/indexing).
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Get the configured query batch size (used for live search queries, default 1 for CPU-optimal throughput).
+    pub fn query_batch_size(&self) -> usize {
+        self.query_batch_size
     }
 
     /// Send a chat completion request to Ollama and return the response content.
@@ -1597,7 +1604,12 @@ mod tests {
 
         // Only 1 POST should have been made — second hit from cache
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "expected 1 Ollama call, got {}", requests.len());
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected 1 Ollama call, got {}",
+            requests.len()
+        );
     }
 
     #[test]
@@ -1607,8 +1619,14 @@ mod tests {
         cache.insert("b".to_string(), vec![2.0]);
         cache.insert("c".to_string(), vec![3.0]);
         cache.insert("d".to_string(), vec![4.0]); // should evict "a"
-        assert!(cache.get("a").is_none(), "oldest entry 'a' should have been evicted");
-        assert!(cache.get("d").is_some(), "newest entry 'd' should be present");
+        assert!(
+            cache.get("a").is_none(),
+            "oldest entry 'a' should have been evicted"
+        );
+        assert!(
+            cache.get("d").is_some(),
+            "newest entry 'd' should be present"
+        );
         assert_eq!(cache.len(), 3);
     }
 
@@ -1634,7 +1652,12 @@ mod tests {
 
         // Both queries are different — 2 Ollama calls expected
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2, "expected 2 Ollama calls, got {}", requests.len());
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected 2 Ollama calls, got {}",
+            requests.len()
+        );
     }
 
     #[tokio::test]
@@ -1646,9 +1669,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/embed"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"embeddings": [[0.1, 0.2], [0.3, 0.4]]}),
-                ),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2], [0.3, 0.4]]})),
             )
             .mount(&server)
             .await;
@@ -1662,10 +1684,19 @@ mod tests {
 
         // Multi-text calls bypass cache — 2 Ollama calls expected
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2, "expected 2 Ollama calls for multi-text, got {}", requests.len());
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected 2 Ollama calls for multi-text, got {}",
+            requests.len()
+        );
 
         // Cache should be empty since multi-text calls do not populate it
-        assert_eq!(client.query_cache_len(), 0, "cache should be empty after multi-text calls");
+        assert_eq!(
+            client.query_cache_len(),
+            0,
+            "cache should be empty after multi-text calls"
+        );
     }
 }
 
