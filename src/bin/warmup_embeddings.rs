@@ -172,14 +172,12 @@ async fn main() {
 
         // Dispatch all batches in this group concurrently. Borrows from
         // batch_data and ollama — both outlive the join_all await point.
-        let results = future::join_all(
-            batch_data
-                .iter()
-                .map(|(batch_idx, chunk_start, chunk_end, n, texts)| async {
-                    let r = ollama.embed(texts).await;
-                    (*batch_idx, *chunk_start, *chunk_end, *n, r)
-                }),
-        )
+        let results = future::join_all(batch_data.iter().map(
+            |(batch_idx, chunk_start, chunk_end, n, texts)| async {
+                let r = ollama.embed(texts).await;
+                (*batch_idx, *chunk_start, *chunk_end, *n, r)
+            },
+        ))
         .await;
 
         // Merge results into cache_map sequentially (no lock needed).
