@@ -105,11 +105,31 @@ impl CacheData {
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Save a CacheData to disk using rkyv serialization.
-/// Uses atomic write: write to a unique temp file then rename.
+///
+/// Multi-process safe: before writing, reloads the on-disk state and merges it
+/// with `data`. Without this, two processes sharing the same cache file (e.g.
+/// two Claude Code sessions each spawning their own MCP, or an offline warmup
+/// binary running alongside a live MCP server) would clobber each other —
+/// each process snapshots its own in-memory state and the last writer wins.
+///
+/// The merge is "incoming overrides disk by key": entries present in both keep
+/// the incoming hash + vector, entries unique to either side are preserved.
+/// This reflects the typical caller intent — a fresh embed for a re-hashed
+/// file should win over a stale cache entry, and embeds neither process knows
+/// about should be retained.
+///
+/// Atomic on-disk swap is preserved (write to unique temp file then rename).
 pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     ensure_cache_dir(root_dir)?;
 
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(data)
+    // Read-modify-write: merge with whatever is currently on disk so we don't
+    // lose entries written by a concurrent process between our load and save.
+    let merged = match load_cache(root_dir, name)? {
+        Some(disk) => merge_cache_data(disk, data),
+        None => clone_cache_data(data),
+    };
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&merged)
         .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
 
     let path = cache_path(root_dir, name);
@@ -136,6 +156,78 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn clone_cache_data(data: &CacheData) -> CacheData {
+    CacheData {
+        dims: data.dims,
+        keys: data.keys.clone(),
+        hashes: data.hashes.clone(),
+        vectors: data.vectors.clone(),
+    }
+}
+
+/// Merge two `CacheData` snapshots, with `incoming` overriding `disk` for
+/// entries that share a key. Returns a freshly-allocated `CacheData`.
+///
+/// Dim mismatches with both sides non-empty (e.g. caches from different
+/// embedding models pointed at the same path) are unrecoverable; in that
+/// case `incoming` wins outright and `disk` is dropped. This shouldn't
+/// happen in normal operation because cache file names include the model.
+fn merge_cache_data(disk: CacheData, incoming: &CacheData) -> CacheData {
+    if !disk.keys.is_empty() && !incoming.keys.is_empty() && disk.dims != incoming.dims {
+        return clone_cache_data(incoming);
+    }
+
+    let dim = if disk.keys.is_empty() {
+        incoming.dims as usize
+    } else {
+        disk.dims as usize
+    };
+
+    if dim == 0 {
+        return clone_cache_data(incoming);
+    }
+
+    let mut map: HashMap<String, (String, Vec<f32>)> =
+        HashMap::with_capacity(disk.keys.len() + incoming.keys.len());
+
+    let mut insert = |keys: Vec<String>, hashes: Vec<String>, vectors: Vec<f32>| {
+        for (i, key) in keys.into_iter().enumerate() {
+            let off = i * dim;
+            if off + dim > vectors.len() {
+                continue;
+            }
+            let hash = hashes.get(i).cloned().unwrap_or_default();
+            let vec = vectors[off..off + dim].to_vec();
+            map.insert(key, (hash, vec));
+        }
+    };
+
+    insert(disk.keys, disk.hashes, disk.vectors);
+    // Incoming overwrites by key (newer embed wins for shared keys)
+    insert(
+        incoming.keys.clone(),
+        incoming.hashes.clone(),
+        incoming.vectors.clone(),
+    );
+
+    let n = map.len();
+    let mut keys = Vec::with_capacity(n);
+    let mut hashes = Vec::with_capacity(n);
+    let mut vectors = Vec::with_capacity(n * dim);
+    for (key, (hash, vec)) in map {
+        keys.push(key);
+        hashes.push(hash);
+        vectors.extend_from_slice(&vec);
+    }
+
+    CacheData {
+        dims: dim as u32,
+        keys,
+        hashes,
+        vectors,
+    }
 }
 
 /// Load a CacheData from disk.
@@ -461,6 +553,118 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // -- Concurrent-writer merge regression tests --
+
+    #[test]
+    fn save_preserves_disk_entries_not_in_incoming() {
+        // Simulates: process A loaded N entries, process B saved N+M entries,
+        // process A then saves only its (smaller) snapshot. Without the merge,
+        // process B's M new entries would be wiped.
+        let dir = TempDir::new().unwrap();
+
+        // Process B writes a richer state to disk first
+        let disk = CacheData {
+            dims: 2,
+            keys: vec!["a".into(), "b".into(), "c".into()],
+            hashes: vec!["ha".into(), "hb".into(), "hc".into()],
+            vectors: vec![1.0, 1.1, 2.0, 2.1, 3.0, 3.1],
+        };
+        save_cache(dir.path(), "race", &disk).unwrap();
+
+        // Process A snapshots only the original 1 entry it knew about
+        let stale = CacheData {
+            dims: 2,
+            keys: vec!["a".into()],
+            hashes: vec!["ha".into()],
+            vectors: vec![1.0, 1.1],
+        };
+        save_cache(dir.path(), "race", &stale).unwrap();
+
+        let loaded = load_cache(dir.path(), "race").unwrap().unwrap();
+        let key_set: std::collections::HashSet<_> = loaded.keys.iter().cloned().collect();
+        assert!(
+            key_set.contains("b") && key_set.contains("c"),
+            "merge must preserve b/c written by the concurrent writer; got keys={:?}",
+            loaded.keys
+        );
+        assert_eq!(loaded.keys.len(), 3);
+    }
+
+    #[test]
+    fn save_incoming_overrides_disk_for_shared_keys() {
+        // When the same key is in both, incoming wins (re-embed of a changed file
+        // should replace the stale entry rather than be silently discarded).
+        let dir = TempDir::new().unwrap();
+
+        let disk = CacheData {
+            dims: 2,
+            keys: vec!["a".into()],
+            hashes: vec!["old-hash".into()],
+            vectors: vec![0.1, 0.2],
+        };
+        save_cache(dir.path(), "override", &disk).unwrap();
+
+        let incoming = CacheData {
+            dims: 2,
+            keys: vec!["a".into()],
+            hashes: vec!["new-hash".into()],
+            vectors: vec![0.9, 0.8],
+        };
+        save_cache(dir.path(), "override", &incoming).unwrap();
+
+        let loaded = load_cache(dir.path(), "override").unwrap().unwrap();
+        let idx = loaded.keys.iter().position(|k| k == "a").unwrap();
+        assert_eq!(loaded.hashes[idx], "new-hash");
+        assert!((loaded.vectors[idx * 2] - 0.9).abs() < 1e-6);
+        assert!((loaded.vectors[idx * 2 + 1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn save_fresh_path_no_merge_needed() {
+        // When the cache file doesn't exist, save the incoming data verbatim.
+        let dir = TempDir::new().unwrap();
+        let data = CacheData {
+            dims: 2,
+            keys: vec!["x".into(), "y".into()],
+            hashes: vec!["hx".into(), "hy".into()],
+            vectors: vec![0.1, 0.2, 0.3, 0.4],
+        };
+        save_cache(dir.path(), "fresh", &data).unwrap();
+
+        let loaded = load_cache(dir.path(), "fresh").unwrap().unwrap();
+        assert_eq!(loaded.keys.len(), 2);
+        let key_set: std::collections::HashSet<_> = loaded.keys.iter().cloned().collect();
+        assert!(key_set.contains("x") && key_set.contains("y"));
+    }
+
+    #[test]
+    fn save_preserves_disk_entries_when_incoming_is_empty() {
+        // Edge case: a writer with no in-memory entries shouldn't wipe the disk.
+        let dir = TempDir::new().unwrap();
+
+        let disk = CacheData {
+            dims: 2,
+            keys: vec!["keep-me".into()],
+            hashes: vec!["h1".into()],
+            vectors: vec![0.5, 0.5],
+        };
+        save_cache(dir.path(), "noop", &disk).unwrap();
+
+        let empty = CacheData {
+            dims: 2,
+            keys: vec![],
+            hashes: vec![],
+            vectors: vec![],
+        };
+        save_cache(dir.path(), "noop", &empty).unwrap();
+
+        let loaded = load_cache(dir.path(), "noop").unwrap().unwrap();
+        assert!(
+            loaded.keys.iter().any(|k| k == "keep-me"),
+            "an empty incoming snapshot must not wipe pre-existing entries"
+        );
+    }
+
     #[test]
     fn atomic_write_survives() {
         let dir = TempDir::new().unwrap();
@@ -471,7 +675,10 @@ mod tests {
         save_cache(dir.path(), "atomic", &data).unwrap();
 
         let loaded = load_cache(dir.path(), "atomic").unwrap().unwrap();
-        assert_eq!(loaded.keys, data.keys);
+        // Order is not preserved through the merge round-trip, but the key set must match.
+        let loaded_keys: std::collections::HashSet<_> = loaded.keys.iter().cloned().collect();
+        let data_keys: std::collections::HashSet<_> = data.keys.iter().cloned().collect();
+        assert_eq!(loaded_keys, data_keys);
 
         // No temp files should linger in the cache directory
         let cache = cache_dir(dir.path());
