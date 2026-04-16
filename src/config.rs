@@ -53,7 +53,10 @@ pub struct Config {
     pub idle_timeout_ms: u64,
     pub parent_poll_ms: u64,
     pub embed_chunk_chars: usize,
+    pub query_batch_size: usize,
 }
+
+const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
 
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 const DEFAULT_EMBED_MODEL: &str = "snowflake-arctic-embed2";
@@ -170,6 +173,7 @@ impl Config {
                 DEFAULT_EMBED_CHUNK_CHARS,
             )
             .clamp(MIN_EMBED_CHUNK_CHARS, MAX_EMBED_CHUNK_CHARS),
+            query_batch_size: env_parse("CONTEXTPLUS_QUERY_BATCH_SIZE", DEFAULT_QUERY_BATCH_SIZE),
         }
     }
 }
@@ -453,6 +457,37 @@ mod tests {
             let cfg = Config::from_env();
             assert_eq!(cfg.embed_chunk_chars, 4000);
         });
+    }
+
+    #[test]
+    fn query_batch_size_defaults_to_1() {
+        with_cleared_env(&["CONTEXTPLUS_QUERY_BATCH_SIZE"], || {
+            let c = Config::from_env();
+            assert_eq!(c.query_batch_size, 1);
+        });
+    }
+
+    #[test]
+    fn query_batch_size_reads_from_env() {
+        with_env(&[("CONTEXTPLUS_QUERY_BATCH_SIZE", "4")], || {
+            let c = Config::from_env();
+            assert_eq!(c.query_batch_size, 4);
+        });
+    }
+
+    #[test]
+    fn embed_batch_size_unaffected_by_query_batch_size_env() {
+        with_env(
+            &[
+                ("CONTEXTPLUS_QUERY_BATCH_SIZE", "99"),
+                ("CONTEXTPLUS_EMBED_BATCH_SIZE", "50"),
+            ],
+            || {
+                let c = Config::from_env();
+                assert_ne!(c.embed_batch_size, 99);
+                assert_eq!(c.embed_batch_size, 50);
+            },
+        );
     }
 
     #[test]

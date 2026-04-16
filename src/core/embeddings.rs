@@ -73,6 +73,56 @@ impl EmbedRuntimeOptions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BoundedLruCache
+// ---------------------------------------------------------------------------
+
+/// A simple bounded LRU cache for query embeddings.
+/// Uses a VecDeque to track insertion order for eviction.
+/// No external dependencies — stdlib only.
+struct BoundedLruCache {
+    cap: usize,
+    order: std::collections::VecDeque<String>,
+    map: std::collections::HashMap<String, Vec<f32>>,
+}
+
+impl BoundedLruCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: std::collections::VecDeque::with_capacity(cap + 1),
+            map: std::collections::HashMap::with_capacity(cap + 1),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<&Vec<f32>> {
+        if self.map.contains_key(key) {
+            // Move to back (most recently used)
+            self.order.retain(|k| k != key);
+            self.order.push_back(key.to_string());
+            self.map.get(key)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: String, val: Vec<f32>) {
+        if self.map.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        } else if self.map.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, val);
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 #[derive(Clone)]
 pub struct OllamaClient {
     client: reqwest::Client,
@@ -80,10 +130,12 @@ pub struct OllamaClient {
     model: String,
     chat_model: String,
     batch_size: usize,
+    query_batch_size: usize,
     embed_options: Option<EmbedRuntimeOptions>,
     embed_chunk_chars: usize,
     cancel_token: CancellationToken,
     request_timeout: std::time::Duration,
+    query_cache: Arc<std::sync::Mutex<BoundedLruCache>>,
 }
 
 #[derive(serde::Serialize)]
@@ -112,11 +164,18 @@ impl OllamaClient {
             model: config.ollama_embed_model.clone(),
             chat_model: config.ollama_chat_model.clone(),
             batch_size: config.embed_batch_size,
+            query_batch_size: config.query_batch_size,
             embed_options: EmbedRuntimeOptions::from_config(config),
             embed_chunk_chars: config.embed_chunk_chars,
             cancel_token: CancellationToken::new(),
             request_timeout: EMBED_REQUEST_TIMEOUT,
+            query_cache: Arc::new(std::sync::Mutex::new(BoundedLruCache::new(256))),
         }
+    }
+
+    /// Return the number of entries in the query embedding LRU cache.
+    pub fn query_cache_len(&self) -> usize {
+        self.query_cache.lock().unwrap().len()
     }
 
     /// Override the per-request wall-clock deadline. Mostly useful in tests.
@@ -135,9 +194,24 @@ impl OllamaClient {
 
     /// Embed a slice of texts, returning one vector per text.
     /// Handles chunking of oversized inputs, batching, and adaptive retry.
+    ///
+    /// For single-text (query) calls the result is served from an in-process
+    /// LRU cache (cap=256) on cache hit, skipping Ollama entirely.
+    /// Multi-text batch calls (warmup/indexing) bypass the cache.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Cache check: single-text (query) path only.
+        if texts.len() == 1 {
+            let cached = {
+                let mut cache = self.query_cache.lock().unwrap();
+                cache.get(&texts[0]).cloned()
+            };
+            if let Some(vec) = cached {
+                return Ok(vec![vec]);
+            }
         }
 
         // Split each input into chunks; short inputs produce a single chunk.
@@ -169,12 +243,25 @@ impl OllamaClient {
             offset += chunks.len();
         }
 
+        // Cache population: single-text (query) path only.
+        if texts.len() == 1 {
+            if let Some(v) = results.first() {
+                let mut cache = self.query_cache.lock().unwrap();
+                cache.insert(texts[0].clone(), v.clone());
+            }
+        }
+
         Ok(results)
     }
 
-    /// Get the configured batch size.
+    /// Get the configured batch size (used for warmup/indexing).
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Get the configured query batch size (used for live search queries, default 1 for CPU-optimal throughput).
+    pub fn query_batch_size(&self) -> usize {
+        self.query_batch_size
     }
 
     /// Send a chat completion request to Ollama and return the response content.
@@ -1488,6 +1575,128 @@ mod tests {
         let result = client.embed(&["test".to_string()]).await;
         assert!(result.is_err());
         assert!(matches!(result, Err(ContextPlusError::Cancelled)));
+    }
+
+    // -- LRU cache tests --
+
+    #[tokio::test]
+    async fn query_lru_cache_hit_skips_ollama() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+
+        // Call embed with the same text twice
+        let result1 = client.embed(&["stripe webhook".to_string()]).await.unwrap();
+        let result2 = client.embed(&["stripe webhook".to_string()]).await.unwrap();
+
+        assert_eq!(result1, result2);
+
+        // Only 1 POST should have been made — second hit from cache
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected 1 Ollama call, got {}",
+            requests.len()
+        );
+    }
+
+    #[test]
+    fn query_lru_cache_evicts_oldest_at_capacity() {
+        let mut cache = BoundedLruCache::new(3);
+        cache.insert("a".to_string(), vec![1.0]);
+        cache.insert("b".to_string(), vec![2.0]);
+        cache.insert("c".to_string(), vec![3.0]);
+        cache.insert("d".to_string(), vec![4.0]); // should evict "a"
+        assert!(
+            cache.get("a").is_none(),
+            "oldest entry 'a' should have been evicted"
+        );
+        assert!(
+            cache.get("d").is_some(),
+            "newest entry 'd' should be present"
+        );
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_lru_cache_miss_on_different_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.5, 0.6, 0.7]]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+
+        client.embed(&["query one".to_string()]).await.unwrap();
+        client.embed(&["query two".to_string()]).await.unwrap();
+
+        // Both queries are different — 2 Ollama calls expected
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected 2 Ollama calls, got {}",
+            requests.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_text_embed_skips_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2], [0.3, 0.4]]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        let texts = vec!["a".to_string(), "b".to_string()];
+
+        // Call embed twice with the same multi-text slice
+        client.embed(&texts).await.unwrap();
+        client.embed(&texts).await.unwrap();
+
+        // Multi-text calls bypass cache — 2 Ollama calls expected
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected 2 Ollama calls for multi-text, got {}",
+            requests.len()
+        );
+
+        // Cache should be empty since multi-text calls do not populate it
+        assert_eq!(
+            client.query_cache_len(),
+            0,
+            "cache should be empty after multi-text calls"
+        );
     }
 }
 
