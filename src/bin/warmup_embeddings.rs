@@ -123,15 +123,7 @@ async fn main() {
             _ => HashMap::new(),
         };
 
-    // Files needing embed = those whose hash differs from cache (or absent)
-    let needs_embed: Vec<usize> = docs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (rel, hash, _))| match cache_map.get(rel) {
-            Some(entry) if &entry.hash == hash => None, // already cached, content unchanged
-            _ => Some(i),
-        })
-        .collect();
+    let needs_embed = partition_needs_embed(&docs, &cache_map);
 
     println!(
         "{} files need embedding, {} already cached and current",
@@ -208,4 +200,104 @@ async fn main() {
         failed_batches,
         cache_map.len()
     );
+}
+
+/// Decide which docs need re-embedding: every doc whose `(rel_path, hash)`
+/// pair is not already current in `cache_map`.
+///
+/// A doc is skipped only when the cache holds the **same key AND same hash**.
+/// Different hash for the same key (file content changed since last embed)
+/// returns the index for re-embedding. Missing key likewise.
+fn partition_needs_embed(
+    docs: &[(String, String, String)],
+    cache_map: &HashMap<String, CacheEntry>,
+) -> Vec<usize> {
+    docs.iter()
+        .enumerate()
+        .filter_map(|(i, (rel, hash, _))| match cache_map.get(rel) {
+            Some(entry) if &entry.hash == hash => None,
+            _ => Some(i),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(rel: &str, hash: &str, body: &str) -> (String, String, String) {
+        (rel.to_string(), hash.to_string(), body.to_string())
+    }
+
+    fn entry(hash: &str, dim: usize) -> CacheEntry {
+        CacheEntry {
+            hash: hash.to_string(),
+            vector: vec![0.0; dim],
+        }
+    }
+
+    #[test]
+    fn partition_empty_cache_returns_all_docs() {
+        let docs = vec![doc("a.ts", "h1", "x"), doc("b.ts", "h2", "y")];
+        let cache: HashMap<String, CacheEntry> = HashMap::new();
+
+        let result = partition_needs_embed(&docs, &cache);
+
+        assert_eq!(result, vec![0, 1]);
+    }
+
+    #[test]
+    fn partition_all_cached_with_matching_hash_returns_empty() {
+        let docs = vec![doc("a.ts", "h1", "x"), doc("b.ts", "h2", "y")];
+        let mut cache = HashMap::new();
+        cache.insert("a.ts".into(), entry("h1", 4));
+        cache.insert("b.ts".into(), entry("h2", 4));
+
+        let result = partition_needs_embed(&docs, &cache);
+
+        assert!(result.is_empty(), "fully-current cache should need no work");
+    }
+
+    #[test]
+    fn partition_stale_hash_re_embeds() {
+        // Same key, different hash => re-embed (content changed since last cache)
+        let docs = vec![doc("a.ts", "h1-NEW", "x")];
+        let mut cache = HashMap::new();
+        cache.insert("a.ts".into(), entry("h1-OLD", 4));
+
+        let result = partition_needs_embed(&docs, &cache);
+
+        assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn partition_mixed_only_returns_changed_or_missing() {
+        let docs = vec![
+            doc("kept.ts", "h-keep", "k"),    // index 0: cached + current → skip
+            doc("changed.ts", "h-NEW", "c"),  // index 1: cached but stale → embed
+            doc("brandnew.ts", "h-new", "n"), // index 2: not in cache → embed
+        ];
+        let mut cache = HashMap::new();
+        cache.insert("kept.ts".into(), entry("h-keep", 4));
+        cache.insert("changed.ts".into(), entry("h-OLD", 4));
+
+        let result = partition_needs_embed(&docs, &cache);
+
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn partition_extra_cache_entries_are_ignored() {
+        // The cache may contain entries for files no longer in the workspace.
+        // partition_needs_embed only considers what's in `docs`; orphans are
+        // left alone (the merging save_cache will preserve them on disk).
+        let docs = vec![doc("present.ts", "h-p", "p")];
+        let mut cache = HashMap::new();
+        cache.insert("present.ts".into(), entry("h-p", 4));
+        cache.insert("deleted-since.ts".into(), entry("h-x", 4));
+
+        let result = partition_needs_embed(&docs, &cache);
+
+        assert!(result.is_empty());
+    }
 }
