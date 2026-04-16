@@ -109,10 +109,10 @@ impl BoundedLruCache {
     fn insert(&mut self, key: String, val: Vec<f32>) {
         if self.map.contains_key(&key) {
             self.order.retain(|k| k != &key);
-        } else if self.map.len() >= self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
+        } else if self.map.len() >= self.cap
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.map.remove(&oldest);
         }
         self.order.push_back(key.clone());
         self.map.insert(key, val);
@@ -244,11 +244,11 @@ impl OllamaClient {
         }
 
         // Cache population: single-text (query) path only.
-        if texts.len() == 1 {
-            if let Some(v) = results.first() {
-                let mut cache = self.query_cache.lock().unwrap();
-                cache.insert(texts[0].clone(), v.clone());
-            }
+        if texts.len() == 1
+            && let Some(v) = results.first()
+        {
+            let mut cache = self.query_cache.lock().unwrap();
+            cache.insert(texts[0].clone(), v.clone());
         }
 
         Ok(results)
