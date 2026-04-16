@@ -18,6 +18,16 @@ const MIN_EMBED_INPUT_CHARS: usize = 1;
 const SINGLE_INPUT_SHRINK_FACTOR: f64 = 0.75;
 const MAX_SINGLE_INPUT_RETRIES: usize = 15;
 
+/// Hard wall-clock ceiling for a single embed HTTP call (send + body read).
+///
+/// Acts as a circuit breaker: reqwest's `Client::timeout` is best-effort and
+/// has historically not always covered streamed body reads via `.json()`.
+/// On CPU-only Ollama with large dense models (e.g. embeddinggemma at 300M+
+/// params), a single 32-string batch can take > 60s, so this needs to be
+/// generous — but bounded so a wedged connection cannot stall the warmup
+/// binaries indefinitely.
+const EMBED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 // ---------------------------------------------------------------------------
 // OllamaClient
 // ---------------------------------------------------------------------------
@@ -73,6 +83,7 @@ pub struct OllamaClient {
     embed_options: Option<EmbedRuntimeOptions>,
     embed_chunk_chars: usize,
     cancel_token: CancellationToken,
+    request_timeout: std::time::Duration,
 }
 
 #[derive(serde::Serialize)]
@@ -104,7 +115,14 @@ impl OllamaClient {
             embed_options: EmbedRuntimeOptions::from_config(config),
             embed_chunk_chars: config.embed_chunk_chars,
             cancel_token: CancellationToken::new(),
+            request_timeout: EMBED_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the per-request wall-clock deadline. Mostly useful in tests.
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// Cancel all in-flight embedding requests.
@@ -270,34 +288,53 @@ impl OllamaClient {
             options: self.embed_options.as_ref(),
         };
 
+        // Cover the WHOLE request lifecycle (send + status check + body read)
+        // under a single deadline + cancel race. Previously only `.send()` was
+        // raced against the cancel token, which left `response.json().await`
+        // unsupervised — a slow/wedged Ollama body read could hang forever,
+        // deadlocking the warmup binaries.
         let token = self.cancel_token.clone();
-        let response = tokio::select! {
-            _ = token.cancelled() => {
-                return Err(ContextPlusError::Cancelled);
+        let request = async {
+            let response = self
+                .client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "unknown error".to_string());
+                return Err(ContextPlusError::Ollama(format!(
+                    "HTTP {}: {}",
+                    status, text
+                )));
             }
-            result = self.client.post(&url).json(&body).send() => {
-                result.map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?
-            }
+
+            let embed_response: EmbedResponse = response
+                .json()
+                .await
+                .map_err(|e| ContextPlusError::Ollama(format!("response parse error: {}", e)))?;
+
+            Ok(embed_response.embeddings)
         };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(ContextPlusError::Ollama(format!(
-                "HTTP {}: {}",
-                status, text
-            )));
+        let deadline = self.request_timeout;
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(ContextPlusError::Cancelled),
+            result = tokio::time::timeout(deadline, request) => match result {
+                Ok(inner) => inner,
+                Err(_) => Err(ContextPlusError::Ollama(format!(
+                    "embedding request exceeded {}ms wall-clock deadline",
+                    deadline.as_millis()
+                ))),
+            },
         }
-
-        let embed_response: EmbedResponse = response
-            .json()
-            .await
-            .map_err(|e| ContextPlusError::Ollama(format!("response parse error: {}", e)))?;
-
-        Ok(embed_response.embeddings)
     }
 }
 
@@ -1388,6 +1425,56 @@ mod tests {
             matches!(result, Err(ContextPlusError::Cancelled)),
             "error should be Cancelled variant"
         );
+    }
+
+    #[tokio::test]
+    async fn embed_request_timeout_returns_ollama_error_within_bound() {
+        // Regression for the warmup deadlock: prior to the fix, only `.send()`
+        // was raced against the cancel token, leaving `response.json().await`
+        // unsupervised. A slow/wedged Ollama body read could hang forever.
+        // After the fix, the whole send+body lifecycle is bounded by
+        // `with_request_timeout`.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[1.0, 2.0, 3.0]]}))
+                    // Simulate a wedged Ollama: response would arrive far past the
+                    // configured request_timeout. With the deadline race in place
+                    // we should bail with an Ollama error in ~200ms, not hang for
+                    // the full delay.
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = config_with_host(&server.uri());
+        let client =
+            OllamaClient::new(&config).with_request_timeout(std::time::Duration::from_millis(200));
+
+        let start = std::time::Instant::now();
+        let result = client.embed(&["hello".to_string()]).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should bail near the deadline, took {:?}",
+            elapsed
+        );
+        match result {
+            Err(ContextPlusError::Ollama(msg)) => {
+                assert!(
+                    msg.contains("deadline"),
+                    "expected deadline error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Ollama deadline error, got {:?}", other),
+        }
     }
 
     #[tokio::test]
