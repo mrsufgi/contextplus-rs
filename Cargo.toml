@@ -91,6 +91,7 @@ rand = "0.8"
 
 # CPU parallelism (affinity matrix, kmeans, find_nearest, symbol parsing)
 rayon = "1"
+instant-distance = "0.6.1"
 
 [dev-dependencies]
 # Mock HTTP server (for Ollama API)
