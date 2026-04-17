@@ -1471,6 +1471,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1526,6 +1527,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1592,6 +1594,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1664,6 +1667,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1726,6 +1730,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1813,6 +1818,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1886,6 +1892,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1950,6 +1957,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2019,6 +2027,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2087,6 +2096,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2151,6 +2161,7 @@ mod tests {
             idle_timeout_ms: 0,
             parent_poll_ms: 5000,
             embed_chunk_chars: 2000,
+            query_batch_size: 1,
         };
         let ollama = OllamaClient::new(&config);
 
