@@ -147,7 +147,8 @@ struct EmbedRequest<'a> {
     /// Keep model loaded in Ollama indefinitely after this request.
     /// Without this, Ollama evicts the model after 5 min of idle time,
     /// adding a cold-load penalty (~3-5s) to the first query after any gap.
-    keep_alive: &'static str,
+    /// Ollama treats -1 as "keep loaded forever" (numeric seconds).
+    keep_alive: i32,
 }
 
 #[derive(serde::Deserialize)]
@@ -377,7 +378,7 @@ impl OllamaClient {
             model: &self.model,
             input: inputs,
             options: self.embed_options.as_ref(),
-            keep_alive: "-1",
+            keep_alive: -1,
         };
 
         // Cover the WHOLE request lifecycle (send + status check + body read)
@@ -1437,11 +1438,11 @@ mod tests {
             model: "t",
             input: &[],
             options: None,
-            keep_alive: "-1",
+            keep_alive: -1,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("options").is_none());
-        assert_eq!(v["keep_alive"], "-1");
+        assert_eq!(v["keep_alive"], -1);
     }
     #[test]
     fn req_with_opts() {
@@ -1458,11 +1459,11 @@ mod tests {
             model: "t",
             input: &i,
             options: Some(&o),
-            keep_alive: "-1",
+            keep_alive: -1,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["options"]["num_gpu"], 2);
-        assert_eq!(v["keep_alive"], "-1");
+        assert_eq!(v["keep_alive"], -1);
     }
 
     // -- adaptive retry constant tests --
