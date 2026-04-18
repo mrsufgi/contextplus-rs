@@ -69,6 +69,9 @@ ignore = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Advisory file locking (pure-Rust, no C deps)
+fd-lock = "4"
+
 # Unix process checks
 libc = "0.2"
 

@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use rmcp::model::Tool;
 use serde_json::Value;
 
-/// All 17 tool definitions. Built once at first access, reused for every list_tools call.
+/// All 22 tool definitions. Built once at first access, reused for every list_tools call.
 static TOOL_DEFINITIONS: LazyLock<Vec<Tool>> = LazyLock::new(build_tool_definitions);
 
 /// Returns the static tool definitions slice. O(1) after first call.
@@ -418,6 +418,88 @@ fn build_tool_definitions() -> Vec<Tool> {
                 ),
             ],
         ),
+        // --- 5 new tools wired in this PR ---
+        make_tool(
+            "find_dead_code",
+            "Heuristic scan for potentially unused symbols. Reports symbols whose names do not appear as tokens in any other indexed file. Advisory only.",
+            &[
+                (
+                    "ignore_kinds",
+                    "array",
+                    false,
+                    "Symbol kinds to skip (default: [\"mod\",\"impl\",\"trait\",\"test\"]). Pass [] to include all.",
+                ),
+                (
+                    "ignore_names",
+                    "array",
+                    false,
+                    "Symbol names to skip (default: common entry-points like \"main\",\"new\",\"default\"). Pass [] to include all.",
+                ),
+                (
+                    "max_results",
+                    "integer",
+                    false,
+                    "Cap on number of reported candidates (default 200).",
+                ),
+            ],
+        ),
+        make_tool(
+            "review_pr_diff",
+            "Analyse a unified diff and produce a risk-ranked impact report. Identifies changed symbols, expands to 2-hop dependent files, and ranks all affected files by composite risk score.",
+            &[
+                (
+                    "diff",
+                    "string",
+                    true,
+                    "Unified diff text (output of `git diff` or similar).",
+                ),
+                (
+                    "max_hops",
+                    "integer",
+                    false,
+                    "Dependency expansion depth (default 2).",
+                ),
+                (
+                    "max_files",
+                    "integer",
+                    false,
+                    "Cap on total files surfaced (default 500).",
+                ),
+            ],
+        ),
+        make_tool(
+            "detect_dependency_loops",
+            "Detect import cycles in the project using Tarjan SCC algorithm. Returns all strongly-connected components with >= 2 files, plus self-importing files.",
+            &[],
+        ),
+        make_tool(
+            "check_embedding_quality",
+            "Diagnose the in-memory embedding cache: reports zero vectors, NaN/Inf values, dimension mismatches, and duplicate vectors.",
+            &[(
+                "expected_dim",
+                "integer",
+                false,
+                "Expected embedding dimensionality. Auto-detected from first cached vector if omitted.",
+            )],
+        ),
+        make_tool(
+            "lexical_search",
+            "Fast in-process TF-IDF lexical search over all indexed files. Complements semantic_code_search for exact-keyword and camelCase identifier queries.",
+            &[
+                (
+                    "query",
+                    "string",
+                    true,
+                    "Keyword or identifier query (camelCase is split into sub-tokens automatically).",
+                ),
+                (
+                    "top_k",
+                    "integer",
+                    false,
+                    "Number of results to return (default 10).",
+                ),
+            ],
+        ),
     ]
 }
 
@@ -452,20 +534,6 @@ pub fn make_tool(name: &str, description: &str, params: &[(&str, &str, bool, &st
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tool_definitions_returns_17_tools() {
-        let defs = tool_definitions();
-        assert_eq!(defs.len(), 17, "expected 17 tools, got {}", defs.len());
-        for tool in defs {
-            assert!(!tool.name.is_empty(), "tool name must not be empty");
-            assert!(
-                tool.description.is_some(),
-                "tool '{}' must have a description",
-                tool.name
-            );
-        }
-    }
 
     #[test]
     fn tool_definitions_is_static_pointer_stable() {

@@ -195,6 +195,10 @@ export type ProfileService = ReturnType<typeof createProfileService>;
             min_combined_score: 0.1,
             require_keyword_match: false,
             require_semantic_match: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            recency_window_days: None,
+            root_dir: std::path::PathBuf::new(),
         };
         // Warm up
         let _ = index.search("feature validation", &query_vec, &opts);

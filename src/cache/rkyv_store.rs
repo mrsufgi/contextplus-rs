@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fd_lock::RwLock as FdRwLock;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::core::embeddings::{CacheEntry, VectorStore};
@@ -22,16 +23,63 @@ const _: () = assert!(
 // ---------------------------------------------------------------------------
 
 const CACHE_DIR: &str = ".mcp_data";
+const WORKTREE_SUBDIR: &str = "worktrees";
 const CACHE_VERSION: u8 = 1;
 /// Header size padded to 16-byte alignment so rkyv data starts aligned.
 const HEADER_SIZE: usize = 16;
 
+/// Detect whether `root_dir` is a git worktree (as opposed to a main checkout
+/// or non-git directory). Returns the worktree name if so.
+///
+/// Git worktrees are identified by `.git` being a *file* (not a directory)
+/// containing `gitdir: /path/to/main/.git/worktrees/<name>`. The main checkout
+/// has `.git` as a directory; non-git directories have neither.
+///
+/// Without this distinction, two checkouts of the same repo (main + worktree)
+/// would silently share `.mcp_data/*.rkyv` — embeddings keyed by relative paths
+/// would collide and corrupt each other (see memory: worktree_corrupts_git_config).
+fn worktree_name(root_dir: &Path) -> Option<String> {
+    let git_path = root_dir.join(".git");
+    let metadata = fs::metadata(&git_path).ok()?;
+    if metadata.is_dir() {
+        return None; // main checkout
+    }
+    let contents = fs::read_to_string(&git_path).ok()?;
+    let line = contents.lines().find(|l| l.starts_with("gitdir:"))?;
+    let gitdir = line.trim_start_matches("gitdir:").trim();
+    // Expect: /path/to/main/.git/worktrees/<name>
+    let path = Path::new(gitdir);
+    let parent = path.parent()?;
+    if parent.file_name()?.to_str()? != "worktrees" {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    // Reject names that would resolve to a parent directory or contain a path
+    // separator: a malicious or buggy `gitdir:` pointer ending in `..` would
+    // otherwise collapse the worktree's cache into the main checkout's
+    // directory and silently defeat the per-worktree isolation guarantee.
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn cache_dir(root_dir: &Path) -> PathBuf {
-    root_dir.join(CACHE_DIR)
+    let base = root_dir.join(CACHE_DIR);
+    match worktree_name(root_dir) {
+        Some(name) => base.join(WORKTREE_SUBDIR).join(name),
+        None => base,
+    }
 }
 
 fn cache_path(root_dir: &Path, name: &str) -> PathBuf {
     cache_dir(root_dir).join(format!("{}.rkyv", name))
+}
+
+fn write_lock_path(root_dir: &Path, name: &str) -> PathBuf {
+    // Per-cache lock so that concurrent writes to *different* caches in the
+    // same directory don't serialize against each other.
+    cache_dir(root_dir).join(format!(".{}.write.lock", name))
 }
 
 pub fn ensure_cache_dir(root_dir: &Path) -> Result<()> {
@@ -80,10 +128,20 @@ impl CacheData {
         }
         let n = cache.len();
         let dims = cache.values().next()?.vector.len() as u32;
+        debug_assert!(
+            cache.values().all(|e| e.vector.len() == dims as usize),
+            "from_cache_map: mixed vector dimensions in cache"
+        );
         let mut keys = Vec::with_capacity(n);
         let mut hashes = Vec::with_capacity(n);
         let mut vectors = Vec::with_capacity(n * dims as usize);
         for (key, entry) in cache {
+            // Skip mismatched-dim entries rather than panicking — corrupts
+            // would otherwise propagate into the on-disk archive and poison
+            // every future load.
+            if entry.vector.len() != dims as usize {
+                continue;
+            }
             keys.push(key.clone());
             hashes.push(entry.hash.clone());
             vectors.extend_from_slice(&entry.vector);
@@ -122,6 +180,24 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     ensure_cache_dir(root_dir)?;
 
+    // Acquire an exclusive advisory lock on the sentinel file before the
+    // load-merge-write sequence to prevent TOCTOU lost-update races between
+    // concurrent writers (multiple threads or processes sharing the same cache
+    // directory). The lock is blocking: a waiting writer will park until the
+    // current writer releases it, which is preferable to silently losing entries.
+    let lock_path = write_lock_path(root_dir, name);
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let mut fd_lock = FdRwLock::new(lock_file);
+    // `write()` blocks until all other holders release the lock.
+    let _guard = fd_lock.write()?;
+
+    // --- critical section: load → merge → write ---
+
     // Read-modify-write: merge with whatever is currently on disk so we don't
     // lose entries written by a concurrent process between our load and save.
     let merged = match load_cache(root_dir, name)? {
@@ -155,6 +231,7 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
         return Err(e.into());
     }
 
+    // _guard dropped here, releasing the exclusive lock
     Ok(())
 }
 
@@ -694,6 +771,69 @@ mod tests {
         );
     }
 
+    /// ADV-004 regression: N concurrent threads each writing disjoint keys must
+    /// produce a final cache that contains ALL entries (union), not just the last
+    /// writer's batch.  Without the file lock this test fails intermittently
+    /// (last writer silently drops earlier writers' entries); with the lock it
+    /// must pass every time.
+    #[test]
+    fn concurrent_writers_no_lost_updates() {
+        use std::collections::HashSet;
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+
+        const N: usize = 4;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Ensure the cache dir and lock file exist before spawning threads so
+        // all threads race against the same pre-created sentinel.
+        ensure_cache_dir(&root).unwrap();
+
+        let barrier = StdArc::new(Barrier::new(N));
+
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let root = root.clone();
+                let barrier = StdArc::clone(&barrier);
+                s.spawn(move || {
+                    // Each thread owns exactly one unique key.
+                    let key = format!("file_{}.ts", i);
+                    let data = CacheData {
+                        dims: 2,
+                        keys: vec![key],
+                        hashes: vec![format!("hash_{}", i)],
+                        vectors: vec![i as f32, i as f32 + 0.1],
+                    };
+                    // All threads synchronize here to maximise the chance of
+                    // concurrent entry into save_cache.
+                    barrier.wait();
+                    save_cache(&root, "race-test", &data).unwrap();
+                });
+            }
+        });
+
+        let loaded = load_cache(&root, "race-test").unwrap().unwrap();
+        let key_set: HashSet<_> = loaded.keys.iter().cloned().collect();
+
+        for i in 0..N {
+            let expected = format!("file_{}.ts", i);
+            assert!(
+                key_set.contains(&expected),
+                "key '{}' was lost in concurrent write — TOCTOU not fixed; got keys={:?}",
+                expected,
+                loaded.keys
+            );
+        }
+        assert_eq!(
+            loaded.keys.len(),
+            N,
+            "expected exactly {} keys, got {} — duplicate or missing entries",
+            N,
+            loaded.keys.len()
+        );
+    }
+
     // -- mmap_vector_store tests (zero-copy) --
 
     #[test]
@@ -811,6 +951,142 @@ mod tests {
                 m.1
             );
         }
+    }
+
+    // -- Worktree-aware namespacing --
+
+    #[test]
+    fn cache_dir_main_checkout_unchanged() {
+        // No .git → treated as main checkout (backward-compatible path).
+        let dir = TempDir::new().unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn cache_dir_with_git_directory_is_main_checkout() {
+        // .git as directory → main checkout.
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn cache_dir_with_git_file_is_worktree() {
+        // .git as file with `gitdir: …/worktrees/<name>` → namespaced.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/main/.git/worktrees/feature-x\n",
+        )
+        .unwrap();
+        let expected = dir
+            .path()
+            .join(".mcp_data")
+            .join("worktrees")
+            .join("feature-x");
+        assert_eq!(cache_dir(dir.path()), expected);
+    }
+
+    #[test]
+    fn worktree_caches_dont_collide_with_main() {
+        // Critical: the same key written to a worktree must NOT clobber the
+        // main checkout's cache entry of the same name.
+        let main = TempDir::new().unwrap();
+        let wt = TempDir::new().unwrap();
+
+        // Mark `wt` as a worktree
+        fs::write(
+            wt.path().join(".git"),
+            "gitdir: /tmp/main/.git/worktrees/wt-a\n",
+        )
+        .unwrap();
+
+        let main_data = CacheData {
+            dims: 1,
+            keys: vec!["k".into()],
+            hashes: vec!["main".into()],
+            vectors: vec![1.0],
+        };
+        let wt_data = CacheData {
+            dims: 1,
+            keys: vec!["k".into()],
+            hashes: vec!["worktree".into()],
+            vectors: vec![9.0],
+        };
+
+        save_cache(main.path(), "shared", &main_data).unwrap();
+        save_cache(wt.path(), "shared", &wt_data).unwrap();
+
+        let loaded_main = load_cache(main.path(), "shared").unwrap().unwrap();
+        let loaded_wt = load_cache(wt.path(), "shared").unwrap().unwrap();
+
+        assert_eq!(loaded_main.hashes[0], "main");
+        assert_eq!(loaded_wt.hashes[0], "worktree");
+    }
+
+    #[test]
+    fn malformed_git_file_falls_through_to_main_checkout() {
+        // A .git file without `gitdir:` or with malformed contents shouldn't
+        // crash — fall back to the unprefixed cache path.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".git"), "garbage\n").unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn git_file_pointing_outside_worktrees_falls_through() {
+        // gitdir pointing somewhere other than .git/worktrees/<name> (e.g.
+        // submodule) shouldn't be treated as a worktree.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/repo/.git/modules/sub\n",
+        )
+        .unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn write_lock_paths_are_per_cache_name() {
+        // Two different cache names in the same directory must use distinct
+        // lock files; otherwise concurrent writes serialize unnecessarily.
+        let dir = TempDir::new().unwrap();
+        let lock_a = write_lock_path(dir.path(), "cache_a");
+        let lock_b = write_lock_path(dir.path(), "cache_b");
+        assert_ne!(lock_a, lock_b);
+        assert!(
+            lock_a
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("cache_a"),
+            "lock filename must include the cache name, got {:?}",
+            lock_a
+        );
+    }
+
+    #[test]
+    fn worktree_name_rejects_path_traversal_pointers() {
+        // A malicious gitdir pointer ending in `..` or `.` would otherwise
+        // collapse the worktree's cache into the main checkout's directory.
+        let dir = TempDir::new().unwrap();
+
+        // gitdir ending in ".." → reject
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/repo/.git/worktrees/..\n",
+        )
+        .unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+
+        // gitdir ending in "." → reject
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/repo/.git/worktrees/.\n",
+        )
+        .unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
     }
 
     #[test]
