@@ -14,8 +14,7 @@
 //! a model. Tune by editing the constants below if a calibration dataset
 //! shows the ordering is wrong.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const WEIGHT_CHANGED_LINES: f64 = 1.0;
 pub const WEIGHT_CHANGED_SYMBOLS: f64 = 5.0;
@@ -83,31 +82,6 @@ pub fn rank(inputs: &[FileRiskInput]) -> Vec<FileRisk> {
     out
 }
 
-/// Convenience: build risk inputs from raw count maps. Files that appear
-/// in any of the three maps are scored; missing entries default to zero.
-pub fn rank_from_maps(
-    changed_lines: &HashMap<PathBuf, u32>,
-    changed_symbols: &HashMap<PathBuf, u32>,
-    dependents: &HashMap<PathBuf, u32>,
-) -> Vec<FileRisk> {
-    let mut all: std::collections::BTreeSet<&Path> = std::collections::BTreeSet::new();
-    all.extend(changed_lines.keys().map(|p| p.as_path()));
-    all.extend(changed_symbols.keys().map(|p| p.as_path()));
-    all.extend(dependents.keys().map(|p| p.as_path()));
-
-    let inputs: Vec<FileRiskInput> = all
-        .into_iter()
-        .map(|p| FileRiskInput {
-            path: p.to_path_buf(),
-            changed_lines: changed_lines.get(p).copied().unwrap_or(0),
-            changed_symbol_count: changed_symbols.get(p).copied().unwrap_or(0),
-            dependent_count: dependents.get(p).copied().unwrap_or(0),
-        })
-        .collect();
-
-    rank(&inputs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,34 +136,6 @@ mod tests {
     #[test]
     fn rank_empty_input_returns_empty() {
         assert!(rank(&[]).is_empty());
-    }
-
-    #[test]
-    fn rank_from_maps_unions_keys() {
-        let mut lines = HashMap::new();
-        lines.insert(PathBuf::from("a.rs"), 10);
-        let mut symbols = HashMap::new();
-        symbols.insert(PathBuf::from("b.rs"), 1);
-        let mut deps = HashMap::new();
-        deps.insert(PathBuf::from("c.rs"), 5);
-
-        let ranked = rank_from_maps(&lines, &symbols, &deps);
-        let paths: Vec<&PathBuf> = ranked.iter().map(|r| &r.path).collect();
-        assert_eq!(paths.len(), 3);
-        assert!(paths.contains(&&PathBuf::from("a.rs")));
-        assert!(paths.contains(&&PathBuf::from("b.rs")));
-        assert!(paths.contains(&&PathBuf::from("c.rs")));
-    }
-
-    #[test]
-    fn rank_from_maps_default_missing_to_zero() {
-        let mut lines = HashMap::new();
-        lines.insert(PathBuf::from("a.rs"), 5);
-        let symbols = HashMap::new();
-        let deps = HashMap::new();
-        let ranked = rank_from_maps(&lines, &symbols, &deps);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].score, WEIGHT_CHANGED_LINES * 5.0);
     }
 
     #[test]
