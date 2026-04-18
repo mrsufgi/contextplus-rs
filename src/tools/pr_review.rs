@@ -65,7 +65,12 @@ pub fn analyze(
         changed_symbols_grouped(&changes, symbols_by_file);
     let changed_symbol_count_map: HashMap<PathBuf, u32> = symbols_per_file_set
         .iter()
-        .map(|(p, syms)| (PathBuf::from(p), syms.len() as u32))
+        .map(|(p, syms)| {
+            (
+                PathBuf::from(p),
+                u32::try_from(syms.len()).unwrap_or(u32::MAX),
+            )
+        })
         .collect();
 
     let dependent_count_map = dependent_count_per_seed(&changed_paths, &dependents);

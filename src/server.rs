@@ -451,16 +451,28 @@ impl ContextPlusServer {
                     }
                 }
 
-                // Persist to disk outside the write lock scope
+                // Persist to disk outside the write lock scope. The save path
+                // takes a blocking fd-lock + does sync I/O, so move it off the
+                // Tokio worker via spawn_blocking.
                 let store = crate::core::embeddings::VectorStore::from_cache(&cache);
                 drop(cache);
                 let embed_cache_name =
                     cache_name("embeddings", &self.state.config.ollama_embed_model);
-                if let Some(s) = store
-                    && let Err(e) =
-                        rkyv_store::save_vector_store(&self.state.root_dir, &embed_cache_name, &s)
-                {
-                    tracing::warn!("Failed to save incremental embedding cache: {e}");
+                if let Some(s) = store {
+                    let root = self.state.root_dir.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        rkyv_store::save_vector_store(&root, &embed_cache_name, &s)
+                    })
+                    .await;
+                    match result {
+                        Ok(Err(e)) => tracing::warn!(
+                            "Failed to save incremental embedding cache: {e}"
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            "save_vector_store spawn_blocking join failed: {join_err}"
+                        ),
+                        Ok(Ok(())) => {}
+                    }
                 }
             }
             Err(e) => {
@@ -629,10 +641,20 @@ impl ContextPlusServer {
                         .collect();
                     let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
                     let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
-                    if let Err(e) =
-                        rkyv_store::save_vector_store(&self.state.root_dir, &id_cache_name, &store)
-                    {
-                        tracing::warn!("Failed to save identifier embedding cache: {e}");
+                    let root = self.state.root_dir.clone();
+                    let cache_name_owned = id_cache_name.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        rkyv_store::save_vector_store(&root, &cache_name_owned, &store)
+                    })
+                    .await;
+                    match result {
+                        Ok(Err(e)) => tracing::warn!(
+                            "Failed to save identifier embedding cache: {e}"
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            "save_vector_store spawn_blocking join failed: {join_err}"
+                        ),
+                        Ok(Ok(())) => {}
                     }
                 }
             }
@@ -1275,7 +1297,9 @@ impl ContextPlusServer {
             .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
         let ignore_names: Option<std::collections::HashSet<String>> = Self::get_string_array(&args, "ignore_names")
             .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
-        let max_results = Self::get_usize(&args, "max_results");
+        // Treat 0 as "use default" so callers cannot accidentally request a
+        // truncated-to-zero result set that looks like "no dead code found".
+        let max_results = Self::get_usize(&args, "max_results").filter(|&n| n > 0);
 
         let formatted = tokio::task::spawn_blocking(move || {
             let mut symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
@@ -1331,8 +1355,16 @@ impl ContextPlusServer {
 
         let diff = Self::get_str(&args, "diff")
             .ok_or_else(|| ContextPlusError::Other("diff is required".into()))?;
-        let max_hops = Self::get_usize(&args, "max_hops");
-        let max_files = Self::get_usize(&args, "max_files");
+        // Clamp caller-supplied bounds so a missing/large value cannot
+        // turn the BFS into an effectively unbounded walk.
+        const MAX_HOPS_CAP: usize = 10;
+        const MAX_FILES_CAP: usize = 2000;
+        let max_hops = Self::get_usize(&args, "max_hops")
+            .unwrap_or(2)
+            .min(MAX_HOPS_CAP);
+        let max_files = Self::get_usize(&args, "max_files")
+            .unwrap_or(500)
+            .min(MAX_FILES_CAP);
 
         let cache = self.ensure_project_cache().await?;
         let root = self.state.root_dir.clone();
@@ -1354,8 +1386,8 @@ impl ContextPlusServer {
 
             let reverse_graph = build_reverse_graph(&all_abs_paths);
             let expansion_opts = ExpansionOptions {
-                max_hops: max_hops.unwrap_or(2),
-                max_files: max_files.unwrap_or(500),
+                max_hops,
+                max_files,
             };
 
             let report = analyze(&diff, &symbols_by_file, &reverse_graph, expansion_opts);
@@ -1420,7 +1452,11 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         use crate::tools::embedding_quality_check::{check_embeddings, format_report};
 
-        let requested_dim = Self::get_usize(&args, "expected_dim");
+        // Reject explicit expected_dim=0 — without this filter, callers
+        // passing 0 would have every non-empty vector flagged as a
+        // dimension mismatch, producing a misleading "everything is broken"
+        // report.
+        let requested_dim = Self::get_usize(&args, "expected_dim").filter(|&d| d > 0);
 
         let vectors: Vec<(PathBuf, Vec<f32>)> = {
             let guard = self.state.embedding_cache.read().await;
