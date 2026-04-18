@@ -18,9 +18,9 @@ use crate::tools::semantic_search::{split_camel_case, SearchDocument};
 
 /// In-process inverted index over a [`SearchDocument`] slice.
 ///
-/// Each posting maps a lowercase token → sorted `Vec` of doc indices that
-/// contain it (binary presence — multiple occurrences do **not** inflate the
-/// posting list).
+/// Construct via [`LexicalIndex::build`]. Each posting maps a lowercase token
+/// → sorted `Vec` of doc indices that contain it (binary presence — multiple
+/// occurrences do **not** inflate the posting list).
 pub struct LexicalIndex {
     /// token → sorted list of doc indices that contain the token.
     posting: HashMap<String, Vec<usize>>,
@@ -28,14 +28,6 @@ pub struct LexicalIndex {
 }
 
 impl LexicalIndex {
-    /// Create an empty index.
-    pub fn new() -> Self {
-        Self {
-            posting: HashMap::new(),
-            doc_count: 0,
-        }
-    }
-
     /// Build an index from a slice of [`SearchDocument`]s.
     ///
     /// Tokenises `path + header + symbols.join(' ') + content` via
@@ -125,12 +117,6 @@ impl LexicalIndex {
         });
         ranked.truncate(top_k);
         ranked
-    }
-}
-
-impl Default for LexicalIndex {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
