@@ -818,6 +818,28 @@ impl SearchIndex {
         let query_lower = query.trim().to_lowercase();
         let query_kind = detect_query_kind(query);
 
+        // Precompute recency boost for every document ONCE before the parallel
+        // scoring loop.  For a 5k-document index this reduces fs::metadata()
+        // calls from O(N) inside rayon work-units (expensive per-thread
+        // syscall) to a single sequential O(N) pass whose results are read via
+        // O(1) HashMap look-ups inside par_iter.
+        // Skip building the map entirely when the window is disabled.
+        let recency_by_path: std::collections::HashMap<&str, f64> =
+            if opts.recency_window_days.map_or(true, |w| w == 0) {
+                std::collections::HashMap::new()
+            } else {
+                self.documents
+                    .iter()
+                    .map(|d| {
+                        let boost = recency_boost(
+                            &opts.root_dir.join(&d.path),
+                            opts.recency_window_days,
+                        );
+                        (d.path.as_str(), boost)
+                    })
+                    .collect()
+            };
+
         #[allow(clippy::type_complexity)]
         let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = self
             .documents
@@ -859,10 +881,11 @@ impl SearchIndex {
                 let keyword_score = clamp01(raw_keyword_score * query_kind_boost(query_kind, best_kind));
                 let base_combined = compute_combined_score(semantic_score, keyword_score, opts);
                 // Recency: small additive nudge so freshly-touched files break ties upward.
-                let recency = recency_boost(
-                    &opts.root_dir.join(&doc.path),
-                    opts.recency_window_days,
-                );
+                // Value was precomputed into `recency_by_path` before par_iter — O(1) lookup.
+                let recency = recency_by_path
+                    .get(doc.path.as_str())
+                    .copied()
+                    .unwrap_or(0.0);
                 let combined_score = clamp01(base_combined + recency);
 
                 if opts.require_semantic_match && semantic_score <= 0.0 {
@@ -1379,6 +1402,62 @@ mod tests {
 
         let results = index.search("something", &query_vec, &opts);
         assert!(results.is_empty());
+    }
+
+    // -- recency precompute path (200-doc smoke test) --
+
+    #[test]
+    fn test_search_recency_precompute_200_docs() {
+        // Build 200 documents so that the precomputed-recency code path is
+        // exercised at a non-trivial scale.  Correctness is covered by the
+        // targeted recency_boost_* tests; this test verifies the loop
+        // completes without panicking and returns sensible results.
+        let n = 200usize;
+        let docs: Vec<SearchDocument> = (0..n)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/module_{i}.ts"),
+                    format!("module {i}"),
+                    vec![format!("fn_{i}")],
+                    vec![],
+                    format!("content for module {i}"),
+                )
+            })
+            .collect();
+
+        // Vectors diverge slightly so cosine similarity spreads the scores.
+        let query_vec = vec![1.0_f32, 0.0, 0.0];
+        let vectors: Vec<Option<Vec<f32>>> = (0..n)
+            .map(|i| {
+                let x = 1.0 - i as f32 * 0.004; // 1.0 → 0.204
+                let y = (1.0_f32 - x * x).max(0.0).sqrt();
+                Some(vec![x, y, 0.0])
+            })
+            .collect();
+
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let opts = ResolvedSearchOptions {
+            top_k: 10,
+            semantic_weight: 0.72,
+            keyword_weight: 0.28,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            recency_window_days: Some(7), // exercise the precompute branch
+            ..Default::default()
+        };
+
+        let results = index.search("module", &query_vec, &opts);
+        // We asked for top_k=10 and have 200 docs — must get exactly 10 back.
+        assert_eq!(results.len(), 10);
+        // Scores must be in descending order.
+        for w in results.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
     }
 
     // -- format output tests --
