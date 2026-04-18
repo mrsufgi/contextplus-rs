@@ -700,6 +700,11 @@ impl ContextPlusServer {
             "prune_stale_links" => self.handle_prune_stale_links(args).await,
             "add_interlinked_context" => self.handle_add_interlinked_context(args).await,
             "retrieve_with_traversal" => self.handle_retrieve_with_traversal(args).await,
+            "find_dead_code" => self.handle_find_dead_code(args).await,
+            "review_pr_diff" => self.handle_review_pr_diff(args).await,
+            "detect_dependency_loops" => self.handle_detect_dependency_loops(args).await,
+            "check_embedding_quality" => self.handle_check_embedding_quality(args).await,
+            "lexical_search" => self.handle_lexical_search(args).await,
             _ => Ok(Self::err_text(format!("Unknown tool: {}", name))),
         }
     }
@@ -1255,6 +1260,284 @@ impl ContextPlusServer {
         }
         self.state.root_dir.clone()
     }
+
+    // ----- find_dead_code -----
+
+    async fn handle_find_dead_code(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        use crate::tools::dead_code_find::{find_dead_symbols, format_dead_symbols, DeadCodeOptions};
+
+        let cache = self.ensure_project_cache().await?;
+
+        let ignore_kinds: Option<std::collections::HashSet<String>> = args
+            .get("ignore_kinds")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            });
+        let ignore_names: Option<std::collections::HashSet<String>> = args
+            .get("ignore_names")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            });
+        let max_results = Self::get_usize(&args, "max_results");
+
+        let formatted = tokio::task::spawn_blocking(move || {
+            let mut symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
+                HashMap::new();
+            let mut tokens_by_file: HashMap<PathBuf, std::collections::HashSet<String>> =
+                HashMap::new();
+
+            for (rel_path, lines) in &cache.file_lines {
+                let path = PathBuf::from(rel_path);
+                let content = lines.join("\n");
+                let ext = rel_path.rsplit('.').next().unwrap_or("");
+                if let Ok(syms) = parse_with_tree_sitter(&content, ext) {
+                    symbols_by_file.insert(path.clone(), syms);
+                }
+                let tokens: std::collections::HashSet<String> = content
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.to_string())
+                    .collect();
+                tokens_by_file.insert(path, tokens);
+            }
+
+            let mut opts = DeadCodeOptions::default();
+            if let Some(kinds) = ignore_kinds {
+                opts.ignore_kinds = kinds;
+            }
+            if let Some(names) = ignore_names {
+                opts.ignore_names = names;
+            }
+            if let Some(max) = max_results {
+                opts.max_results = max;
+            }
+
+            let dead = find_dead_symbols(&symbols_by_file, &tokens_by_file, &opts);
+            format_dead_symbols(&dead)
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!("find_dead_code spawn_blocking failed: {e}"))
+        })?;
+
+        Ok(Self::ok_text(formatted))
+    }
+
+    // ----- review_pr_diff -----
+
+    async fn handle_review_pr_diff(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        use crate::core::dependent_expand::{build_reverse_graph, ExpansionOptions};
+        use crate::tools::pr_review::{analyze, format_report};
+
+        let diff = Self::get_str(&args, "diff")
+            .ok_or_else(|| ContextPlusError::Other("diff is required".into()))?;
+        let max_hops = Self::get_usize(&args, "max_hops");
+        let max_files = Self::get_usize(&args, "max_files");
+
+        let cache = self.ensure_project_cache().await?;
+        let root = self.state.root_dir.clone();
+
+        let formatted = tokio::task::spawn_blocking(move || {
+            let mut symbols_by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
+                HashMap::new();
+            let mut all_abs_paths: Vec<PathBuf> = Vec::new();
+
+            for (rel_path, lines) in &cache.file_lines {
+                let abs = root.join(rel_path);
+                all_abs_paths.push(abs);
+                let content = lines.join("\n");
+                let ext = rel_path.rsplit('.').next().unwrap_or("");
+                if let Ok(syms) = parse_with_tree_sitter(&content, ext) {
+                    symbols_by_file.insert(rel_path.clone(), syms);
+                }
+            }
+
+            let reverse_graph = build_reverse_graph(&all_abs_paths);
+            let expansion_opts = ExpansionOptions {
+                max_hops: max_hops.unwrap_or(2),
+                max_files: max_files.unwrap_or(500),
+            };
+
+            let report = analyze(&diff, &symbols_by_file, &reverse_graph, expansion_opts);
+            format_report(&report)
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!("review_pr_diff spawn_blocking failed: {e}"))
+        })?;
+
+        Ok(Self::ok_text(formatted))
+    }
+
+    // ----- detect_dependency_loops -----
+
+    async fn handle_detect_dependency_loops(
+        &self,
+        _args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        use crate::core::dependent_expand::build_reverse_graph;
+        use crate::tools::dependency_loop_detect::{find_cycles, format_cycles};
+
+        let cache = self.ensure_project_cache().await?;
+        let root = self.state.root_dir.clone();
+
+        let formatted = tokio::task::spawn_blocking(move || {
+            let all_abs_paths: Vec<PathBuf> =
+                cache.file_lines.keys().map(|rel| root.join(rel)).collect();
+
+            // build_reverse_graph gives reverse edges (imported -> {importers}).
+            // Invert to forward graph (importer -> {imported}) for cycle detection.
+            let reverse = build_reverse_graph(&all_abs_paths);
+            let mut forward: HashMap<PathBuf, std::collections::HashSet<PathBuf>> =
+                HashMap::new();
+            for (imported, importers) in &reverse {
+                for importer in importers {
+                    forward
+                        .entry(importer.clone())
+                        .or_default()
+                        .insert(imported.clone());
+                }
+            }
+
+            let cycles = find_cycles(&forward);
+            format_cycles(&cycles)
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!(
+                "detect_dependency_loops spawn_blocking failed: {e}"
+            ))
+        })?;
+
+        Ok(Self::ok_text(formatted))
+    }
+
+    // ----- check_embedding_quality -----
+
+    async fn handle_check_embedding_quality(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        use crate::tools::embedding_quality_check::{check_embeddings, format_report};
+
+        let requested_dim = Self::get_usize(&args, "expected_dim");
+
+        let vectors: Vec<(PathBuf, Vec<f32>)> = {
+            let guard = self.state.embedding_cache.read().await;
+            guard
+                .iter()
+                .map(|(path, entry)| (PathBuf::from(path), entry.vector.clone()))
+                .collect()
+        };
+
+        let expected_dim = requested_dim
+            .or_else(|| vectors.first().map(|(_, v)| v.len()))
+            .unwrap_or(0);
+
+        let formatted = tokio::task::spawn_blocking(move || {
+            let report = check_embeddings(&vectors, expected_dim);
+            format_report(&report)
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!(
+                "check_embedding_quality spawn_blocking failed: {e}"
+            ))
+        })?;
+
+        Ok(Self::ok_text(formatted))
+    }
+
+    // ----- lexical_search -----
+
+    async fn handle_lexical_search(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        use crate::tools::lexical_search::LexicalIndex;
+        use crate::tools::semantic_search::SearchDocument;
+
+        let query = Self::get_str(&args, "query")
+            .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
+        let top_k = Self::get_usize(&args, "top_k").unwrap_or(10);
+
+        let cache = self.ensure_project_cache().await?;
+
+        let formatted = tokio::task::spawn_blocking(move || {
+            let docs: Vec<SearchDocument> = cache
+                .file_entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .map(|e| {
+                    let content = cache
+                        .file_lines
+                        .get(&e.relative_path)
+                        .map(|lines| lines.join("\n"))
+                        .unwrap_or_default();
+                    let ext = e.relative_path.rsplit('.').next().unwrap_or("");
+                    let symbols: Vec<String> = parse_with_tree_sitter(&content, ext)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect();
+                    let header = crate::core::parser::extract_header(&content);
+                    SearchDocument::new(
+                        e.relative_path.clone(),
+                        header,
+                        symbols,
+                        vec![],
+                        content,
+                    )
+                })
+                .collect();
+
+            if docs.is_empty() {
+                return "No files indexed. Ensure the project cache is populated.".to_string();
+            }
+
+            let index = LexicalIndex::build(&docs);
+            let hits = index.search(&query, top_k);
+
+            if hits.is_empty() {
+                return format!("No lexical matches found for: {query}");
+            }
+
+            let mut lines = vec![format!(
+                "Lexical search: {} result(s) for \"{query}\"",
+                hits.len()
+            )];
+            lines.push(String::new());
+            for (rank, (doc_idx, score)) in hits.iter().enumerate() {
+                if *doc_idx < docs.len() {
+                    lines.push(format!(
+                        "{}. {} (score: {:.3})",
+                        rank + 1,
+                        docs[*doc_idx].path,
+                        score
+                    ));
+                }
+            }
+            lines.join("\n")
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!("lexical_search spawn_blocking failed: {e}"))
+        })?;
+
+        Ok(Self::ok_text(formatted))
+    }
 }
 
 // --- ServerHandler implementation ---
@@ -1405,9 +1688,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_17_tools() {
+    fn tool_definitions_returns_all_22_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 17, "expected 17 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 22, "expected 22 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -2803,5 +3086,144 @@ mod tests {
             line,
             "rp-123-abc456 | 2024-01-15T11:30:45Z | src/main.rs, src/lib.rs | test restore\n"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // New tool handlers: dispatch tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatch_find_dead_code_empty_project_returns_no_candidates() {
+        // With an empty project cache (no files), the tool should succeed and
+        // report that no dead-symbol candidates were found.
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("find_dead_code", args).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("No dead-symbol candidates"),
+            "empty project should yield no candidates, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_review_pr_diff_missing_diff_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("review_pr_diff", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("diff is required"),
+            "expected diff error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_review_pr_diff_empty_diff_returns_empty_report() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("diff".to_string(), json!(""));
+        let result = server.dispatch("review_pr_diff", args).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("empty diff"),
+            "empty diff should produce empty-report message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_detect_dependency_loops_empty_project_returns_no_cycles() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("detect_dependency_loops", args).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("No import cycles"),
+            "empty project should have no cycles, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_check_embedding_quality_empty_cache_reports_no_issues() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("check_embedding_quality", args).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("No issues found") || text.contains("0 vector"),
+            "empty cache should yield no issues, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_lexical_search_missing_query_returns_error() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let result = server.dispatch("lexical_search", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("query is required"),
+            "expected query error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_lexical_search_empty_project_reports_no_files() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), json!("anything"));
+        let result = server.dispatch("lexical_search", args).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        // Either "No files indexed" (no cache) or "No lexical matches" (empty result).
+        assert!(
+            text.contains("No files indexed") || text.contains("No lexical matches"),
+            "empty project should yield no results, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_definitions_includes_new_five_tools() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|t| t.name.as_ref()).collect();
+        for expected in &[
+            "find_dead_code",
+            "review_pr_diff",
+            "detect_dependency_loops",
+            "check_embedding_quality",
+            "lexical_search",
+        ] {
+            assert!(
+                names.contains(expected),
+                "tool_definitions missing: {expected}"
+            );
+        }
     }
 }
