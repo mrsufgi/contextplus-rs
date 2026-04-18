@@ -117,10 +117,20 @@ impl CacheData {
         }
         let n = cache.len();
         let dims = cache.values().next()?.vector.len() as u32;
+        debug_assert!(
+            cache.values().all(|e| e.vector.len() == dims as usize),
+            "from_cache_map: mixed vector dimensions in cache"
+        );
         let mut keys = Vec::with_capacity(n);
         let mut hashes = Vec::with_capacity(n);
         let mut vectors = Vec::with_capacity(n * dims as usize);
         for (key, entry) in cache {
+            // Skip mismatched-dim entries rather than panicking — corrupts
+            // would otherwise propagate into the on-disk archive and poison
+            // every future load.
+            if entry.vector.len() != dims as usize {
+                continue;
+            }
             keys.push(key.clone());
             hashes.push(entry.hash.clone());
             vectors.extend_from_slice(&entry.vector);

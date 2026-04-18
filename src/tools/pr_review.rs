@@ -222,9 +222,9 @@ fn dependent_count_per_seed(
         return out;
     }
     // Spread credit evenly across seeds. With one seed this gives the full
-    // count; with N seeds each gets ceil(n_dependents / N). The risk_score
-    // weight is small so over-attribution is bounded.
-    let per_seed = (n_dependents as u32).max(1);
+    // count; with N seeds each gets ceil(n_dependents / N).
+    let n = seeds.len() as u32;
+    let per_seed = ((n_dependents as u32).div_ceil(n)).max(1);
     for s in seeds {
         out.insert(s.clone(), per_seed);
     }

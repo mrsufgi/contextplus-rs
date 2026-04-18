@@ -49,7 +49,32 @@ pub fn hooks_dir(root_dir: &Path) -> Result<PathBuf> {
         .lines()
         .find(|l| l.starts_with("gitdir:"))
         .ok_or_else(|| ContextPlusError::Cache(".git file missing gitdir entry".into()))?;
-    let gitdir = Path::new(line.trim_start_matches("gitdir:").trim());
+    let raw = line.trim_start_matches("gitdir:").trim();
+    // Resolve gitdir to an absolute, canonical path. The .git file may
+    // contain a relative path; canonicalize against root_dir so a hostile
+    // pointer like "../../etc" cannot escape to an arbitrary directory
+    // without the path actually existing on disk.
+    let gitdir_raw = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        root_dir.join(raw)
+    };
+    let gitdir = fs::canonicalize(&gitdir_raw).map_err(|e| {
+        ContextPlusError::Cache(format!(
+            "gitdir pointer does not resolve: {} ({})",
+            gitdir_raw.display(),
+            e
+        ))
+    })?;
+    // Sanity check: the resolved gitdir must look like a real worktree dir
+    // (contains a HEAD file). This catches both corrupt .git pointers and
+    // adversarial ones that aim at attacker-controlled directories.
+    if !gitdir.is_dir() || !gitdir.join("HEAD").is_file() {
+        return Err(ContextPlusError::Cache(format!(
+            "gitdir is not a valid worktree directory: {}",
+            gitdir.display()
+        )));
+    }
     // <commondir>/worktrees/<name> → walk back to <commondir>
     let commondir = gitdir
         .parent()
@@ -96,6 +121,10 @@ pub fn uninstall_hooks(root_dir: &Path) -> Result<Vec<PathBuf>> {
             continue;
         };
         let stripped = strip_block(&existing);
+        // Nothing to do — the file existed but didn't contain our block.
+        if stripped == existing {
+            continue;
+        }
         // Treat shebang-only or whitespace-only as empty.
         let trimmed: String = stripped
             .lines()
@@ -114,12 +143,30 @@ pub fn uninstall_hooks(root_dir: &Path) -> Result<Vec<PathBuf>> {
 fn block_for(hook: &str, sentinel_dir: &Path) -> String {
     let sentinel = sentinel_dir.join(hook);
     format!(
-        "{}\n# Touch a sentinel that the running contextplus-rs MCP server picks up.\n# No-op when contextplus-rs isn't running — safe to leave installed.\nmkdir -p \"{}\" 2>/dev/null && touch \"{}\" 2>/dev/null || true\n{}",
+        "{}\n# Touch a sentinel that the running contextplus-rs MCP server picks up.\n# No-op when contextplus-rs isn't running — safe to leave installed.\nmkdir -p {} 2>/dev/null && touch {} 2>/dev/null || true\n{}",
         BEGIN_MARK,
-        sentinel_dir.display(),
-        sentinel.display(),
+        shell_quote(sentinel_dir),
+        shell_quote(&sentinel),
         END_MARK,
     )
+}
+
+/// POSIX-safe single-quoted shell literal. Single quotes in the input
+/// become `'\''`. Always returns a quoted string suitable for direct shell
+/// interpolation.
+fn shell_quote(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Insert or replace our marker block within an existing hook file.
@@ -197,6 +244,9 @@ mod tests {
 
         let wt = TempDir::new().unwrap();
         let gitdir = main.path().join(".git").join("worktrees").join("wt-a");
+        // Real git creates a HEAD file inside each worktree's gitdir; the
+        // installer now requires it as a sanity check against bogus pointers.
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(
             wt.path().join(".git"),
             format!("gitdir: {}\n", gitdir.display()),
@@ -297,6 +347,67 @@ mod tests {
         init_main_checkout(&tmp);
         install_hooks(tmp.path()).unwrap();
         assert!(tmp.path().join(".mcp_data/hooks").exists());
+    }
+
+    #[test]
+    fn hooks_dir_rejects_gitdir_pointing_at_nonexistent_path() {
+        let wt = TempDir::new().unwrap();
+        fs::write(
+            wt.path().join(".git"),
+            "gitdir: /nonexistent/path/that/does/not/exist\n",
+        )
+        .unwrap();
+        let err = hooks_dir(wt.path()).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("does not resolve") || msg.contains("not a valid"),
+            "expected gitdir validation error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn hooks_dir_rejects_gitdir_without_head_file() {
+        let main = TempDir::new().unwrap();
+        let bogus = main.path().join("not-a-worktree");
+        fs::create_dir(&bogus).unwrap();
+        let wt = TempDir::new().unwrap();
+        fs::write(
+            wt.path().join(".git"),
+            format!("gitdir: {}\n", bogus.display()),
+        )
+        .unwrap();
+        let err = hooks_dir(wt.path()).unwrap_err();
+        assert!(format!("{:?}", err).contains("not a valid worktree directory"));
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        let p = Path::new("/path with 'quotes' in it");
+        let q = shell_quote(p);
+        assert_eq!(q, "'/path with '\\''quotes'\\'' in it'");
+    }
+
+    #[test]
+    fn block_for_handles_paths_with_special_characters() {
+        let dir = Path::new("/tmp/dir with spaces/and$dollar`backtick");
+        let b = block_for("post-commit", dir);
+        // The dollar/backtick must end up inside single quotes so the shell
+        // doesn't expand them.
+        assert!(b.contains("'/tmp/dir with spaces/and$dollar`backtick'"));
+    }
+
+    #[test]
+    fn uninstall_skips_hook_files_without_our_block() {
+        let tmp = TempDir::new().unwrap();
+        init_main_checkout(&tmp);
+        let path = tmp.path().join(".git/hooks/post-commit");
+        fs::write(&path, "#!/usr/bin/env bash\necho user-only\n").unwrap();
+        let removed = uninstall_hooks(tmp.path()).unwrap();
+        assert!(removed.is_empty(), "should not report files we didn't touch");
+        // File still intact.
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("echo user-only"));
     }
 
     #[cfg(unix)]

@@ -31,8 +31,16 @@ fn normalize(v: &[f32]) -> Option<Vec<u64>> {
     if norm < 1e-6 {
         return None;
     }
-    // Represent as quantized bits for hashing equality
-    let normalized: Vec<u64> = v.iter().map(|x| (x / norm).to_bits() as u64).collect();
+    // Represent as quantized bits for hashing equality. Normalize -0.0 →
+    // +0.0 first so vectors that differ only in zero sign hash identically.
+    let normalized: Vec<u64> = v
+        .iter()
+        .map(|x| {
+            let scaled = x / norm;
+            let canonical = if scaled == 0.0 { 0.0f32 } else { scaled };
+            canonical.to_bits() as u64
+        })
+        .collect();
     Some(normalized)
 }
 

@@ -193,7 +193,24 @@ pub fn start_tracker(
                 }
             }
             if !new_files.is_empty() {
-                let _ = event_tx.try_send(new_files);
+                if let Err(e) = event_tx.try_send(new_files.clone()) {
+                    // The receiving task is gone or the channel is full.
+                    // metadata_unchanged() already recorded these paths as
+                    // "seen", so a silent drop would mean the next identical
+                    // watcher event would skip them as unchanged → lost
+                    // refresh. Roll the cache entries back so the next event
+                    // re-triggers processing.
+                    warn!(
+                        "Embedding tracker event_tx send failed ({}); invalidating {} cached metadata entries so they will be re-processed",
+                        e,
+                        new_files.len()
+                    );
+                    if let Ok(mut guard) = handler_meta_cache.lock() {
+                        for f in &new_files {
+                            guard.remove(f);
+                        }
+                    }
+                }
             }
         }
         Err(errors) => {

@@ -355,37 +355,40 @@ fn compile_globs(globs: Option<&[String]>) -> Vec<Regex> {
 ///   `?`   → match a single non-`/` character
 ///   anything else is matched literally
 pub fn glob_to_regex(glob: &str) -> String {
+    // Iterate by char (not byte) so multi-byte UTF-8 in paths survives intact.
     let mut out = String::with_capacity(glob.len() * 2 + 4);
     out.push('^');
-    let bytes = glob.as_bytes();
+    let chars: Vec<char> = glob.chars().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
+    while i < chars.len() {
+        let c = chars[i];
         match c {
-            b'*' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+            '*' if i + 1 < chars.len() && chars[i + 1] == '*' => {
                 // ** → match zero or more path segments
                 out.push_str(".*");
                 i += 2;
                 // swallow a trailing slash so `src/**/foo` accepts `src/foo`
-                if i < bytes.len() && bytes[i] == b'/' {
+                if i < chars.len() && chars[i] == '/' {
                     i += 1;
                 }
             }
-            b'*' => {
+            '*' => {
                 out.push_str("[^/]*");
                 i += 1;
             }
-            b'?' => {
+            '?' => {
                 out.push_str("[^/]");
                 i += 1;
             }
-            b'.' | b'+' | b'(' | b')' | b'|' | b'^' | b'$' | b'{' | b'}' | b'[' | b']' | b'\\' => {
+            // All Rust-regex metacharacters that need escaping when matched
+            // literally. Source: regex crate "Syntax" docs.
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
                 out.push('\\');
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
             _ => {
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
         }
@@ -513,8 +516,14 @@ pub(crate) fn snippet_for_doc(
 
 /// Cosine similarity between two f32 vectors.
 /// Delegates to simsimd for SIMD-accelerated computation.
+///
+/// Returns 0.0 if dimensions mismatch — simsimd would otherwise read past
+/// the shorter slice's end (UB in release builds).
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
+    if a.len() != b.len() {
+        debug_assert!(false, "vector dimension mismatch: {} vs {}", a.len(), b.len());
+        return 0.0;
+    }
     if a.iter().all(|&v| v == 0.0) {
         return 0.0;
     }
@@ -664,8 +673,9 @@ pub fn detect_query_kind(query: &str) -> QueryKind {
     if trimmed.is_empty() {
         return QueryKind::Generic;
     }
-    // Multi-word natural language — no shape to lean on.
-    if trimmed.chars().filter(|c| c.is_whitespace()).count() >= 2 {
+    // Multi-word natural language — no shape to lean on. Anything with
+    // whitespace inside it is a phrase, not an identifier.
+    if trimmed.chars().any(|c| c.is_whitespace()) {
         return QueryKind::Generic;
     }
     if trimmed.contains("::") || trimmed.contains('/') || trimmed.contains('.') {
@@ -778,12 +788,17 @@ impl SearchIndex {
         let mut buffer = vec![0.0f32; n * dims];
         let mut has_vec = Vec::with_capacity(n);
         for (i, v) in vectors.iter().enumerate() {
-            if let Some(vec) = v {
-                let offset = i * dims;
-                buffer[offset..offset + dims].copy_from_slice(vec);
-                has_vec.push(true);
-            } else {
-                has_vec.push(false);
+            match v {
+                Some(vec) if vec.len() == dims => {
+                    let offset = i * dims;
+                    buffer[offset..offset + dims].copy_from_slice(vec);
+                    has_vec.push(true);
+                }
+                Some(_) => {
+                    // Mixed-dim vector — treat as missing rather than panicking.
+                    has_vec.push(false);
+                }
+                None => has_vec.push(false),
             }
         }
         self.documents = docs;
@@ -1458,6 +1473,15 @@ mod tests {
         assert_eq!(detect_query_kind(""), QueryKind::Generic);
     }
 
+    #[test]
+    fn detect_two_word_phrases_as_generic() {
+        // Pre-fix these were classified as Function/Class because the
+        // whitespace-count guard required >=2 spaces (3+ words).
+        assert_eq!(detect_query_kind("doStuff more"), QueryKind::Generic);
+        assert_eq!(detect_query_kind("parseHTML config"), QueryKind::Generic);
+        assert_eq!(detect_query_kind("MemberRepo find"), QueryKind::Generic);
+    }
+
     // -- query_kind_boost mapping --
 
     #[test]
@@ -1606,6 +1630,21 @@ mod tests {
     fn glob_escapes_regex_metacharacters() {
         assert!(glob_matches("file.rs", "file.rs"));
         assert!(!glob_matches("file.rs", "fileXrs"));
+    }
+
+    #[test]
+    fn glob_handles_multibyte_utf8_paths() {
+        // Pre-fix this iterated bytes and split UTF-8 sequences mid-codepoint.
+        assert!(glob_matches("**/café/**", "src/café/menu.ts"));
+        assert!(glob_matches("docs/中文.md", "docs/中文.md"));
+        assert!(!glob_matches("docs/中文.md", "docs/eng.md"));
+    }
+
+    #[test]
+    fn glob_escapes_brackets_and_braces_literally() {
+        assert!(glob_matches("file[1].rs", "file[1].rs"));
+        assert!(!glob_matches("file[1].rs", "file1.rs"));
+        assert!(glob_matches("a{b}c", "a{b}c"));
     }
 
     // -- path_passes_filters tests --
