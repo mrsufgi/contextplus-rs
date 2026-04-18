@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fd_lock::RwLock as FdRwLock;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::core::embeddings::{CacheEntry, VectorStore};
@@ -69,6 +70,10 @@ fn cache_dir(root_dir: &Path) -> PathBuf {
 
 fn cache_path(root_dir: &Path, name: &str) -> PathBuf {
     cache_dir(root_dir).join(format!("{}.rkyv", name))
+}
+
+fn write_lock_path(root_dir: &Path) -> PathBuf {
+    cache_dir(root_dir).join(".write.lock")
 }
 
 pub fn ensure_cache_dir(root_dir: &Path) -> Result<()> {
@@ -169,6 +174,24 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     ensure_cache_dir(root_dir)?;
 
+    // Acquire an exclusive advisory lock on the sentinel file before the
+    // load-merge-write sequence to prevent TOCTOU lost-update races between
+    // concurrent writers (multiple threads or processes sharing the same cache
+    // directory). The lock is blocking: a waiting writer will park until the
+    // current writer releases it, which is preferable to silently losing entries.
+    let lock_path = write_lock_path(root_dir);
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let mut fd_lock = FdRwLock::new(lock_file);
+    // `write()` blocks until all other holders release the lock.
+    let _guard = fd_lock.write()?;
+
+    // --- critical section: load → merge → write ---
+
     // Read-modify-write: merge with whatever is currently on disk so we don't
     // lose entries written by a concurrent process between our load and save.
     let merged = match load_cache(root_dir, name)? {
@@ -202,6 +225,7 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
         return Err(e.into());
     }
 
+    // _guard dropped here, releasing the exclusive lock
     Ok(())
 }
 
@@ -738,6 +762,69 @@ mod tests {
             lingering.is_empty(),
             "temp files should not linger: {:?}",
             lingering
+        );
+    }
+
+    /// ADV-004 regression: N concurrent threads each writing disjoint keys must
+    /// produce a final cache that contains ALL entries (union), not just the last
+    /// writer's batch.  Without the file lock this test fails intermittently
+    /// (last writer silently drops earlier writers' entries); with the lock it
+    /// must pass every time.
+    #[test]
+    fn concurrent_writers_no_lost_updates() {
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+        use std::sync::Arc as StdArc;
+
+        const N: usize = 4;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Ensure the cache dir and lock file exist before spawning threads so
+        // all threads race against the same pre-created sentinel.
+        ensure_cache_dir(&root).unwrap();
+
+        let barrier = StdArc::new(Barrier::new(N));
+
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let root = root.clone();
+                let barrier = StdArc::clone(&barrier);
+                s.spawn(move || {
+                    // Each thread owns exactly one unique key.
+                    let key = format!("file_{}.ts", i);
+                    let data = CacheData {
+                        dims: 2,
+                        keys: vec![key],
+                        hashes: vec![format!("hash_{}", i)],
+                        vectors: vec![i as f32, i as f32 + 0.1],
+                    };
+                    // All threads synchronize here to maximise the chance of
+                    // concurrent entry into save_cache.
+                    barrier.wait();
+                    save_cache(&root, "race-test", &data).unwrap();
+                });
+            }
+        });
+
+        let loaded = load_cache(&root, "race-test").unwrap().unwrap();
+        let key_set: HashSet<_> = loaded.keys.iter().cloned().collect();
+
+        for i in 0..N {
+            let expected = format!("file_{}.ts", i);
+            assert!(
+                key_set.contains(&expected),
+                "key '{}' was lost in concurrent write — TOCTOU not fixed; got keys={:?}",
+                expected,
+                loaded.keys
+            );
+        }
+        assert_eq!(
+            loaded.keys.len(),
+            N,
+            "expected exactly {} keys, got {} — duplicate or missing entries",
+            N,
+            loaded.keys.len()
         );
     }
 
