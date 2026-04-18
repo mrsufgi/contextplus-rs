@@ -1,12 +1,15 @@
 pub mod blast_radius;
 pub mod context_tree;
+pub mod dead_code_find;
 pub mod feature_hub;
 pub mod file_skeleton;
 pub mod labels;
 pub mod memory_tools;
 pub mod modes;
 pub mod navigate_constants;
+pub mod pr_review;
 pub mod propose_commit;
+pub mod risk_score;
 pub mod semantic_identifiers;
 pub mod semantic_navigate;
 pub mod semantic_search;

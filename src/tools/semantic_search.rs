@@ -133,6 +133,11 @@ pub struct SearchResult {
     pub header: String,
     pub matched_symbols: Vec<String>,
     pub matched_symbol_locations: Vec<String>,
+    /// Short content excerpt anchored at the first matched symbol (or the
+    /// document header). Bounded to a few lines so callers can render it
+    /// inline without bloating context. `None` when no useful snippet can
+    /// be extracted (empty content, etc.).
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -427,6 +432,83 @@ pub fn recency_boost(path: &Path, window_days: Option<u32>) -> f64 {
         return 0.0;
     }
     MAX_RECENCY_BOOST * (1.0 - age_days / window_days)
+}
+
+/// Maximum number of lines emitted in a result snippet (excluding the
+/// optional `…` truncation marker). Keeps result payloads small enough
+/// that callers can render many results without context blow-up.
+pub const SNIPPET_MAX_LINES: usize = 6;
+
+/// Pull a short excerpt out of `content` anchored at `line` (1-indexed).
+/// Skips blank-only excerpts. When `end_line` is supplied the snippet
+/// won't exceed it. Returns `None` when there's nothing meaningful to
+/// surface (empty content or a line that's out of bounds).
+pub fn extract_snippet(content: &str, line: u32, end_line: Option<u32>) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    if line == 0 {
+        return None;
+    }
+    let start_idx = (line as usize).saturating_sub(1);
+    let lines: Vec<&str> = content.lines().collect();
+    if start_idx >= lines.len() {
+        return None;
+    }
+    let hard_end = end_line
+        .map(|e| (e as usize).min(lines.len()))
+        .unwrap_or(lines.len());
+    let soft_end = (start_idx + SNIPPET_MAX_LINES).min(hard_end);
+    let take_end = soft_end.max(start_idx + 1);
+    let slice = &lines[start_idx..take_end];
+    let joined: String = slice.join("\n");
+    if joined.trim().is_empty() {
+        return None;
+    }
+    if take_end < hard_end {
+        Some(format!("{joined}\n…"))
+    } else {
+        Some(joined)
+    }
+}
+
+/// Parse a `name@L<start>` or `name@L<start>-L<end>` location string back
+/// into `(start, Option<end>)`. Returns `None` for malformed inputs.
+pub(crate) fn parse_location_string(loc: &str) -> Option<(u32, Option<u32>)> {
+    let (_name, range) = loc.rsplit_once('@')?;
+    let range = range.strip_prefix('L')?;
+    if let Some((s, e)) = range.split_once("-L") {
+        let start: u32 = s.parse().ok()?;
+        let end: u32 = e.parse().ok()?;
+        Some((start, Some(end)))
+    } else {
+        let start: u32 = range.parse().ok()?;
+        Some((start, None))
+    }
+}
+
+/// Pick a snippet for `doc` using its first matched-symbol location, or
+/// fall back to the document header / first content line when no symbol
+/// matched.
+pub(crate) fn snippet_for_doc(
+    doc: &SearchDocument,
+    matched_symbol_locations: &[String],
+) -> Option<String> {
+    if let Some(loc) = matched_symbol_locations.first() {
+        if let Some((start, end)) = parse_location_string(loc) {
+            if let Some(snippet) = extract_snippet(&doc.content, start, end) {
+                return Some(snippet);
+            }
+        }
+    }
+    // Fall back to the first non-empty content line if no symbol info.
+    let first_line = doc.content.lines().find(|l| !l.trim().is_empty())?;
+    let trimmed: String = first_line.chars().take(160).collect();
+    if trimmed.trim().is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Cosine similarity between two f32 vectors.
@@ -815,6 +897,7 @@ impl SearchIndex {
                     matched_symbol_locations,
                 )| {
                     let doc = &self.documents[idx];
+                    let snippet = snippet_for_doc(doc, &matched_symbol_locations);
                     SearchResult {
                         path: doc.path.clone(),
                         score: (score * 1000.0).round() / 10.0,
@@ -823,6 +906,7 @@ impl SearchIndex {
                         header: doc.header.clone(),
                         matched_symbols,
                         matched_symbol_locations,
+                        snippet,
                     }
                 },
             )
@@ -840,6 +924,17 @@ impl SearchIndex {
 
 /// Format search results as text output (matching TS format).
 pub fn format_search_results(query: &str, results: &[SearchResult]) -> String {
+    format_search_results_with_freshness(query, results, None)
+}
+
+/// Format search results with an optional cache-freshness banner. The
+/// banner reports total indexed documents so the caller can sanity-check
+/// that the search ran against a populated index.
+pub fn format_search_results_with_freshness(
+    query: &str,
+    results: &[SearchResult],
+    indexed_documents: Option<usize>,
+) -> String {
     if results.is_empty() {
         return "No matching files found for the given query.".to_string();
     }
@@ -850,6 +945,9 @@ pub fn format_search_results(query: &str, results: &[SearchResult]) -> String {
         results.len(),
         query
     ));
+    if let Some(count) = indexed_documents {
+        lines.push(format!("Index: {count} document(s)\n"));
+    }
 
     for (i, r) in results.iter().enumerate() {
         lines.push(format!("{}. {} ({}% total)", i + 1, r.path, r.score));
@@ -871,6 +969,12 @@ pub fn format_search_results(query: &str, results: &[SearchResult]) -> String {
                 "   Definition lines: {}",
                 r.matched_symbol_locations.join(", ")
             ));
+        }
+        if let Some(snippet) = &r.snippet {
+            lines.push("   Snippet:".to_string());
+            for snippet_line in snippet.lines() {
+                lines.push(format!("     {snippet_line}"));
+            }
         }
         lines.push(String::new());
     }
@@ -911,7 +1015,11 @@ pub async fn semantic_code_search(
     index.index_with_vectors(docs, vectors);
 
     let results = index.search(query.as_ref(), &query_vec, &resolved);
-    Ok(format_search_results(query.as_ref(), &results))
+    Ok(format_search_results_with_freshness(
+        query.as_ref(),
+        &results,
+        Some(index.document_count()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,6 +1384,7 @@ mod tests {
             header: "auth module".to_string(),
             matched_symbols: vec!["verifyToken".to_string()],
             matched_symbol_locations: vec!["verifyToken@L10-L25".to_string()],
+            snippet: None,
         }];
         let output = format_search_results("auth", &results);
         assert!(output.contains("src/auth.ts"));
@@ -1572,5 +1681,159 @@ mod tests {
         assert!(boost <= MAX_RECENCY_BOOST);
         // a freshly-touched file should be very close to MAX (within a few seconds)
         assert!(boost > MAX_RECENCY_BOOST * 0.99);
+    }
+
+    // -- parse_location_string tests --
+
+    #[test]
+    fn parse_location_string_with_range() {
+        assert_eq!(
+            parse_location_string("getUserById@L10-L25"),
+            Some((10, Some(25)))
+        );
+    }
+
+    #[test]
+    fn parse_location_string_without_range() {
+        assert_eq!(parse_location_string("foo@L42"), Some((42, None)));
+    }
+
+    #[test]
+    fn parse_location_string_handles_at_in_name() {
+        // names containing '@' use the LAST '@' as the separator
+        assert_eq!(
+            parse_location_string("ns@inner@L1-L2"),
+            Some((1, Some(2)))
+        );
+    }
+
+    #[test]
+    fn parse_location_string_rejects_garbage() {
+        assert_eq!(parse_location_string(""), None);
+        assert_eq!(parse_location_string("nothing"), None);
+        assert_eq!(parse_location_string("foo@notaline"), None);
+        assert_eq!(parse_location_string("foo@L"), None);
+    }
+
+    // -- extract_snippet tests --
+
+    #[test]
+    fn extract_snippet_uses_line_range() {
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        let s = extract_snippet(content, 2, Some(4)).unwrap();
+        assert!(s.starts_with("line2\n"));
+        assert!(s.contains("line3"));
+        assert!(s.contains("line4"));
+        // start..end was 3 lines so SNIPPET_MAX_LINES isn't the cap
+        assert!(!s.contains('…'));
+    }
+
+    #[test]
+    fn extract_snippet_truncates_at_max_lines() {
+        let content: String = (1..=20).map(|n| format!("line{n}\n")).collect();
+        let s = extract_snippet(&content, 1, Some(20)).unwrap();
+        assert!(s.contains("line1"));
+        assert!(s.contains("line6"));
+        assert!(s.ends_with("…"));
+    }
+
+    #[test]
+    fn extract_snippet_returns_none_for_empty_content() {
+        assert!(extract_snippet("", 1, None).is_none());
+    }
+
+    #[test]
+    fn extract_snippet_returns_none_for_out_of_bounds_line() {
+        assert!(extract_snippet("only\none\nline\n", 99, None).is_none());
+    }
+
+    #[test]
+    fn extract_snippet_returns_none_for_line_zero() {
+        assert!(extract_snippet("foo\nbar\n", 0, None).is_none());
+    }
+
+    // -- snippet_for_doc tests --
+
+    fn doc_with(content: &str, symbols: Vec<SymbolSearchEntry>) -> SearchDocument {
+        SearchDocument::new(
+            "src/foo.ts".to_string(),
+            "header".to_string(),
+            symbols.iter().map(|s| s.name.clone()).collect(),
+            symbols,
+            content.to_string(),
+        )
+    }
+
+    #[test]
+    fn snippet_for_doc_uses_matched_location() {
+        let doc = doc_with("a\nb\nc\nd\ne\n", vec![]);
+        let snippet = snippet_for_doc(&doc, &["foo@L2-L4".to_string()]).unwrap();
+        assert!(snippet.contains('b'));
+        assert!(snippet.contains('d'));
+    }
+
+    #[test]
+    fn snippet_for_doc_falls_back_to_first_line_when_no_locations() {
+        let doc = doc_with("\n\nfirst real line\nmore\n", vec![]);
+        let snippet = snippet_for_doc(&doc, &[]).unwrap();
+        assert_eq!(snippet, "first real line");
+    }
+
+    #[test]
+    fn snippet_for_doc_returns_none_for_empty_content() {
+        let doc = doc_with("", vec![]);
+        assert!(snippet_for_doc(&doc, &[]).is_none());
+    }
+
+    // -- format_search_results_with_freshness tests --
+
+    #[test]
+    fn format_results_includes_freshness_banner() {
+        let results = vec![SearchResult {
+            path: "src/x.ts".to_string(),
+            score: 50.0,
+            semantic_score: 60.0,
+            keyword_score: 40.0,
+            header: String::new(),
+            matched_symbols: vec![],
+            matched_symbol_locations: vec![],
+            snippet: None,
+        }];
+        let out = format_search_results_with_freshness("q", &results, Some(123));
+        assert!(out.contains("Index: 123 document(s)"));
+    }
+
+    #[test]
+    fn format_results_renders_snippet_indented() {
+        let results = vec![SearchResult {
+            path: "src/x.ts".to_string(),
+            score: 50.0,
+            semantic_score: 60.0,
+            keyword_score: 40.0,
+            header: String::new(),
+            matched_symbols: vec![],
+            matched_symbol_locations: vec![],
+            snippet: Some("fn foo() {\n  bar()\n}".to_string()),
+        }];
+        let out = format_search_results_with_freshness("q", &results, None);
+        assert!(out.contains("Snippet:"));
+        assert!(out.contains("     fn foo() {"));
+        assert!(out.contains("       bar()"));
+    }
+
+    #[test]
+    fn format_results_omits_freshness_when_none() {
+        let results = vec![SearchResult {
+            path: "src/x.ts".to_string(),
+            score: 50.0,
+            semantic_score: 60.0,
+            keyword_score: 40.0,
+            header: String::new(),
+            matched_symbols: vec![],
+            matched_symbol_locations: vec![],
+            snippet: None,
+        }];
+        let out = format_search_results_with_freshness("q", &results, None);
+        assert!(!out.contains("Index:"));
     }
 }
