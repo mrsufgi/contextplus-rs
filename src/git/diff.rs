@@ -77,12 +77,11 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
                     ranges: Vec::new(),
                 });
             }
-        } else if line.starts_with("@@") {
-            if let Some(range) = parse_hunk_header(line)
-                && let Some(c) = current.as_mut()
-            {
-                c.ranges.push(range);
-            }
+        } else if line.starts_with("@@")
+            && let Some(range) = parse_hunk_header(line)
+            && let Some(c) = current.as_mut()
+        {
+            c.ranges.push(range);
         }
     }
     if let Some(c) = current.take() {

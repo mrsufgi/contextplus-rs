@@ -158,11 +158,11 @@ mod tests {
         assert_eq!(hits[0].hop, 0);
         assert!(
             hits.iter()
-                .any(|h| h.path == PathBuf::from("b.ts") && h.hop == 1)
+                .any(|h| h.path == Path::new("b.ts") && h.hop == 1)
         );
         assert!(
             hits.iter()
-                .any(|h| h.path == PathBuf::from("c.ts") && h.hop == 1)
+                .any(|h| h.path == Path::new("c.ts") && h.hop == 1)
         );
     }
 
@@ -186,11 +186,11 @@ mod tests {
         );
         assert!(
             hits.iter()
-                .any(|h| h.path == PathBuf::from("c.ts") && h.hop == 1)
+                .any(|h| h.path == Path::new("c.ts") && h.hop == 1)
         );
         assert!(
             hits.iter()
-                .any(|h| h.path == PathBuf::from("d.ts") && h.hop == 2)
+                .any(|h| h.path == Path::new("d.ts") && h.hop == 2)
         );
     }
 
@@ -215,9 +215,9 @@ mod tests {
             max_files: 100,
         };
         let hits = expand_dependents(&reverse, &[PathBuf::from("a.ts")], opts);
-        assert!(hits.iter().any(|h| h.path == PathBuf::from("c.ts")));
-        assert!(!hits.iter().any(|h| h.path == PathBuf::from("d.ts")));
-        assert!(!hits.iter().any(|h| h.path == PathBuf::from("e.ts")));
+        assert!(hits.iter().any(|h| h.path == Path::new("c.ts")));
+        assert!(!hits.iter().any(|h| h.path == Path::new("d.ts")));
+        assert!(!hits.iter().any(|h| h.path == Path::new("e.ts")));
     }
 
     #[test]
@@ -258,10 +258,7 @@ mod tests {
             &[PathBuf::from("seed.ts")],
             ExpansionOptions::default(),
         );
-        let x_count = hits
-            .iter()
-            .filter(|h| h.path == PathBuf::from("x.ts"))
-            .count();
+        let x_count = hits.iter().filter(|h| h.path == Path::new("x.ts")).count();
         assert_eq!(x_count, 1, "diamond importer must appear exactly once");
     }
 
@@ -284,10 +281,7 @@ mod tests {
             ExpansionOptions::default(),
         );
         // Just verifies termination + no duplication of seed.
-        let a_count = hits
-            .iter()
-            .filter(|h| h.path == PathBuf::from("a.ts"))
-            .count();
+        let a_count = hits.iter().filter(|h| h.path == Path::new("a.ts")).count();
         assert_eq!(a_count, 1);
     }
 

@@ -179,10 +179,10 @@ fn strongconnect_iterative(start: usize, adj: &[Vec<usize>], state: &mut TarjanS
         } else {
             // All edges from v processed — pop.
             work.pop();
-            if let Some(&(parent, _)) = work.last() {
-                if state.lowlinks[v] < state.lowlinks[parent] {
-                    state.lowlinks[parent] = state.lowlinks[v];
-                }
+            if let Some(&(parent, _)) = work.last()
+                && state.lowlinks[v] < state.lowlinks[parent]
+            {
+                state.lowlinks[parent] = state.lowlinks[v];
             }
             // If v is a root of an SCC, pop the stack.
             if state.lowlinks[v] == state.indices[v].unwrap() {
@@ -206,7 +206,7 @@ fn strongconnect_iterative(start: usize, adj: &[Vec<usize>], state: &mut TarjanS
 // ---------------------------------------------------------------------------
 
 /// Rotate `ring` so the lexicographically smallest element is first.
-fn normalise(ring: &mut Vec<PathBuf>) {
+fn normalise(ring: &mut [PathBuf]) {
     if ring.is_empty() {
         return;
     }

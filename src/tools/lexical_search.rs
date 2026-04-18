@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn rrf_merge_single_ranking_returns_it() {
         let ranking = vec![0usize, 1, 2];
-        let merged = rrf_merge(&[ranking.clone()], 60.0, 10);
+        let merged = rrf_merge(std::slice::from_ref(&ranking), 60.0, 10);
         // Order must be preserved (rank 0 has the highest RRF score).
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0].0, 0);
@@ -283,8 +283,8 @@ mod tests {
     fn rrf_merge_larger_k_flattens_contributions() {
         // With larger k the difference between rank-0 and rank-1 scores shrinks.
         let ranking = vec![0usize, 1];
-        let merged_small_k = rrf_merge(&[ranking.clone()], 1.0, 2);
-        let merged_large_k = rrf_merge(&[ranking.clone()], 1000.0, 2);
+        let merged_small_k = rrf_merge(std::slice::from_ref(&ranking), 1.0, 2);
+        let merged_large_k = rrf_merge(std::slice::from_ref(&ranking), 1000.0, 2);
         let diff_small = merged_small_k[0].1 - merged_small_k[1].1;
         let diff_large = merged_large_k[0].1 - merged_large_k[1].1;
         assert!(

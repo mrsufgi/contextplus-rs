@@ -302,7 +302,7 @@ mod tests {
             report
                 .entries
                 .iter()
-                .any(|e| e.path == PathBuf::from("src/api/login.rs") && !e.is_changed)
+                .any(|e| e.path == Path::new("src/api/login.rs") && !e.is_changed)
         );
     }
 

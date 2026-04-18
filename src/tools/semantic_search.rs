@@ -495,12 +495,11 @@ pub(crate) fn snippet_for_doc(
     doc: &SearchDocument,
     matched_symbol_locations: &[String],
 ) -> Option<String> {
-    if let Some(loc) = matched_symbol_locations.first() {
-        if let Some((start, end)) = parse_location_string(loc) {
-            if let Some(snippet) = extract_snippet(&doc.content, start, end) {
-                return Some(snippet);
-            }
-        }
+    if let Some(loc) = matched_symbol_locations.first()
+        && let Some((start, end)) = parse_location_string(loc)
+        && let Some(snippet) = extract_snippet(&doc.content, start, end)
+    {
+        return Some(snippet);
     }
     // Fall back to the first non-empty content line if no symbol info.
     let first_line = doc.content.lines().find(|l| !l.trim().is_empty())?;
@@ -828,7 +827,7 @@ impl SearchIndex {
         // O(1) HashMap look-ups inside par_iter.
         // Skip building the map entirely when the window is disabled.
         let recency_by_path: std::collections::HashMap<&str, f64> =
-            if opts.recency_window_days.map_or(true, |w| w == 0) {
+            if opts.recency_window_days.is_none_or(|w| w == 0) {
                 std::collections::HashMap::new()
             } else {
                 self.documents
