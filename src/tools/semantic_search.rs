@@ -10,8 +10,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
+use regex::Regex;
 
 use crate::error::{ContextPlusError, Result};
+
+/// Maximum additive bonus from recency (kept small so it nudges ties, not
+/// dominates relevance).
+const MAX_RECENCY_BOOST: f64 = 0.05;
 
 /// Type alias for the boxed future returned by embedding functions.
 type EmbedFuture<'a> =
@@ -108,6 +113,15 @@ pub struct SemanticSearchOptions {
     pub min_combined_score: Option<f64>,
     pub require_keyword_match: Option<bool>,
     pub require_semantic_match: Option<bool>,
+    /// Globs (`src/**/*.ts`, `*.rs`) that a result path must match. Empty = no
+    /// restriction. Patterns are OR'd — a path matching *any* glob passes.
+    pub include_globs: Option<Vec<String>>,
+    /// Globs that exclude a result path (applied after include_globs). Useful
+    /// for filtering out tests, generated code, vendored deps, etc.
+    pub exclude_globs: Option<Vec<String>>,
+    /// Optional recency window in days. Results within the window receive a
+    /// small score boost, decaying linearly with age. None = no recency tilt.
+    pub recency_window_days: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +210,35 @@ pub struct ResolvedSearchOptions {
     pub min_combined_score: f64,
     pub require_keyword_match: bool,
     pub require_semantic_match: bool,
+    /// Compiled include globs — a result must match at least one (empty = pass-all).
+    pub include_globs: Vec<Regex>,
+    /// Compiled exclude globs — a result matching any of these is dropped.
+    pub exclude_globs: Vec<Regex>,
+    /// Recency window applied as a small additive score boost (0..MAX_RECENCY_BOOST).
+    pub recency_window_days: Option<u32>,
+    /// Root directory used to resolve relative `doc.path` to absolute paths
+    /// (needed by recency_boost to stat the file). Empty when unknown — the
+    /// recency boost simply degrades to 0 in that case.
+    pub root_dir: PathBuf,
+}
+
+impl Default for ResolvedSearchOptions {
+    fn default() -> Self {
+        Self {
+            top_k: DEFAULT_TOP_K,
+            semantic_weight: DEFAULT_SEMANTIC_WEIGHT,
+            keyword_weight: DEFAULT_KEYWORD_WEIGHT,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: DEFAULT_MIN_COMBINED_SCORE,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            include_globs: Vec::new(),
+            exclude_globs: Vec::new(),
+            recency_window_days: None,
+            root_dir: PathBuf::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +323,110 @@ fn resolve_search_options(opts: &SemanticSearchOptions) -> ResolvedSearchOptions
         ),
         require_keyword_match: opts.require_keyword_match.unwrap_or(false),
         require_semantic_match: opts.require_semantic_match.unwrap_or(false),
+        include_globs: compile_globs(opts.include_globs.as_deref()),
+        exclude_globs: compile_globs(opts.exclude_globs.as_deref()),
+        recency_window_days: opts.recency_window_days,
+        root_dir: opts.root_dir.clone(),
     }
+}
+
+/// Compile a list of user-supplied globs into anchored regexes.
+/// Invalid patterns are silently dropped — better to over-match than to fail
+/// a search outright on a bad glob.
+fn compile_globs(globs: Option<&[String]>) -> Vec<Regex> {
+    let Some(globs) = globs else {
+        return Vec::new();
+    };
+    globs
+        .iter()
+        .filter_map(|g| Regex::new(&glob_to_regex(g)).ok())
+        .collect()
+}
+
+/// Translate a path glob (`src/**/*.ts`, `*.rs`, `tests/foo_?.rs`) into an
+/// anchored regex. Recognized syntax:
+///   `**`  → match any number of path components (including zero)
+///   `*`   → match any character except `/`
+///   `?`   → match a single non-`/` character
+///   anything else is matched literally
+pub fn glob_to_regex(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len() * 2 + 4);
+    out.push('^');
+    let bytes = glob.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'*' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // ** → match zero or more path segments
+                out.push_str(".*");
+                i += 2;
+                // swallow a trailing slash so `src/**/foo` accepts `src/foo`
+                if i < bytes.len() && bytes[i] == b'/' {
+                    i += 1;
+                }
+            }
+            b'*' => {
+                out.push_str("[^/]*");
+                i += 1;
+            }
+            b'?' => {
+                out.push_str("[^/]");
+                i += 1;
+            }
+            b'.' | b'+' | b'(' | b')' | b'|' | b'^' | b'$' | b'{' | b'}' | b'[' | b']' | b'\\' => {
+                out.push('\\');
+                out.push(c as char);
+                i += 1;
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out.push('$');
+    out
+}
+
+fn path_passes_filters(path: &str, opts: &ResolvedSearchOptions) -> bool {
+    if !opts.include_globs.is_empty()
+        && !opts.include_globs.iter().any(|r| r.is_match(path))
+    {
+        return false;
+    }
+    if opts.exclude_globs.iter().any(|r| r.is_match(path)) {
+        return false;
+    }
+    true
+}
+
+/// Compute a small additive recency boost for a file based on its mtime.
+/// Returns 0.0 when no boost should apply (no window configured, file
+/// missing, etc.). Boost decays linearly: a file modified today gets the
+/// full MAX_RECENCY_BOOST, a file at the edge of the window gets ~0.
+pub fn recency_boost(path: &Path, window_days: Option<u32>) -> f64 {
+    let Some(window) = window_days else {
+        return 0.0;
+    };
+    if window == 0 {
+        return 0.0;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0.0;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return 0.0;
+    };
+    let Ok(age) = mtime.elapsed() else {
+        return 0.0; // mtime in the future — treat as no boost
+    };
+    let age_days = age.as_secs() as f64 / 86_400.0;
+    let window_days = window as f64;
+    if age_days >= window_days {
+        return 0.0;
+    }
+    MAX_RECENCY_BOOST * (1.0 - age_days / window_days)
 }
 
 /// Cosine similarity between two f32 vectors.
@@ -405,6 +551,90 @@ fn compute_combined_score(
     )
 }
 
+/// Heuristic classification of a search query, used to boost matches against
+/// the symbol kinds the user is most likely looking for.
+///
+/// The mapping is intentionally loose — the boost is small and stacks with
+/// (rather than overrides) the semantic + keyword scores. Mismatches stay
+/// rankable on those signals alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    /// PascalCase (`MemberRepo`, `StripeError`) → likely class/interface/type.
+    Class,
+    /// snake_case or camelCase identifier (`get_user`, `getUserById`) → likely function/method.
+    Function,
+    /// Dotted (`foo.bar.baz`), double-colon (`module::Type`), or contains '/' →
+    /// likely a qualified module path.
+    Path,
+    /// Anything else (free-form English question, single lowercase word, etc.).
+    Generic,
+}
+
+/// Multipliers applied to the keyword component when the query kind matches the
+/// kind of the best-matched symbol. Small enough to nudge ties, not overrule.
+const QUERY_KIND_BOOST_CLASS: f64 = 1.5;
+const QUERY_KIND_BOOST_FUNCTION: f64 = 1.3;
+const QUERY_KIND_BOOST_PATH: f64 = 2.0;
+
+/// Detect the lexical shape of a query.
+pub fn detect_query_kind(query: &str) -> QueryKind {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryKind::Generic;
+    }
+    // Multi-word natural language — no shape to lean on.
+    if trimmed.chars().filter(|c| c.is_whitespace()).count() >= 2 {
+        return QueryKind::Generic;
+    }
+    if trimmed.contains("::") || trimmed.contains('/') || trimmed.contains('.') {
+        return QueryKind::Path;
+    }
+    let mut chars = trimmed.chars();
+    let first = chars.next().unwrap();
+    let has_underscore = trimmed.contains('_');
+    let has_upper_after_first = chars.clone().any(|c| c.is_ascii_uppercase());
+
+    if first.is_ascii_uppercase() && !has_underscore {
+        // Pure PascalCase or single capital letter → class-shape.
+        return QueryKind::Class;
+    }
+    if has_underscore || has_upper_after_first {
+        // snake_case or camelCase → function/method-shape.
+        return QueryKind::Function;
+    }
+    QueryKind::Generic
+}
+
+/// Multiplier to apply to the keyword score given a query kind and the
+/// kind of the best-matched symbol entry. Returns 1.0 when no boost applies.
+pub fn query_kind_boost(query_kind: QueryKind, matched_kind: Option<&str>) -> f64 {
+    let Some(kind) = matched_kind else {
+        return 1.0;
+    };
+    let kind = kind.to_ascii_lowercase();
+    match query_kind {
+        QueryKind::Class
+            if matches!(
+                kind.as_str(),
+                "class" | "interface" | "type" | "struct" | "enum" | "trait"
+            ) =>
+        {
+            QUERY_KIND_BOOST_CLASS
+        }
+        QueryKind::Function
+            if matches!(
+                kind.as_str(),
+                "function" | "method" | "fn" | "const" | "let" | "var"
+            ) =>
+        {
+            QUERY_KIND_BOOST_FUNCTION
+        }
+        // Paths boost any symbol — the *file path* is what matters.
+        QueryKind::Path => QUERY_KIND_BOOST_PATH,
+        _ => 1.0,
+    }
+}
+
 /// Truncate query to MAX_QUERY_LEN characters.
 /// Returns `Cow::Borrowed` when no modification is needed (zero allocation).
 pub fn sanitize_query(query: &str) -> Cow<'_, str> {
@@ -489,6 +719,7 @@ impl SearchIndex {
     ) -> Vec<SearchResult> {
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
         let query_lower = query.trim().to_lowercase();
+        let query_kind = detect_query_kind(query);
 
         #[allow(clippy::type_complexity)]
         let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = self
@@ -497,6 +728,9 @@ impl SearchIndex {
             .enumerate()
             .filter_map(|(i, doc)| {
                 if !self.has_vector[i] {
+                    return None;
+                }
+                if !path_passes_filters(&doc.path, opts) {
                     return None;
                 }
                 let offset = i * self.dims;
@@ -518,9 +752,21 @@ impl SearchIndex {
                     .map(|e| format!("{}@{}", e.name, format_line_range(e.line, e.end_line)))
                     .collect();
 
-                let keyword_score =
+                let raw_keyword_score =
                     compute_keyword_score(&query_lower, &query_terms, doc, &matched_symbols);
-                let combined_score = compute_combined_score(semantic_score, keyword_score, opts);
+                // Apply query-kind boost using the kind of the best-matched symbol entry
+                // (first matched_entries hit; falls back to no boost when nothing matched).
+                let best_kind = matched_entries
+                    .first()
+                    .and_then(|e| e.kind.as_deref());
+                let keyword_score = clamp01(raw_keyword_score * query_kind_boost(query_kind, best_kind));
+                let base_combined = compute_combined_score(semantic_score, keyword_score, opts);
+                // Recency: small additive nudge so freshly-touched files break ties upward.
+                let recency = recency_boost(
+                    &opts.root_dir.join(&doc.path),
+                    opts.recency_window_days,
+                );
+                let combined_score = clamp01(base_combined + recency);
 
                 if opts.require_semantic_match && semantic_score <= 0.0 {
                     return None;
@@ -877,6 +1123,7 @@ mod tests {
             min_combined_score: 0.1,
             require_keyword_match: false,
             require_semantic_match: false,
+            ..Default::default()
         };
         let combined = compute_combined_score(0.8, 0.6, &opts);
         let expected = 0.72 * 0.8 + 0.28 * 0.6;
@@ -928,6 +1175,7 @@ mod tests {
             min_combined_score: 0.0,
             require_keyword_match: false,
             require_semantic_match: false,
+            ..Default::default()
         };
 
         let results = index.search("auth", &query_vec, &opts);
@@ -966,6 +1214,7 @@ mod tests {
             min_combined_score: 0.0,
             require_keyword_match: false,
             require_semantic_match: false,
+            ..Default::default()
         };
 
         let results = index.search("getUserById", &query_vec, &opts);
@@ -1002,6 +1251,7 @@ mod tests {
             min_combined_score: 0.0,
             require_keyword_match: false,
             require_semantic_match: false,
+            ..Default::default()
         };
 
         let results = index.search("something", &query_vec, &opts);
@@ -1064,6 +1314,68 @@ mod tests {
         assert_eq!(normalize_top_k(Some(100), 5), MAX_TOP_K);
         assert_eq!(normalize_top_k(Some(0), 5), 5); // fallback for 0
         assert_eq!(normalize_top_k(None, 5), 5);
+    }
+
+    // -- query_kind detection --
+
+    #[test]
+    fn detect_pascal_case_as_class() {
+        assert_eq!(detect_query_kind("MemberRepo"), QueryKind::Class);
+        assert_eq!(detect_query_kind("StripeError"), QueryKind::Class);
+        assert_eq!(detect_query_kind("X"), QueryKind::Class);
+    }
+
+    #[test]
+    fn detect_camel_or_snake_as_function() {
+        assert_eq!(detect_query_kind("getUserById"), QueryKind::Function);
+        assert_eq!(detect_query_kind("get_user_by_id"), QueryKind::Function);
+        assert_eq!(detect_query_kind("doStuff"), QueryKind::Function);
+    }
+
+    #[test]
+    fn detect_dotted_or_path_as_path() {
+        assert_eq!(detect_query_kind("foo.bar.baz"), QueryKind::Path);
+        assert_eq!(detect_query_kind("module::Type"), QueryKind::Path);
+        assert_eq!(detect_query_kind("src/auth/login.ts"), QueryKind::Path);
+    }
+
+    #[test]
+    fn detect_natural_language_as_generic() {
+        assert_eq!(
+            detect_query_kind("how does login work"),
+            QueryKind::Generic
+        );
+        assert_eq!(detect_query_kind("user"), QueryKind::Generic);
+        assert_eq!(detect_query_kind(""), QueryKind::Generic);
+    }
+
+    // -- query_kind_boost mapping --
+
+    #[test]
+    fn boost_class_query_against_class_symbol() {
+        let boost = query_kind_boost(QueryKind::Class, Some("class"));
+        assert!((boost - QUERY_KIND_BOOST_CLASS).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boost_function_query_against_method_symbol() {
+        let boost = query_kind_boost(QueryKind::Function, Some("method"));
+        assert!((boost - QUERY_KIND_BOOST_FUNCTION).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boost_path_query_always_applies() {
+        // Paths describe file location — any matched symbol is fine.
+        assert!((query_kind_boost(QueryKind::Path, Some("function")) - QUERY_KIND_BOOST_PATH).abs() < 1e-9);
+        assert!((query_kind_boost(QueryKind::Path, Some("class")) - QUERY_KIND_BOOST_PATH).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boost_returns_one_when_kinds_misalign() {
+        assert_eq!(query_kind_boost(QueryKind::Class, Some("function")), 1.0);
+        assert_eq!(query_kind_boost(QueryKind::Function, Some("class")), 1.0);
+        assert_eq!(query_kind_boost(QueryKind::Generic, Some("class")), 1.0);
+        assert_eq!(query_kind_boost(QueryKind::Class, None), 1.0);
     }
 
     // -- is_text_index_candidate tests --
@@ -1152,5 +1464,113 @@ mod tests {
         let content: String = "a".repeat(5000);
         let truncated: String = content.chars().take(MAX_TEXT_DOC_CHARS).collect();
         assert_eq!(truncated.len(), MAX_TEXT_DOC_CHARS);
+    }
+
+    // -- glob_to_regex tests --
+
+    fn glob_matches(glob: &str, path: &str) -> bool {
+        Regex::new(&glob_to_regex(glob)).unwrap().is_match(path)
+    }
+
+    #[test]
+    fn glob_double_star_crosses_components() {
+        assert!(glob_matches("src/**/*.ts", "src/auth/login.ts"));
+        assert!(glob_matches("src/**/*.ts", "src/auth/handlers/login.ts"));
+        assert!(glob_matches("src/**/foo.ts", "src/foo.ts"));
+        assert!(!glob_matches("src/**/*.ts", "lib/auth.ts"));
+    }
+
+    #[test]
+    fn glob_single_star_does_not_cross_separator() {
+        assert!(glob_matches("*.rs", "main.rs"));
+        assert!(!glob_matches("*.rs", "src/main.rs"));
+    }
+
+    #[test]
+    fn glob_question_matches_single_char() {
+        assert!(glob_matches("foo_?.rs", "foo_a.rs"));
+        assert!(!glob_matches("foo_?.rs", "foo_ab.rs"));
+        assert!(!glob_matches("foo_?.rs", "foo_/b.rs"));
+    }
+
+    #[test]
+    fn glob_escapes_regex_metacharacters() {
+        assert!(glob_matches("file.rs", "file.rs"));
+        assert!(!glob_matches("file.rs", "fileXrs"));
+    }
+
+    // -- path_passes_filters tests --
+
+    fn opts_with_globs(include: &[&str], exclude: &[&str]) -> ResolvedSearchOptions {
+        ResolvedSearchOptions {
+            include_globs: include
+                .iter()
+                .map(|g| Regex::new(&glob_to_regex(g)).unwrap())
+                .collect(),
+            exclude_globs: exclude
+                .iter()
+                .map(|g| Regex::new(&glob_to_regex(g)).unwrap())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn path_filters_empty_globs_passes_all() {
+        let opts = opts_with_globs(&[], &[]);
+        assert!(path_passes_filters("anywhere/foo.rs", &opts));
+        assert!(path_passes_filters("vendor/dep.ts", &opts));
+    }
+
+    #[test]
+    fn path_filters_include_only_keeps_matches() {
+        let opts = opts_with_globs(&["src/**/*.rs"], &[]);
+        assert!(path_passes_filters("src/foo.rs", &opts));
+        assert!(path_passes_filters("src/sub/bar.rs", &opts));
+        assert!(!path_passes_filters("tests/main.rs", &opts));
+    }
+
+    #[test]
+    fn path_filters_exclude_overrides_include() {
+        let opts = opts_with_globs(&["src/**/*.rs"], &["**/generated/*.rs"]);
+        assert!(path_passes_filters("src/foo.rs", &opts));
+        assert!(!path_passes_filters("src/generated/proto.rs", &opts));
+    }
+
+    #[test]
+    fn path_filters_exclude_only_drops_matches() {
+        let opts = opts_with_globs(&[], &["target/**"]);
+        assert!(path_passes_filters("src/main.rs", &opts));
+        assert!(!path_passes_filters("target/debug/foo", &opts));
+    }
+
+    // -- recency_boost tests --
+
+    #[test]
+    fn recency_boost_no_window_returns_zero() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(recency_boost(tmp.path(), None), 0.0);
+    }
+
+    #[test]
+    fn recency_boost_zero_window_returns_zero() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(recency_boost(tmp.path(), Some(0)), 0.0);
+    }
+
+    #[test]
+    fn recency_boost_missing_file_returns_zero() {
+        let path = std::path::Path::new("/nonexistent/path/that/should/not/exist.rs");
+        assert_eq!(recency_boost(path, Some(7)), 0.0);
+    }
+
+    #[test]
+    fn recency_boost_fresh_file_near_max() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let boost = recency_boost(tmp.path(), Some(7));
+        assert!(boost > 0.0);
+        assert!(boost <= MAX_RECENCY_BOOST);
+        // a freshly-touched file should be very close to MAX (within a few seconds)
+        assert!(boost > MAX_RECENCY_BOOST * 0.99);
     }
 }

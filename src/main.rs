@@ -64,6 +64,19 @@ enum Commands {
         #[arg(long)]
         max_tokens: Option<usize>,
     },
+    /// Manage git hooks that nudge contextplus-rs on commit/checkout/merge
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Install (or refresh) managed git hooks in this repository
+    Install,
+    /// Remove the managed git hook block (preserves any user-authored content)
+    Uninstall,
 }
 
 #[tokio::main]
@@ -250,6 +263,19 @@ async fn main() -> anyhow::Result<()> {
             let result = context_tree::get_context_tree(options, &entries, &analyses).await?;
             println!("{}", result);
         }
+        Some(Commands::Hooks { action }) => match action {
+            HooksAction::Install => {
+                let installed = contextplus_rs::git::hooks::install_hooks(&root_dir)?;
+                eprintln!("Installed {} hook(s):", installed.len());
+                for path in installed {
+                    eprintln!("  {}", path.display());
+                }
+            }
+            HooksAction::Uninstall => {
+                let removed = contextplus_rs::git::hooks::uninstall_hooks(&root_dir)?;
+                eprintln!("Cleaned {} hook(s).", removed.len());
+            }
+        },
     }
 
     Ok(())

@@ -283,6 +283,18 @@ impl ContextPlusServer {
         args.get(key).and_then(|v| v.as_bool())
     }
 
+    fn get_u32(args: &serde_json::Map<String, Value>, key: &str) -> Option<u32> {
+        args.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
+    }
+
+    fn get_string_array(args: &serde_json::Map<String, Value>, key: &str) -> Option<Vec<String>> {
+        args.get(key).and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+    }
+
     fn ok_text(text: String) -> CallToolResult {
         CallToolResult::success(vec![Content::text(text)])
     }
@@ -864,6 +876,9 @@ impl ContextPlusServer {
             min_combined_score: Self::get_f64(&args, "min_combined_score"),
             require_keyword_match: Self::get_bool(&args, "require_keyword_match"),
             require_semantic_match: Self::get_bool(&args, "require_semantic_match"),
+            include_globs: Self::get_string_array(&args, "include_globs"),
+            exclude_globs: Self::get_string_array(&args, "exclude_globs"),
+            recency_window_days: Self::get_u32(&args, "recency_window_days"),
         };
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());

@@ -22,12 +22,49 @@ const _: () = assert!(
 // ---------------------------------------------------------------------------
 
 const CACHE_DIR: &str = ".mcp_data";
+const WORKTREE_SUBDIR: &str = "worktrees";
 const CACHE_VERSION: u8 = 1;
 /// Header size padded to 16-byte alignment so rkyv data starts aligned.
 const HEADER_SIZE: usize = 16;
 
+/// Detect whether `root_dir` is a git worktree (as opposed to a main checkout
+/// or non-git directory). Returns the worktree name if so.
+///
+/// Git worktrees are identified by `.git` being a *file* (not a directory)
+/// containing `gitdir: /path/to/main/.git/worktrees/<name>`. The main checkout
+/// has `.git` as a directory; non-git directories have neither.
+///
+/// Without this distinction, two checkouts of the same repo (main + worktree)
+/// would silently share `.mcp_data/*.rkyv` — embeddings keyed by relative paths
+/// would collide and corrupt each other (see memory: worktree_corrupts_git_config).
+fn worktree_name(root_dir: &Path) -> Option<String> {
+    let git_path = root_dir.join(".git");
+    let metadata = fs::metadata(&git_path).ok()?;
+    if metadata.is_dir() {
+        return None; // main checkout
+    }
+    let contents = fs::read_to_string(&git_path).ok()?;
+    let line = contents.lines().find(|l| l.starts_with("gitdir:"))?;
+    let gitdir = line.trim_start_matches("gitdir:").trim();
+    // Expect: /path/to/main/.git/worktrees/<name>
+    let path = Path::new(gitdir);
+    let parent = path.parent()?;
+    if parent.file_name()?.to_str()? != "worktrees" {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn cache_dir(root_dir: &Path) -> PathBuf {
-    root_dir.join(CACHE_DIR)
+    let base = root_dir.join(CACHE_DIR);
+    match worktree_name(root_dir) {
+        Some(name) => base.join(WORKTREE_SUBDIR).join(name),
+        None => base,
+    }
 }
 
 fn cache_path(root_dir: &Path, name: &str) -> PathBuf {
@@ -811,6 +848,99 @@ mod tests {
                 m.1
             );
         }
+    }
+
+    // -- Worktree-aware namespacing --
+
+    #[test]
+    fn cache_dir_main_checkout_unchanged() {
+        // No .git → treated as main checkout (backward-compatible path).
+        let dir = TempDir::new().unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn cache_dir_with_git_directory_is_main_checkout() {
+        // .git as directory → main checkout.
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn cache_dir_with_git_file_is_worktree() {
+        // .git as file with `gitdir: …/worktrees/<name>` → namespaced.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/main/.git/worktrees/feature-x\n",
+        )
+        .unwrap();
+        let expected = dir
+            .path()
+            .join(".mcp_data")
+            .join("worktrees")
+            .join("feature-x");
+        assert_eq!(cache_dir(dir.path()), expected);
+    }
+
+    #[test]
+    fn worktree_caches_dont_collide_with_main() {
+        // Critical: the same key written to a worktree must NOT clobber the
+        // main checkout's cache entry of the same name.
+        let main = TempDir::new().unwrap();
+        let wt = TempDir::new().unwrap();
+
+        // Mark `wt` as a worktree
+        fs::write(
+            wt.path().join(".git"),
+            "gitdir: /tmp/main/.git/worktrees/wt-a\n",
+        )
+        .unwrap();
+
+        let main_data = CacheData {
+            dims: 1,
+            keys: vec!["k".into()],
+            hashes: vec!["main".into()],
+            vectors: vec![1.0],
+        };
+        let wt_data = CacheData {
+            dims: 1,
+            keys: vec!["k".into()],
+            hashes: vec!["worktree".into()],
+            vectors: vec![9.0],
+        };
+
+        save_cache(main.path(), "shared", &main_data).unwrap();
+        save_cache(wt.path(), "shared", &wt_data).unwrap();
+
+        let loaded_main = load_cache(main.path(), "shared").unwrap().unwrap();
+        let loaded_wt = load_cache(wt.path(), "shared").unwrap().unwrap();
+
+        assert_eq!(loaded_main.hashes[0], "main");
+        assert_eq!(loaded_wt.hashes[0], "worktree");
+    }
+
+    #[test]
+    fn malformed_git_file_falls_through_to_main_checkout() {
+        // A .git file without `gitdir:` or with malformed contents shouldn't
+        // crash — fall back to the unprefixed cache path.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".git"), "garbage\n").unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn git_file_pointing_outside_worktrees_falls_through() {
+        // gitdir pointing somewhere other than .git/worktrees/<name> (e.g.
+        // submodule) shouldn't be treated as a worktree.
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/repo/.git/modules/sub\n",
+        )
+        .unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
     }
 
     #[test]

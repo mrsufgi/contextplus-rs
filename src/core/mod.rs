@@ -1,4 +1,5 @@
 pub mod clustering;
+pub mod dependent_expand;
 pub mod embedding_tracker;
 pub mod embeddings;
 pub mod hub;

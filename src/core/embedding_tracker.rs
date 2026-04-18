@@ -3,12 +3,55 @@
 
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Snapshot of a file's identity for quick "did this actually change?" checks.
+/// Combining mtime + size catches the overwhelming majority of real edits while
+/// avoiding the cost of opening + hashing untouched files. Editors that write
+/// atomically (rename-into-place) rotate the inode but always update mtime, so
+/// any meaningful save is observable here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileSig {
+    mtime: SystemTime,
+    size: u64,
+}
+
+/// Pre-callback skip gate: returns true if the file has the same mtime+size
+/// as the last time we successfully reported it. Also updates the cache to
+/// the current signature when reporting through (so the next no-op event
+/// fires the skip path).
+///
+/// Public for reuse by warmup binaries that walk the project up-front.
+pub(crate) fn metadata_unchanged(
+    cache: &Mutex<HashMap<String, FileSig>>,
+    rel_path: &str,
+    abs_path: &Path,
+) -> bool {
+    let meta = match std::fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(_) => return false, // file gone or unreadable — let the callback decide
+    };
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let size = meta.len();
+    let sig = FileSig { mtime, size };
+
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // poisoned lock — recover and continue
+    };
+    match guard.get(rel_path) {
+        Some(prev) if *prev == sig => true,
+        _ => {
+            guard.insert(rel_path.to_string(), sig);
+            false
+        }
+    }
+}
 
 const DEFAULT_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_MAX_FILES_PER_TICK: usize = 8;
@@ -116,8 +159,15 @@ pub fn start_tracker(
     // Channel for debounced events from notify to our async processor
     let (event_tx, mut event_rx) = mpsc::channel::<Vec<String>>(64);
 
+    // Per-tracker mtime+size cache so spurious watcher events (e.g. chmod,
+    // touch-without-change, atime updates) for unchanged files are dropped
+    // before we incur file-read + hashing cost downstream.
+    let metadata_cache: Arc<Mutex<HashMap<String, FileSig>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // Set up notify debouncer with an event handler that filters and collects paths
     let handler_root = root_dir.clone();
+    let handler_meta_cache = metadata_cache.clone();
 
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => {
@@ -132,9 +182,14 @@ pub fn start_tracker(
                         continue;
                     }
                     let normalized = normalize_relative_path(&relative);
-                    if !normalized.is_empty() {
-                        new_files.push(normalized);
+                    if normalized.is_empty() {
+                        continue;
                     }
+                    if metadata_unchanged(&handler_meta_cache, &normalized, path) {
+                        debug!("Embedding tracker skip (unchanged metadata): {}", normalized);
+                        continue;
+                    }
+                    new_files.push(normalized);
                 }
             }
             if !new_files.is_empty() {
@@ -508,5 +563,52 @@ mod tests {
     #[test]
     fn pending_cap_constant_is_50() {
         assert_eq!(MAX_PENDING_FILES, 50);
+    }
+
+    // -- metadata-skip gate (mtime + size pre-filter) --
+
+    #[test]
+    fn metadata_unchanged_first_observation_returns_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.rs");
+        std::fs::write(&f, b"fn x() {}").unwrap();
+
+        let cache = Mutex::new(HashMap::new());
+        // First time we see the file: must NOT skip — we have no prior signature.
+        assert!(!metadata_unchanged(&cache, "a.rs", &f));
+    }
+
+    #[test]
+    fn metadata_unchanged_second_call_with_same_file_skips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.rs");
+        std::fs::write(&f, b"fn x() {}").unwrap();
+
+        let cache = Mutex::new(HashMap::new());
+        let _ = metadata_unchanged(&cache, "a.rs", &f);
+        // Second call without touching the file: skip.
+        assert!(metadata_unchanged(&cache, "a.rs", &f));
+    }
+
+    #[test]
+    fn metadata_unchanged_detects_size_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.rs");
+        std::fs::write(&f, b"fn x() {}").unwrap();
+
+        let cache = Mutex::new(HashMap::new());
+        let _ = metadata_unchanged(&cache, "a.rs", &f);
+
+        std::fs::write(&f, b"fn xy() {}").unwrap(); // size changes
+        assert!(!metadata_unchanged(&cache, "a.rs", &f));
+    }
+
+    #[test]
+    fn metadata_unchanged_returns_false_for_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("ghost.rs");
+        let cache = Mutex::new(HashMap::new());
+        // No file → can't trust the gate; let the callback handle it.
+        assert!(!metadata_unchanged(&cache, "ghost.rs", &f));
     }
 }
