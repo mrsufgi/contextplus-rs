@@ -6,6 +6,7 @@ pub mod embedding_quality_check;
 pub mod feature_hub;
 pub mod file_skeleton;
 pub mod labels;
+pub mod lexical_search;
 pub mod memory_tools;
 pub mod modes;
 pub mod navigate_constants;
