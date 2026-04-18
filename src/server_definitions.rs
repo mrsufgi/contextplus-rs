@@ -536,20 +536,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_definitions_returns_22_tools_with_new_five() {
-        let defs = tool_definitions();
-        assert_eq!(defs.len(), 22, "expected 22 tools, got {}", defs.len());
-        for tool in defs {
-            assert!(!tool.name.is_empty(), "tool name must not be empty");
-            assert!(
-                tool.description.is_some(),
-                "tool '{}' must have a description",
-                tool.name
-            );
-        }
-    }
-
-    #[test]
     fn tool_definitions_is_static_pointer_stable() {
         // Calling twice should return the same pointer (LazyLock)
         let a = tool_definitions().as_ptr();

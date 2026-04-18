@@ -72,8 +72,10 @@ fn cache_path(root_dir: &Path, name: &str) -> PathBuf {
     cache_dir(root_dir).join(format!("{}.rkyv", name))
 }
 
-fn write_lock_path(root_dir: &Path) -> PathBuf {
-    cache_dir(root_dir).join(".write.lock")
+fn write_lock_path(root_dir: &Path, name: &str) -> PathBuf {
+    // Per-cache lock so that concurrent writes to *different* caches in the
+    // same directory don't serialize against each other.
+    cache_dir(root_dir).join(format!(".{}.write.lock", name))
 }
 
 pub fn ensure_cache_dir(root_dir: &Path) -> Result<()> {
@@ -179,7 +181,7 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     // concurrent writers (multiple threads or processes sharing the same cache
     // directory). The lock is blocking: a waiting writer will park until the
     // current writer releases it, which is preferable to silently losing entries.
-    let lock_path = write_lock_path(root_dir);
+    let lock_path = write_lock_path(root_dir, name);
     let lock_file = fs::OpenOptions::new()
         .read(true)
         .write(true)

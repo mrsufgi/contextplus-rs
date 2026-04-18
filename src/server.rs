@@ -1271,22 +1271,10 @@ impl ContextPlusServer {
 
         let cache = self.ensure_project_cache().await?;
 
-        let ignore_kinds: Option<std::collections::HashSet<String>> = args
-            .get("ignore_kinds")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            });
-        let ignore_names: Option<std::collections::HashSet<String>> = args
-            .get("ignore_names")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                    .collect()
-            });
+        let ignore_kinds: Option<std::collections::HashSet<String>> = Self::get_string_array(&args, "ignore_kinds")
+            .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
+        let ignore_names: Option<std::collections::HashSet<String>> = Self::get_string_array(&args, "ignore_names")
+            .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
         let max_results = Self::get_usize(&args, "max_results");
 
         let formatted = tokio::task::spawn_blocking(move || {
@@ -1442,9 +1430,15 @@ impl ContextPlusServer {
                 .collect()
         };
 
-        let expected_dim = requested_dim
-            .or_else(|| vectors.first().map(|(_, v)| v.len()))
-            .unwrap_or(0);
+        let expected_dim = match requested_dim.or_else(|| vectors.first().map(|(_, v)| v.len())) {
+            Some(d) if d > 0 => d,
+            // Empty cache + no expected_dim: nothing meaningful to check.
+            _ => {
+                return Ok(Self::ok_text(
+                    "Embedding quality report: 0 vector(s) cached and no `expected_dim` provided — nothing to check.".to_string(),
+                ));
+            }
+        };
 
         let formatted = tokio::task::spawn_blocking(move || {
             let report = check_embeddings(&vectors, expected_dim);
@@ -1723,6 +1717,11 @@ mod tests {
             "prune_stale_links",
             "add_interlinked_context",
             "retrieve_with_traversal",
+            "find_dead_code",
+            "review_pr_diff",
+            "detect_dependency_loops",
+            "check_embedding_quality",
+            "lexical_search",
         ];
         for name in expected {
             assert!(names.contains(&name), "missing tool: {}", name);
@@ -3209,21 +3208,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tool_definitions_includes_new_five_tools() {
-        let defs = tool_definitions();
-        let names: Vec<&str> = defs.iter().map(|t| t.name.as_ref()).collect();
-        for expected in &[
-            "find_dead_code",
-            "review_pr_diff",
-            "detect_dependency_loops",
-            "check_embedding_quality",
-            "lexical_search",
-        ] {
-            assert!(
-                names.contains(expected),
-                "tool_definitions missing: {expected}"
-            );
-        }
-    }
 }
