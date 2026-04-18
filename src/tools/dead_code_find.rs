@@ -73,12 +73,14 @@ pub fn find_dead_symbols(
     tokens_by_file: &HashMap<PathBuf, HashSet<String>>,
     opts: &DeadCodeOptions,
 ) -> Vec<DeadSymbol> {
-    // Build a (token → defining-file) reverse map so we can quickly check
-    // whether an identifier is used outside its defining file.
-    let mut name_use_count: HashMap<&str, HashSet<&Path>> = HashMap::new();
+    // Build a `(token → set of files that mention it)` reverse map so we
+    // can quickly check whether an identifier appears outside its defining
+    // file. The value is the set of *files* that reference the token, not
+    // a count of references — `files_referencing` reflects that.
+    let mut files_referencing: HashMap<&str, HashSet<&Path>> = HashMap::new();
     for (path, tokens) in tokens_by_file {
         for tok in tokens {
-            name_use_count
+            files_referencing
                 .entry(tok.as_str())
                 .or_default()
                 .insert(path.as_path());
@@ -88,7 +90,7 @@ pub fn find_dead_symbols(
     let mut out = Vec::new();
     for (path, symbols) in symbols_by_file {
         for sym in symbols {
-            collect_dead(path, sym, &name_use_count, opts, &mut out);
+            collect_dead(path, sym, &files_referencing, opts, &mut out);
         }
     }
 
@@ -101,7 +103,7 @@ pub fn find_dead_symbols(
 fn collect_dead(
     path: &Path,
     sym: &CodeSymbol,
-    name_use: &HashMap<&str, HashSet<&Path>>,
+    files_referencing: &HashMap<&str, HashSet<&Path>>,
     opts: &DeadCodeOptions,
     out: &mut Vec<DeadSymbol>,
 ) {
@@ -110,7 +112,7 @@ fn collect_dead(
     let skip = opts.ignore_kinds.contains(&kind_lc) || opts.ignore_names.contains(&name_lc);
 
     if !skip && !sym.name.is_empty() {
-        let users = name_use.get(sym.name.as_str());
+        let users = files_referencing.get(sym.name.as_str());
         let used_elsewhere = users
             .map(|set| set.iter().any(|p| *p != path))
             .unwrap_or(false);
@@ -125,7 +127,7 @@ fn collect_dead(
     }
 
     for child in &sym.children {
-        collect_dead(path, child, name_use, opts, out);
+        collect_dead(path, child, files_referencing, opts, out);
     }
 }
 

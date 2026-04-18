@@ -200,9 +200,25 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
 
     // Read-modify-write: merge with whatever is currently on disk so we don't
     // lose entries written by a concurrent process between our load and save.
-    let merged = match load_cache(root_dir, name)? {
-        Some(disk) => merge_cache_data(disk, data),
-        None => clone_cache_data(data),
+    //
+    // A corrupt or version-mismatched on-disk file (truncated payload, bumped
+    // CACHE_VERSION, partial write from a prior crash) returns Err here.
+    // Propagating it would brick every subsequent save_cache call indefinitely
+    // until the cache file is manually removed. Treat any load failure as
+    // "no usable disk state" and overwrite — the new snapshot is whole and
+    // self-consistent, so resetting from it is strictly better than refusing
+    // to write forever.
+    let merged = match load_cache(root_dir, name) {
+        Ok(Some(disk)) => merge_cache_data(disk, data),
+        Ok(None) => clone_cache_data(data),
+        Err(e) => {
+            tracing::warn!(
+                cache = name,
+                error = %e,
+                "save_cache: on-disk cache unreadable; overwriting with incoming snapshot"
+            );
+            clone_cache_data(data)
+        }
     };
 
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&merged)
@@ -832,6 +848,50 @@ mod tests {
             N,
             loaded.keys.len()
         );
+
+        // TEST-004: assert per-thread CONTENT (hash + vector bytes) survives,
+        // not just the key. A regression where merge silently dropped
+        // values but kept keys (e.g. by re-using a stale disk vector under
+        // a key the incoming writer was overwriting) would still pass the
+        // key-set check above. This pins the "incoming-overrides-disk"
+        // contract end-to-end.
+        let dim = loaded.dims as usize;
+        assert_eq!(dim, 2);
+        assert_eq!(
+            loaded.vectors.len(),
+            N * dim,
+            "vectors buffer length mismatch: {} ≠ {} keys × {} dims",
+            loaded.vectors.len(),
+            N,
+            dim
+        );
+        for (idx, key) in loaded.keys.iter().enumerate() {
+            // Recover writer index from the key; each thread writes exactly one
+            // disjoint key so reconstruction is deterministic.
+            let writer = key
+                .strip_prefix("file_")
+                .and_then(|s| s.strip_suffix(".ts"))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("unexpected key shape: {}", key));
+            assert_eq!(
+                loaded.hashes[idx],
+                format!("hash_{}", writer),
+                "hash for key {} doesn't match writer {}",
+                key,
+                writer
+            );
+            let off = idx * dim;
+            assert!(
+                (loaded.vectors[off] - writer as f32).abs() < 1e-6
+                    && (loaded.vectors[off + 1] - (writer as f32 + 0.1)).abs() < 1e-6,
+                "vector bytes for key {} corrupted; expected [{}, {}], got [{}, {}]",
+                key,
+                writer,
+                writer as f32 + 0.1,
+                loaded.vectors[off],
+                loaded.vectors[off + 1]
+            );
+        }
     }
 
     // -- mmap_vector_store tests (zero-copy) --
@@ -1111,5 +1171,107 @@ mod tests {
         assert_eq!(entry.hash, "hx");
         assert!((entry.vector[0] - 0.5).abs() < 1e-6);
         assert!((entry.vector[1] - 0.7).abs() < 1e-6);
+    }
+
+    // TEST-001..003: protect merge_cache_data + load_cache contracts that
+    // were silently breaking before the Round 3 fixes (dim mismatch dropped
+    // disk; truncated vectors panicked; corrupted payloads bricked the
+    // cache instead of surfacing as a load error).
+
+    #[test]
+    fn merge_drops_disk_when_dims_disagree() {
+        // Disk and incoming come from different embedding models — the
+        // vector spaces are incompatible, so the only safe merge is to
+        // discard the disk side and keep `incoming` whole.
+        let disk = CacheData {
+            dims: 4,
+            keys: vec!["src/a.ts".to_string()],
+            hashes: vec!["ha".to_string()],
+            vectors: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let incoming = CacheData {
+            dims: 3,
+            keys: vec!["src/b.ts".to_string()],
+            hashes: vec!["hb".to_string()],
+            vectors: vec![0.1, 0.2, 0.3],
+        };
+
+        let merged = merge_cache_data(disk, &incoming);
+
+        assert_eq!(merged.dims, 3);
+        assert_eq!(merged.keys, vec!["src/b.ts".to_string()]);
+        assert_eq!(merged.hashes, vec!["hb".to_string()]);
+        assert_eq!(merged.vectors, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn merge_skips_entries_with_truncated_vector_buffer() {
+        // disk advertises two keys at dims=3 but only carries one vector's
+        // worth of floats. The bounds-check inside merge must skip the
+        // truncated entry instead of panicking on the slice.
+        let disk = CacheData {
+            dims: 3,
+            keys: vec!["src/keep.ts".to_string(), "src/truncated.ts".to_string()],
+            hashes: vec!["hk".to_string(), "ht".to_string()],
+            vectors: vec![0.1, 0.2, 0.3], // only enough for the first key
+        };
+        let incoming = CacheData {
+            dims: 3,
+            keys: vec!["src/new.ts".to_string()],
+            hashes: vec!["hn".to_string()],
+            vectors: vec![0.4, 0.5, 0.6],
+        };
+
+        let merged = merge_cache_data(disk, &incoming);
+
+        assert_eq!(merged.dims, 3);
+        let mut by_key: HashMap<&str, (&str, &[f32])> = HashMap::new();
+        for (i, k) in merged.keys.iter().enumerate() {
+            let off = i * merged.dims as usize;
+            by_key.insert(
+                k.as_str(),
+                (
+                    merged.hashes[i].as_str(),
+                    &merged.vectors[off..off + merged.dims as usize],
+                ),
+            );
+        }
+        assert!(by_key.contains_key("src/keep.ts"));
+        assert!(by_key.contains_key("src/new.ts"));
+        assert!(
+            !by_key.contains_key("src/truncated.ts"),
+            "truncated entry must be dropped, not retained with garbage data"
+        );
+        let (kh, kv) = by_key["src/keep.ts"];
+        assert_eq!(kh, "hk");
+        assert_eq!(kv, &[0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn load_returns_cache_error_on_truncated_payload() {
+        // Header says version OK, but the rkyv body has been truncated.
+        // load_cache must return Err(Cache(...)) so save_cache's Round 3
+        // fallback path can decide to overwrite instead of bricking — the
+        // pre-fix behavior bubbled the error up and killed the writer.
+        let dir = TempDir::new().unwrap();
+        ensure_cache_dir(dir.path()).unwrap();
+
+        // Write a valid header + a single byte of "rkyv body" — definitely
+        // not a valid serialized CacheData.
+        let path = cache_path(dir.path(), "truncated");
+        let mut bad = vec![0u8; HEADER_SIZE + 1];
+        bad[0] = CACHE_VERSION;
+        fs::write(&path, &bad).unwrap();
+
+        let result = load_cache(dir.path(), "truncated");
+        match result {
+            Err(ContextPlusError::Cache(msg)) => {
+                assert!(
+                    msg.contains("rkyv") || msg.to_lowercase().contains("deserial"),
+                    "expected rkyv deserialize error, got: {msg}"
+                );
+            }
+            other => panic!("expected Err(Cache(_)), got {:?}", other),
+        }
     }
 }

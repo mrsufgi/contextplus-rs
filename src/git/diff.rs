@@ -58,25 +58,25 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
     let mut current: Option<FileChange> = None;
 
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ b/") {
+        if let Some(rest) = line.strip_prefix("+++ ") {
             if let Some(c) = current.take() {
                 out.push(c);
             }
+            // Strip the optional `b/` (or `"b/`) prefix produced by `git diff`
+            // and unquote C-escaped paths (paths with whitespace, tabs,
+            // newlines, or non-ASCII bytes are emitted as
+            // `+++ "b/foo\nbar.rs"`). Without C-unquoting, the literal quoted
+            // string never matches the project's relative paths and the file
+            // is silently dropped from the report.
+            let trimmed = rest.trim();
+            if trimmed == "/dev/null" {
+                continue;
+            }
+            let path = parse_diff_header_path(trimmed);
             current = Some(FileChange {
-                path: rest.trim().to_string(),
+                path,
                 ranges: Vec::new(),
             });
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
-            // `+++ /dev/null` (deletion) — still record so callers see the file
-            if let Some(c) = current.take() {
-                out.push(c);
-            }
-            if rest.trim() != "/dev/null" {
-                current = Some(FileChange {
-                    path: rest.trim().to_string(),
-                    ranges: Vec::new(),
-                });
-            }
         } else if line.starts_with("@@")
             && let Some(range) = parse_hunk_header(line)
             && let Some(c) = current.as_mut()
@@ -88,6 +88,76 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
         out.push(c);
     }
     out
+}
+
+/// Strip the optional `b/` prefix and decode a C-quoted path emitted by
+/// `git diff` for filenames containing whitespace, control characters, or
+/// non-ASCII bytes (`+++ "b/foo\nbar.rs"`). Quoted form is signalled by a
+/// leading `"`; we honour `\n`, `\t`, `\r`, `\\`, `\"`, and `\NNN` (3-digit
+/// octal) escapes. Unrecognised escapes pass through literally so the parser
+/// stays permissive against future git format quirks.
+fn parse_diff_header_path(raw: &str) -> String {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        let unquoted = c_unquote(inner);
+        unquoted.strip_prefix("b/").unwrap_or(&unquoted).to_string()
+    } else {
+        raw.strip_prefix("b/").unwrap_or(raw).to_string()
+    }
+}
+
+fn c_unquote(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                b'"' => {
+                    out.push(b'"');
+                    i += 2;
+                }
+                b'0'..=b'7' if i + 3 < bytes.len() => {
+                    let oct = std::str::from_utf8(&bytes[i + 1..i + 4])
+                        .ok()
+                        .and_then(|s| u8::from_str_radix(s, 8).ok());
+                    match oct {
+                        Some(b) => {
+                            out.push(b);
+                            i += 4;
+                        }
+                        None => {
+                            out.push(bytes[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Parse a `@@ -A[,B] +C[,D] @@ ...` hunk header. Returns the new-side range.
@@ -348,5 +418,95 @@ diff --git a/src/foo.rs b/src/foo.rs
         assert!(r.overlaps_symbol(&sym("contains", "fn", 1, 100)));
         assert!(!r.overlaps_symbol(&sym("before", "fn", 1, 9)));
         assert!(!r.overlaps_symbol(&sym("after", "fn", 21, 25)));
+    }
+
+    // ----- C-quoted path coverage -----
+    //
+    // git emits `+++ b/"path"` for filenames containing spaces, control
+    // chars, or non-ASCII. Without C-unquoting, those changes were silently
+    // dropped from the change set.
+
+    #[test]
+    fn c_unquote_decodes_named_escapes() {
+        assert_eq!(c_unquote("a\\nb"), "a\nb");
+        assert_eq!(c_unquote("a\\tb"), "a\tb");
+        assert_eq!(c_unquote("a\\rb"), "a\rb");
+        assert_eq!(c_unquote("a\\\\b"), "a\\b");
+        assert_eq!(c_unquote("a\\\"b"), "a\"b");
+    }
+
+    #[test]
+    fn c_unquote_decodes_three_digit_octal_utf8() {
+        // \303\244 == U+00E4 (ä) in UTF-8 — git's standard encoding for
+        // non-ASCII path bytes.
+        assert_eq!(c_unquote("h\\303\\244ndler.rs"), "händler.rs");
+    }
+
+    #[test]
+    fn c_unquote_passes_unrecognised_escapes_literally() {
+        // No \q escape exists; we want the parser to stay permissive
+        // instead of dropping the byte.
+        assert_eq!(c_unquote("a\\qb"), "a\\qb");
+    }
+
+    #[test]
+    fn c_unquote_handles_trailing_backslash() {
+        // A lone backslash at EOF must not panic on bounds.
+        assert_eq!(c_unquote("a\\"), "a\\");
+    }
+
+    #[test]
+    fn c_unquote_malformed_octal_falls_through() {
+        // \\078 — first byte 0 enters the octal arm, but '8' is not an
+        // octal digit so `from_str_radix(.., 8)` returns None. The parser
+        // must emit the literal backslash and keep walking instead of
+        // dropping the bytes.
+        assert_eq!(c_unquote("a\\078b"), "a\\078b");
+    }
+
+    #[test]
+    fn parse_diff_header_path_unquoted() {
+        assert_eq!(parse_diff_header_path("b/src/foo.rs"), "src/foo.rs");
+        assert_eq!(
+            parse_diff_header_path("src/no_prefix.rs"),
+            "src/no_prefix.rs"
+        );
+    }
+
+    #[test]
+    fn parse_diff_header_path_quoted_with_space() {
+        assert_eq!(
+            parse_diff_header_path("\"b/src/file with space.rs\""),
+            "src/file with space.rs"
+        );
+    }
+
+    #[test]
+    fn parse_diff_header_path_quoted_with_octal_utf8() {
+        // \303\244 == ä — confirm full round-trip from quoted header to
+        // the relative path used as a graph key.
+        assert_eq!(
+            parse_diff_header_path("\"b/src/h\\303\\244ndler.rs\""),
+            "src/händler.rs"
+        );
+    }
+
+    #[test]
+    fn parses_quoted_path_with_space_through_full_pipeline() {
+        // The original bug: the change was parsed but the path was empty
+        // or garbage, so reverse-graph lookups missed and the file vanished
+        // from review.
+        let diff = "\
+diff --git \"a/src/file with space.rs\" \"b/src/file with space.rs\"
+--- \"a/src/file with space.rs\"
++++ \"b/src/file with space.rs\"
+@@ -1,2 +1,3 @@
+ unchanged
++new
+";
+        let changes = parse_unified_diff(diff);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "src/file with space.rs");
+        assert_eq!(changes[0].ranges, vec![LineRange { start: 1, end: 3 }]);
     }
 }
