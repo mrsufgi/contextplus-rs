@@ -206,12 +206,15 @@ fn changed_symbols_grouped<'a>(
     out
 }
 
-/// For each changed seed file, count how many strict-dependent (hop > 0)
-/// hits trace back through the reverse graph reachable from it. Cheap
-/// approximation: every dependent counts towards every seed it could have
-/// been reached from. For a single-seed diff this is exact; for a
-/// multi-seed diff we attribute the dependent's hop count to each seed
-/// (slight over-counting is fine for risk ranking).
+/// Approximate per-seed dependent count for risk ranking.
+///
+/// Counts strict dependents (`hop > 0`) once across the whole expansion,
+/// then divides them evenly across all seeds (`ceil(total / n_seeds)`,
+/// minimum 1). For a single-seed diff this is exact; for a multi-seed
+/// diff the same number is broadcast to every seed — we do **not** track
+/// which seed each dependent was reached from. Good enough for risk
+/// ranking, but do not read this as "dependents attributable to this
+/// specific seed".
 fn dependent_count_per_seed(
     seeds: &[PathBuf],
     expansion: &[ExpansionHit],

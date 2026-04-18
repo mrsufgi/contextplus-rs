@@ -18,6 +18,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use fd_lock::RwLock as FdRwLock;
+
 use crate::error::{ContextPlusError, Result};
 
 const BEGIN_MARK: &str = "# >>> contextplus-rs hooks (managed) >>>";
@@ -95,6 +97,23 @@ pub fn install_hooks(root_dir: &Path) -> Result<Vec<PathBuf>> {
     let sentinel_dir = root_dir.join(".mcp_data").join("hooks");
     fs::create_dir_all(&sentinel_dir)?;
 
+    // Two MCP servers (or warmup binary + live server) installing hooks
+    // concurrently in the same repo would race the read-modify-write of each
+    // hook file: stale snapshots could produce duplicated managed blocks or
+    // truncate user content. Hold an exclusive file-system advisory lock
+    // across the whole install pass — same fd_lock pattern as save_cache.
+    // Installs are rare so the cost is irrelevant; the lock is released when
+    // the function returns.
+    let lock_path = dir.join(".contextplus.install.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let mut fd_lock = FdRwLock::new(lock_file);
+    let _guard = fd_lock.write()?;
+
     let mut installed = Vec::new();
     for hook in MANAGED_HOOKS {
         let path = dir.join(hook);
@@ -114,6 +133,19 @@ pub fn install_hooks(root_dir: &Path) -> Result<Vec<PathBuf>> {
 /// shebang) we delete it; otherwise we keep the user's content.
 pub fn uninstall_hooks(root_dir: &Path) -> Result<Vec<PathBuf>> {
     let dir = hooks_dir(root_dir)?;
+
+    // Same race protection as install_hooks — uninstall also reads, edits,
+    // and rewrites each hook file.
+    let lock_path = dir.join(".contextplus.install.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let mut fd_lock = FdRwLock::new(lock_file);
+    let _guard = fd_lock.write()?;
+
     let mut removed = Vec::new();
     for hook in MANAGED_HOOKS {
         let path = dir.join(hook);

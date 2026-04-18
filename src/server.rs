@@ -1285,24 +1285,19 @@ impl ContextPlusServer {
         let max_results = Self::get_usize(&args, "max_results").filter(|&n| n > 0);
 
         let formatted = tokio::task::spawn_blocking(move || {
-            let mut symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
-                HashMap::new();
+            let symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
+                build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
             let mut tokens_by_file: HashMap<PathBuf, std::collections::HashSet<String>> =
                 HashMap::new();
 
             for (rel_path, lines) in &cache.file_lines {
-                let path = PathBuf::from(rel_path);
                 let content = lines.join("\n");
-                let ext = rel_path.rsplit('.').next().unwrap_or("");
-                if let Ok(syms) = parse_with_tree_sitter(&content, ext) {
-                    symbols_by_file.insert(path.clone(), syms);
-                }
                 let tokens: std::collections::HashSet<String> = content
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .filter(|t| !t.is_empty())
                     .map(|t| t.to_string())
                     .collect();
-                tokens_by_file.insert(path, tokens);
+                tokens_by_file.insert(PathBuf::from(rel_path), tokens);
             }
 
             let mut opts = DeadCodeOptions::default();
@@ -1353,21 +1348,34 @@ impl ContextPlusServer {
         let root = self.state.root_dir.clone();
 
         let formatted = tokio::task::spawn_blocking(move || {
-            let mut symbols_by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
-                HashMap::new();
-            let mut all_abs_paths: Vec<PathBuf> = Vec::new();
+            let symbols_by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
+                build_symbols_by_file(&cache, |rel| rel.to_string());
+            let all_abs_paths: Vec<PathBuf> = cache
+                .file_lines
+                .keys()
+                .map(|rel_path| root.join(rel_path))
+                .collect();
 
-            for (rel_path, lines) in &cache.file_lines {
-                let abs = root.join(rel_path);
-                all_abs_paths.push(abs);
-                let content = lines.join("\n");
-                let ext = rel_path.rsplit('.').next().unwrap_or("");
-                if let Ok(syms) = parse_with_tree_sitter(&content, ext) {
-                    symbols_by_file.insert(rel_path.clone(), syms);
-                }
-            }
-
-            let reverse_graph = build_reverse_graph(&all_abs_paths);
+            // build_reverse_graph requires absolute paths (it stat()s each file
+            // through extract_imports), but analyze receives diff-derived seeds
+            // which are RELATIVE (parsed from `+++ b/<rel>`). Re-key the graph
+            // to relative paths so the BFS lookup matches; without this the
+            // dependents half of every report is silently empty (RV3-001).
+            let reverse_graph_abs = build_reverse_graph(&all_abs_paths);
+            let reverse_graph: HashMap<PathBuf, std::collections::HashSet<PathBuf>> =
+                reverse_graph_abs
+                    .into_iter()
+                    .filter_map(|(imported, importers)| {
+                        let imported_rel = imported.strip_prefix(&root).ok()?.to_path_buf();
+                        let importers_rel: std::collections::HashSet<PathBuf> = importers
+                            .into_iter()
+                            .filter_map(|p| {
+                                p.strip_prefix(&root).ok().map(std::path::Path::to_path_buf)
+                            })
+                            .collect();
+                        Some((imported_rel, importers_rel))
+                    })
+                    .collect();
             let expansion_opts = ExpansionOptions {
                 max_hops,
                 max_files,
@@ -1679,6 +1687,31 @@ fn code_sym_to_skel_sym(
         signature: sym.signature.clone().unwrap_or_default(),
         children: sym.children.iter().map(code_sym_to_skel_sym).collect(),
     }
+}
+
+// --- Symbol-index helper ---
+
+/// Walk a [`ProjectCache`] once and parse every file via tree-sitter, keying
+/// the resulting symbol map by whatever the caller wants. `key_fn` lets
+/// callers pick `String` (review_pr_diff) or `PathBuf` (find_dead_code)
+/// without copy-pasting the loop body.
+fn build_symbols_by_file<K, F>(
+    cache: &ProjectCache,
+    key_fn: F,
+) -> HashMap<K, Vec<crate::core::parser::CodeSymbol>>
+where
+    K: Eq + std::hash::Hash,
+    F: Fn(&str) -> K,
+{
+    let mut symbols_by_file: HashMap<K, Vec<crate::core::parser::CodeSymbol>> = HashMap::new();
+    for (rel_path, lines) in &cache.file_lines {
+        let content = lines.join("\n");
+        let ext = rel_path.rsplit('.').next().unwrap_or("");
+        if let Ok(syms) = parse_with_tree_sitter(&content, ext) {
+            symbols_by_file.insert(key_fn(rel_path), syms);
+        }
+    }
+    symbols_by_file
 }
 
 // --- Metadata helper ---

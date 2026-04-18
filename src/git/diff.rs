@@ -58,25 +58,25 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
     let mut current: Option<FileChange> = None;
 
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ b/") {
+        if let Some(rest) = line.strip_prefix("+++ ") {
             if let Some(c) = current.take() {
                 out.push(c);
             }
+            // Strip the optional `b/` (or `"b/`) prefix produced by `git diff`
+            // and unquote C-escaped paths (paths with whitespace, tabs,
+            // newlines, or non-ASCII bytes are emitted as
+            // `+++ "b/foo\nbar.rs"`). Without C-unquoting, the literal quoted
+            // string never matches the project's relative paths and the file
+            // is silently dropped from the report.
+            let trimmed = rest.trim();
+            if trimmed == "/dev/null" {
+                continue;
+            }
+            let path = parse_diff_header_path(trimmed);
             current = Some(FileChange {
-                path: rest.trim().to_string(),
+                path,
                 ranges: Vec::new(),
             });
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
-            // `+++ /dev/null` (deletion) — still record so callers see the file
-            if let Some(c) = current.take() {
-                out.push(c);
-            }
-            if rest.trim() != "/dev/null" {
-                current = Some(FileChange {
-                    path: rest.trim().to_string(),
-                    ranges: Vec::new(),
-                });
-            }
         } else if line.starts_with("@@")
             && let Some(range) = parse_hunk_header(line)
             && let Some(c) = current.as_mut()
@@ -88,6 +88,76 @@ pub fn parse_unified_diff(diff: &str) -> Vec<FileChange> {
         out.push(c);
     }
     out
+}
+
+/// Strip the optional `b/` prefix and decode a C-quoted path emitted by
+/// `git diff` for filenames containing whitespace, control characters, or
+/// non-ASCII bytes (`+++ "b/foo\nbar.rs"`). Quoted form is signalled by a
+/// leading `"`; we honour `\n`, `\t`, `\r`, `\\`, `\"`, and `\NNN` (3-digit
+/// octal) escapes. Unrecognised escapes pass through literally so the parser
+/// stays permissive against future git format quirks.
+fn parse_diff_header_path(raw: &str) -> String {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        let unquoted = c_unquote(inner);
+        unquoted.strip_prefix("b/").unwrap_or(&unquoted).to_string()
+    } else {
+        raw.strip_prefix("b/").unwrap_or(raw).to_string()
+    }
+}
+
+fn c_unquote(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'n' => {
+                    out.push(b'\n');
+                    i += 2;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                b'"' => {
+                    out.push(b'"');
+                    i += 2;
+                }
+                b'0'..=b'7' if i + 3 < bytes.len() => {
+                    let oct = std::str::from_utf8(&bytes[i + 1..i + 4])
+                        .ok()
+                        .and_then(|s| u8::from_str_radix(s, 8).ok());
+                    match oct {
+                        Some(b) => {
+                            out.push(b);
+                            i += 4;
+                        }
+                        None => {
+                            out.push(bytes[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Parse a `@@ -A[,B] +C[,D] @@ ...` hunk header. Returns the new-side range.

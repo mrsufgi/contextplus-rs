@@ -230,10 +230,27 @@ pub fn start_tracker(
 
     // Spawn async task to process batched events
     let root_for_task = root_dir.clone();
+    let consumer_meta_cache = metadata_cache.clone();
     tokio::spawn(async move {
         // Keep debouncer alive in this task so it's not dropped
         let _debouncer = debouncer;
         let mut pending_set: HashSet<String> = HashSet::new();
+
+        // RV3-002: when the consumer drops a file due to pending-cap pressure,
+        // also invalidate its metadata-cache entry. metadata_unchanged() records
+        // the new (mtime, size) sig the moment a watcher event arrives, before
+        // the path reaches the consumer. If the consumer silently drops it, the
+        // next identical watcher event would skip it as "unchanged" → permanent
+        // miss until the file is modified again with a different sig. Mirror
+        // the rollback path the event_handler already uses on try_send failure.
+        let invalidate_dropped =
+            |dropped: &[String], cache: &Arc<Mutex<HashMap<String, FileSig>>>| {
+                if let Ok(mut guard) = cache.lock() {
+                    for f in dropped {
+                        guard.remove(f);
+                    }
+                }
+            };
 
         loop {
             tokio::select! {
@@ -243,13 +260,15 @@ pub fn start_tracker(
                     break;
                 }
                 Some(files) = event_rx.recv() => {
+                    let mut dropped: Vec<String> = Vec::new();
                     for f in files {
                         if pending_set.len() >= MAX_PENDING_FILES {
                             warn!(
                                 "Embedding tracker pending cap ({}) reached, dropping event for: {}",
                                 MAX_PENDING_FILES, f
                             );
-                            break;
+                            dropped.push(f);
+                            continue;
                         }
                         pending_set.insert(f);
                     }
@@ -262,10 +281,15 @@ pub fn start_tracker(
                                     "Embedding tracker pending cap ({}) reached, dropping events",
                                     MAX_PENDING_FILES
                                 );
-                                break;
+                                dropped.push(f);
+                                continue;
                             }
                             pending_set.insert(f);
                         }
+                    }
+
+                    if !dropped.is_empty() {
+                        invalidate_dropped(&dropped, &consumer_meta_cache);
                     }
 
                     if pending_set.is_empty() {
