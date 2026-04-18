@@ -3297,4 +3297,111 @@ mod tests {
             "empty project should yield no results, got: {text}"
         );
     }
+
+    // ----- build_symbols_by_file (M-R3-04) -----
+    //
+    // The helper consolidates symbol-build loops in `find_dead_code` and
+    // `review_pr_diff`. Direct unit tests guarantee the contract regardless
+    // of which handler exercises it.
+
+    fn cache_with_files(files: Vec<(&str, &str)>) -> ProjectCache {
+        let entries: Vec<crate::core::walker::FileEntry> = files
+            .iter()
+            .map(|(path, _)| crate::core::walker::FileEntry {
+                path: PathBuf::from(path),
+                relative_path: path.to_string(),
+                is_directory: false,
+                depth: 0,
+            })
+            .collect();
+        let file_lines: HashMap<String, Vec<String>> = files
+            .into_iter()
+            .map(|(path, content)| {
+                (
+                    path.to_string(),
+                    content.lines().map(|l| l.to_string()).collect(),
+                )
+            })
+            .collect();
+        ProjectCache {
+            file_entries: entries,
+            file_lines,
+            last_refresh: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn build_symbols_by_file_string_keys_includes_parsed_files() {
+        let cache = cache_with_files(vec![(
+            "src/foo.rs",
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )]);
+
+        let by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
+            build_symbols_by_file(&cache, |rel| rel.to_string());
+
+        assert!(
+            by_file.contains_key("src/foo.rs"),
+            "expected helper to use String key directly from rel_path"
+        );
+        let names: Vec<&str> = by_file["src/foo.rs"]
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"alpha"), "found {:?}", names);
+        assert!(names.contains(&"beta"), "found {:?}", names);
+    }
+
+    #[test]
+    fn build_symbols_by_file_pathbuf_keys_match_string_keys() {
+        let cache = cache_with_files(vec![("src/lib.rs", "pub fn solo() {}\n")]);
+
+        let by_str: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
+            build_symbols_by_file(&cache, |rel| rel.to_string());
+        let by_path: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
+            build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
+
+        assert_eq!(by_str.len(), by_path.len());
+        let str_names: Vec<String> = by_str["src/lib.rs"]
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let path_names: Vec<String> = by_path[&PathBuf::from("src/lib.rs")]
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(str_names, path_names, "key type must not affect contents");
+    }
+
+    #[test]
+    fn build_symbols_by_file_skips_files_without_extension() {
+        // tree-sitter dispatch is extension-driven; files with no extension
+        // (Makefile, LICENSE) yield Err and must not appear in the map
+        // rather than insert an empty Vec that callers would mistake for
+        // "parsed but no symbols".
+        let cache = cache_with_files(vec![
+            ("README", "# project"),
+            ("src/util.rs", "pub fn k() {}\n"),
+        ]);
+
+        let by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
+            build_symbols_by_file(&cache, |rel| rel.to_string());
+
+        assert!(
+            by_file.contains_key("src/util.rs"),
+            "rust file must be present"
+        );
+        assert!(
+            !by_file.contains_key("README"),
+            "extensionless files must be omitted, not inserted as empty"
+        );
+    }
+
+    #[test]
+    fn build_symbols_by_file_empty_cache_returns_empty_map() {
+        let cache = cache_with_files(vec![]);
+        let by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
+            build_symbols_by_file(&cache, |rel| rel.to_string());
+        assert!(by_file.is_empty());
+    }
 }

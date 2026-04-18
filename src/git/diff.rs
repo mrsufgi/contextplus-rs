@@ -419,4 +419,94 @@ diff --git a/src/foo.rs b/src/foo.rs
         assert!(!r.overlaps_symbol(&sym("before", "fn", 1, 9)));
         assert!(!r.overlaps_symbol(&sym("after", "fn", 21, 25)));
     }
+
+    // ----- C-quoted path coverage -----
+    //
+    // git emits `+++ b/"path"` for filenames containing spaces, control
+    // chars, or non-ASCII. Without C-unquoting, those changes were silently
+    // dropped from the change set.
+
+    #[test]
+    fn c_unquote_decodes_named_escapes() {
+        assert_eq!(c_unquote("a\\nb"), "a\nb");
+        assert_eq!(c_unquote("a\\tb"), "a\tb");
+        assert_eq!(c_unquote("a\\rb"), "a\rb");
+        assert_eq!(c_unquote("a\\\\b"), "a\\b");
+        assert_eq!(c_unquote("a\\\"b"), "a\"b");
+    }
+
+    #[test]
+    fn c_unquote_decodes_three_digit_octal_utf8() {
+        // \303\244 == U+00E4 (ä) in UTF-8 — git's standard encoding for
+        // non-ASCII path bytes.
+        assert_eq!(c_unquote("h\\303\\244ndler.rs"), "händler.rs");
+    }
+
+    #[test]
+    fn c_unquote_passes_unrecognised_escapes_literally() {
+        // No \q escape exists; we want the parser to stay permissive
+        // instead of dropping the byte.
+        assert_eq!(c_unquote("a\\qb"), "a\\qb");
+    }
+
+    #[test]
+    fn c_unquote_handles_trailing_backslash() {
+        // A lone backslash at EOF must not panic on bounds.
+        assert_eq!(c_unquote("a\\"), "a\\");
+    }
+
+    #[test]
+    fn c_unquote_malformed_octal_falls_through() {
+        // \\078 — first byte 0 enters the octal arm, but '8' is not an
+        // octal digit so `from_str_radix(.., 8)` returns None. The parser
+        // must emit the literal backslash and keep walking instead of
+        // dropping the bytes.
+        assert_eq!(c_unquote("a\\078b"), "a\\078b");
+    }
+
+    #[test]
+    fn parse_diff_header_path_unquoted() {
+        assert_eq!(parse_diff_header_path("b/src/foo.rs"), "src/foo.rs");
+        assert_eq!(
+            parse_diff_header_path("src/no_prefix.rs"),
+            "src/no_prefix.rs"
+        );
+    }
+
+    #[test]
+    fn parse_diff_header_path_quoted_with_space() {
+        assert_eq!(
+            parse_diff_header_path("\"b/src/file with space.rs\""),
+            "src/file with space.rs"
+        );
+    }
+
+    #[test]
+    fn parse_diff_header_path_quoted_with_octal_utf8() {
+        // \303\244 == ä — confirm full round-trip from quoted header to
+        // the relative path used as a graph key.
+        assert_eq!(
+            parse_diff_header_path("\"b/src/h\\303\\244ndler.rs\""),
+            "src/händler.rs"
+        );
+    }
+
+    #[test]
+    fn parses_quoted_path_with_space_through_full_pipeline() {
+        // The original bug: the change was parsed but the path was empty
+        // or garbage, so reverse-graph lookups missed and the file vanished
+        // from review.
+        let diff = "\
+diff --git \"a/src/file with space.rs\" \"b/src/file with space.rs\"
+--- \"a/src/file with space.rs\"
++++ \"b/src/file with space.rs\"
+@@ -1,2 +1,3 @@
+ unchanged
++new
+";
+        let changes = parse_unified_diff(diff);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "src/file with space.rs");
+        assert_eq!(changes[0].ranges, vec![LineRange { start: 1, end: 3 }]);
+    }
 }

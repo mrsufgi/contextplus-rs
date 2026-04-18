@@ -53,6 +53,28 @@ pub(crate) fn metadata_unchanged(
     }
 }
 
+/// Drop the metadata-cache entry for every path in `dropped`.
+///
+/// `metadata_unchanged` records the new (mtime, size) sig the moment a
+/// watcher event arrives, *before* the path reaches the consumer. If the
+/// consumer silently drops the path (cap reached, channel full), the next
+/// identical watcher event would skip it as "unchanged" → permanent miss
+/// until the file is modified again with a different sig. This rollback
+/// keeps the metadata cache aligned with what was actually processed.
+///
+/// Poisoned mutex is silently ignored: at worst we re-process some files,
+/// which is the same behavior as the rest of `metadata_unchanged`.
+pub(crate) fn invalidate_metadata_entries(
+    dropped: &[String],
+    cache: &Arc<Mutex<HashMap<String, FileSig>>>,
+) {
+    if let Ok(mut guard) = cache.lock() {
+        for f in dropped {
+            guard.remove(f);
+        }
+    }
+}
+
 const DEFAULT_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_MAX_FILES_PER_TICK: usize = 8;
 const MIN_FILES_PER_TICK: usize = 5;
@@ -236,22 +258,6 @@ pub fn start_tracker(
         let _debouncer = debouncer;
         let mut pending_set: HashSet<String> = HashSet::new();
 
-        // RV3-002: when the consumer drops a file due to pending-cap pressure,
-        // also invalidate its metadata-cache entry. metadata_unchanged() records
-        // the new (mtime, size) sig the moment a watcher event arrives, before
-        // the path reaches the consumer. If the consumer silently drops it, the
-        // next identical watcher event would skip it as "unchanged" → permanent
-        // miss until the file is modified again with a different sig. Mirror
-        // the rollback path the event_handler already uses on try_send failure.
-        let invalidate_dropped =
-            |dropped: &[String], cache: &Arc<Mutex<HashMap<String, FileSig>>>| {
-                if let Ok(mut guard) = cache.lock() {
-                    for f in dropped {
-                        guard.remove(f);
-                    }
-                }
-            };
-
         loop {
             tokio::select! {
                 biased;
@@ -289,7 +295,7 @@ pub fn start_tracker(
                     }
 
                     if !dropped.is_empty() {
-                        invalidate_dropped(&dropped, &consumer_meta_cache);
+                        invalidate_metadata_entries(&dropped, &consumer_meta_cache);
                     }
 
                     if pending_set.is_empty() {
@@ -648,5 +654,100 @@ mod tests {
         let cache = Mutex::new(HashMap::new());
         // No file → can't trust the gate; let the callback handle it.
         assert!(!metadata_unchanged(&cache, "ghost.rs", &f));
+    }
+
+    // -- pending-cap rollback (RV3-002) --
+
+    #[test]
+    fn invalidate_metadata_entries_drops_only_listed_paths() {
+        // Simulate the consumer-side rollback: events were registered in
+        // the metadata cache (because metadata_unchanged was called when
+        // the watcher event arrived) but then dropped at the cap. The
+        // dropped paths' sigs must be removed so the next identical event
+        // re-fires the consumer instead of being skipped as "unchanged".
+        let cache: Arc<Mutex<HashMap<String, FileSig>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = cache.lock().unwrap();
+            for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+                g.insert(
+                    name.to_string(),
+                    FileSig {
+                        mtime: SystemTime::UNIX_EPOCH,
+                        size: 1,
+                    },
+                );
+            }
+        }
+
+        let dropped = vec!["b.rs".to_string(), "d.rs".to_string()];
+        invalidate_metadata_entries(&dropped, &cache);
+
+        let g = cache.lock().unwrap();
+        assert!(g.contains_key("a.rs"), "untouched entry survives");
+        assert!(g.contains_key("c.rs"), "untouched entry survives");
+        assert!(!g.contains_key("b.rs"), "dropped entry must be removed");
+        assert!(!g.contains_key("d.rs"), "dropped entry must be removed");
+        assert_eq!(g.len(), 2);
+    }
+
+    #[test]
+    fn invalidate_metadata_entries_empty_dropped_is_noop() {
+        let cache: Arc<Mutex<HashMap<String, FileSig>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = cache.lock().unwrap();
+            g.insert(
+                "keep.rs".to_string(),
+                FileSig {
+                    mtime: SystemTime::UNIX_EPOCH,
+                    size: 1,
+                },
+            );
+        }
+
+        invalidate_metadata_entries(&[], &cache);
+
+        let g = cache.lock().unwrap();
+        assert_eq!(g.len(), 1, "empty dropped list must not perturb cache");
+        assert!(g.contains_key("keep.rs"));
+    }
+
+    #[test]
+    fn invalidate_metadata_entries_unknown_paths_are_silent() {
+        // The closure was originally local to start_tracker; if a path
+        // appears in `dropped` but was never inserted into the cache (e.g.
+        // metadata-skip itself failed), `remove` must not panic — it just
+        // returns None.
+        let cache: Arc<Mutex<HashMap<String, FileSig>>> = Arc::new(Mutex::new(HashMap::new()));
+        invalidate_metadata_entries(&["never_seen.rs".to_string()], &cache);
+        assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracker_rollback_re_fires_after_cap_pressure() {
+        // Integration-style: drive the tracker via the consumer side.
+        // We can't reach the closure directly, but the contract we care
+        // about is: after a path is dropped at the cap, hitting metadata
+        // for that same path must again return `false` (= "process me").
+        let cache: Arc<Mutex<HashMap<String, FileSig>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("hot.rs");
+        std::fs::write(&f, b"fn x() {}").unwrap();
+
+        // Step 1: watcher event arrives → metadata_unchanged records sig
+        // and returns false (first observation).
+        assert!(!metadata_unchanged(&cache, "hot.rs", &f));
+        // Step 2: same event arrives again → would normally skip. This
+        // models the "consumer dropped the file at cap" hazard.
+        assert!(metadata_unchanged(&cache, "hot.rs", &f));
+
+        // Step 3: rollback fires for the dropped path.
+        invalidate_metadata_entries(&["hot.rs".to_string()], &cache);
+
+        // Step 4: next watcher event must once again be reported through.
+        assert!(
+            !metadata_unchanged(&cache, "hot.rs", &f),
+            "after rollback, the same file must re-enter the pipeline"
+        );
     }
 }
