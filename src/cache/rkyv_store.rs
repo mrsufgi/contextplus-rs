@@ -54,7 +54,11 @@ fn worktree_name(root_dir: &Path) -> Option<String> {
         return None;
     }
     let name = path.file_name()?.to_str()?;
-    if name.is_empty() {
+    // Reject names that would resolve to a parent directory or contain a path
+    // separator: a malicious or buggy `gitdir:` pointer ending in `..` would
+    // otherwise collapse the worktree's cache into the main checkout's
+    // directory and silently defeat the per-worktree isolation guarantee.
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return None;
     }
     Some(name.to_string())
@@ -1037,6 +1041,49 @@ mod tests {
         fs::write(
             dir.path().join(".git"),
             "gitdir: /tmp/repo/.git/modules/sub\n",
+        )
+        .unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+    }
+
+    #[test]
+    fn write_lock_paths_are_per_cache_name() {
+        // Two different cache names in the same directory must use distinct
+        // lock files; otherwise concurrent writes serialize unnecessarily.
+        let dir = TempDir::new().unwrap();
+        let lock_a = write_lock_path(dir.path(), "cache_a");
+        let lock_b = write_lock_path(dir.path(), "cache_b");
+        assert_ne!(lock_a, lock_b);
+        assert!(
+            lock_a
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("cache_a"),
+            "lock filename must include the cache name, got {:?}",
+            lock_a
+        );
+    }
+
+    #[test]
+    fn worktree_name_rejects_path_traversal_pointers() {
+        // A malicious gitdir pointer ending in `..` or `.` would otherwise
+        // collapse the worktree's cache into the main checkout's directory.
+        let dir = TempDir::new().unwrap();
+
+        // gitdir ending in ".." → reject
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/repo/.git/worktrees/..\n",
+        )
+        .unwrap();
+        assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));
+
+        // gitdir ending in "." → reject
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /tmp/repo/.git/worktrees/.\n",
         )
         .unwrap();
         assert_eq!(cache_dir(dir.path()), dir.path().join(".mcp_data"));

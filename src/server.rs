@@ -950,14 +950,7 @@ impl ContextPlusServer {
             top_calls_per_identifier: Self::get_usize(&args, "top_calls_per_identifier"),
             semantic_weight: Self::get_f64(&args, "semantic_weight"),
             keyword_weight: Self::get_f64(&args, "keyword_weight"),
-            include_kinds: args
-                .get("include_kinds")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                }),
+            include_kinds: Self::get_string_array(&args, "include_kinds"),
         };
 
         let result = semantic_identifier_search(
@@ -1163,14 +1156,7 @@ impl ContextPlusServer {
                 .ok_or_else(|| ContextPlusError::Other("query is required".into()))?,
             max_depth: Self::get_usize(&args, "max_depth"),
             top_k: Self::get_usize(&args, "top_k"),
-            edge_filter: args
-                .get("edge_filter")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                }),
+            edge_filter: Self::get_string_array(&args, "edge_filter"),
         };
 
         let store = &self.state.memory_graph;
@@ -1247,14 +1233,7 @@ impl ContextPlusServer {
             node_id: Self::get_str(&args, "start_node_id")
                 .ok_or_else(|| ContextPlusError::Other("start_node_id is required".into()))?,
             max_depth: Self::get_usize(&args, "max_depth"),
-            edge_filter: args
-                .get("edge_filter")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                }),
+            edge_filter: Self::get_string_array(&args, "edge_filter"),
         };
 
         let store = &self.state.memory_graph;
@@ -1469,13 +1448,23 @@ impl ContextPlusServer {
                 .collect()
         };
 
-        let expected_dim = match requested_dim.or_else(|| vectors.first().map(|(_, v)| v.len())) {
+        // Pick a dim: caller override > first non-zero-length cached vector >
+        // bail out. Distinguishing empty-cache from corrupt-cache (every
+        // entry is zero-length) matters: the latter is a real diagnostic
+        // signal that should not be silently swallowed.
+        let inferred_dim = vectors.iter().map(|(_, v)| v.len()).find(|&n| n > 0);
+        let expected_dim = match requested_dim.or(inferred_dim) {
             Some(d) if d > 0 => d,
-            // Empty cache + no expected_dim: nothing meaningful to check.
             _ => {
-                return Ok(Self::ok_text(
-                    "Embedding quality report: 0 vector(s) cached and no `expected_dim` provided — nothing to check.".to_string(),
-                ));
+                let msg = if vectors.is_empty() {
+                    "Embedding quality report: 0 vector(s) cached and no `expected_dim` provided — nothing to check.".to_string()
+                } else {
+                    format!(
+                        "Embedding quality report: cache appears corrupt — all {} vector(s) have zero length and no `expected_dim` was provided.",
+                        vectors.len()
+                    )
+                };
+                return Ok(Self::ok_text(msg));
             }
         };
 
@@ -1504,7 +1493,12 @@ impl ContextPlusServer {
 
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
-        let top_k = Self::get_usize(&args, "top_k").unwrap_or(10);
+        // top_k=0 would silently return zero hits (LexicalIndex::search short-
+        // circuits on n=0) and the user would see "No matches" — masking the
+        // bad input. Treat 0 as "use default" the same way find_dead_code does.
+        let top_k = Self::get_usize(&args, "top_k")
+            .filter(|&n| n > 0)
+            .unwrap_or(10);
 
         let cache = self.ensure_project_cache().await?;
 
@@ -3188,6 +3182,36 @@ mod tests {
         assert!(
             text.contains("No import cycles"),
             "empty project should have no cycles, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_review_pr_diff_clamps_oversized_caps() {
+        // Caller-supplied max_hops / max_files larger than the internal caps
+        // (10 / 2000) must be silently clamped — the call must still succeed
+        // rather than triggering an effectively unbounded BFS.
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        // Minimal synthetic unified diff so the analyzer doesn't short-circuit
+        // on the empty-diff path before the clamp matters.
+        args.insert(
+            "diff".to_string(),
+            json!(
+                "diff --git a/x.rs b/x.rs\n\
+                 --- a/x.rs\n\
+                 +++ b/x.rs\n\
+                 @@ -1,1 +1,1 @@\n\
+                 -fn old() {}\n\
+                 +fn new() {}\n"
+            ),
+        );
+        args.insert("max_hops".to_string(), json!(9_999_usize));
+        args.insert("max_files".to_string(), json!(1_000_000_usize));
+        let result = server.dispatch("review_pr_diff", args).await;
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "oversized caps must clamp (not error)"
         );
     }
 

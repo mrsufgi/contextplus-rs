@@ -60,7 +60,7 @@ const MAX_FILES_PER_TICK: usize = 200;
 const MIN_DEBOUNCE_MS: u64 = 100;
 
 /// Maximum number of pending file change events before new events are dropped.
-pub const MAX_PENDING_FILES: usize = 50;
+const MAX_PENDING_FILES: usize = 50;
 
 /// Configuration for the embedding tracker.
 #[derive(Debug, Clone)]
@@ -577,11 +577,6 @@ mod tests {
         }
 
         handle.stop().await;
-    }
-
-    #[test]
-    fn pending_cap_constant_is_50() {
-        assert_eq!(MAX_PENDING_FILES, 50);
     }
 
     // -- metadata-skip gate (mtime + size pre-filter) --

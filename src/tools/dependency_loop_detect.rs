@@ -11,9 +11,12 @@ use std::path::PathBuf;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// One import cycle: an ordered ring where `files[i]` imports `files[(i+1) % n]`
-/// and the last file imports the first. The ring is normalised so the
-/// lexicographically smallest file appears first.
+/// One strongly-connected component of the import graph: every file in
+/// `files` can reach every other file via import edges. The ordering inside
+/// `files` is **not** a Hamiltonian cycle — Tarjan's SCC pop order is DFS
+/// completion order, which only happens to coincide with a traversal ring
+/// for trivial 2-cycles. The list is normalised so the lexicographically
+/// smallest file appears first, purely for stable output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyCycle {
     pub files: Vec<PathBuf>,
@@ -56,13 +59,13 @@ pub fn format_cycles(cycles: &[DependencyCycle]) -> String {
 
     let mut out = String::new();
     for (i, cycle) in cycles.iter().enumerate() {
-        out.push_str(&format!("Cycle {} ({} files):\n", i + 1, cycle.files.len()));
+        out.push_str(&format!(
+            "Cycle {} ({} files in SCC):\n",
+            i + 1,
+            cycle.files.len()
+        ));
         for file in &cycle.files {
             out.push_str(&format!("  {}\n", file.display()));
-        }
-        // Show the closing edge explicitly.
-        if !cycle.files.is_empty() {
-            out.push_str(&format!("  → {}\n", cycle.files[0].display()));
         }
     }
     out
@@ -343,7 +346,7 @@ mod tests {
             files: vec![p("a"), p("b")],
         };
         let out = format_cycles(&[cycle]);
-        assert!(out.contains("Cycle 1 (2 files)"));
+        assert!(out.contains("Cycle 1 (2 files in SCC)"));
         assert!(out.contains("a"));
         assert!(out.contains("b"));
     }
