@@ -241,7 +241,10 @@ diff --git a/src/foo.rs b/src/foo.rs
             vec![
                 LineRange { start: 1, end: 3 },
                 LineRange { start: 51, end: 55 },
-                LineRange { start: 106, end: 106 },
+                LineRange {
+                    start: 106,
+                    end: 106
+                },
             ]
         );
     }
@@ -270,7 +273,10 @@ diff --git a/src/foo.rs b/src/foo.rs
 -old
 ";
         let changes = parse_unified_diff(diff);
-        assert!(changes.is_empty(), "deletion-only diff should produce no FileChange");
+        assert!(
+            changes.is_empty(),
+            "deletion-only diff should produce no FileChange"
+        );
     }
 
     #[test]

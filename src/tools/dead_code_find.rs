@@ -54,14 +54,7 @@ impl Default for DeadCodeOptions {
             .map(|s| s.to_lowercase())
             .collect();
         let ignore_names = [
-            "main",
-            "default",
-            "new",
-            "drop",
-            "clone",
-            "fmt",
-            "from",
-            "into",
+            "main", "default", "new", "drop", "clone", "fmt", "from", "into",
         ]
         .iter()
         .map(|s| s.to_lowercase())
@@ -233,8 +226,10 @@ mod tests {
             path_a.clone(),
             vec![sym("MyTrait", "trait", 5), sym("foo", "function", 20)],
         )]);
-        let tokens =
-            HashMap::from([(path_a.clone(), HashSet::from(["MyTrait".to_string(), "foo".to_string()]))]);
+        let tokens = HashMap::from([(
+            path_a.clone(),
+            HashSet::from(["MyTrait".to_string(), "foo".to_string()]),
+        )]);
         let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
         assert_eq!(dead.len(), 1, "trait should be skipped, foo flagged");
         assert_eq!(dead[0].name, "foo");
@@ -261,7 +256,10 @@ mod tests {
         let path_b = PathBuf::from("b.rs");
         let symbols = HashMap::from([(path_a.clone(), vec![parent])]);
         let tokens = HashMap::from([
-            (path_a.clone(), HashSet::from(["dead_method".to_string(), "Parent".to_string()])),
+            (
+                path_a.clone(),
+                HashSet::from(["dead_method".to_string(), "Parent".to_string()]),
+            ),
             (path_b.clone(), HashSet::from(["Parent".to_string()])),
         ]);
         let dead = find_dead_symbols(&symbols, &tokens, &options_no_filters());
@@ -301,10 +299,16 @@ mod tests {
         let path_b = PathBuf::from("b.rs");
         let symbols = HashMap::from([
             (path_b.clone(), vec![sym("z1", "function", 50)]),
-            (path_a.clone(), vec![sym("a2", "function", 20), sym("a1", "function", 5)]),
+            (
+                path_a.clone(),
+                vec![sym("a2", "function", 20), sym("a1", "function", 5)],
+            ),
         ]);
         let tokens = HashMap::from([
-            (path_a.clone(), HashSet::from(["a1".to_string(), "a2".to_string()])),
+            (
+                path_a.clone(),
+                HashSet::from(["a1".to_string(), "a2".to_string()]),
+            ),
             (path_b.clone(), HashSet::from(["z1".to_string()])),
         ]);
         let dead = find_dead_symbols(&symbols, &tokens, &options_no_filters());
@@ -317,10 +321,7 @@ mod tests {
 
     #[test]
     fn format_output_handles_empty() {
-        assert_eq!(
-            format_dead_symbols(&[]),
-            "No dead-symbol candidates found."
-        );
+        assert_eq!(format_dead_symbols(&[]), "No dead-symbol candidates found.");
     }
 
     #[test]

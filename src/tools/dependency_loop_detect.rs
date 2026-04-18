@@ -62,10 +62,7 @@ pub fn format_cycles(cycles: &[DependencyCycle]) -> String {
         }
         // Show the closing edge explicitly.
         if !cycle.files.is_empty() {
-            out.push_str(&format!(
-                "  → {}\n",
-                cycle.files[0].display()
-            ));
+            out.push_str(&format!("  → {}\n", cycle.files[0].display()));
         }
     }
     out
@@ -99,8 +96,7 @@ fn tarjan_sccs(graph: &HashMap<PathBuf, HashSet<PathBuf>>) -> Vec<DependencyCycl
     nodes.dedup();
 
     let n = nodes.len();
-    let node_id: HashMap<&PathBuf, usize> =
-        nodes.iter().enumerate().map(|(i, p)| (p, i)).collect();
+    let node_id: HashMap<&PathBuf, usize> = nodes.iter().enumerate().map(|(i, p)| (p, i)).collect();
 
     // Build adjacency list using integer IDs.
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -296,7 +292,11 @@ mod tests {
         let cycles = find_cycles(&g);
         assert_eq!(cycles.len(), 1);
         assert_eq!(cycles[0].files.len(), 2);
-        let names: Vec<&str> = cycles[0].files.iter().map(|p| p.to_str().unwrap()).collect();
+        let names: Vec<&str> = cycles[0]
+            .files
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect();
         assert!(names.contains(&"a") && names.contains(&"b"));
     }
 
@@ -305,13 +305,7 @@ mod tests {
     fn two_independent_cycles() {
         // Cycle 1: a↔b (length 2)
         // Cycle 2: c→d→e→c (length 3)
-        let g = make_graph(&[
-            ("a", "b"),
-            ("b", "a"),
-            ("c", "d"),
-            ("d", "e"),
-            ("e", "c"),
-        ]);
+        let g = make_graph(&[("a", "b"), ("b", "a"), ("c", "d"), ("d", "e"), ("e", "c")]);
         let cycles = find_cycles(&g);
         assert_eq!(cycles.len(), 2);
         // Shortest first

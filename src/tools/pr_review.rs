@@ -53,10 +53,7 @@ pub fn analyze(
     expansion_opts: ExpansionOptions,
 ) -> PrReviewReport {
     let changes = parse_unified_diff(diff);
-    let changed_paths: Vec<PathBuf> = changes
-        .iter()
-        .map(|c| PathBuf::from(&c.path))
-        .collect();
+    let changed_paths: Vec<PathBuf> = changes.iter().map(|c| PathBuf::from(&c.path)).collect();
     let dependents: Vec<ExpansionHit> =
         expand_dependents(reverse_graph, &changed_paths, expansion_opts);
 
@@ -76,8 +73,7 @@ pub fn analyze(
     let dependent_count_map = dependent_count_per_seed(&changed_paths, &dependents);
 
     // Build risk inputs for every file we want to surface (changed ∪ dependents).
-    let mut all_paths: Vec<PathBuf> =
-        dependents.iter().map(|h| h.path.clone()).collect();
+    let mut all_paths: Vec<PathBuf> = dependents.iter().map(|h| h.path.clone()).collect();
     for c in &changed_paths {
         if !all_paths.iter().any(|p| p == c) {
             all_paths.push(c.clone());
@@ -88,8 +84,7 @@ pub fn analyze(
         .iter()
         .map(|path| {
             let changed_lines = lines_per_file.get(path).copied().unwrap_or(0);
-            let changed_symbol_count =
-                changed_symbol_count_map.get(path).copied().unwrap_or(0);
+            let changed_symbol_count = changed_symbol_count_map.get(path).copied().unwrap_or(0);
             // For changed files, use the count of *their* dependent files.
             // For dependent files, use 0 (we don't recurse another level).
             let dependent_count = dependent_count_map.get(path).copied().unwrap_or(0);
@@ -267,10 +262,8 @@ mod tests {
 
     #[test]
     fn analyze_returns_changed_file_entry() {
-        let symbols = HashMap::from([(
-            "src/auth.rs".to_string(),
-            vec![sym("verify_token", 8, 20)],
-        )]);
+        let symbols =
+            HashMap::from([("src/auth.rs".to_string(), vec![sym("verify_token", 8, 20)])]);
         let reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
 
         let report = analyze(
@@ -290,10 +283,8 @@ mod tests {
 
     #[test]
     fn analyze_includes_dependent_files() {
-        let symbols = HashMap::from([(
-            "src/auth.rs".to_string(),
-            vec![sym("verify_token", 8, 20)],
-        )]);
+        let symbols =
+            HashMap::from([("src/auth.rs".to_string(), vec![sym("verify_token", 8, 20)])]);
         let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
         reverse.insert(
             PathBuf::from("src/auth.rs"),
@@ -354,15 +345,16 @@ mod tests {
             total_changed_files: 0,
             total_dependent_files: 0,
         };
-        assert_eq!(format_report(&report), "PR review: empty diff (no files changed).");
+        assert_eq!(
+            format_report(&report),
+            "PR review: empty diff (no files changed)."
+        );
     }
 
     #[test]
     fn format_report_renders_summary_and_entries() {
-        let symbols = HashMap::from([(
-            "src/auth.rs".to_string(),
-            vec![sym("verify_token", 8, 20)],
-        )]);
+        let symbols =
+            HashMap::from([("src/auth.rs".to_string(), vec![sym("verify_token", 8, 20)])]);
         let reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
         let report = analyze(
             diff_one_file(),

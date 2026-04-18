@@ -465,9 +465,9 @@ impl ContextPlusServer {
                     })
                     .await;
                     match result {
-                        Ok(Err(e)) => tracing::warn!(
-                            "Failed to save incremental embedding cache: {e}"
-                        ),
+                        Ok(Err(e)) => {
+                            tracing::warn!("Failed to save incremental embedding cache: {e}")
+                        }
                         Err(join_err) => tracing::warn!(
                             "save_vector_store spawn_blocking join failed: {join_err}"
                         ),
@@ -648,9 +648,9 @@ impl ContextPlusServer {
                     })
                     .await;
                     match result {
-                        Ok(Err(e)) => tracing::warn!(
-                            "Failed to save identifier embedding cache: {e}"
-                        ),
+                        Ok(Err(e)) => {
+                            tracing::warn!("Failed to save identifier embedding cache: {e}")
+                        }
                         Err(join_err) => tracing::warn!(
                             "save_vector_store spawn_blocking join failed: {join_err}"
                         ),
@@ -1289,14 +1289,18 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        use crate::tools::dead_code_find::{find_dead_symbols, format_dead_symbols, DeadCodeOptions};
+        use crate::tools::dead_code_find::{
+            DeadCodeOptions, find_dead_symbols, format_dead_symbols,
+        };
 
         let cache = self.ensure_project_cache().await?;
 
-        let ignore_kinds: Option<std::collections::HashSet<String>> = Self::get_string_array(&args, "ignore_kinds")
-            .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
-        let ignore_names: Option<std::collections::HashSet<String>> = Self::get_string_array(&args, "ignore_names")
-            .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
+        let ignore_kinds: Option<std::collections::HashSet<String>> =
+            Self::get_string_array(&args, "ignore_kinds")
+                .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
+        let ignore_names: Option<std::collections::HashSet<String>> =
+            Self::get_string_array(&args, "ignore_names")
+                .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
         // Treat 0 as "use default" so callers cannot accidentally request a
         // truncated-to-zero result set that looks like "no dead code found".
         let max_results = Self::get_usize(&args, "max_results").filter(|&n| n > 0);
@@ -1350,7 +1354,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        use crate::core::dependent_expand::{build_reverse_graph, ExpansionOptions};
+        use crate::core::dependent_expand::{ExpansionOptions, build_reverse_graph};
         use crate::tools::pr_review::{analyze, format_report};
 
         let diff = Self::get_str(&args, "diff")
@@ -1420,8 +1424,7 @@ impl ContextPlusServer {
             // build_reverse_graph gives reverse edges (imported -> {importers}).
             // Invert to forward graph (importer -> {imported}) for cycle detection.
             let reverse = build_reverse_graph(&all_abs_paths);
-            let mut forward: HashMap<PathBuf, std::collections::HashSet<PathBuf>> =
-                HashMap::new();
+            let mut forward: HashMap<PathBuf, std::collections::HashSet<PathBuf>> = HashMap::new();
             for (imported, importers) in &reverse {
                 for importer in importers {
                     forward
@@ -1523,13 +1526,7 @@ impl ContextPlusServer {
                         .map(|s| s.name)
                         .collect();
                     let header = crate::core::parser::extract_header(&content);
-                    SearchDocument::new(
-                        e.relative_path.clone(),
-                        header,
-                        symbols,
-                        vec![],
-                        content,
-                    )
+                    SearchDocument::new(e.relative_path.clone(), header, symbols, vec![], content)
                 })
                 .collect();
 
@@ -3243,5 +3240,4 @@ mod tests {
             "empty project should yield no results, got: {text}"
         );
     }
-
 }

@@ -398,9 +398,7 @@ pub fn glob_to_regex(glob: &str) -> String {
 }
 
 fn path_passes_filters(path: &str, opts: &ResolvedSearchOptions) -> bool {
-    if !opts.include_globs.is_empty()
-        && !opts.include_globs.iter().any(|r| r.is_match(path))
-    {
+    if !opts.include_globs.is_empty() && !opts.include_globs.iter().any(|r| r.is_match(path)) {
         return false;
     }
     if opts.exclude_globs.iter().any(|r| r.is_match(path)) {
@@ -521,7 +519,12 @@ pub(crate) fn snippet_for_doc(
 /// the shorter slice's end (UB in release builds).
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() {
-        debug_assert!(false, "vector dimension mismatch: {} vs {}", a.len(), b.len());
+        debug_assert!(
+            false,
+            "vector dimension mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         return 0.0;
     }
     if a.iter().all(|&v| v == 0.0) {
@@ -831,10 +834,8 @@ impl SearchIndex {
                 self.documents
                     .iter()
                     .map(|d| {
-                        let boost = recency_boost(
-                            &opts.root_dir.join(&d.path),
-                            opts.recency_window_days,
-                        );
+                        let boost =
+                            recency_boost(&opts.root_dir.join(&d.path), opts.recency_window_days);
                         (d.path.as_str(), boost)
                     })
                     .collect()
@@ -875,10 +876,9 @@ impl SearchIndex {
                     compute_keyword_score(&query_lower, &query_terms, doc, &matched_symbols);
                 // Apply query-kind boost using the kind of the best-matched symbol entry
                 // (first matched_entries hit; falls back to no boost when nothing matched).
-                let best_kind = matched_entries
-                    .first()
-                    .and_then(|e| e.kind.as_deref());
-                let keyword_score = clamp01(raw_keyword_score * query_kind_boost(query_kind, best_kind));
+                let best_kind = matched_entries.first().and_then(|e| e.kind.as_deref());
+                let keyword_score =
+                    clamp01(raw_keyword_score * query_kind_boost(query_kind, best_kind));
                 let base_combined = compute_combined_score(semantic_score, keyword_score, opts);
                 // Recency: small additive nudge so freshly-touched files break ties upward.
                 // Value was precomputed into `recency_by_path` before par_iter — O(1) lookup.
@@ -1544,10 +1544,7 @@ mod tests {
 
     #[test]
     fn detect_natural_language_as_generic() {
-        assert_eq!(
-            detect_query_kind("how does login work"),
-            QueryKind::Generic
-        );
+        assert_eq!(detect_query_kind("how does login work"), QueryKind::Generic);
         assert_eq!(detect_query_kind("user"), QueryKind::Generic);
         assert_eq!(detect_query_kind(""), QueryKind::Generic);
     }
@@ -1578,8 +1575,13 @@ mod tests {
     #[test]
     fn boost_path_query_always_applies() {
         // Paths describe file location — any matched symbol is fine.
-        assert!((query_kind_boost(QueryKind::Path, Some("function")) - QUERY_KIND_BOOST_PATH).abs() < 1e-9);
-        assert!((query_kind_boost(QueryKind::Path, Some("class")) - QUERY_KIND_BOOST_PATH).abs() < 1e-9);
+        assert!(
+            (query_kind_boost(QueryKind::Path, Some("function")) - QUERY_KIND_BOOST_PATH).abs()
+                < 1e-9
+        );
+        assert!(
+            (query_kind_boost(QueryKind::Path, Some("class")) - QUERY_KIND_BOOST_PATH).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -1819,10 +1821,7 @@ mod tests {
     #[test]
     fn parse_location_string_handles_at_in_name() {
         // names containing '@' use the LAST '@' as the separator
-        assert_eq!(
-            parse_location_string("ns@inner@L1-L2"),
-            Some((1, Some(2)))
-        );
+        assert_eq!(parse_location_string("ns@inner@L1-L2"), Some((1, Some(2))));
     }
 
     #[test]

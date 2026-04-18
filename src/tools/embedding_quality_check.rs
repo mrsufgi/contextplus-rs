@@ -61,11 +61,7 @@ pub fn check_embeddings(vectors: &[(PathBuf, Vec<f32>)], expected_dim: usize) ->
             issues.push(VectorIssue {
                 path: path.clone(),
                 kind: IssueKind::DimensionMismatch,
-                detail: format!(
-                    "expected dim {}, got {}",
-                    expected_dim,
-                    vec.len()
-                ),
+                detail: format!("expected dim {}, got {}", expected_dim, vec.len()),
             });
             // Still continue to check other issues if possible, but skip norm/dup checks
             // since dimensionality is wrong — we can still check for non-finite values.
@@ -98,7 +94,10 @@ pub fn check_embeddings(vectors: &[(PathBuf, Vec<f32>)], expected_dim: usize) ->
 
             // Build normalized fingerprint for duplicate detection
             if let Some(fingerprint) = normalize(vec) {
-                normalized_map.entry(fingerprint).or_default().push(path.clone());
+                normalized_map
+                    .entry(fingerprint)
+                    .or_default()
+                    .push(path.clone());
             }
         }
     }
@@ -326,6 +325,10 @@ mod tests {
             .collect();
         let report = check_embeddings(&vecs, 4);
         let text = format_report(&report);
-        assert!(text.contains("(+10 more)"), "expected truncation footer, got:\n{}", text);
+        assert!(
+            text.contains("(+10 more)"),
+            "expected truncation footer, got:\n{}",
+            text
+        );
     }
 }

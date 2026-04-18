@@ -775,8 +775,8 @@ mod tests {
     #[test]
     fn concurrent_writers_no_lost_updates() {
         use std::collections::HashSet;
-        use std::sync::Barrier;
         use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
 
         const N: usize = 4;
         let dir = TempDir::new().unwrap();

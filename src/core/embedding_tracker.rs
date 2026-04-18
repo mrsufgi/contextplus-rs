@@ -162,8 +162,7 @@ pub fn start_tracker(
     // Per-tracker mtime+size cache so spurious watcher events (e.g. chmod,
     // touch-without-change, atime updates) for unchanged files are dropped
     // before we incur file-read + hashing cost downstream.
-    let metadata_cache: Arc<Mutex<HashMap<String, FileSig>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let metadata_cache: Arc<Mutex<HashMap<String, FileSig>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Set up notify debouncer with an event handler that filters and collects paths
     let handler_root = root_dir.clone();
@@ -186,7 +185,10 @@ pub fn start_tracker(
                         continue;
                     }
                     if metadata_unchanged(&handler_meta_cache, &normalized, path) {
-                        debug!("Embedding tracker skip (unchanged metadata): {}", normalized);
+                        debug!(
+                            "Embedding tracker skip (unchanged metadata): {}",
+                            normalized
+                        );
                         continue;
                     }
                     new_files.push(normalized);

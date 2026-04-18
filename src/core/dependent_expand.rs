@@ -63,10 +63,7 @@ pub fn build_reverse_graph(all_files: &[PathBuf]) -> HashMap<PathBuf, HashSet<Pa
             // an external dependency or a path outside the project would only
             // pollute the reverse graph.
             if in_set.contains(imported.as_path()) {
-                reverse
-                    .entry(imported)
-                    .or_default()
-                    .insert(importing);
+                reverse.entry(imported).or_default().insert(importing);
             }
         }
     }
@@ -159,32 +156,59 @@ mod tests {
         // seed + 2 importers
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].hop, 0);
-        assert!(hits.iter().any(|h| h.path == PathBuf::from("b.ts") && h.hop == 1));
-        assert!(hits.iter().any(|h| h.path == PathBuf::from("c.ts") && h.hop == 1));
+        assert!(
+            hits.iter()
+                .any(|h| h.path == PathBuf::from("b.ts") && h.hop == 1)
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h.path == PathBuf::from("c.ts") && h.hop == 1)
+        );
     }
 
     #[test]
     fn expand_finds_grand_importers_at_hop_two() {
         // d.ts → c.ts → a.ts. Seed = a.ts. Expect d.ts at hop 2.
         let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-        reverse.insert(PathBuf::from("a.ts"), HashSet::from([PathBuf::from("c.ts")]));
-        reverse.insert(PathBuf::from("c.ts"), HashSet::from([PathBuf::from("d.ts")]));
+        reverse.insert(
+            PathBuf::from("a.ts"),
+            HashSet::from([PathBuf::from("c.ts")]),
+        );
+        reverse.insert(
+            PathBuf::from("c.ts"),
+            HashSet::from([PathBuf::from("d.ts")]),
+        );
 
         let hits = expand_dependents(
             &reverse,
             &[PathBuf::from("a.ts")],
             ExpansionOptions::default(),
         );
-        assert!(hits.iter().any(|h| h.path == PathBuf::from("c.ts") && h.hop == 1));
-        assert!(hits.iter().any(|h| h.path == PathBuf::from("d.ts") && h.hop == 2));
+        assert!(
+            hits.iter()
+                .any(|h| h.path == PathBuf::from("c.ts") && h.hop == 1)
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h.path == PathBuf::from("d.ts") && h.hop == 2)
+        );
     }
 
     #[test]
     fn expand_respects_max_hops() {
         let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-        reverse.insert(PathBuf::from("a.ts"), HashSet::from([PathBuf::from("c.ts")]));
-        reverse.insert(PathBuf::from("c.ts"), HashSet::from([PathBuf::from("d.ts")]));
-        reverse.insert(PathBuf::from("d.ts"), HashSet::from([PathBuf::from("e.ts")]));
+        reverse.insert(
+            PathBuf::from("a.ts"),
+            HashSet::from([PathBuf::from("c.ts")]),
+        );
+        reverse.insert(
+            PathBuf::from("c.ts"),
+            HashSet::from([PathBuf::from("d.ts")]),
+        );
+        reverse.insert(
+            PathBuf::from("d.ts"),
+            HashSet::from([PathBuf::from("e.ts")]),
+        );
 
         let opts = ExpansionOptions {
             max_hops: 1,
@@ -220,15 +244,24 @@ mod tests {
             PathBuf::from("seed.ts"),
             HashSet::from([PathBuf::from("a.ts"), PathBuf::from("b.ts")]),
         );
-        reverse.insert(PathBuf::from("a.ts"), HashSet::from([PathBuf::from("x.ts")]));
-        reverse.insert(PathBuf::from("b.ts"), HashSet::from([PathBuf::from("x.ts")]));
+        reverse.insert(
+            PathBuf::from("a.ts"),
+            HashSet::from([PathBuf::from("x.ts")]),
+        );
+        reverse.insert(
+            PathBuf::from("b.ts"),
+            HashSet::from([PathBuf::from("x.ts")]),
+        );
 
         let hits = expand_dependents(
             &reverse,
             &[PathBuf::from("seed.ts")],
             ExpansionOptions::default(),
         );
-        let x_count = hits.iter().filter(|h| h.path == PathBuf::from("x.ts")).count();
+        let x_count = hits
+            .iter()
+            .filter(|h| h.path == PathBuf::from("x.ts"))
+            .count();
         assert_eq!(x_count, 1, "diamond importer must appear exactly once");
     }
 
@@ -236,8 +269,14 @@ mod tests {
     fn expand_handles_cycle_without_infinite_loop() {
         // a ↔ b: both import each other
         let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-        reverse.insert(PathBuf::from("a.ts"), HashSet::from([PathBuf::from("b.ts")]));
-        reverse.insert(PathBuf::from("b.ts"), HashSet::from([PathBuf::from("a.ts")]));
+        reverse.insert(
+            PathBuf::from("a.ts"),
+            HashSet::from([PathBuf::from("b.ts")]),
+        );
+        reverse.insert(
+            PathBuf::from("b.ts"),
+            HashSet::from([PathBuf::from("a.ts")]),
+        );
 
         let hits = expand_dependents(
             &reverse,
@@ -245,7 +284,10 @@ mod tests {
             ExpansionOptions::default(),
         );
         // Just verifies termination + no duplication of seed.
-        let a_count = hits.iter().filter(|h| h.path == PathBuf::from("a.ts")).count();
+        let a_count = hits
+            .iter()
+            .filter(|h| h.path == PathBuf::from("a.ts"))
+            .count();
         assert_eq!(a_count, 1);
     }
 
@@ -254,8 +296,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         fs::write(dir.join("a.ts"), "export const a = 1;").unwrap();
-        fs::write(dir.join("b.ts"), "import { a } from './a';\nexport const b = a;").unwrap();
-        fs::write(dir.join("c.ts"), "import { b } from './b';\nexport const c = b;").unwrap();
+        fs::write(
+            dir.join("b.ts"),
+            "import { a } from './a';\nexport const b = a;",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("c.ts"),
+            "import { b } from './b';\nexport const c = b;",
+        )
+        .unwrap();
 
         let files = vec![dir.join("a.ts"), dir.join("b.ts"), dir.join("c.ts")];
         let reverse = build_reverse_graph(&files);
@@ -286,10 +336,12 @@ mod tests {
         // No entry for "stripe" (external)
         assert!(!reverse.contains_key(&PathBuf::from("stripe")));
         // local is correctly inverted
-        assert!(reverse
-            .get(&dir.join("local.ts"))
-            .map(|s| s.contains(&dir.join("app.ts")))
-            .unwrap_or(false));
+        assert!(
+            reverse
+                .get(&dir.join("local.ts"))
+                .map(|s| s.contains(&dir.join("app.ts")))
+                .unwrap_or(false)
+        );
     }
 
     #[test]

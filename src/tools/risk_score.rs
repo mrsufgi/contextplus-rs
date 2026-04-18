@@ -50,10 +50,7 @@ pub fn score_file(input: &FileRiskInput) -> FileRisk {
         reasons.push(format!("{} changed lines", input.changed_lines));
     }
     if input.changed_symbol_count > 0 {
-        reasons.push(format!(
-            "{} changed symbol(s)",
-            input.changed_symbol_count
-        ));
+        reasons.push(format!("{} changed symbol(s)", input.changed_symbol_count));
     }
     if input.dependent_count > 0 {
         reasons.push(format!(
@@ -98,9 +95,8 @@ mod tests {
     #[test]
     fn score_file_combines_all_three_components() {
         let r = score_file(&input("a", 10, 2, 3));
-        let expected = WEIGHT_CHANGED_LINES * 10.0
-            + WEIGHT_CHANGED_SYMBOLS * 2.0
-            + WEIGHT_DEPENDENTS * 3.0;
+        let expected =
+            WEIGHT_CHANGED_LINES * 10.0 + WEIGHT_CHANGED_SYMBOLS * 2.0 + WEIGHT_DEPENDENTS * 3.0;
         assert!((r.score - expected).abs() < 1e-9);
         assert_eq!(r.reasons.len(), 3);
     }

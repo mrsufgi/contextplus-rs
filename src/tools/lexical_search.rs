@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::tools::semantic_search::{split_camel_case, SearchDocument};
+use crate::tools::semantic_search::{SearchDocument, split_camel_case};
 
 // ---------------------------------------------------------------------------
 // LexicalIndex
@@ -99,8 +99,7 @@ impl LexicalIndex {
         for token in &query_tokens {
             if let Some(postings) = self.posting.get(token.as_str()) {
                 let df = postings.len() as f64;
-                let idf =
-                    ((1.0 + self.doc_count as f64) / (1.0 + df)).ln() + 1.0;
+                let idf = ((1.0 + self.doc_count as f64) / (1.0 + df)).ln() + 1.0;
                 for &doc_idx in postings {
                     // tf_present = 1.0 (binary)
                     *scores.entry(doc_idx).or_insert(0.0) += idf;

@@ -172,7 +172,10 @@ fn shell_quote(p: &Path) -> String {
 /// Insert or replace our marker block within an existing hook file.
 fn upsert_block(existing: &str, new_block: &str) -> String {
     if let (Some(start), Some(end)) = (existing.find(BEGIN_MARK), existing.find(END_MARK)) {
-        let end_line_end = existing[end..].find('\n').map(|i| end + i + 1).unwrap_or(existing.len());
+        let end_line_end = existing[end..]
+            .find('\n')
+            .map(|i| end + i + 1)
+            .unwrap_or(existing.len());
         let mut out = String::with_capacity(existing.len());
         out.push_str(&existing[..start]);
         out.push_str(new_block);
@@ -195,7 +198,10 @@ fn strip_block(existing: &str) -> String {
     let (Some(start), Some(end)) = (existing.find(BEGIN_MARK), existing.find(END_MARK)) else {
         return existing.to_string();
     };
-    let end_line_end = existing[end..].find('\n').map(|i| end + i + 1).unwrap_or(existing.len());
+    let end_line_end = existing[end..]
+        .find('\n')
+        .map(|i| end + i + 1)
+        .unwrap_or(existing.len());
     let mut out = String::with_capacity(existing.len());
     out.push_str(&existing[..start]);
     out.push_str(&existing[end_line_end..]);
@@ -231,7 +237,10 @@ mod tests {
     fn hooks_dir_for_main_checkout() {
         let tmp = TempDir::new().unwrap();
         init_main_checkout(&tmp);
-        assert_eq!(hooks_dir(tmp.path()).unwrap(), tmp.path().join(".git/hooks"));
+        assert_eq!(
+            hooks_dir(tmp.path()).unwrap(),
+            tmp.path().join(".git/hooks")
+        );
     }
 
     #[test]
@@ -254,7 +263,14 @@ mod tests {
         .unwrap();
 
         let resolved = hooks_dir(wt.path()).unwrap();
-        assert_eq!(resolved, main.path().join(".git").join("hooks"));
+        // Canonicalize the expected path: hooks_dir() canonicalizes the
+        // gitdir pointer, which on macOS resolves /var → /private/var, while
+        // TempDir's path retains the symlink form.
+        let expected = fs::canonicalize(main.path())
+            .unwrap()
+            .join(".git")
+            .join("hooks");
+        assert_eq!(resolved, expected);
     }
 
     #[test]
@@ -404,7 +420,10 @@ mod tests {
         let path = tmp.path().join(".git/hooks/post-commit");
         fs::write(&path, "#!/usr/bin/env bash\necho user-only\n").unwrap();
         let removed = uninstall_hooks(tmp.path()).unwrap();
-        assert!(removed.is_empty(), "should not report files we didn't touch");
+        assert!(
+            removed.is_empty(),
+            "should not report files we didn't touch"
+        );
         // File still intact.
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("echo user-only"));
