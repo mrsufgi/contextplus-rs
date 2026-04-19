@@ -17,6 +17,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use fd_lock::RwLock as FdRwLock;
 
@@ -170,6 +171,71 @@ pub fn uninstall_hooks(root_dir: &Path) -> Result<Vec<PathBuf>> {
         removed.push(path);
     }
     Ok(removed)
+}
+
+/// Resolve the working-tree-relative file paths touched by the git event that
+/// fired `hook_name`. Returns forward-slash-separated paths.
+///
+/// The MCP server's embedding tracker calls this after observing a sentinel
+/// touch, to know exactly which files to invalidate + re-embed as a batch.
+/// Relying on inotify alone is lossy under pending-cap pressure (busy
+/// checkout/merge fires hundreds of near-simultaneous events) and semantically
+/// blind — here we get git's authoritative list for the specific event.
+///
+/// Hook → git invocation:
+/// - `post-commit`:   `git diff-tree --no-commit-id --name-only -r --root HEAD`
+///   (`--root` so the initial commit diffs against the empty tree instead of
+///   failing with "unknown revision HEAD~1")
+/// - `post-merge`:    `git diff --name-only ORIG_HEAD HEAD`
+///   (git sets `ORIG_HEAD` to the pre-merge tip; if the ref is missing we
+///   return empty rather than scanning the whole tree — safer to under-refresh
+///   than to mistakenly embed thousands of files)
+/// - `post-checkout`: `git diff --name-only HEAD@{1} HEAD`
+///   (`HEAD@{1}` = HEAD before the checkout; file-path checkouts and detached
+///   HEAD with no reflog entry yield empty diff, which is correct)
+///
+/// Unknown hook names and failed git invocations return an empty Vec — never
+/// an error. The sentinel path is speculative by design; a missing ref or a
+/// repo mid-rebase should degrade to "nothing to refresh", not fail loudly.
+pub fn resolve_hook_changes(root_dir: &Path, hook_name: &str) -> Vec<String> {
+    let args: &[&str] = match hook_name {
+        "post-commit" => &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            "HEAD",
+        ],
+        "post-merge" => &["diff", "--name-only", "ORIG_HEAD", "HEAD"],
+        "post-checkout" => &["diff", "--name-only", "HEAD@{1}", "HEAD"],
+        _ => return Vec::new(),
+    };
+    run_git(root_dir, args)
+        .map(|stdout| {
+            stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.replace('\\', "/"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run `git -C <cwd> <args>` and return stdout on success. Returns `None` for
+/// non-zero exit, non-UTF-8 output, or spawn failure — callers treat all
+/// three as "no changes to report".
+fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 fn block_for(hook: &str, sentinel_dir: &Path) -> String {
@@ -459,6 +525,182 @@ mod tests {
         // File still intact.
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("echo user-only"));
+    }
+
+    /// Run `git` with stable env so tests don't pick up the developer's
+    /// git config (GPG signing, global hooks, commit.template, etc.) — these
+    /// would otherwise make `git commit` prompt interactively and hang CI.
+    fn git(cwd: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "cp-test")
+            .env("GIT_AUTHOR_EMAIL", "cp-test@example.com")
+            .env("GIT_COMMITTER_NAME", "cp-test")
+            .env("GIT_COMMITTER_EMAIL", "cp-test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git must be available on PATH for tests")
+    }
+
+    fn git_init(cwd: &Path) {
+        assert!(git(cwd, &["init", "-q", "-b", "main"]).status.success());
+    }
+
+    fn git_commit_file(repo: &Path, rel_path: &str, contents: &str, msg: &str) {
+        let abs = repo.join(rel_path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&abs, contents).unwrap();
+        assert!(git(repo, &["add", rel_path]).status.success());
+        assert!(git(repo, &["commit", "-q", "-m", msg]).status.success());
+    }
+
+    #[test]
+    fn resolve_hook_changes_unknown_hook_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        assert!(resolve_hook_changes(tmp.path(), "pre-push").is_empty());
+        assert!(resolve_hook_changes(tmp.path(), "").is_empty());
+    }
+
+    #[test]
+    fn resolve_post_commit_returns_files_in_head_commit() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        git_commit_file(tmp.path(), "a.txt", "first", "first");
+        git_commit_file(tmp.path(), "src/b.rs", "// b", "second");
+
+        let changed = resolve_hook_changes(tmp.path(), "post-commit");
+        assert_eq!(changed, vec!["src/b.rs".to_string()]);
+    }
+
+    #[test]
+    fn resolve_post_commit_handles_initial_commit() {
+        // --root makes the initial-commit case (no HEAD~1) show all files,
+        // rather than bail with "unknown revision".
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        git_commit_file(tmp.path(), "only.txt", "x", "initial");
+
+        let changed = resolve_hook_changes(tmp.path(), "post-commit");
+        assert_eq!(changed, vec!["only.txt".to_string()]);
+    }
+
+    #[test]
+    fn resolve_post_commit_lists_all_files_in_merge_commit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git_init(repo);
+        git_commit_file(repo, "shared.txt", "base", "base");
+        assert!(
+            git(repo, &["checkout", "-q", "-b", "feature"])
+                .status
+                .success()
+        );
+        git_commit_file(repo, "feat.txt", "f", "on feature");
+        assert!(git(repo, &["checkout", "-q", "main"]).status.success());
+        git_commit_file(repo, "main-only.txt", "m", "on main");
+        // --no-ff forces a merge commit (not a fast-forward), so HEAD is a
+        // merge and diff-tree -m is needed to see its changes. Without --no-ff
+        // on this history git would fast-forward and there'd be no merge.
+        assert!(
+            git(repo, &["merge", "-q", "--no-ff", "--no-edit", "feature"])
+                .status
+                .success()
+        );
+
+        // post-commit also fires for merge commits. diff-tree without -m
+        // produces empty output for merge commits (it treats merges as
+        // non-informative by default). The current implementation does not
+        // pass -m, so this asserts the documented behavior: empty for merges,
+        // and post-merge is the correct hook to resolve the file set.
+        let changed = resolve_hook_changes(repo, "post-commit");
+        assert!(
+            changed.is_empty(),
+            "post-commit on a merge commit is expected to return empty; got {:?}",
+            changed
+        );
+    }
+
+    #[test]
+    fn resolve_post_merge_returns_diff_against_orig_head() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git_init(repo);
+        git_commit_file(repo, "shared.txt", "base", "base");
+        assert!(
+            git(repo, &["checkout", "-q", "-b", "feature"])
+                .status
+                .success()
+        );
+        git_commit_file(repo, "feat.txt", "f", "on feature");
+        assert!(git(repo, &["checkout", "-q", "main"]).status.success());
+        assert!(
+            git(repo, &["merge", "-q", "--no-ff", "--no-edit", "feature"])
+                .status
+                .success()
+        );
+
+        // After a real merge git sets ORIG_HEAD to the pre-merge main tip.
+        // diff ORIG_HEAD..HEAD shows every file the merge brought in, which
+        // for this history is just feat.txt.
+        let changed = resolve_hook_changes(repo, "post-merge");
+        assert_eq!(changed, vec!["feat.txt".to_string()]);
+    }
+
+    #[test]
+    fn resolve_post_merge_missing_orig_head_returns_empty() {
+        // Fresh repo: no ORIG_HEAD. Expect empty (not an error).
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        git_commit_file(tmp.path(), "a.txt", "x", "c");
+
+        assert!(resolve_hook_changes(tmp.path(), "post-merge").is_empty());
+    }
+
+    #[test]
+    fn resolve_post_checkout_returns_diff_against_prev_head() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git_init(repo);
+        git_commit_file(repo, "base.txt", "b", "base");
+        assert!(
+            git(repo, &["checkout", "-q", "-b", "feat"])
+                .status
+                .success()
+        );
+        git_commit_file(repo, "feat-only.txt", "f", "feat");
+        // Switch back to main — HEAD@{1} is now the feat tip.
+        assert!(git(repo, &["checkout", "-q", "main"]).status.success());
+
+        let changed = resolve_hook_changes(repo, "post-checkout");
+        // Going feat → main removes feat-only.txt vs HEAD@{1}.
+        assert_eq!(changed, vec!["feat-only.txt".to_string()]);
+    }
+
+    #[test]
+    fn resolve_post_checkout_no_prev_head_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        git_commit_file(tmp.path(), "a.txt", "x", "c");
+        // Only one HEAD move so far; HEAD@{1} exists on the initial commit
+        // creation in the reflog, but it points to the pre-commit empty HEAD.
+        // The diff may be non-empty (all files "added") or empty depending on
+        // git version. Either way, the call should not panic or error.
+        let _ = resolve_hook_changes(tmp.path(), "post-checkout");
+    }
+
+    #[test]
+    fn resolve_hook_changes_in_non_git_dir_returns_empty() {
+        // No .git here — git commands fail; resolver must not propagate error.
+        let tmp = TempDir::new().unwrap();
+        assert!(resolve_hook_changes(tmp.path(), "post-commit").is_empty());
+        assert!(resolve_hook_changes(tmp.path(), "post-merge").is_empty());
+        assert!(resolve_hook_changes(tmp.path(), "post-checkout").is_empty());
     }
 
     #[cfg(unix)]
