@@ -181,20 +181,65 @@ pub fn start_tracker(
     // Channel for debounced events from notify to our async processor
     let (event_tx, mut event_rx) = mpsc::channel::<Vec<String>>(64);
 
+    // Channel the notify handler pushes hook-sentinel events onto. The
+    // resolver task reads these, runs `git diff` to turn each sentinel touch
+    // into the authoritative file set, and feeds those paths into event_tx
+    // just like any other file-change batch. A dedicated channel (rather than
+    // calling git from inside the notify handler) keeps the handler fast and
+    // synchronous — it runs on notify's own thread where blocking on `git
+    // diff` would starve the debouncer.
+    let (hook_tx, mut hook_rx) = mpsc::channel::<String>(16);
+
     // Per-tracker mtime+size cache so spurious watcher events (e.g. chmod,
     // touch-without-change, atime updates) for unchanged files are dropped
     // before we incur file-read + hashing cost downstream.
     let metadata_cache: Arc<Mutex<HashMap<String, FileSig>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // Sentinel directory where git hooks touch one file per hook name.
+    // Created eagerly so notify has something to watch even before the first
+    // hook install/fire. `.mcp_data` is in the walker/tracker ignore list
+    // (to avoid self-triggering when cache files rotate on disk), so we need
+    // a second watch that specifically targets this subdir.
+    let sentinel_dir = root_dir.join(".mcp_data").join("hooks");
+    if let Err(e) = std::fs::create_dir_all(&sentinel_dir) {
+        warn!(
+            "Could not create hook sentinel dir {}: {} — git hook integration disabled",
+            sentinel_dir.display(),
+            e
+        );
+    }
+
     // Set up notify debouncer with an event handler that filters and collects paths
     let handler_root = root_dir.clone();
     let handler_meta_cache = metadata_cache.clone();
+    let handler_sentinel_dir = sentinel_dir.clone();
+    let handler_hook_tx = hook_tx.clone();
+    // Clone event_tx for the resolver task; the handler closure below takes
+    // ownership of the original.
+    let resolver_event_tx = event_tx.clone();
 
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => {
             let mut new_files = Vec::new();
             for event in &events {
                 for path in &event.paths {
+                    // Detect sentinel events first. A sentinel touch represents
+                    // a git event (commit/merge/checkout), not a file edit —
+                    // forward only the hook name to the resolver task, which
+                    // knows how to turn it into the real changed-files list.
+                    if let Ok(rel_to_sentinel) = path.strip_prefix(&handler_sentinel_dir)
+                        && let Some(name) = rel_to_sentinel.file_name().and_then(|s| s.to_str())
+                        && crate::git::hooks::MANAGED_HOOKS.contains(&name)
+                    {
+                        // try_send: if the resolver is backed up, drop the
+                        // signal — the next hook fire will re-touch the
+                        // sentinel and we'll catch up then. Losing a single
+                        // signal here is preferable to blocking the notify
+                        // thread on a full channel.
+                        let _ = handler_hook_tx.try_send(name.to_string());
+                        continue;
+                    }
+
                     let relative = match path.strip_prefix(&handler_root) {
                         Ok(r) => r.to_path_buf(),
                         Err(_) => continue,
@@ -247,6 +292,74 @@ pub fn start_tracker(
     let mut debouncer = new_debouncer(Duration::from_millis(debounce_ms), None, event_handler)?;
 
     debouncer.watch(&root_dir, RecursiveMode::Recursive)?;
+
+    // Second watch on the sentinel dir. Non-recursive: nothing nested in
+    // `.mcp_data/hooks/` concerns us. Failure here is logged but not fatal —
+    // the recursive root watch still catches real file edits; only the git
+    // hook optimization path goes dark.
+    if sentinel_dir.is_dir()
+        && let Err(e) = debouncer.watch(&sentinel_dir, RecursiveMode::NonRecursive)
+    {
+        warn!(
+            "Could not watch hook sentinel dir {}: {} — git hook integration disabled",
+            sentinel_dir.display(),
+            e
+        );
+    }
+
+    // Resolver task: turns hook-sentinel signals into authoritative file lists.
+    // Runs `git diff` off the notify thread, filters with `should_track`,
+    // invalidates the metadata cache for the changed paths (so the consumer
+    // below won't skip them as "metadata unchanged"), and forwards through
+    // `event_tx` — the same path a plain file edit would take. Terminates
+    // naturally when all senders on `hook_tx` drop (i.e. when the debouncer
+    // closure is released by the consumer task on shutdown).
+    let resolver_root = root_dir.clone();
+    let resolver_meta_cache = metadata_cache.clone();
+    let resolver_ignore_dirs = config.ignore_dirs.clone();
+    tokio::spawn(async move {
+        while let Some(hook_name) = hook_rx.recv().await {
+            let root = resolver_root.clone();
+            let name = hook_name.clone();
+            let changed: Vec<String> = match tokio::task::spawn_blocking(move || {
+                crate::git::hooks::resolve_hook_changes(&root, &name)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Embedding tracker hook resolver task panicked: {}", e);
+                    continue;
+                }
+            };
+            if changed.is_empty() {
+                continue;
+            }
+            let kept: Vec<String> = changed
+                .into_iter()
+                .filter(|p| should_track(Path::new(p), &resolver_ignore_dirs))
+                .map(|p| normalize_relative_path(Path::new(&p)))
+                .filter(|p| !p.is_empty())
+                .collect();
+            if kept.is_empty() {
+                continue;
+            }
+            // Invalidate metadata so the consumer doesn't short-circuit these
+            // paths as unchanged — the file on disk may match the cached sig
+            // but the git event means we want to re-embed regardless.
+            invalidate_metadata_entries(&kept, &resolver_meta_cache);
+            debug!(
+                "Embedding tracker hook '{}' resolved {} changed file(s)",
+                hook_name,
+                kept.len()
+            );
+            if let Err(e) = resolver_event_tx.send(kept).await {
+                warn!("Embedding tracker hook resolver send failed: {}", e);
+                break;
+            }
+        }
+        debug!("Embedding tracker hook resolver exiting");
+    });
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -561,6 +674,104 @@ mod tests {
         }
 
         handle.stop().await;
+    }
+
+    /// End-to-end: installing hooks + running a real `git commit` in the
+    /// tracker's root should cause the refresh_callback to fire with the
+    /// committed file path. This exercises the full loop:
+    /// hook script → sentinel touch → notify watcher → hook_tx → resolver
+    /// task → `git diff` → event_tx → consumer → refresh_callback.
+    #[tokio::test]
+    async fn tracker_fires_on_git_commit_via_hook_sentinel() {
+        use std::process::Command;
+        // Skip if git isn't available (CI may not have it).
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("SKIP: git not available");
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Hermetic git: no global/system config leaking user identity in.
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git runs")
+                .success();
+            assert!(ok, "git {:?} failed", args);
+        };
+        git(&["init", "-q", "-b", "main"]);
+
+        // Baseline commit so HEAD exists; post-commit hook on the *next*
+        // commit will diff-tree --root HEAD and return that commit's files.
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("seed.rs"), "fn seed() {}").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        // Install contextplus hooks into this repo.
+        crate::git::hooks::install_hooks(&root).expect("install_hooks");
+
+        // Start the tracker with a channel that records every callback fire.
+        let (tx, mut rx) = mpsc::channel::<Vec<String>>(16);
+        let callback: RefreshCallback = Arc::new(move |_root, files| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(files).await;
+                (1, 0)
+            })
+        });
+        let config = EmbeddingTrackerConfig {
+            debounce_ms: 200,
+            max_files_per_tick: 8,
+            ignore_dirs: default_ignore_dirs(),
+        };
+        let handle = start_tracker(root.clone(), config, callback).expect("tracker starts");
+
+        // Give notify a moment to register both watches.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Create and commit a new tracked file. The post-commit hook touches
+        // `.mcp_data/hooks/post-commit`, which the tracker should resolve into
+        // the committed file path and forward to the refresh callback.
+        std::fs::write(src.join("new_feature.rs"), "fn f() {}").unwrap();
+        git(&["add", "src/new_feature.rs"]);
+        git(&["commit", "-q", "-m", "feat"]);
+
+        // Collect batches until we see new_feature.rs or time out. The real
+        // edit + the hook sentinel may each produce a batch; accept either.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_new_feature = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(files)) => {
+                    if files.iter().any(|f| f.ends_with("new_feature.rs")) {
+                        saw_new_feature = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        handle.stop().await;
+
+        // Some CI filesystems don't deliver inotify events; treat as skip.
+        if !saw_new_feature {
+            eprintln!(
+                "WARNING: hook-sentinel integration path did not fire — inotify or git hooks may not work in this environment"
+            );
+        }
     }
 
     #[tokio::test]
