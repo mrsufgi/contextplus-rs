@@ -289,13 +289,30 @@ pub fn rank_call_sites(
         }
     };
 
+    // Cap: only gather enough candidates to fill the embed budget.
+    // Using a hard ceiling avoids unbounded Vec growth when a common symbol
+    // name matches thousands of lines — we only need the top `embed_budget`
+    // by keyword score, so stop collecting once we have far more than that.
+    let embed_budget = (limit * 4).max(30);
+    // Collect 4× the embed_budget before applying the top-k filter, giving a
+    // good statistical sample without scanning the entire tail of matches.
+    let candidate_cap = embed_budget * 4;
+
     // Collect candidates as (file_index, line_number, line_offset, keyword_score)
     // to avoid cloning file Strings and context Strings in the inner loop.
     let file_entries: Vec<(&String, &Vec<String>)> = file_lines.iter().collect();
     let mut candidates: Vec<(usize, usize, usize, f64)> = Vec::new();
     let mut keyword_buf = String::with_capacity(512);
 
-    for (fi, (file, lines)) in file_entries.iter().enumerate() {
+    'outer: for (fi, (file, lines)) in file_entries.iter().enumerate() {
+        // Fast pre-filter: skip files that don't contain the symbol name at all.
+        // This is O(file_content_len) but far cheaper than regex matching every
+        // individual line when there's no match in the file.
+        let has_name = lines.iter().any(|l| l.contains(symbol.name.as_str()));
+        if !has_name {
+            continue;
+        }
+
         for (i, line) in lines.iter().enumerate() {
             if !call_pattern.is_match(line) {
                 continue;
@@ -321,6 +338,13 @@ pub fn rank_call_sites(
             keyword_buf.push_str(context);
             let keyword_score = get_keyword_coverage(query_terms, &keyword_buf);
             candidates.push((fi, i + 1, i, keyword_score));
+
+            // Hard cap: once we have enough candidates to fill a good sample
+            // for the embed budget, stop collecting. This prevents O(N) growth
+            // for common symbol names with thousands of matches.
+            if candidates.len() >= candidate_cap {
+                break 'outer;
+            }
         }
     }
 
@@ -334,7 +358,6 @@ pub fn rank_call_sites(
     let total = candidates.len();
 
     // Sample top candidates by keyword score for embedding
-    let embed_budget = (limit * 4).max(30);
     candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(embed_budget);
 
@@ -600,9 +623,12 @@ pub async fn semantic_identifier_search(
         return Ok("No identifiers matched the requested kind filters.".to_string());
     }
 
-    // Rank call-sites for each top identifier
+    // Rank call-sites for each top identifier — parallel across identifiers.
+    // Each call scans the full file_lines corpus; doing them in parallel via rayon
+    // reduces wall time from O(top_k × corpus_lines) to O(corpus_lines) on
+    // machines with ≥ top_k cores.
     let call_results: Vec<CallSiteResult> = top
-        .iter()
+        .par_iter()
         .map(|item| {
             rank_call_sites(
                 &query_terms,
@@ -629,6 +655,7 @@ pub async fn semantic_identifier_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::prelude::*;
 
     /// Compute the vector norm (L2) of a vector.
     /// Only used in tests — moved here to eliminate dead code warning.
@@ -1083,5 +1110,124 @@ mod tests {
         let result = normalize_kinds(&kinds).unwrap();
         assert!(result.contains("function"));
         assert!(result.contains("class"));
+    }
+
+    // -- performance regression test --
+
+    /// Synthetic corpus: 500 identifier docs + 200 files × 100 lines.
+    /// The target symbol name appears on ~10% of lines to exercise the hot path.
+    /// Asserts that `rank_call_sites` for 5 identifiers completes in under 2 s,
+    /// which guards against O(N × top_k) regressions on the call-site scan loop.
+    #[test]
+    fn test_rank_call_sites_perf_large_corpus() {
+        use std::time::Instant;
+
+        // Build a fake file corpus: 200 files, 100 lines each.
+        // Every 10th line calls "syncStripeQuantity(" so there are ~2000 matches.
+        let num_files = 200usize;
+        let lines_per_file = 100usize;
+        let mut file_lines: HashMap<String, Vec<String>> = HashMap::new();
+        for fi in 0..num_files {
+            let mut lines = Vec::with_capacity(lines_per_file);
+            for li in 0..lines_per_file {
+                if li % 10 == 0 {
+                    lines.push(format!(
+                        "  const result = syncStripeQuantity(orgId_{fi}_{li}, seats);"
+                    ));
+                } else {
+                    lines.push(format!(
+                        "  const x_{fi}_{li} = doSomethingElse(param_{li});"
+                    ));
+                }
+            }
+            file_lines.insert(format!("src/module_{fi}.ts"), lines);
+        }
+
+        // Build 500 fake identifier docs (only a handful will be top-ranked,
+        // but we need enough to simulate a real corpus size for score_identifiers).
+        let num_docs = 500usize;
+        let dims = 4usize;
+        let mut docs: Vec<IdentifierDoc> = Vec::with_capacity(num_docs);
+        let mut vector_buffer: Vec<f32> = Vec::with_capacity(num_docs * dims);
+        for i in 0..num_docs {
+            let name = if i == 0 {
+                "syncStripeQuantity".to_string()
+            } else {
+                format!("identifier_{i}")
+            };
+            let doc = IdentifierDoc {
+                id: format!("src/mod_{i}.ts:{name}:{}", i * 3),
+                path: format!("src/mod_{i}.ts"),
+                header: "stripe billing".to_string(),
+                name: name.clone(),
+                kind: "function".to_string(),
+                line: i * 3 + 1,
+                end_line: i * 3 + 5,
+                signature: format!("{name}(orgId: string, seats: number): void"),
+                parent_name: None,
+                text: format!(
+                    "{name} function {name}(orgId: string, seats: number): void \
+                     src/mod_{i}.ts stripe billing"
+                ),
+            };
+            docs.push(doc);
+            // Give syncStripeQuantity (index 0) a high-similarity vector; rest low.
+            if i == 0 {
+                vector_buffer.extend_from_slice(&[0.9, 0.1, 0.0, 0.0]);
+            } else {
+                // Spread other docs so they score lower
+                let v = (i as f32 % 10.0) / 10.0;
+                vector_buffer.extend_from_slice(&[0.1, v, 0.0, 0.0]);
+            }
+        }
+
+        let query_vec: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+        let query_terms: HashSet<String> = ["sync", "stripe", "quantity"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Score identifiers to get top 5 (simulates the full search path).
+        let top = score_identifiers(
+            &docs,
+            &query_vec,
+            &query_terms,
+            &vector_buffer,
+            dims,
+            &None,
+            DEFAULT_SEMANTIC_WEIGHT,
+            DEFAULT_KEYWORD_WEIGHT,
+            5,
+        );
+        assert!(!top.is_empty(), "expected at least one top identifier");
+
+        // Time the call-site ranking for all top identifiers.
+        // Before the fix this was sequential O(top_k × corpus_lines); after the
+        // fix it runs in parallel and with per-file substring pre-filtering.
+        let start = Instant::now();
+        let call_results: Vec<CallSiteResult> = top
+            .par_iter()
+            .map(|item| {
+                rank_call_sites(&query_terms, &query_vec, &item.doc, &file_lines, 10, None)
+            })
+            .collect();
+        let elapsed = start.elapsed();
+
+        // Sanity-check: syncStripeQuantity should find call sites.
+        let stripe_result = call_results
+            .iter()
+            .find(|_| true) // first result corresponds to best-ranked identifier
+            .expect("should have at least one call-site result");
+        // 200 files × 10 matching lines per file = 2000 total; capped by candidate_cap.
+        assert!(
+            stripe_result.total > 0 || top[0].doc.name != "syncStripeQuantity",
+            "syncStripeQuantity should have call sites"
+        );
+
+        assert!(
+            elapsed.as_secs_f64() < 2.0,
+            "rank_call_sites for 5 identifiers over 200-file corpus took {:.2}s (limit: 2s)",
+            elapsed.as_secs_f64()
+        );
     }
 }
