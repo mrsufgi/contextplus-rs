@@ -200,6 +200,39 @@ fn extract_signature<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
     }
 }
 
+/// Return `true` if `node` is a variable/lexical declaration whose binding
+/// target is a destructure pattern (`object_pattern` or `array_pattern`).
+///
+/// Tree-sitter structure for `const { a, b } = rhs()`:
+///   lexical_declaration
+///     variable_declarator
+///       name: object_pattern    ← destructure
+///       value: call_expression
+///
+/// vs. `const foo = rhs()`:
+///   lexical_declaration
+///     variable_declarator
+///       name: identifier        ← plain binding — keep emitting
+///       value: call_expression
+///
+/// Skipping destructure-binding declarations prevents dead-code false
+/// positives: the bound names appear later in the same file as *references*
+/// (not definitions), and the cross-file heuristic should never flag them.
+fn is_destructure_binding(node: &Node) -> bool {
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i)
+            && (child.kind() == "variable_declarator" || child.kind() == "const_declaration")
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let k = name_node.kind();
+            if k == "object_pattern" || k == "array_pattern" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Walk the AST and collect symbols, returning them as a Vec.
 fn collect_symbols(
     node: &Node,
@@ -215,6 +248,12 @@ fn collect_symbols(
     let mut results = Vec::new();
 
     if let Some(&kind) = def_types.get(node.kind()) {
+        // Skip destructure-binding declarations — they are not true symbol
+        // definitions and would produce false-positive dead-code candidates.
+        if is_destructure_binding(node) {
+            return results;
+        }
+
         // This node is a definition — collect its children as nested symbols
         let mut children = Vec::new();
         for i in 0..node.named_child_count() {
@@ -992,5 +1031,60 @@ fn main() {}
         let code = "export function hello() { return 'world'; }\n";
         let imports = extract_imports_from_str(code, ".ts");
         assert!(imports.is_empty());
+    }
+
+    // --- Destructure-binding LHS fix ---
+
+    /// Top-level `const foo = bar()` MUST appear in the symbol list.
+    /// Destructure-binding LHS identifiers (`const { x, y } = z()`) MUST NOT.
+    ///
+    /// This guards against the false-positive dead-code reports described in
+    /// https://github.com/mrsufgi/contextplus-rs/issues — where names like
+    /// `redis` and `sessionStore` from `const { redis, sessionStore } = makeStores()`
+    /// were flagged as dead symbols even though they were used inline.
+    #[test]
+    fn const_plain_binding_emitted_destructure_lhs_skipped() {
+        let code = r#"
+const foo = makeFoo();
+const { x, y } = makePoint();
+const [a, b] = makePair();
+"#;
+        let symbols = parse_with_tree_sitter(code, ".ts").unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+
+        // Plain binding should still be collected
+        assert!(
+            names.contains(&"foo"),
+            "expected 'foo' in symbols, got: {names:?}"
+        );
+
+        // Destructure LHS names must NOT be emitted as top-level symbols —
+        // neither as bare identifiers nor as raw object-pattern text like "{ x, y }".
+        // The whole lexical_declaration for a destructure should be skipped entirely.
+        assert!(
+            !names.contains(&"x"),
+            "destructure LHS 'x' must not appear in symbols, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"y"),
+            "destructure LHS 'y' must not appear in symbols, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"a"),
+            "array destructure LHS 'a' must not appear in symbols, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"b"),
+            "array destructure LHS 'b' must not appear in symbols, got: {names:?}"
+        );
+
+        // Also verify no symbol with a name starting with '{' or '[' sneaks through
+        // (which would be the raw object_pattern / array_pattern text)
+        for name in &names {
+            assert!(
+                !name.starts_with('{') && !name.starts_with('['),
+                "raw destructure pattern text leaked as symbol name: {name:?}"
+            );
+        }
     }
 }
