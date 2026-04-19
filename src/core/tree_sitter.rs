@@ -329,6 +329,41 @@ pub fn get_supported_extensions() -> &'static [&'static str] {
     ]
 }
 
+/// Return `true` when a TypeScript/TSX `import_statement` or `export_statement`
+/// node represents a *type-only* declaration that is fully erased at compile
+/// time and therefore creates no runtime dependency.
+///
+/// Covers the top-level form only:
+/// - `import type { Foo } from './bar'`
+/// - `export type { Foo } from './bar'`
+///
+/// Per-specifier type modifiers (`import { type Foo, Bar }`) are NOT
+/// considered type-only at the statement level because the statement still
+/// carries at least one runtime import (`Bar`). Those edges are correctly
+/// retained.
+fn is_type_only_ts_import(node: &Node<'_>) -> bool {
+    // The `type` keyword, when present at the statement level, appears as a
+    // non-named child immediately after the `import`/`export` keyword token.
+    // Iterate all children (both named and anonymous) and look for a child
+    // whose kind is the literal string "type" before the first named import
+    // clause or namespace import.
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i) {
+            match child.kind() {
+                // The `type` keyword signals a type-only import/export.
+                "type" => return true,
+                // Stop scanning once we hit the import clause — the `type`
+                // keyword would have appeared before it.
+                "import_clause" | "namespace_import" | "named_imports" | "export_clause"
+                | "namespace_export" => return false,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Recursively collect import paths from AST nodes.
 ///
 /// Per-language match arms each guard on `node.kind()` via a nested `if`
@@ -346,6 +381,14 @@ fn collect_imports_from_node(
         "typescript" | "tsx" | "javascript" => {
             // ES import/export: import ... from 'path'; export ... from 'path'
             if node.kind() == "import_statement" || node.kind() == "export_statement" {
+                // Skip type-only declarations: `import type { … }` and
+                // `export type { … }` are erased at compile time and never
+                // create a runtime dependency. Keeping them in the graph
+                // produces false-positive cycles (e.g. the berries
+                // subscription-domain 3-file SCC).
+                if is_type_only_ts_import(&node) {
+                    return;
+                }
                 if let Some(source_node) = node.child_by_field_name("source")
                     && let Ok(text) = source_node.utf8_text(source)
                 {
@@ -552,9 +595,13 @@ pub fn extract_imports(path: &Path) -> Vec<String> {
         })
     });
 
+    // Fall back to regex ONLY when tree-sitter failed to produce a parse tree
+    // (result is None). An empty import list from a successful parse is
+    // authoritative — falling back on empty would re-introduce type-only
+    // imports that the tree-sitter pass correctly suppressed.
     match result {
-        Some(imports) if !imports.is_empty() => imports,
-        _ => extract_imports_regex(&content),
+        Some(imports) => imports,
+        None => extract_imports_regex(&content),
     }
 }
 
@@ -583,9 +630,13 @@ pub fn extract_imports_from_str(content: &str, ext: &str) -> Vec<String> {
         })
     });
 
+    // Fall back to regex ONLY when tree-sitter failed to produce a parse tree
+    // (result is None). An empty import list from a successful parse is
+    // authoritative — falling back on empty would re-introduce type-only
+    // imports that the tree-sitter pass correctly suppressed.
     match result {
-        Some(imports) if !imports.is_empty() => imports,
-        _ => extract_imports_regex(content),
+        Some(imports) => imports,
+        None => extract_imports_regex(content),
     }
 }
 
@@ -900,7 +951,41 @@ export function doStuff() {}
         assert!(imports.contains(&"./billing-service".to_string()));
         assert!(imports.contains(&"@berries/lib-context".to_string()));
         assert!(imports.contains(&"fs/promises".to_string()));
-        assert!(imports.contains(&"../config".to_string()));
+        // `import type { … }` is erased at compile time — it must NOT appear
+        // in the runtime import list so it cannot form false dependency cycles.
+        assert!(
+            !imports.contains(&"../config".to_string()),
+            "type-only import must be excluded from runtime imports"
+        );
+    }
+
+    #[test]
+    fn extract_imports_typescript_type_only_excluded() {
+        // All three forms of type-only imports must be dropped.
+        let code = r#"
+import type { Foo } from './foo';
+import type * as bar from './bar';
+export type { Baz } from './baz';
+"#;
+        let imports = extract_imports_from_str(code, ".ts");
+        assert!(
+            imports.is_empty(),
+            "all type-only imports/re-exports must be excluded; got: {:?}",
+            imports
+        );
+    }
+
+    #[test]
+    fn extract_imports_typescript_mixed_keeps_runtime_edge() {
+        // `import { type Foo, Bar }` — only Foo is type-only, Bar is runtime.
+        // The whole statement still carries a runtime edge and must be retained.
+        let code = "import { type Foo, Bar } from './mixed';\n";
+        let imports = extract_imports_from_str(code, ".ts");
+        assert!(
+            imports.contains(&"./mixed".to_string()),
+            "mixed import (type + runtime specifiers) must retain the edge; got: {:?}",
+            imports
+        );
     }
 
     #[test]
