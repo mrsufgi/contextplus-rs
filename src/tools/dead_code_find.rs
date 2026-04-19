@@ -339,4 +339,52 @@ mod tests {
         assert!(out.contains("function bar"));
         assert!(out.contains("1 dead-symbol candidate"));
     }
+
+    /// End-to-end: parse TypeScript with a destructure binding, then run the
+    /// dead-code heuristic. Names from the destructure LHS (`redis`,
+    /// `sessionStore`) must not appear as dead-code candidates — they are
+    /// references used later in the same file, not standalone definitions.
+    ///
+    /// Mirrors the real-world false positive from `apps/emr-api/src/app.ts`:
+    ///   const { redis, sessionStore } = makeStores(config);
+    ///   // ... used inline ...
+    ///   app.register(redisPlugin, { client: redis });
+    #[test]
+    fn destructure_lhs_not_flagged_as_dead_code() {
+        use crate::core::tree_sitter::parse_with_tree_sitter;
+
+        let code = r#"
+const { redis, sessionStore } = makeStores(config);
+
+export function startApp() {
+    app.register(redisPlugin, { client: redis });
+    app.register(sessionPlugin, { store: sessionStore });
+}
+"#;
+
+        let path = PathBuf::from("app.ts");
+        let symbols = parse_with_tree_sitter(code, ".ts").unwrap();
+        let symbols_by_file = HashMap::from([(path.clone(), symbols)]);
+
+        // Token map: the whole file is the token set (simulates what the MCP tool
+        // builds from the file content).
+        let tokens: HashSet<String> = code
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .collect();
+        let tokens_by_file = HashMap::from([(path.clone(), tokens)]);
+
+        let dead = find_dead_symbols(&symbols_by_file, &tokens_by_file, &options_no_filters());
+        let dead_names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !dead_names.contains(&"redis"),
+            "destructure LHS 'redis' must not be reported dead; got: {dead_names:?}"
+        );
+        assert!(
+            !dead_names.contains(&"sessionStore"),
+            "destructure LHS 'sessionStore' must not be reported dead; got: {dead_names:?}"
+        );
+    }
 }
