@@ -243,6 +243,115 @@ mod tests {
         g
     }
 
+    // 11. Type-only cross-imports must NOT form a reported cycle.
+    //
+    // Reproduces the berries subscription-domain false positive: three files
+    // that mutually `import type` each other. At runtime the TypeScript
+    // compiler erases every such edge, so there is no actual circular
+    // dependency. The graph fed to Tarjan must not contain those edges.
+    #[test]
+    fn type_only_imports_do_not_form_cycle() {
+        use crate::core::dependent_expand::build_reverse_graph;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // entitlement.ts  → import type { Plan } from './subscription-plan'
+        // subscription-plan.ts → import type { Seat } from './member-seat'
+        // member-seat.ts  → import type { Entitlement } from './entitlement'
+        //
+        // All three edges are type-only → no runtime cycle.
+        fs::write(
+            dir.join("entitlement.ts"),
+            "import type { Plan } from './subscription-plan';\nexport type Entitlement = { id: string };\n",
+        ).unwrap();
+        fs::write(
+            dir.join("subscription-plan.ts"),
+            "import type { Seat } from './member-seat';\nexport type Plan = { name: string };\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("member-seat.ts"),
+            "import type { Entitlement } from './entitlement';\nexport type Seat = { count: number };\n",
+        ).unwrap();
+
+        let files = vec![
+            dir.join("entitlement.ts"),
+            dir.join("subscription-plan.ts"),
+            dir.join("member-seat.ts"),
+        ];
+
+        let reverse = build_reverse_graph(&files);
+        let mut forward: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        for (imported, importers) in &reverse {
+            for importer in importers {
+                forward
+                    .entry(importer.clone())
+                    .or_default()
+                    .insert(imported.clone());
+            }
+        }
+
+        let cycles = find_cycles(&forward);
+        assert!(
+            cycles.is_empty(),
+            "type-only cross-imports must not form a cycle; got: {:#?}",
+            cycles
+        );
+    }
+
+    // 12. A mixed file (type-only import + runtime import going the other way)
+    //     must still report a cycle for the runtime edge, and NOT for the
+    //     type-only edge direction.
+    //
+    //   a.ts  runtime-imports  b.ts   (a → b, runtime)
+    //   b.ts  type-only-imports a.ts  (b → a, type-only, must be ignored)
+    //
+    // Only a runtime cycle (a → b → a) forms if BOTH edges were counted.
+    // With the fix, b's type-only import of a must be dropped, so there is
+    // no cycle at all.
+    #[test]
+    fn runtime_edge_one_way_type_only_other_way_no_cycle() {
+        use crate::core::dependent_expand::build_reverse_graph;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fs::write(
+            dir.join("a.ts"),
+            "import { doWork } from './b';\nexport const run = () => doWork();\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.ts"),
+            "import type { RunFn } from './a';\nexport function doWork() {}\n",
+        )
+        .unwrap();
+
+        let files = vec![dir.join("a.ts"), dir.join("b.ts")];
+        let reverse = build_reverse_graph(&files);
+        let mut forward: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        for (imported, importers) in &reverse {
+            for importer in importers {
+                forward
+                    .entry(importer.clone())
+                    .or_default()
+                    .insert(imported.clone());
+            }
+        }
+
+        let cycles = find_cycles(&forward);
+        assert!(
+            cycles.is_empty(),
+            "one-way runtime + reverse type-only must not form a cycle; got: {:#?}",
+            cycles
+        );
+    }
+
     // 1. Empty graph → no cycles.
     #[test]
     fn empty_graph() {
