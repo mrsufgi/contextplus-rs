@@ -655,7 +655,6 @@ pub async fn semantic_identifier_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rayon::prelude::*;
 
     /// Compute the vector norm (L2) of a vector.
     /// Only used in tests — moved here to eliminate dead code warning.
@@ -1207,9 +1206,7 @@ mod tests {
         let start = Instant::now();
         let call_results: Vec<CallSiteResult> = top
             .par_iter()
-            .map(|item| {
-                rank_call_sites(&query_terms, &query_vec, &item.doc, &file_lines, 10, None)
-            })
+            .map(|item| rank_call_sites(&query_terms, &query_vec, &item.doc, &file_lines, 10, None))
             .collect();
         let elapsed = start.elapsed();
 
