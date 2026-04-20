@@ -1009,7 +1009,18 @@ async fn load_graph_from_disk(root_dir: &str) -> Result<MemoryGraph> {
 
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
-        Err(_) => return Ok(MemoryGraph::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MemoryGraph::new());
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to read memory graph file — file exists but is unreadable; \
+                 returning error to prevent overwriting potentially valid data"
+            );
+            return Err(ContextPlusError::Io(e));
+        }
     };
 
     let raw: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
@@ -1020,12 +1031,22 @@ async fn load_graph_from_disk(root_dir: &str) -> Result<MemoryGraph> {
 
     // Load nodes
     if let Some(nodes_obj) = raw.get("nodes").and_then(|v| v.as_object()) {
-        for (_id, node_val) in nodes_obj {
-            if let Ok(node) = serde_json::from_value::<MemoryNode>(node_val.clone()) {
-                let key = (node.label.clone(), node.node_type.as_str().to_string());
-                let idx = graph.graph.add_node(node.clone());
-                graph.node_index.insert(key, idx);
-                graph.id_index.insert(node.id.clone(), idx);
+        for (node_key, node_val) in nodes_obj {
+            match serde_json::from_value::<MemoryNode>(node_val.clone()) {
+                Ok(node) => {
+                    let key = (node.label.clone(), node.node_type.as_str().to_string());
+                    let idx = graph.graph.add_node(node.clone());
+                    graph.node_index.insert(key, idx);
+                    graph.id_index.insert(node.id.clone(), idx);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        node_key = %node_key,
+                        error = %e,
+                        "Skipping malformed node in memory graph — data may be partially corrupted"
+                    );
+                }
             }
         }
     }
@@ -1722,5 +1743,89 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(parsed.get("nodes").is_some());
         assert!(parsed.get("edges").is_some());
+    }
+
+    #[tokio::test]
+    async fn load_graph_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        // No file written — should silently return empty graph (first-run case)
+        let graph = load_graph_from_disk(&root)
+            .await
+            .expect("should succeed on missing file");
+        assert_eq!(graph.graph.node_count(), 0);
+        assert_eq!(graph.graph.edge_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn load_graph_unreadable_file_returns_error() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join(CACHE_DIR);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let graph_path = cache_dir.join(GRAPH_FILE_JSON);
+        // Write a valid file, then revoke read permissions
+        fs::write(&graph_path, b"{\"nodes\":{},\"edges\":{}}").unwrap();
+        fs::set_permissions(&graph_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let root = dir.path().to_string_lossy().to_string();
+        let result = load_graph_from_disk(&root).await;
+
+        // Restore permissions so tempdir cleanup doesn't fail
+        fs::set_permissions(&graph_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Must propagate as error — not silently return empty graph
+        assert!(result.is_err(), "expected Err on unreadable file, got Ok");
+        assert!(
+            matches!(result.err().unwrap(), ContextPlusError::Io(_)),
+            "expected Io variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_graph_partial_malformed_nodes_loads_valid_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join(CACHE_DIR);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let graph_path = cache_dir.join(GRAPH_FILE_JSON);
+
+        // JSON with one valid node and one garbage node (missing required fields)
+        let json = serde_json::json!({
+            "nodes": {
+                "good-id": {
+                    "id": "good-id",
+                    "label": "auth",
+                    "node_type": "concept",
+                    "content": "auth module",
+                    "embedding": [0.1, 0.2],
+                    "created_at": 0u64,
+                    "updated_at": 0u64,
+                    "access_count": 0u64,
+                    "last_accessed": 0u64,
+                    "metadata": {}
+                },
+                "bad-id": {
+                    "this_is": "garbage"
+                }
+            },
+            "edges": {}
+        });
+        tokio::fs::write(&graph_path, json.to_string())
+            .await
+            .unwrap();
+
+        let root = dir.path().to_string_lossy().to_string();
+        let graph = load_graph_from_disk(&root)
+            .await
+            .expect("should succeed despite malformed node");
+        // Only the valid node should be loaded
+        assert_eq!(
+            graph.graph.node_count(),
+            1,
+            "expected 1 valid node, got {}",
+            graph.graph.node_count()
+        );
     }
 }
