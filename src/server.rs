@@ -1760,9 +1760,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_22_tools() {
+    fn tool_definitions_returns_all_23_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 22, "expected 22 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 23, "expected 23 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
