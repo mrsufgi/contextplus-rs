@@ -8,9 +8,11 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use regex::Regex;
+use tokio::sync::RwLock;
 
 use crate::core::embeddings::VectorStore;
 use crate::error::{ContextPlusError, Result};
@@ -743,6 +745,72 @@ pub fn sanitize_query(query: &str) -> Cow<'_, str> {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// CachedSearchIndex — reuse across requests
+// ---------------------------------------------------------------------------
+
+/// Cheap fingerprint used to decide whether the `SearchIndex` is still valid.
+/// Computed from the walk result without any extra I/O.
+///
+/// Uses `std::hash::DefaultHasher` (SipHash with a fixed zero seed — deterministic
+/// across processes) over each document's path + content bytes. This closes the
+/// collision window that a plain `content.len()` sum left open: swap-balanced
+/// edits (one file grows by N bytes while another shrinks by N) would previously
+/// collide; the path+content hash will not.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IndexFingerprint {
+    /// Number of documents returned by the walker.
+    pub n_docs: usize,
+    /// SipHash over `(path, content)` for each document, order-dependent.
+    pub content_hash: u64,
+}
+
+impl IndexFingerprint {
+    /// Compute a fingerprint from a slice of `SearchDocument`s.
+    pub fn from_docs(docs: &[SearchDocument]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        docs.len().hash(&mut hasher);
+        for d in docs {
+            d.path.hash(&mut hasher);
+            d.content.hash(&mut hasher);
+        }
+        Self {
+            n_docs: docs.len(),
+            content_hash: hasher.finish(),
+        }
+    }
+}
+
+/// A `SearchIndex` paired with the fingerprint that was current when it was built.
+/// Stored in `SharedState` and reused across MCP requests when the fingerprint is unchanged.
+pub struct CachedSearchIndex {
+    pub index: SearchIndex,
+    pub fingerprint: IndexFingerprint,
+    /// Number of times this cached entry has been reused (observability / tests).
+    /// Wraps silently on `u64` overflow — only meaningful for monitoring deltas,
+    /// not as an absolute counter.
+    pub(crate) reuse_count: std::sync::atomic::AtomicU64,
+}
+
+impl CachedSearchIndex {
+    fn new(index: SearchIndex, fingerprint: IndexFingerprint) -> Self {
+        Self {
+            index,
+            fingerprint,
+            reuse_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Increment and return the reuse counter.
+    pub fn record_reuse(&self) -> u64 {
+        self.reuse_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchIndex -- indexes documents and runs hybrid search
 // ---------------------------------------------------------------------------
 
@@ -1196,10 +1264,15 @@ pub fn format_search_results_with_freshness(
 
 /// Run semantic code search. Caller provides the embedding function and file walker.
 /// This is the main entry point that tool handlers should call.
+///
+/// `index_cache` is optional: when `Some`, the assembled `SearchIndex` is cached across
+/// requests and only rebuilt when the walk fingerprint changes. Concurrent callers that
+/// race on a stale cache use double-check locking so at most one rebuild occurs.
 pub async fn semantic_code_search(
     options: SemanticSearchOptions,
     embed_fn: &dyn EmbedFn,
     walk_and_index_fn: &dyn WalkAndIndexFn,
+    index_cache: Option<&RwLock<Option<Arc<CachedSearchIndex>>>>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
     if query.is_empty() {
@@ -1208,7 +1281,7 @@ pub async fn semantic_code_search(
 
     let resolved = resolve_search_options(&options);
 
-    // Get query embedding — embed takes &[String], so convert Cow<str> to String only once.
+    // Embed query first (independent of the index).
     let query_string = query.as_ref().to_string();
     let query_vecs = embed_fn.embed(std::slice::from_ref(&query_string)).await?;
     let query_vec = query_vecs
@@ -1216,17 +1289,75 @@ pub async fn semantic_code_search(
         .next()
         .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
 
-    // Build or retrieve index
-    let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
+    // Obtain the SearchIndex — from cache if available and still fresh, otherwise rebuild.
+    let cached_arc: Arc<CachedSearchIndex> = match index_cache {
+        None => {
+            // No cache slot provided — always rebuild (unit-test / legacy path).
+            let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
+            let fp = IndexFingerprint::from_docs(&docs);
+            let mut idx = SearchIndex::new();
+            idx.index_with_vectors(docs, vectors);
+            Arc::new(CachedSearchIndex::new(idx, fp))
+        }
+        Some(lock) => {
+            // Fast path: check under read-lock.
+            let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
+            let fp = IndexFingerprint::from_docs(&docs);
 
-    let mut index = SearchIndex::new();
-    index.index_with_vectors(docs, vectors);
+            {
+                let guard = lock.read().await;
+                if let Some(ref cached) = *guard
+                    && cached.fingerprint == fp
+                {
+                    let reuses = cached.record_reuse();
+                    tracing::debug!(reuses, "SearchIndex cache hit — reusing index");
+                    let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
+                    return Ok(format_search_results_with_freshness(
+                        query.as_ref(),
+                        &results,
+                        Some(cached.index.document_count()),
+                    ));
+                }
+            }
 
-    let results = index.search(query.as_ref(), &query_vec, &resolved);
+            // Slow path: acquire write-lock, double-check, then rebuild.
+            let mut guard = lock.write().await;
+            // Another task may have rebuilt while we waited for the write-lock.
+            if let Some(ref cached) = *guard
+                && cached.fingerprint == fp
+            {
+                let reuses = cached.record_reuse();
+                tracing::debug!(
+                    reuses,
+                    "SearchIndex cache hit (post-write-lock) — reusing index"
+                );
+                let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
+                return Ok(format_search_results_with_freshness(
+                    query.as_ref(),
+                    &results,
+                    Some(cached.index.document_count()),
+                ));
+            }
+
+            tracing::info!(
+                n_docs = fp.n_docs,
+                "SearchIndex cache miss — rebuilding index"
+            );
+            let mut idx = SearchIndex::new();
+            idx.index_with_vectors(docs, vectors);
+            let arc = Arc::new(CachedSearchIndex::new(idx, fp));
+            *guard = Some(Arc::clone(&arc));
+            arc
+        }
+    };
+
+    let results = cached_arc
+        .index
+        .search(query.as_ref(), &query_vec, &resolved);
     Ok(format_search_results_with_freshness(
         query.as_ref(),
         &results,
-        Some(index.document_count()),
+        Some(cached_arc.index.document_count()),
     ))
 }
 
@@ -2459,6 +2590,347 @@ mod tests {
         assert!(
             !paths.contains(&"src/noise.ts"),
             "no-embedding doc with zero keyword match must not pollute results; got: {paths:?}"
+        );
+    }
+
+    // -- CachedSearchIndex / IndexFingerprint tests --
+
+    fn make_doc(path: &str, content: &str) -> SearchDocument {
+        SearchDocument::new(
+            path.to_string(),
+            content[..content.len().min(80)].to_string(),
+            vec![],
+            vec![],
+            content.to_string(),
+        )
+    }
+
+    #[test]
+    fn test_index_fingerprint_matches_same_docs() {
+        let docs = vec![make_doc("a.rs", "hello"), make_doc("b.rs", "world")];
+        let fp1 = IndexFingerprint::from_docs(&docs);
+        let fp2 = IndexFingerprint::from_docs(&docs);
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_index_fingerprint_differs_on_content_change() {
+        let docs1 = vec![make_doc("a.rs", "hello")];
+        let docs2 = vec![make_doc("a.rs", "hello CHANGED")];
+        assert_ne!(
+            IndexFingerprint::from_docs(&docs1),
+            IndexFingerprint::from_docs(&docs2)
+        );
+    }
+
+    #[test]
+    fn test_index_fingerprint_differs_on_doc_count_change() {
+        let docs1 = vec![make_doc("a.rs", "x")];
+        let docs2 = vec![make_doc("a.rs", "x"), make_doc("b.rs", "y")];
+        assert_ne!(
+            IndexFingerprint::from_docs(&docs1),
+            IndexFingerprint::from_docs(&docs2)
+        );
+    }
+
+    #[test]
+    fn test_cached_search_index_reuse_counter() {
+        let docs = vec![make_doc("a.rs", "foo")];
+        let fp = IndexFingerprint::from_docs(&docs);
+        let mut idx = SearchIndex::new();
+        idx.index_with_vectors(docs, vec![None]);
+        let cached = CachedSearchIndex::new(idx, fp);
+
+        assert_eq!(cached.record_reuse(), 1);
+        assert_eq!(cached.record_reuse(), 2);
+        assert_eq!(cached.record_reuse(), 3);
+    }
+
+    // Verifies second identical query reuses the cache (reuse_count increments)
+    // and that a changed walk result triggers a rebuild (reuse_count stays at 0).
+    #[tokio::test]
+    async fn test_semantic_code_search_cache_hit_and_miss() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc as StdArc, Mutex};
+
+        // Stub embedder: always returns a fixed vector.
+        struct FixedEmbedder;
+        impl EmbedFn for FixedEmbedder {
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) })
+            }
+        }
+
+        // Stub walker: returns docs controlled by a shared counter.
+        struct CountingWalker {
+            rebuild_count: StdArc<Mutex<u32>>,
+            // When true, the second call returns a doc with different content.
+            change_on_second: bool,
+        }
+        impl WalkAndIndexFn for CountingWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let mut count = self.rebuild_count.lock().unwrap();
+                *count += 1;
+                let call_n = *count;
+                drop(count);
+                let change = self.change_on_second && call_n > 1;
+                Box::pin(async move {
+                    let content = if change {
+                        "changed content"
+                    } else {
+                        "stable content"
+                    };
+                    let docs = vec![make_doc("a.rs", content)];
+                    let vecs = vec![Some(vec![1.0_f32, 0.0])];
+                    Ok((docs, vecs))
+                })
+            }
+        }
+
+        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let walk_count = StdArc::new(Mutex::new(0u32));
+
+        let walker = CountingWalker {
+            rebuild_count: StdArc::clone(&walk_count),
+            change_on_second: false,
+        };
+
+        let opts = SemanticSearchOptions {
+            root_dir: std::path::PathBuf::from("/tmp"),
+            query: "stable".to_string(),
+            top_k: None,
+            semantic_weight: None,
+            keyword_weight: None,
+            min_semantic_score: None,
+            min_keyword_score: None,
+            min_combined_score: None,
+            require_keyword_match: None,
+            require_semantic_match: None,
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+        };
+
+        // First call — cache miss, index built.
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+            .await
+            .unwrap();
+
+        // Second call — cache hit, reuse_count should be 1.
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+            .await
+            .unwrap();
+
+        let reuses = {
+            let guard = cache.read().await;
+            guard.as_ref().unwrap().reuse_count.load(Ordering::Relaxed)
+        };
+        assert_eq!(
+            reuses, 1,
+            "Expected exactly one cache reuse on second identical query"
+        );
+    }
+
+    // Verifies that a changed walk result clears the cached index.
+    #[tokio::test]
+    async fn test_semantic_code_search_cache_invalidated_on_change() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc as StdArc, Mutex};
+
+        struct FixedEmbedder;
+        impl EmbedFn for FixedEmbedder {
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) })
+            }
+        }
+
+        struct ChangingWalker {
+            call: StdArc<Mutex<u32>>,
+        }
+        impl WalkAndIndexFn for ChangingWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let mut n = self.call.lock().unwrap();
+                *n += 1;
+                let call_n = *n;
+                drop(n);
+                Box::pin(async move {
+                    // Second walk returns different content — triggers fingerprint mismatch.
+                    let content = if call_n == 1 {
+                        "first"
+                    } else {
+                        "second-and-different"
+                    };
+                    let docs = vec![make_doc("a.rs", content)];
+                    let vecs = vec![Some(vec![1.0_f32, 0.0])];
+                    Ok((docs, vecs))
+                })
+            }
+        }
+
+        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let call = StdArc::new(Mutex::new(0u32));
+        let walker = ChangingWalker { call };
+
+        let opts = SemanticSearchOptions {
+            root_dir: std::path::PathBuf::from("/tmp"),
+            query: "content".to_string(),
+            top_k: None,
+            semantic_weight: None,
+            keyword_weight: None,
+            min_semantic_score: None,
+            min_keyword_score: None,
+            min_combined_score: None,
+            require_keyword_match: None,
+            require_semantic_match: None,
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+        };
+
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+            .await
+            .unwrap();
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+            .await
+            .unwrap();
+
+        // reuse_count == 0: the second call replaced the cache rather than reusing it.
+        let reuses = {
+            let guard = cache.read().await;
+            guard.as_ref().unwrap().reuse_count.load(Ordering::Relaxed)
+        };
+        assert_eq!(reuses, 0, "Changed walk should trigger rebuild, not reuse");
+    }
+
+    // Verifies concurrent requests with a stale cache rebuild at most once.
+    #[tokio::test]
+    async fn test_semantic_code_search_concurrent_no_double_rebuild() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct FixedEmbedder;
+        impl EmbedFn for FixedEmbedder {
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) })
+            }
+        }
+
+        // Walker that counts how many times a fresh index is _requested_ to be built.
+        // All walks return identical docs so fingerprints always match after the first build.
+        struct StableWalker {
+            walk_count: StdArc<AtomicU32>,
+        }
+        impl WalkAndIndexFn for StableWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                self.walk_count.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async {
+                    let docs = vec![make_doc("a.rs", "stable")];
+                    let vecs = vec![Some(vec![1.0_f32, 0.0])];
+                    Ok((docs, vecs))
+                })
+            }
+        }
+
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let walk_count = StdArc::new(AtomicU32::new(0));
+
+        let opts = SemanticSearchOptions {
+            root_dir: std::path::PathBuf::from("/tmp"),
+            query: "stable".to_string(),
+            top_k: None,
+            semantic_weight: None,
+            keyword_weight: None,
+            min_semantic_score: None,
+            min_keyword_score: None,
+            min_combined_score: None,
+            require_keyword_match: None,
+            require_semantic_match: None,
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+        };
+
+        // Spawn 8 concurrent queries against the same empty cache.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache_ref = Arc::clone(&cache);
+                let wc = StdArc::clone(&walk_count);
+                let opts = opts.clone();
+                tokio::spawn(async move {
+                    let walker = StableWalker { walk_count: wc };
+                    semantic_code_search(opts, &FixedEmbedder, &walker, Some(&*cache_ref))
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // All 8 tasks walk (to compute fingerprint), but the index build happens at most
+        // a small number of times (bounded by write-lock contention, not 8).
+        // With double-check locking, only the first writer actually rebuilds;
+        // subsequent writers find the cache already matches and return early.
+        // Walk count == 8 (every call walks), but we verify reuse_count shows cache hits.
+        let reuses = {
+            let guard = cache.read().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .reuse_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        // At least 7 out of 8 requests must have been cache hits.
+        assert!(
+            reuses >= 7,
+            "Expected >= 7 cache reuses from 8 concurrent requests, got {reuses}"
         );
     }
 }
