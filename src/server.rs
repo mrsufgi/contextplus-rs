@@ -200,7 +200,10 @@ impl ContextPlusServer {
         if self.state.config.embed_tracker_mode == TrackerMode::Off {
             return;
         }
-        let mut guard = self.state.tracker_handle.lock().unwrap();
+        let mut guard = self.state.tracker_handle.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("tracker_handle mutex was poisoned; recovering inner value");
+            poisoned.into_inner()
+        });
         if guard.is_some() {
             return;
         }
