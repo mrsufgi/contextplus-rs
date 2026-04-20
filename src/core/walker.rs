@@ -22,35 +22,15 @@ pub struct WalkOptions<'a> {
     pub ignore_dirs: &'a HashSet<String>,
 }
 
-/// Path prefixes that are always excluded from indexing, regardless of the
-/// ignore_dirs set.  These are multi-segment patterns checked against the
-/// start of the normalised (forward-slash) relative path.
-///
-/// `.claude/worktrees/` houses parallel-agent worktrees — copies of the main
-/// workspace used by Claude Code sub-agents.  Indexing them produces massive
-/// embedding duplication with zero informational gain.
-const ALWAYS_IGNORE_PREFIXES: &[&str] = &[".claude/worktrees/"];
-
 /// Segment-based path ignore check.
 /// Checks if any path segment matches the ignore set.
 /// Also skips any segment starting with `.` (hidden files/dirs), matching
 /// the TS walker's `entry.name.startsWith(".")` check.
 /// This is the correct approach (matching our TS fork fix) — prevents
 /// false positives from prefix matching like "generated" matching "gen".
-///
-/// Additionally, any path whose prefix matches an entry in
-/// `ALWAYS_IGNORE_PREFIXES` is rejected unconditionally.
 pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
     if path.is_empty() {
         return false;
-    }
-    // Reject paths that start with a known multi-segment prefix (e.g.
-    // `.claude/worktrees/`).  These cannot be caught by the per-segment dot
-    // check alone when the walker is started from inside a hidden directory.
-    for prefix in ALWAYS_IGNORE_PREFIXES {
-        if path.starts_with(prefix) {
-            return false;
-        }
     }
     for segment in path.split('/') {
         if segment.starts_with('.') {
@@ -169,26 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn should_track_excludes_claude_worktrees() {
-        let ignore = make_ignore_set(&[]);
-        // Paths inside .claude/worktrees/ must always be rejected
-        assert!(!should_track(
-            ".claude/worktrees/agent-acd43174/packages/libs/types/generated/foo.ts",
-            &ignore
-        ));
-        assert!(!should_track(
-            ".claude/worktrees/agent-acd43174/src/main.rs",
-            &ignore
-        ));
-        // The prefix itself (exact) is also rejected
-        assert!(!should_track(".claude/worktrees/", &ignore));
-        // Paths outside worktrees that are otherwise valid should still pass
-        assert!(should_track("src/main.rs", &ignore));
-        // .claude itself (non-worktrees) is still skipped by the dot-segment rule
-        assert!(!should_track(".claude/settings.json", &ignore));
-    }
-
-    #[test]
     fn should_track_basic() {
         let ignore = make_ignore_set(&["node_modules", ".git", "dist"]);
         assert!(should_track("src/main.rs", &ignore));
@@ -265,6 +225,33 @@ mod tests {
                 entry
             );
         }
+    }
+
+    /// Regression guard: `.claude/worktrees/` paths must be excluded by the
+    /// existing dot-segment hidden-file check in `should_track`.
+    ///
+    /// The first segment of `.claude/worktrees/...` is `.claude`, which starts
+    /// with `.` and is therefore rejected unconditionally — no special-case
+    /// constant is needed.  This test locks in that behavior so future
+    /// refactors of the dot-segment logic cannot silently regress it.
+    #[test]
+    fn should_track_excludes_claude_worktrees() {
+        let ignore = make_ignore_set(&[]);
+        // Paths inside .claude/worktrees/ must always be rejected
+        assert!(!should_track(
+            ".claude/worktrees/agent-acd43174/packages/libs/types/generated/foo.ts",
+            &ignore
+        ));
+        assert!(!should_track(
+            ".claude/worktrees/agent-acd43174/src/main.rs",
+            &ignore
+        ));
+        // The prefix itself (exact) is also rejected
+        assert!(!should_track(".claude/worktrees/", &ignore));
+        // Paths outside worktrees that are otherwise valid should still pass
+        assert!(should_track("src/main.rs", &ignore));
+        // .claude itself (non-worktrees) is still skipped by the dot-segment rule
+        assert!(!should_track(".claude/settings.json", &ignore));
     }
 
     #[test]
@@ -377,6 +364,14 @@ mod tests {
         assert!(paths.iter().all(|p| p.starts_with("src/")));
     }
 
+    /// Integration test: walk_directory must never return paths under
+    /// `.claude/worktrees/` even when the directory is physically present.
+    ///
+    /// The `ignore` crate's `hidden(true)` flag precludes the walker from
+    /// descending into `.claude/` on most platforms; `should_track`'s
+    /// dot-segment check provides a belt-and-suspenders safety net for any
+    /// edge cases (e.g. symlink-followed paths, explicit `target_path` inside
+    /// `.claude/`).  Both layers are exercised here.
     #[test]
     fn walk_directory_excludes_claude_worktrees() {
         let dir = TempDir::new().unwrap();
@@ -395,9 +390,6 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub fn lib() {}").unwrap();
 
         let ignore = make_ignore_set(&[]);
-        // Note: hidden(true) in WalkBuilder already skips .claude/ on most
-        // platforms, but should_track provides an additional safety net via
-        // ALWAYS_IGNORE_PREFIXES for edge cases (e.g. follow_links, target_path).
         let entries = walk_directory(&WalkOptions {
             root_dir: root,
             target_path: None,
