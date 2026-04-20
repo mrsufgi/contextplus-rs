@@ -1025,6 +1025,12 @@ impl SearchIndex {
                 let best_kind = matched_entries.first().and_then(|e| e.kind.as_deref());
                 let keyword_score =
                     clamp01(raw_keyword_score * query_kind_boost(query_kind, best_kind));
+                // Zero-score pollution guard: a doc with no embedding and no keyword
+                // match contributes nothing — don't surface it just because the
+                // default `min_combined_score = 0.0` lets zero through.
+                if keyword_score <= 0.0 {
+                    return None;
+                }
                 let base_combined = compute_combined_score(semantic_score, keyword_score, opts);
                 let recency = recency_by_path
                     .get(doc.path.as_str())
@@ -2410,6 +2416,49 @@ mod tests {
         assert!(
             paths.contains(&"src/special.ts"),
             "no-embedding doc with keyword match must appear in results; got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_embedding_doc_without_keyword_does_not_pollute_results() {
+        // Regression guard for the zero-score pollution gap: a doc with NO
+        // embedding AND NO keyword match must NOT surface just because
+        // `min_combined_score = 0.0` (default) lets a zero-score through.
+        let docs = vec![
+            SearchDocument::new(
+                "src/alpha.ts".to_string(),
+                "alpha module".to_string(),
+                vec!["alpha".to_string()],
+                vec![],
+                "alpha content".to_string(),
+            ),
+            // No embedding, no symbol or content term that matches `findTarget`.
+            SearchDocument::new(
+                "src/noise.ts".to_string(),
+                "unrelated".to_string(),
+                vec!["nothingHere".to_string()],
+                vec![],
+                "unrelated content".to_string(),
+            ),
+        ];
+        let vectors: Vec<Option<Vec<f32>>> = vec![Some(vec![0.9, 0.1, 0.0, 0.0]), None];
+
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let query_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 1.0, // fully semantic — keyword contributes 0
+            keyword_weight: 0.0,
+            ..Default::default() // min_* all 0.0 by default
+        };
+
+        let results = index.search("findTarget", &query_vec, &opts);
+        let paths: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            !paths.contains(&"src/noise.ts"),
+            "no-embedding doc with zero keyword match must not pollute results; got: {paths:?}"
         );
     }
 }
