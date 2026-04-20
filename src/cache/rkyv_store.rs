@@ -366,6 +366,54 @@ pub fn save_vector_store(root_dir: &Path, name: &str, store: &VectorStore) -> Re
     save_cache(root_dir, name, &data)
 }
 
+/// Save `data` to disk **without** loading or merging the existing file.
+///
+/// Use this on the live MCP path where the in-memory `VectorStore` is the
+/// single ground-truth writer. Skips the ~146 MB read + ~200K String clones
+/// + ~146 MB write overhead of the merging `save_cache`.
+///
+/// Still uses an atomic write (tmp → rename) so the on-disk file is never
+/// left in a partial state. Does NOT acquire the fd-lock — this is a
+/// single-writer path by design; the warmup binaries use `save_cache` instead.
+pub fn save_cache_overwrite(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
+    ensure_cache_dir(root_dir)?;
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(data)
+        .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
+
+    let path = cache_path(root_dir, name);
+    let tmp_path = cache_dir(root_dir).join(format!(
+        "{}.rkyv.{}.{}.tmp",
+        name,
+        std::process::id(),
+        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    let mut buf = Vec::with_capacity(HEADER_SIZE + bytes.len());
+    buf.resize(HEADER_SIZE, 0);
+    buf[0] = CACHE_VERSION;
+    buf.extend_from_slice(&bytes);
+
+    if let Err(e) = fs::write(&tmp_path, &buf) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    Ok(())
+}
+
+/// Save a VectorStore to disk without loading or merging the existing file.
+///
+/// Single-writer live MCP path variant — see `save_cache_overwrite`.
+pub fn save_vector_store_overwrite(root_dir: &Path, name: &str, store: &VectorStore) -> Result<()> {
+    let data = CacheData::from_store(store);
+    save_cache_overwrite(root_dir, name, &data)
+}
+
 /// Load cache with mmap for zero-copy read (uses memmap2).
 /// Falls back to regular load on mmap failure.
 pub fn load_cache_mmap(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
@@ -1124,6 +1172,109 @@ mod tests {
             "lock filename must include the cache name, got {:?}",
             lock_a
         );
+    }
+
+    // -- save_cache_overwrite tests --
+
+    #[test]
+    fn overwrite_does_not_preserve_disk_only_keys() {
+        // Proves that save_cache_overwrite is a true overwrite: keys that were
+        // on disk but absent from the incoming CacheData are NOT preserved.
+        let dir = TempDir::new().unwrap();
+
+        // Write a richer state first via the merging path.
+        let disk = CacheData {
+            dims: 2,
+            keys: vec!["disk-only".into(), "shared".into()],
+            hashes: vec!["hd".into(), "hs".into()],
+            vectors: vec![1.0, 1.1, 2.0, 2.1],
+        };
+        save_cache(dir.path(), "ow", &disk).unwrap();
+
+        // Overwrite with a snapshot that only contains "shared".
+        let incoming = CacheData {
+            dims: 2,
+            keys: vec!["shared".into()],
+            hashes: vec!["hs-new".into()],
+            vectors: vec![3.0, 3.1],
+        };
+        save_cache_overwrite(dir.path(), "ow", &incoming).unwrap();
+
+        let loaded = load_cache(dir.path(), "ow").unwrap().unwrap();
+        assert_eq!(
+            loaded.keys.len(),
+            1,
+            "overwrite must not retain disk-only keys; got {:?}",
+            loaded.keys
+        );
+        assert_eq!(loaded.keys[0], "shared");
+        assert_eq!(loaded.hashes[0], "hs-new");
+        assert!(
+            !loaded.keys.iter().any(|k| k == "disk-only"),
+            "disk-only key must be gone after overwrite"
+        );
+    }
+
+    #[test]
+    fn save_cache_merge_still_preserves_disk_keys() {
+        // Regression guard: the merging save_cache must still preserve disk-side
+        // keys absent from the incoming snapshot (concurrent-writer safety).
+        let dir = TempDir::new().unwrap();
+
+        let disk = CacheData {
+            dims: 2,
+            keys: vec!["disk-only".into(), "shared".into()],
+            hashes: vec!["hd".into(), "hs".into()],
+            vectors: vec![1.0, 1.1, 2.0, 2.1],
+        };
+        save_cache(dir.path(), "merge-guard", &disk).unwrap();
+
+        let incoming = CacheData {
+            dims: 2,
+            keys: vec!["shared".into()],
+            hashes: vec!["hs-new".into()],
+            vectors: vec![3.0, 3.1],
+        };
+        save_cache(dir.path(), "merge-guard", &incoming).unwrap();
+
+        let loaded = load_cache(dir.path(), "merge-guard").unwrap().unwrap();
+        assert_eq!(
+            loaded.keys.len(),
+            2,
+            "merging save_cache must preserve disk-only keys; got {:?}",
+            loaded.keys
+        );
+        assert!(
+            loaded.keys.iter().any(|k| k == "disk-only"),
+            "disk-only key must survive a merging save"
+        );
+    }
+
+    #[test]
+    fn overwrite_round_trip_exact() {
+        // Round-trip: load after save_cache_overwrite returns exactly the
+        // incoming CacheData (same keys, hashes, and vectors byte-for-byte).
+        let dir = TempDir::new().unwrap();
+
+        let data = CacheData {
+            dims: 3,
+            keys: vec!["a.rs".into(), "b.rs".into()],
+            hashes: vec!["ha".into(), "hb".into()],
+            vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        };
+        save_cache_overwrite(dir.path(), "rt", &data).unwrap();
+        let loaded = load_cache(dir.path(), "rt").unwrap().unwrap();
+
+        assert_eq!(loaded.dims, data.dims);
+        assert_eq!(loaded.keys, data.keys);
+        assert_eq!(loaded.hashes, data.hashes);
+        assert_eq!(loaded.vectors.len(), data.vectors.len());
+        for (a, b) in loaded.vectors.iter().zip(data.vectors.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "vector mismatch: got {a}, expected {b}"
+            );
+        }
     }
 
     #[test]
