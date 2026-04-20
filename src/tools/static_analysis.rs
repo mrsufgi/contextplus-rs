@@ -359,9 +359,12 @@ mod tests {
             .await
             .unwrap();
         // Create a minimal valid .tsx file.
-        tokio::fs::write(dir.path().join("Component.tsx"), "export const x: number = 1;\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            dir.path().join("Component.tsx"),
+            "export const x: number = 1;\n",
+        )
+        .await
+        .unwrap();
 
         let options = StaticAnalysisOptions {
             root_dir: dir.path().to_path_buf(),
