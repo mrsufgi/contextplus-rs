@@ -934,41 +934,74 @@ impl GraphStore {
 
     /// Get or load the graph for a given root directory.
     /// Automatically schedules a debounced save if the graph becomes dirty.
+    ///
+    /// Uses a single write-lock acquisition with `entry()` to eliminate the
+    /// read-then-write TOCTOU race: a concurrent inserter can no longer slip
+    /// between the `contains_key` check and the write re-acquisition.
     pub async fn get_graph<F, R>(&self, root_dir: &str, f: F) -> Result<R>
     where
         F: FnOnce(&mut MemoryGraph) -> R,
     {
-        let result;
-        {
+        // Fast path: if the graph is already loaded we can skip the async
+        // disk-load entirely.  We still need a write lock so that `f` can
+        // mutate the graph, but we avoid the separate read + write dance.
+        let needs_load = {
             let graphs = self.graphs.read().await;
-            if graphs.contains_key(root_dir) {
-                drop(graphs);
-                let mut graphs = self.graphs.write().await;
-                let graph = graphs.get_mut(root_dir).ok_or_else(|| {
-                    ContextPlusError::Other("Graph not found after check".to_string())
-                })?;
-                let was_dirty = graph.is_dirty();
-                result = f(graph);
-                if !was_dirty && graph.is_dirty() {
-                    self.schedule_save();
-                }
-                return Ok(result);
-            }
-        }
-        let mut graphs = self.graphs.write().await;
-        if !graphs.contains_key(root_dir) {
+            !graphs.contains_key(root_dir)
+        };
+
+        if needs_load {
             let graph = load_graph_from_disk(root_dir).await?;
-            graphs.insert(root_dir.to_string(), graph);
+            let mut graphs = self.graphs.write().await;
+            // Another task may have inserted while we were loading from disk —
+            // use `entry()` so we don't stomp an already-loaded graph.
+            graphs.entry(root_dir.to_string()).or_insert(graph);
         }
+
+        let mut graphs = self.graphs.write().await;
         let graph = graphs.get_mut(root_dir).ok_or_else(|| {
             ContextPlusError::Other("Graph not found after insertion".to_string())
         })?;
         let was_dirty = graph.is_dirty();
-        result = f(graph);
+        let result = f(graph);
         if !was_dirty && graph.is_dirty() {
             self.schedule_save();
         }
         Ok(result)
+    }
+
+    /// Like [`Self::get_graph`] but also returns a [`GraphStats`] snapshot taken
+    /// inside the **same** write-lock acquisition, after `f` runs.
+    ///
+    /// This lets callers (e.g. mutating tool handlers) obtain both the
+    /// mutation result and the post-mutation stats without a second lock
+    /// round-trip.
+    pub async fn get_graph_and_stats<F, R>(&self, root_dir: &str, f: F) -> Result<(R, GraphStats)>
+    where
+        F: FnOnce(&mut MemoryGraph) -> R,
+    {
+        let needs_load = {
+            let graphs = self.graphs.read().await;
+            !graphs.contains_key(root_dir)
+        };
+
+        if needs_load {
+            let graph = load_graph_from_disk(root_dir).await?;
+            let mut graphs = self.graphs.write().await;
+            graphs.entry(root_dir.to_string()).or_insert(graph);
+        }
+
+        let mut graphs = self.graphs.write().await;
+        let graph = graphs.get_mut(root_dir).ok_or_else(|| {
+            ContextPlusError::Other("Graph not found after insertion".to_string())
+        })?;
+        let was_dirty = graph.is_dirty();
+        let result = f(graph);
+        let stats = graph.stats();
+        if !was_dirty && graph.is_dirty() {
+            self.schedule_save();
+        }
+        Ok((result, stats))
     }
 
     /// Persist the graph for a root directory to disk.

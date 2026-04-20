@@ -150,8 +150,8 @@ pub async fn tool_upsert_memory_node(
     let embed_text = format!("{} {}", options.label, options.content);
     let embedding = fetch_embedding(ollama, &embed_text).await?;
 
-    let node = store
-        .get_graph(&options.root_dir, |graph| {
+    let (node, stats) = store
+        .get_graph_and_stats(&options.root_dir, |graph| {
             graph.upsert_node(
                 node_type,
                 &options.label,
@@ -160,10 +160,6 @@ pub async fn tool_upsert_memory_node(
                 options.metadata,
             )
         })
-        .await?;
-
-    let stats = store
-        .get_graph(&options.root_dir, |graph| graph.stats())
         .await?;
 
     store.persist(&options.root_dir).await?;
@@ -246,8 +242,8 @@ pub async fn tool_create_relation(
         return Ok("\u{274C} Failed: either target_id or target_label is required".to_string());
     };
 
-    let edge = store
-        .get_graph(&options.root_dir, |graph| {
+    let (edge, stats) = store
+        .get_graph_and_stats(&options.root_dir, |graph| {
             graph.create_relation(
                 &source_id,
                 &target_id,
@@ -256,10 +252,6 @@ pub async fn tool_create_relation(
                 options.metadata,
             )
         })
-        .await?;
-
-    let stats = store
-        .get_graph(&options.root_dir, |graph| graph.stats())
         .await?;
 
     store.persist(&options.root_dir).await?;
@@ -382,14 +374,10 @@ pub async fn tool_add_interlinked_context(
         ));
     }
 
-    let result = store
-        .get_graph(&options.root_dir, |graph| {
+    let (result, stats) = store
+        .get_graph_and_stats(&options.root_dir, |graph| {
             graph.add_interlinked_context(prepared_items, auto_link)
         })
-        .await?;
-
-    let stats = store
-        .get_graph(&options.root_dir, |graph| graph.stats())
         .await?;
 
     store.persist(&options.root_dir).await?;
@@ -470,16 +458,14 @@ pub async fn tool_delete_memory_node(
     root_dir: &str,
     node_id: &str,
 ) -> Result<String> {
-    let result = store
-        .get_graph(root_dir, |graph| graph.delete_node(node_id))
+    let (result, stats) = store
+        .get_graph_and_stats(root_dir, |graph| graph.delete_node(node_id))
         .await?;
 
     match result {
         None => Ok(format!("Not found: '{}' — nothing deleted.", node_id)),
         Some((label, node_type, edges_removed)) => {
             store.persist(root_dir).await?;
-
-            let stats = store.get_graph(root_dir, |graph| graph.stats()).await?;
 
             Ok(format!(
                 "Deleted: '{}' (type: {}, id: {})\n  Edges removed: {}\n\nGraph: {} nodes, {} edges",
@@ -2556,5 +2542,104 @@ mod tests {
             .await
             .expect("stats ok");
         assert_eq!(stats.nodes, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // TOCTOU / concurrency: two tasks upsert concurrently — no panic,
+    // both nodes end up in the graph.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_upsert_from_two_tasks_both_nodes_present() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = Arc::new(GraphStore::new());
+
+        let store_a = Arc::clone(&store);
+        let root_a = root.clone();
+        let task_a = tokio::spawn(async move {
+            store_a
+                .get_graph(&root_a, |graph| {
+                    graph.upsert_node(
+                        NodeType::Concept,
+                        "node-alpha",
+                        "content alpha",
+                        make_embedding(0.1),
+                        None,
+                    );
+                })
+                .await
+                .expect("task_a upsert ok");
+        });
+
+        let store_b = Arc::clone(&store);
+        let root_b = root.clone();
+        let task_b = tokio::spawn(async move {
+            store_b
+                .get_graph(&root_b, |graph| {
+                    graph.upsert_node(
+                        NodeType::Concept,
+                        "node-beta",
+                        "content beta",
+                        make_embedding(0.9),
+                        None,
+                    );
+                })
+                .await
+                .expect("task_b upsert ok");
+        });
+
+        task_a.await.expect("task_a joined");
+        task_b.await.expect("task_b joined");
+
+        let stats = store
+            .get_graph(&root, |graph| graph.stats())
+            .await
+            .expect("stats ok");
+
+        // Both nodes must be present; there must be no lost write.
+        assert_eq!(stats.nodes, 2, "expected 2 nodes, got {}", stats.nodes);
+    }
+
+    // ---------------------------------------------------------------
+    // get_graph_and_stats: stats reflect the mutation made in the same call.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_graph_and_stats_reflects_mutation_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Graph starts empty.
+        let (_, stats_before) = store
+            .get_graph_and_stats(&root, |graph| graph.stats())
+            .await
+            .expect("before ok");
+        assert_eq!(stats_before.nodes, 0);
+
+        // Upsert via get_graph_and_stats and check returned stats.
+        let (_, stats_after) = store
+            .get_graph_and_stats(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Note,
+                    "check-node",
+                    "hello",
+                    make_embedding(0.5),
+                    None,
+                );
+            })
+            .await
+            .expect("upsert ok");
+
+        // Stats snapshot must already include the newly inserted node —
+        // taken inside the same lock, not via a second round-trip.
+        assert_eq!(
+            stats_after.nodes, 1,
+            "stats should reflect mutation; got {} nodes",
+            stats_after.nodes
+        );
     }
 }
