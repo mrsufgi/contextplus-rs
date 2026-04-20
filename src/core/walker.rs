@@ -227,6 +227,33 @@ mod tests {
         }
     }
 
+    /// Regression guard: `.claude/worktrees/` paths must be excluded by the
+    /// existing dot-segment hidden-file check in `should_track`.
+    ///
+    /// The first segment of `.claude/worktrees/...` is `.claude`, which starts
+    /// with `.` and is therefore rejected unconditionally — no special-case
+    /// constant is needed.  This test locks in that behavior so future
+    /// refactors of the dot-segment logic cannot silently regress it.
+    #[test]
+    fn should_track_excludes_claude_worktrees() {
+        let ignore = make_ignore_set(&[]);
+        // Paths inside .claude/worktrees/ must always be rejected
+        assert!(!should_track(
+            ".claude/worktrees/agent-acd43174/packages/libs/types/generated/foo.ts",
+            &ignore
+        ));
+        assert!(!should_track(
+            ".claude/worktrees/agent-acd43174/src/main.rs",
+            &ignore
+        ));
+        // The prefix itself (exact) is also rejected
+        assert!(!should_track(".claude/worktrees/", &ignore));
+        // Paths outside worktrees that are otherwise valid should still pass
+        assert!(should_track("src/main.rs", &ignore));
+        // .claude itself (non-worktrees) is still skipped by the dot-segment rule
+        assert!(!should_track(".claude/settings.json", &ignore));
+    }
+
     #[test]
     fn walk_directory_basic() {
         let dir = TempDir::new().unwrap();
@@ -335,6 +362,52 @@ mod tests {
 
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert!(paths.iter().all(|p| p.starts_with("src/")));
+    }
+
+    /// Integration test: walk_directory must never return paths under
+    /// `.claude/worktrees/` even when the directory is physically present.
+    ///
+    /// The `ignore` crate's `hidden(true)` flag precludes the walker from
+    /// descending into `.claude/` on most platforms; `should_track`'s
+    /// dot-segment check provides a belt-and-suspenders safety net for any
+    /// edge cases (e.g. symlink-followed paths, explicit `target_path` inside
+    /// `.claude/`).  Both layers are exercised here.
+    #[test]
+    fn walk_directory_excludes_claude_worktrees() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Simulate a workspace with a worktree alongside real source
+        let worktree_file = root
+            .join(".claude")
+            .join("worktrees")
+            .join("agent-abc123")
+            .join("src");
+        fs::create_dir_all(&worktree_file).unwrap();
+        fs::write(worktree_file.join("main.rs"), "fn main() {}").unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn lib() {}").unwrap();
+
+        let ignore = make_ignore_set(&[]);
+        let entries = walk_directory(&WalkOptions {
+            root_dir: root,
+            target_path: None,
+            depth_limit: None,
+            ignore_dirs: &ignore,
+        });
+
+        let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+        // Real source must be present
+        assert!(
+            paths.contains(&"src/lib.rs"),
+            "src/lib.rs should be indexed"
+        );
+        // Nothing from the worktree should be indexed
+        assert!(
+            !paths.iter().any(|p| p.contains("worktrees")),
+            "worktrees paths must not be indexed: {paths:?}"
+        );
     }
 
     #[test]
