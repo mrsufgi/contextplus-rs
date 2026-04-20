@@ -209,12 +209,19 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                         }
                     }
 
-                    // Persist to disk with model-qualified name (lock dropped after block)
+                    // Persist to disk with model-qualified name (lock dropped after block).
+                    // Single-writer overwrite path: this adapter and the server
+                    // background flush both target the same cache file, so using the
+                    // merging variant here would race with the overwrite path and
+                    // silently drop entries. See PR #42.
                     let code_cache_name = cache_name("embeddings", &config.ollama_embed_model);
                     if let Some(store) =
                         crate::core::embeddings::VectorStore::from_cache(&cache_write)
-                        && let Err(e) =
-                            rkyv_store::save_vector_store(store_root, &code_cache_name, &store)
+                        && let Err(e) = rkyv_store::save_vector_store_overwrite(
+                            store_root,
+                            &code_cache_name,
+                            &store,
+                        )
                     {
                         tracing::warn!("Failed to save embedding cache: {e}");
                     }
