@@ -399,7 +399,10 @@ mod tests {
 
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         // Real source must be present
-        assert!(paths.contains(&"src/lib.rs"), "src/lib.rs should be indexed");
+        assert!(
+            paths.contains(&"src/lib.rs"),
+            "src/lib.rs should be indexed"
+        );
         // Nothing from the worktree should be indexed
         assert!(
             !paths.iter().any(|p| p.contains("worktrees")),
