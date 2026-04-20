@@ -12,17 +12,29 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::error::{ContextPlusError, Result};
+use crate::tools::scoring::{DEFAULT_TOP_K, clamp01, keyword_coverage, normalize_weight};
 use crate::tools::semantic_search::{cosine, sanitize_query, split_camel_case};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SEMANTIC_WEIGHT: f64 = 0.78;
-const DEFAULT_KEYWORD_WEIGHT: f64 = 0.22;
-const DEFAULT_TOP_K: usize = 5;
+/// Identifier search uses a higher semantic weight than the file-level default
+/// (0.72) because code symbol names are denser and keyword overlap alone is
+/// insufficient to distinguish semantically similar identifiers.
+const IDENTIFIER_SEMANTIC_WEIGHT: f64 = 0.78;
+const IDENTIFIER_KEYWORD_WEIGHT: f64 = 0.22;
+
+// Aliases so call sites that reference DEFAULT_SEMANTIC_WEIGHT / DEFAULT_KEYWORD_WEIGHT
+// continue to resolve to the identifier-tuned values.
+const DEFAULT_SEMANTIC_WEIGHT: f64 = IDENTIFIER_SEMANTIC_WEIGHT;
+const DEFAULT_KEYWORD_WEIGHT: f64 = IDENTIFIER_KEYWORD_WEIGHT;
+
 const DEFAULT_TOP_CALLS: usize = 10;
 const MAX_TOP_K: usize = 50;
+
+/// Call-site ranking uses an even higher semantic weight (0.82) because the
+/// surrounding context snippet is short and keyword presence is noisy.
 const CALLSITE_SEMANTIC_WEIGHT: f64 = 0.82;
 const CALLSITE_KEYWORD_WEIGHT: f64 = 0.18;
 
@@ -211,27 +223,13 @@ pub fn escape_regex(s: &str) -> String {
 // Keyword coverage
 // ---------------------------------------------------------------------------
 
+/// Tokenize `input` with `split_camel_case` then delegate to
+/// `scoring::keyword_coverage`.  Identifier search always needs to tokenize
+/// the document string on the fly (unlike file-level search, which
+/// pre-computes token sets at index time).
 fn get_keyword_coverage(query_terms: &HashSet<String>, input: &str) -> f64 {
-    if query_terms.is_empty() {
-        return 0.0;
-    }
-    let doc_terms: HashSet<String> = split_camel_case(input).into_iter().collect();
-    let matched = query_terms
-        .iter()
-        .filter(|t| doc_terms.contains(*t))
-        .count();
-    matched as f64 / query_terms.len() as f64
-}
-
-fn clamp01(value: f64) -> f64 {
-    value.clamp(0.0, 1.0)
-}
-
-fn normalize_weight(value: Option<f64>, fallback: f64) -> f64 {
-    match value {
-        Some(v) if v.is_finite() && v >= 0.0 => v,
-        _ => fallback,
-    }
+    let doc_tokens: HashSet<String> = split_camel_case(input).into_iter().collect();
+    keyword_coverage(query_terms, &doc_tokens)
 }
 
 fn format_line_range(line: usize, end_line: usize) -> String {

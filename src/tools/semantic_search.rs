@@ -13,6 +13,10 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::error::{ContextPlusError, Result};
+use crate::tools::scoring::{
+    DEFAULT_KEYWORD_WEIGHT, DEFAULT_SEMANTIC_WEIGHT, DEFAULT_TOP_K, clamp01, keyword_coverage,
+    normalize_weight,
+};
 
 /// Maximum additive bonus from recency (kept small so it nudges ties, not
 /// dominates relevance).
@@ -35,9 +39,8 @@ type WalkAndIndexFuture<'a> = std::pin::Pin<
 // Constants (matching TS reference)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SEMANTIC_WEIGHT: f64 = 0.72;
-const DEFAULT_KEYWORD_WEIGHT: f64 = 0.28;
-const DEFAULT_TOP_K: usize = 5;
+// DEFAULT_SEMANTIC_WEIGHT, DEFAULT_KEYWORD_WEIGHT, DEFAULT_TOP_K re-exported
+// from crate::tools::scoring (canonical source of truth).
 const MAX_TOP_K: usize = 50;
 const MAX_QUERY_LEN: usize = 2000;
 const DEFAULT_MIN_COMBINED_SCORE: f64 = 0.1;
@@ -284,17 +287,6 @@ pub fn split_camel_case(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn clamp01(value: f64) -> f64 {
-    value.clamp(0.0, 1.0)
-}
-
-fn normalize_weight(value: Option<f64>, fallback: f64) -> f64 {
-    match value {
-        Some(v) if v.is_finite() && v >= 0.0 => v,
-        _ => fallback,
-    }
-}
-
 fn normalize_threshold(value: Option<f64>, fallback: f64) -> f64 {
     match value {
         Some(v) if v.is_finite() => {
@@ -533,15 +525,9 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Get term coverage: fraction of query terms that appear in doc terms.
+/// Delegates to `scoring::keyword_coverage` — canonical implementation lives there.
 fn get_term_coverage(query_terms: &HashSet<String>, doc_terms: &HashSet<String>) -> f64 {
-    if query_terms.is_empty() {
-        return 0.0;
-    }
-    let matched = query_terms
-        .iter()
-        .filter(|t| doc_terms.contains(*t))
-        .count();
-    matched as f64 / query_terms.len() as f64
+    keyword_coverage(query_terms, doc_terms)
 }
 
 /// Find symbols whose pre-computed tokens overlap with query terms.

@@ -13,6 +13,7 @@ pub mod navigate_constants;
 pub mod pr_review;
 pub mod propose_commit;
 pub mod risk_score;
+pub mod scoring;
 pub mod semantic_identifiers;
 pub mod semantic_navigate;
 pub mod semantic_search;
