@@ -468,7 +468,9 @@ impl ContextPlusServer {
                 if let Some(s) = store {
                     let root = self.state.root_dir.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        rkyv_store::save_vector_store(&root, &embed_cache_name, &s)
+                        // Single-writer live path: overwrite without merge to avoid
+                        // the ~146 MB read + clone overhead of save_vector_store.
+                        rkyv_store::save_vector_store_overwrite(&root, &embed_cache_name, &s)
                     })
                     .await;
                     match result {
@@ -651,7 +653,8 @@ impl ContextPlusServer {
                     let root = self.state.root_dir.clone();
                     let cache_name_owned = id_cache_name.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        rkyv_store::save_vector_store(&root, &cache_name_owned, &store)
+                        // Single-writer live path: overwrite without merge.
+                        rkyv_store::save_vector_store_overwrite(&root, &cache_name_owned, &store)
                     })
                     .await;
                     match result {
