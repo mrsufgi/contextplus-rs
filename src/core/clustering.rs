@@ -75,12 +75,14 @@ pub fn normalized_laplacian(affinity: &DMatrix<f64>) -> DMatrix<f64> {
     for i in 0..n {
         laplacian[(i, i)] = 1.0;
         let di = d_inv_sqrt[i];
-        if di == 0.0 {
+        // d_inv_sqrt entries are assigned as exactly 0.0 when degree <= ZERO_THRESHOLD;
+        // use epsilon comparison to guard against any future computed-zero paths.
+        if di.abs() < ZERO_THRESHOLD {
             continue;
         }
         for j in (i + 1)..n {
             let dj = d_inv_sqrt[j];
-            if dj == 0.0 {
+            if dj.abs() < ZERO_THRESHOLD {
                 continue;
             }
             let val = -affinity[(i, j)] * di * dj;
@@ -309,6 +311,10 @@ pub fn spectral_cluster_with_min(
                 count += 1;
             }
         }
+        // SAFETY: count is the number of off-diagonal affinity pairs ≤ n*(n-1)/2.
+        // Practical corpus sizes are well below 2^26 files (64 GB RAM limit),
+        // so count < 2^52 and the usize→f64 cast is lossless.
+        #[allow(clippy::cast_precision_loss)]
         let mean = sum / count as f64;
         tracing::debug!(
             n = n_aff,
@@ -321,6 +327,9 @@ pub fn spectral_cluster_with_min(
 
     let laplacian = normalized_laplacian(&affinity);
 
+    // SAFETY: n is the number of input vectors. Practical corpus sizes are bounded
+    // well below 2^52 (f64 mantissa limit) by memory constraints (~4 PB at 1 byte/entry).
+    #[allow(clippy::cast_precision_loss)]
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
 
     let (eigenvalues, eigenvectors) = full_eigen(laplacian);
@@ -466,6 +475,8 @@ pub fn spectral_cluster_with_affinity(
     }
 
     let laplacian = normalized_laplacian(&affinity);
+    // SAFETY: n is bounded by available memory; well below 2^52 in any realistic deployment.
+    #[allow(clippy::cast_precision_loss)]
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
     let (eigenvalues, eigenvectors) = full_eigen(laplacian);
     let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
@@ -515,9 +526,9 @@ mod tests {
         assert!((aff[(0, 1)] - 1.0).abs() < 1e-6);
         // (0,2) should be 0.0 (orthogonal)
         assert!(aff[(0, 2)].abs() < 1e-6);
-        // Diagonal should be 0.0
-        assert_eq!(aff[(0, 0)], 0.0);
-        assert_eq!(aff[(1, 1)], 0.0);
+        // Diagonal should be 0.0 (set by DMatrix::zeros and never written for i==j)
+        assert!(aff[(0, 0)].abs() < 1e-12);
+        assert!(aff[(1, 1)].abs() < 1e-12);
     }
 
     #[test]
@@ -525,7 +536,8 @@ mod tests {
         // Opposite vectors have cosine -1.0, should be clamped to 0.0
         let vectors = vec![vec![1.0_f32, 0.0], vec![-1.0_f32, 0.0]];
         let aff = build_affinity_matrix(&vectors);
-        assert_eq!(aff[(0, 1)], 0.0);
+        // Negative cosine similarity is clamped to 0.0 via .max(0.0); result is exact zero.
+        assert!(aff[(0, 1)].abs() < 1e-12);
     }
 
     #[test]
@@ -927,5 +939,37 @@ mod tests {
 
         let result = spectral_cluster_with_affinity(affinity, 5, 2);
         assert_eq!(result.len(), 2);
+    }
+
+    /// Regression: a vertex with near-zero degree (row sum ≈ 1e-15) must not produce
+    /// NaN or Inf in the Laplacian or eigenvectors. The epsilon guard in
+    /// `normalized_laplacian` treats such rows as isolated (d_inv_sqrt = 0.0).
+    #[test]
+    fn normalized_laplacian_near_zero_degree_no_nan_inf() {
+        // 3×3 affinity: vertex 0 has near-zero degree (sum ≈ 1e-15),
+        // vertices 1 and 2 are strongly connected.
+        let mut affinity = DMatrix::zeros(3, 3);
+        affinity[(0, 1)] = 5e-16_f64;
+        affinity[(1, 0)] = 5e-16_f64;
+        affinity[(0, 2)] = 5e-16_f64;
+        affinity[(2, 0)] = 5e-16_f64;
+        affinity[(1, 2)] = 0.9_f64;
+        affinity[(2, 1)] = 0.9_f64;
+
+        let lap = normalized_laplacian(&affinity);
+
+        // No NaN or Inf anywhere in the Laplacian.
+        for v in lap.iter() {
+            assert!(v.is_finite(), "Laplacian contains non-finite value: {}", v);
+        }
+
+        // Diagonal of isolated vertex stays 1.0 (standard Laplacian convention).
+        assert!((lap[(0, 0)] - 1.0).abs() < 1e-12);
+
+        // The Laplacian must be usable for eigendecomposition without panicking.
+        let (eigenvalues, _eigenvectors) = full_eigen(lap);
+        for ev in &eigenvalues {
+            assert!(ev.is_finite(), "Eigenvalue is non-finite: {}", ev);
+        }
     }
 }
