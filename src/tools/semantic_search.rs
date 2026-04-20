@@ -900,6 +900,24 @@ impl SearchIndex {
             })
             .collect();
 
+        // Partial sort: O(N) partition to top_k, then sort only the small slice.
+        let k = opts.top_k.min(scored.len());
+        if k == 0 {
+            return vec![];
+        }
+        // Partition and sort use the SAME 3-key comparator. Using only
+        // `combined_score` for the partition is unsound: when combined_score
+        // ties exist at position k, `select_nth_unstable` can evict the
+        // tiebreaker-winner, silently changing the final top-k.
+        if k < scored.len() {
+            scored.select_nth_unstable_by(k - 1, |a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            scored.truncate(k);
+        }
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -1443,6 +1461,133 @@ mod tests {
         for w in results.windows(2) {
             assert!(w[0].score >= w[1].score);
         }
+    }
+
+    #[test]
+    fn test_search_partial_sort_top_k_ordering_100_docs() {
+        // Verify that with 100+ candidates the partial-sort path returns exactly
+        // top_k results in strictly descending combined-score order, and that the
+        // scores match a naïve full-sort of all candidates.
+        let n = 100usize;
+        let query_vec = vec![1.0_f32, 0.0, 0.0];
+
+        let docs: Vec<SearchDocument> = (0..n)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/file_{i}.ts"),
+                    format!("file {i}"),
+                    vec![format!("sym_{i}")],
+                    vec![],
+                    format!("content {i}"),
+                )
+            })
+            .collect();
+
+        // Each document gets a unique cosine similarity that decreases with index,
+        // so the expected rank order is doc 0 > doc 1 > … > doc 99.
+        let vectors: Vec<Option<Vec<f32>>> = (0..n)
+            .map(|i| {
+                let x = 1.0 - i as f32 * 0.009; // 1.0 → 0.109
+                let y = (1.0_f32 - x * x).max(0.0).sqrt();
+                Some(vec![x, y, 0.0])
+            })
+            .collect();
+
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let top_k = 10;
+        let opts = ResolvedSearchOptions {
+            top_k,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+
+        let results = index.search("file", &query_vec, &opts);
+
+        // Must return exactly top_k results.
+        assert_eq!(
+            results.len(),
+            top_k,
+            "expected exactly top_k={top_k} results"
+        );
+
+        // Results must be in non-increasing score order.
+        for w in results.windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "out-of-order: {} >= {} violated",
+                w[0].score,
+                w[1].score
+            );
+        }
+
+        // The top result must be file_0 (highest cosine similarity).
+        assert_eq!(results[0].path, "src/file_0.ts");
+
+        // The 10th result must be file_9 (10th highest similarity).
+        assert_eq!(results[top_k - 1].path, "src/file_9.ts");
+    }
+
+    #[test]
+    fn test_search_partial_sort_respects_tiebreakers() {
+        // Regression guard for the partition-vs-sort comparator mismatch bug:
+        // when two docs tie on combined_score, the 3-key comparator must break
+        // the tie consistently in both `select_nth_unstable_by` and `sort_by`
+        // so the keyword-score winner is retained in top-k.
+        //
+        // Setup: N+1 docs all with the same cosine similarity (so combined_score
+        // ties). One doc contains the query keyword; the others don't. With
+        // `top_k = 1`, the keyword-matching doc must win.
+        let n = 20usize;
+        let query_vec = vec![1.0_f32, 0.0, 0.0];
+
+        let mut docs: Vec<SearchDocument> = (0..n)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/noise_{i}.ts"),
+                    format!("noise {i}"),
+                    vec![format!("noise_sym_{i}")],
+                    vec![],
+                    format!("unrelated content {i}"),
+                )
+            })
+            .collect();
+        // The one doc whose symbol matches the query keyword.
+        docs.push(SearchDocument::new(
+            "src/target.ts".to_string(),
+            "target file".to_string(),
+            vec!["findTarget".to_string()],
+            vec![],
+            "findTarget implementation".to_string(),
+        ));
+
+        // All docs get identical cosine similarity — forces combined_score ties.
+        let vectors: Vec<Option<Vec<f32>>> = (0..=n).map(|_| Some(vec![1.0, 0.0, 0.0])).collect();
+
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let opts = ResolvedSearchOptions {
+            top_k: 1,
+            semantic_weight: 0.5,
+            keyword_weight: 0.5,
+            ..Default::default()
+        };
+
+        let results = index.search("findTarget", &query_vec, &opts);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].path, "src/target.ts",
+            "keyword-score tiebreaker must retain the matching doc across partition + sort"
+        );
     }
 
     // -- format output tests --
