@@ -2,6 +2,7 @@
 // Extracted from semantic_navigate.rs for modularity.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use super::navigate_constants::*;
 use super::semantic_navigate::FileInfo;
@@ -351,7 +352,7 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
                         // Check segments from 2 levels up to 3 levels up
                         for i in (0..len.saturating_sub(2)).rev().take(3) {
                             let seg = segs[i];
-                            if !GENERIC_SEGMENTS.contains(&seg)
+                            if !GENERIC_SEGMENTS.contains(seg)
                                 && !matches!(
                                     seg,
                                     "packages"
@@ -421,7 +422,7 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
         }
         if let Some((seg, count)) = seg_counts.iter().max_by_key(|(_, c)| **c)
             && *count > files.len() / 3
-            && !GENERIC_SEGMENTS.contains(seg)
+            && !GENERIC_SEGMENTS.contains(*seg)
             && !is_nextjs_route_param(seg)
         {
             // If there's a second-level distinguisher too, use it
@@ -433,7 +434,7 @@ pub(crate) fn derive_cluster_label(files: &[&FileInfo]) -> Option<String> {
             }
             if let Some((sub_seg, sub_count)) = sub_counts.iter().max_by_key(|(_, c)| **c)
                 && *sub_count > files.len() / 3
-                && !GENERIC_SEGMENTS.contains(sub_seg)
+                && !GENERIC_SEGMENTS.contains(*sub_seg)
                 && !is_nextjs_route_param(sub_seg)
             {
                 let raw = format!("{}/{}", seg, sub_seg);
@@ -618,7 +619,7 @@ pub(crate) fn describe_file_group(refs: &[&FileInfo]) -> String {
             }
         }
         if let Some((seg, _)) = seg_counts.into_iter().max_by_key(|(_, c)| *c)
-            && !GENERIC_SEGMENTS.contains(&seg)
+            && !GENERIC_SEGMENTS.contains(seg)
             && !is_nextjs_route_param(seg)
         {
             return seg.to_string();
@@ -807,8 +808,9 @@ pub(crate) fn deduplicate_sibling_labels(
                 // 1. Suffix is already in the base label (redundant)
                 // 2. Suffix is a generic/technical term (node, src, lib, etc.)
                 // 3. Suffix is just a file count ("N files")
-                let suffix_is_weak = base.to_lowercase().contains(&suffix.to_lowercase())
-                    || GENERIC_SEGMENTS.contains(&suffix.to_lowercase().as_str())
+                let suffix_lower = suffix.to_lowercase();
+                let suffix_is_weak = base.to_lowercase().contains(&suffix_lower)
+                    || GENERIC_SEGMENTS.contains(suffix_lower.as_str())
                     || suffix.contains("files")
                     || suffix == "node"
                     || suffix == "src"
@@ -1108,106 +1110,110 @@ pub(crate) fn extract_api_domain_from_filename(filename: &str) -> Option<String>
 /// Generic label terms describe code nature, not specific subdirectories.
 /// These words commonly appear in LLM labels but rarely in file paths, causing
 /// false rejections when a few paths happen to contain "components/" or "api/".
-pub(crate) const LABEL_ALLOWLIST: &[&str] = &[
-    "react",
-    "vue",
-    "angular",
-    "svelte",
-    "next",
-    "nuxt",
-    "node",
-    "express",
-    "fastify",
-    "nest",
-    "components",
-    "hooks",
-    "pages",
-    "layouts",
-    "views",
-    "widgets",
-    "api",
-    "rest",
-    "graphql",
-    "grpc",
-    "proto",
-    "template",
-    "templates",
-    "config",
-    "configs",
-    "configuration",
-    "server",
-    "client",
-    "frontend",
-    "backend",
-    "typescript",
-    "javascript",
-    "python",
-    "golang",
-    "rust",
-    "source",
-    "modules",
-    "packages",
-    "library",
-    "form",
-    "forms",
-    "modal",
-    "modals",
-    "dialog",
-    "dialogs",
-    "page",
-    "route",
-    "routes",
-    "routing",
-    "navigation",
-    "auth",
-    "authentication",
-    "state",
-    "store",
-    "redux",
-    "zustand",
-    "context",
-    "style",
-    "styles",
-    "styled",
-    "css",
-    "scss",
-    "test",
-    "tests",
-    "spec",
-    "specs",
-    "testing",
-    "util",
-    "utils",
-    "utility",
-    "utilities",
-    "helper",
-    "helpers",
-    "service",
-    "services",
-    "handler",
-    "handlers",
-    "model",
-    "models",
-    "entity",
-    "entities",
-    "schema",
-    "schemas",
-    "feature",
-    "features",
-    "domain",
-    "domains",
-    "shared",
-    "common",
-    "core",
-    "base",
-    "internal",
-    "dashboard",
-    "admin",
-    "portal",
-    "management",
-    "workflow",
-    "workflows",
-];
+pub(crate) static LABEL_ALLOWLIST: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        "react",
+        "vue",
+        "angular",
+        "svelte",
+        "next",
+        "nuxt",
+        "node",
+        "express",
+        "fastify",
+        "nest",
+        "components",
+        "hooks",
+        "pages",
+        "layouts",
+        "views",
+        "widgets",
+        "api",
+        "rest",
+        "graphql",
+        "grpc",
+        "proto",
+        "template",
+        "templates",
+        "config",
+        "configs",
+        "configuration",
+        "server",
+        "client",
+        "frontend",
+        "backend",
+        "typescript",
+        "javascript",
+        "python",
+        "golang",
+        "rust",
+        "source",
+        "modules",
+        "packages",
+        "library",
+        "form",
+        "forms",
+        "modal",
+        "modals",
+        "dialog",
+        "dialogs",
+        "page",
+        "route",
+        "routes",
+        "routing",
+        "navigation",
+        "auth",
+        "authentication",
+        "state",
+        "store",
+        "redux",
+        "zustand",
+        "context",
+        "style",
+        "styles",
+        "styled",
+        "css",
+        "scss",
+        "test",
+        "tests",
+        "spec",
+        "specs",
+        "testing",
+        "util",
+        "utils",
+        "utility",
+        "utilities",
+        "helper",
+        "helpers",
+        "service",
+        "services",
+        "handler",
+        "handlers",
+        "model",
+        "models",
+        "entity",
+        "entities",
+        "schema",
+        "schemas",
+        "feature",
+        "features",
+        "domain",
+        "domains",
+        "shared",
+        "common",
+        "core",
+        "base",
+        "internal",
+        "dashboard",
+        "admin",
+        "portal",
+        "management",
+        "workflow",
+        "workflows",
+    ]
+    .into_iter()
+    .collect()
+});
 
 /// Validate that an LLM-generated label actually represents the cluster content.
 ///
@@ -1236,7 +1242,7 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
     // Filter out allowlisted terms — only use path-specific words for validation
     let path_specific_words: Vec<&&str> = label_words
         .iter()
-        .filter(|w| !LABEL_ALLOWLIST.contains(w))
+        .filter(|w| !LABEL_ALLOWLIST.contains(*w))
         .collect();
 
     // If ALL label words are allowlisted terms (e.g. "React Form Components"),
@@ -2809,5 +2815,31 @@ mod tests {
         let labels = label_files(&files).await;
         assert_eq!(labels[0], "header for src/auth.rs");
         assert_eq!(labels[1], "empty.rs"); // filename fallback
+    }
+
+    // --- LABEL_ALLOWLIST membership tests ---
+
+    #[test]
+    fn label_allowlist_contains_known_term() {
+        assert!(
+            LABEL_ALLOWLIST.contains("components"),
+            "expected 'components' to be in LABEL_ALLOWLIST"
+        );
+        assert!(
+            LABEL_ALLOWLIST.contains("react"),
+            "expected 'react' to be in LABEL_ALLOWLIST"
+        );
+    }
+
+    #[test]
+    fn label_allowlist_does_not_contain_unknown_term() {
+        assert!(
+            !LABEL_ALLOWLIST.contains("scheduling"),
+            "expected 'scheduling' to not be in LABEL_ALLOWLIST"
+        );
+        assert!(
+            !LABEL_ALLOWLIST.contains("invoicing"),
+            "expected 'invoicing' to not be in LABEL_ALLOWLIST"
+        );
     }
 }
