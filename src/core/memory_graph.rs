@@ -970,7 +970,7 @@ impl GraphStore {
         Ok(result)
     }
 
-    /// Like [`get_graph`] but also returns a [`GraphStats`] snapshot taken
+    /// Like [`Self::get_graph`] but also returns a [`GraphStats`] snapshot taken
     /// inside the **same** write-lock acquisition, after `f` runs.
     ///
     /// This lets callers (e.g. mutating tool handlers) obtain both the
