@@ -77,44 +77,42 @@ impl EmbedRuntimeOptions {
 // BoundedLruCache
 // ---------------------------------------------------------------------------
 
-/// A simple bounded LRU cache for query embeddings.
-/// Uses a VecDeque to track insertion order for eviction.
-/// No external dependencies — stdlib only.
+/// A bounded LRU cache for query embeddings.
+///
+/// Uses `IndexMap` for O(1) insertion-ordered storage. Promotion on `get` is
+/// O(1): `shift_remove` swaps the target entry to the back by index, then
+/// `insert` appends it at the tail. Eviction on `insert` is also O(1):
+/// `shift_remove_index(0)` removes the front (oldest) entry in constant time.
+/// This replaces the previous `VecDeque::retain` approach which was O(n) on
+/// every cache hit and on every duplicate `insert`.
 struct BoundedLruCache {
     cap: usize,
-    order: std::collections::VecDeque<String>,
-    map: std::collections::HashMap<String, Vec<f32>>,
+    map: indexmap::IndexMap<String, Vec<f32>>,
 }
 
 impl BoundedLruCache {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            order: std::collections::VecDeque::with_capacity(cap + 1),
-            map: std::collections::HashMap::with_capacity(cap + 1),
+            map: indexmap::IndexMap::with_capacity(cap + 1),
         }
     }
 
     fn get(&mut self, key: &str) -> Option<&Vec<f32>> {
-        if self.map.contains_key(key) {
-            // Move to back (most recently used)
-            self.order.retain(|k| k != key);
-            self.order.push_back(key.to_string());
-            self.map.get(key)
-        } else {
-            None
-        }
+        // O(1): remove entry by key (swap with tail), re-insert at tail (MRU).
+        let val = self.map.shift_remove(key)?;
+        self.map.insert(key.to_string(), val);
+        self.map.get(key)
     }
 
     fn insert(&mut self, key: String, val: Vec<f32>) {
         if self.map.contains_key(&key) {
-            self.order.retain(|k| k != &key);
-        } else if self.map.len() >= self.cap
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.map.remove(&oldest);
+            // O(1): promote existing key to MRU position.
+            self.map.shift_remove(&key);
+        } else if self.map.len() >= self.cap {
+            // O(1): evict LRU (front of insertion-ordered map).
+            self.map.shift_remove_index(0);
         }
-        self.order.push_back(key.clone());
         self.map.insert(key, val);
     }
 
@@ -1721,6 +1719,22 @@ mod tests {
             "newest entry 'd' should be present"
         );
         assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn query_lru_cache_get_promotes_to_mru() {
+        // cap=2: insert a, b → access a (promotes a to MRU) → insert c → b evicted, a survives.
+        let mut cache = BoundedLruCache::new(2);
+        cache.insert("a".to_string(), vec![1.0]);
+        cache.insert("b".to_string(), vec![2.0]);
+        cache.get("a"); // promote "a" — now order is [b, a], LRU is b
+        cache.insert("c".to_string(), vec![3.0]); // should evict "b"
+        assert!(cache.get("b").is_none(), "'b' should have been evicted");
+        assert!(
+            cache.get("a").is_some(),
+            "'a' should survive after promotion"
+        );
+        assert!(cache.get("c").is_some(), "'c' should be present");
     }
 
     #[tokio::test]

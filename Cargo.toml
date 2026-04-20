@@ -96,6 +96,9 @@ rand = "0.8"
 rayon = "1"
 instant-distance = "0.6.1"
 
+# O(1)-promotion LRU cache (indexmap already transitive; adding as direct dep)
+indexmap = "2"
+
 [dev-dependencies]
 # Mock HTTP server (for Ollama API)
 wiremock = "0.6"
