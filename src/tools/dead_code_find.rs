@@ -13,7 +13,10 @@
 //!   - re-exports — the re-exporting file might just re-export by glob
 //!
 //! `ignore_kinds` lets callers filter out symbol kinds that almost
-//! always produce false positives (e.g. `mod`, `impl`).
+//! always produce false positives (e.g. `mod`, `impl`). The defaults
+//! also include `element`, `style`, and `script` — the pseudo-kinds
+//! emitted by the tree-sitter HTML grammar for markup tags. Those are
+//! trivially "unused" by the heuristic and produce only noise.
 //!
 //! ## Inputs
 //!
@@ -38,7 +41,9 @@ pub struct DeadSymbol {
 #[derive(Debug, Clone)]
 pub struct DeadCodeOptions {
     /// Symbol kinds to skip entirely (case-insensitive). Defaults skip
-    /// `mod`, `impl`, `trait`, `test` — common false-positive sources.
+    /// `mod`, `impl`, `trait`, `test` — common false-positive sources —
+    /// and HTML pseudo-kinds `element`, `style`, `script` emitted by the
+    /// tree-sitter HTML grammar for markup tags.
     pub ignore_kinds: HashSet<String>,
     /// Symbol names to skip entirely (case-insensitive). Defaults skip
     /// well-known framework entry points (`main`, `default`, etc.).
@@ -49,10 +54,14 @@ pub struct DeadCodeOptions {
 
 impl Default for DeadCodeOptions {
     fn default() -> Self {
-        let ignore_kinds = ["mod", "impl", "trait", "test"]
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        let ignore_kinds = [
+            "mod", "impl", "trait", "test",
+            // HTML pseudo-kinds emitted by tree-sitter for markup tags:
+            "element", "style", "script",
+        ]
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
         let ignore_names = [
             "main", "default", "new", "drop", "clone", "fmt", "from", "into",
         ]
@@ -386,5 +395,75 @@ export function startApp() {
             !dead_names.contains(&"sessionStore"),
             "destructure LHS 'sessionStore' must not be reported dead; got: {dead_names:?}"
         );
+    }
+
+    // --- HTML noise regression tests ---
+
+    /// HTML parser pseudo-kinds (`element`, `style`, `script`) are suppressed
+    /// by the default `ignore_kinds` list. This is the single filter layer for
+    /// HTML noise — no separate extension-based skip is needed.
+    #[test]
+    fn html_pseudo_kinds_skipped_by_default() {
+        // Simulates the real-world case: an HTML file whose parser emits
+        // tag names (html, head, body) as symbols. All these kinds are in
+        // the default ignore_kinds list, so none should appear in output.
+        let html_path = PathBuf::from("plan-review.html");
+        let rs_path = PathBuf::from("src/lib.rs");
+
+        let symbols = HashMap::from([
+            (
+                html_path.clone(),
+                vec![
+                    sym("html", "element", 9),
+                    sym("head", "element", 10),
+                    sym("body", "element", 694),
+                    sym("style", "style", 24),
+                    sym("nav", "element", 30),
+                ],
+            ),
+            (rs_path.clone(), vec![sym("unused_fn", "function", 5)]),
+        ]);
+        // Tokens: nothing references anything cross-file.
+        let tokens = HashMap::from([
+            (
+                html_path.clone(),
+                HashSet::from(["html".to_string(), "head".to_string()]),
+            ),
+            (rs_path.clone(), HashSet::from(["unused_fn".to_string()])),
+        ]);
+
+        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
+
+        // HTML pseudo-kind symbols must not appear (filtered by ignore_kinds).
+        for d in &dead {
+            assert!(
+                !matches!(d.kind.as_str(), "element" | "style" | "script"),
+                "HTML pseudo-kind symbol should be suppressed but got: {:?}",
+                d
+            );
+        }
+        // The Rust symbol should still be flagged.
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].name, "unused_fn");
+    }
+
+    #[test]
+    fn html_element_kind_skipped_by_default() {
+        // Even if a caller passes an .rs path with kind="element",
+        // the ignore_kinds default should suppress it.
+        let path = PathBuf::from("weird.rs");
+        let symbols = HashMap::from([(
+            path.clone(),
+            vec![sym("body", "element", 1), sym("real_fn", "function", 10)],
+        )]);
+        let tokens = HashMap::from([(
+            path.clone(),
+            HashSet::from(["body".to_string(), "real_fn".to_string()]),
+        )]);
+
+        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
+        // "body" has kind "element" → skipped; "real_fn" has no external users → flagged.
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].name, "real_fn");
     }
 }
