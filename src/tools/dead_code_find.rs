@@ -13,12 +13,10 @@
 //!   - re-exports — the re-exporting file might just re-export by glob
 //!
 //! `ignore_kinds` lets callers filter out symbol kinds that almost
-//! always produce false positives (e.g. `mod`, `impl`).
-//!
-//! `ignore_extensions` skips whole files by extension. HTML files are
-//! excluded by default: every `<html>`, `<body>`, `<nav>` etc. is a
-//! unique tag instance whose name trivially fails the "appears elsewhere"
-//! check — producing pure noise with no actionable signal.
+//! always produce false positives (e.g. `mod`, `impl`). The defaults
+//! also include `element`, `style`, and `script` — the pseudo-kinds
+//! emitted by the tree-sitter HTML grammar for markup tags. Those are
+//! trivially "unused" by the heuristic and produce only noise.
 //!
 //! ## Inputs
 //!
@@ -43,17 +41,13 @@ pub struct DeadSymbol {
 #[derive(Debug, Clone)]
 pub struct DeadCodeOptions {
     /// Symbol kinds to skip entirely (case-insensitive). Defaults skip
-    /// `mod`, `impl`, `trait`, `test` — common false-positive sources.
-    /// Also skips HTML pseudo-kinds `element`, `style`, `script` which
-    /// the tree-sitter HTML grammar emits for markup tags.
+    /// `mod`, `impl`, `trait`, `test` — common false-positive sources —
+    /// and HTML pseudo-kinds `element`, `style`, `script` emitted by the
+    /// tree-sitter HTML grammar for markup tags.
     pub ignore_kinds: HashSet<String>,
     /// Symbol names to skip entirely (case-insensitive). Defaults skip
     /// well-known framework entry points (`main`, `default`, etc.).
     pub ignore_names: HashSet<String>,
-    /// File extensions (without leading dot, lowercase) whose files are
-    /// excluded wholesale. HTML files are excluded by default because
-    /// every tag instance is trivially "unused" by the heuristic.
-    pub ignore_extensions: HashSet<String>,
     /// Cap the result list — first N symbols (sorted by path, then line).
     pub max_results: usize,
 }
@@ -74,14 +68,9 @@ impl Default for DeadCodeOptions {
         .iter()
         .map(|s| s.to_lowercase())
         .collect();
-        let ignore_extensions = ["html", "htm"]
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
         Self {
             ignore_kinds,
             ignore_names,
-            ignore_extensions,
             max_results: 200,
         }
     }
@@ -109,18 +98,6 @@ pub fn find_dead_symbols(
 
     let mut out = Vec::new();
     for (path, symbols) in symbols_by_file {
-        // Skip entire files whose extension is in ignore_extensions (e.g. HTML).
-        // Markup parsers emit tag names as symbols; those are trivially "unused"
-        // by the token-search heuristic and produce only noise.
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-        if opts.ignore_extensions.contains(&ext) {
-            continue;
-        }
-
         for sym in symbols {
             collect_dead(path, sym, &files_referencing, opts, &mut out);
         }
@@ -222,7 +199,6 @@ mod tests {
         DeadCodeOptions {
             ignore_kinds: HashSet::new(),
             ignore_names: HashSet::new(),
-            ignore_extensions: HashSet::new(),
             max_results: 100,
         }
     }
@@ -423,11 +399,14 @@ export function startApp() {
 
     // --- HTML noise regression tests ---
 
+    /// HTML parser pseudo-kinds (`element`, `style`, `script`) are suppressed
+    /// by the default `ignore_kinds` list. This is the single filter layer for
+    /// HTML noise — no separate extension-based skip is needed.
     #[test]
-    fn html_files_skipped_entirely_by_default() {
+    fn html_pseudo_kinds_skipped_by_default() {
         // Simulates the real-world case: an HTML file whose parser emits
-        // tag names (html, head, body) as symbols.  With default options
-        // none of these should appear in the output.
+        // tag names (html, head, body) as symbols. All these kinds are in
+        // the default ignore_kinds list, so none should appear in output.
         let html_path = PathBuf::from("plan-review.html");
         let rs_path = PathBuf::from("src/lib.rs");
 
@@ -439,6 +418,7 @@ export function startApp() {
                     sym("head", "element", 10),
                     sym("body", "element", 694),
                     sym("style", "style", 24),
+                    sym("nav", "element", 30),
                 ],
             ),
             (rs_path.clone(), vec![sym("unused_fn", "function", 5)]),
@@ -451,12 +431,11 @@ export function startApp() {
 
         let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
 
-        // HTML symbols must not appear.
+        // HTML pseudo-kind symbols must not appear (filtered by ignore_kinds).
         for d in &dead {
-            assert_ne!(
-                d.path.extension().and_then(|e| e.to_str()).unwrap_or(""),
-                "html",
-                "HTML file should be excluded but got: {:?}",
+            assert!(
+                !matches!(d.kind.as_str(), "element" | "style" | "script"),
+                "HTML pseudo-kind symbol should be suppressed but got: {:?}",
                 d
             );
         }
@@ -467,7 +446,7 @@ export function startApp() {
 
     #[test]
     fn html_element_kind_skipped_by_default() {
-        // Even if a caller somehow passes an .rs path with kind="element",
+        // Even if a caller passes an .rs path with kind="element",
         // the ignore_kinds default should suppress it.
         let path = PathBuf::from("weird.rs");
         let symbols = HashMap::from([(
@@ -483,38 +462,5 @@ export function startApp() {
         // "body" has kind "element" → skipped; "real_fn" has no external users → flagged.
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].name, "real_fn");
-    }
-
-    #[test]
-    fn htm_extension_also_skipped() {
-        let htm_path = PathBuf::from("index.htm");
-        let symbols = HashMap::from([(
-            htm_path.clone(),
-            vec![sym("nav", "element", 5)],
-        )]);
-        let tokens = HashMap::from([(htm_path.clone(), HashSet::from(["nav".to_string()]))]);
-
-        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
-        assert!(dead.is_empty(), "htm extension should be excluded by default");
-    }
-
-    #[test]
-    fn html_included_when_extension_filter_cleared() {
-        // If a caller explicitly passes ignore_extensions=[], HTML files
-        // are included — opt-out is respected.
-        let html_path = PathBuf::from("page.html");
-        let symbols = HashMap::from([(
-            html_path.clone(),
-            vec![sym("MyComponent", "function", 3)],
-        )]);
-        let tokens = HashMap::from([(html_path.clone(), HashSet::from(["MyComponent".to_string()]))]);
-
-        let mut opts = DeadCodeOptions::default();
-        opts.ignore_extensions.clear();
-        // Also clear ignore_kinds so "element" etc. don't interfere — the
-        // symbol kind here is "function" anyway, but be explicit.
-        let dead = find_dead_symbols(&symbols, &tokens, &opts);
-        assert_eq!(dead.len(), 1, "with extension filter cleared, HTML symbols should appear");
-        assert_eq!(dead[0].name, "MyComponent");
     }
 }
