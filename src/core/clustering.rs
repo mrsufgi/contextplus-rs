@@ -250,6 +250,10 @@ fn kmeans(data: &[Vec<f64>], k: usize) -> Vec<usize> {
                 continue;
             }
             let base = c * dim;
+            // count_val is bounded by n (corpus size), which is memory-bounded
+            // below 2^52 — see the invariant documented at the spectral_cluster
+            // entry points. Safe as f64.
+            #[allow(clippy::cast_precision_loss)]
             let count = count_val as f64;
             for d in 0..dim {
                 centroids[base + d] = sums[base + d] / count;
