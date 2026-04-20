@@ -22,15 +22,35 @@ pub struct WalkOptions<'a> {
     pub ignore_dirs: &'a HashSet<String>,
 }
 
+/// Path prefixes that are always excluded from indexing, regardless of the
+/// ignore_dirs set.  These are multi-segment patterns checked against the
+/// start of the normalised (forward-slash) relative path.
+///
+/// `.claude/worktrees/` houses parallel-agent worktrees — copies of the main
+/// workspace used by Claude Code sub-agents.  Indexing them produces massive
+/// embedding duplication with zero informational gain.
+const ALWAYS_IGNORE_PREFIXES: &[&str] = &[".claude/worktrees/"];
+
 /// Segment-based path ignore check.
 /// Checks if any path segment matches the ignore set.
 /// Also skips any segment starting with `.` (hidden files/dirs), matching
 /// the TS walker's `entry.name.startsWith(".")` check.
 /// This is the correct approach (matching our TS fork fix) — prevents
 /// false positives from prefix matching like "generated" matching "gen".
+///
+/// Additionally, any path whose prefix matches an entry in
+/// `ALWAYS_IGNORE_PREFIXES` is rejected unconditionally.
 pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
     if path.is_empty() {
         return false;
+    }
+    // Reject paths that start with a known multi-segment prefix (e.g.
+    // `.claude/worktrees/`).  These cannot be caught by the per-segment dot
+    // check alone when the walker is started from inside a hidden directory.
+    for prefix in ALWAYS_IGNORE_PREFIXES {
+        if path.starts_with(prefix) {
+            return false;
+        }
     }
     for segment in path.split('/') {
         if segment.starts_with('.') {
@@ -146,6 +166,26 @@ mod tests {
 
     fn make_ignore_set(dirs: &[&str]) -> HashSet<String> {
         dirs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn should_track_excludes_claude_worktrees() {
+        let ignore = make_ignore_set(&[]);
+        // Paths inside .claude/worktrees/ must always be rejected
+        assert!(!should_track(
+            ".claude/worktrees/agent-acd43174/packages/libs/types/generated/foo.ts",
+            &ignore
+        ));
+        assert!(!should_track(
+            ".claude/worktrees/agent-acd43174/src/main.rs",
+            &ignore
+        ));
+        // The prefix itself (exact) is also rejected
+        assert!(!should_track(".claude/worktrees/", &ignore));
+        // Paths outside worktrees that are otherwise valid should still pass
+        assert!(should_track("src/main.rs", &ignore));
+        // .claude itself (non-worktrees) is still skipped by the dot-segment rule
+        assert!(!should_track(".claude/settings.json", &ignore));
     }
 
     #[test]
@@ -335,6 +375,44 @@ mod tests {
 
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert!(paths.iter().all(|p| p.starts_with("src/")));
+    }
+
+    #[test]
+    fn walk_directory_excludes_claude_worktrees() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Simulate a workspace with a worktree alongside real source
+        let worktree_file = root
+            .join(".claude")
+            .join("worktrees")
+            .join("agent-abc123")
+            .join("src");
+        fs::create_dir_all(&worktree_file).unwrap();
+        fs::write(worktree_file.join("main.rs"), "fn main() {}").unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn lib() {}").unwrap();
+
+        let ignore = make_ignore_set(&[]);
+        // Note: hidden(true) in WalkBuilder already skips .claude/ on most
+        // platforms, but should_track provides an additional safety net via
+        // ALWAYS_IGNORE_PREFIXES for edge cases (e.g. follow_links, target_path).
+        let entries = walk_directory(&WalkOptions {
+            root_dir: root,
+            target_path: None,
+            depth_limit: None,
+            ignore_dirs: &ignore,
+        });
+
+        let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+        // Real source must be present
+        assert!(paths.contains(&"src/lib.rs"), "src/lib.rs should be indexed");
+        // Nothing from the worktree should be indexed
+        assert!(
+            !paths.iter().any(|p| p.contains("worktrees")),
+            "worktrees paths must not be indexed: {paths:?}"
+        );
     }
 
     #[test]
