@@ -260,10 +260,13 @@ impl ContextPlusServer {
             .clone()
     }
 
+    // Arg-extraction helpers: try snake_case key first, fall back to camelCase.
+    // MCP clients may send either form; schemas advertise snake_case names but
+    // callers have historically sent camelCase equivalents (topK, semanticWeight, …).
+
     fn get_str(args: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        let camel = crate::server_helpers::snake_to_camel(key);
+        crate::server_helpers::get_str_compat(args, key, &camel).map(|s| s.to_string())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -272,27 +275,28 @@ impl ContextPlusServer {
     }
 
     fn get_usize(args: &serde_json::Map<String, Value>, key: &str) -> Option<usize> {
-        args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+        let camel = crate::server_helpers::snake_to_camel(key);
+        crate::server_helpers::get_usize_compat(args, key, &camel)
     }
 
     fn get_f64(args: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
-        args.get(key).and_then(|v| v.as_f64())
+        let camel = crate::server_helpers::snake_to_camel(key);
+        crate::server_helpers::get_f64_compat(args, key, &camel)
     }
 
     fn get_bool(args: &serde_json::Map<String, Value>, key: &str) -> Option<bool> {
-        args.get(key).and_then(|v| v.as_bool())
+        let camel = crate::server_helpers::snake_to_camel(key);
+        crate::server_helpers::get_bool_compat(args, key, &camel)
     }
 
     fn get_u32(args: &serde_json::Map<String, Value>, key: &str) -> Option<u32> {
-        args.get(key).and_then(|v| v.as_u64()).map(|n| n as u32)
+        let camel = crate::server_helpers::snake_to_camel(key);
+        crate::server_helpers::get_u32_compat(args, key, &camel)
     }
 
     fn get_string_array(args: &serde_json::Map<String, Value>, key: &str) -> Option<Vec<String>> {
-        args.get(key).and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
+        let camel = crate::server_helpers::snake_to_camel(key);
+        crate::server_helpers::get_string_array_compat(args, key, &camel)
     }
 
     fn ok_text(text: String) -> CallToolResult {
@@ -3420,5 +3424,123 @@ mod tests {
         let by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
             build_symbols_by_file(&cache, |rel| rel.to_string());
         assert!(by_file.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // camelCase arg-extraction regression tests (bug fix: MCP schema
+    // advertises camelCase keys; handlers must accept them).
+    // ---------------------------------------------------------------
+
+    /// `get_str("top_k")` should find a key sent as `"topK"` (camelCase fallback).
+    #[test]
+    fn get_str_accepts_camel_case_fallback() {
+        let mut args = serde_json::Map::new();
+        args.insert("queryText".to_string(), json!("hello"));
+        // snake key "query_text" → camel "queryText"
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "query_text"),
+            Some("hello".to_string()),
+        );
+    }
+
+    /// `get_str` still works when only the snake_case key is present.
+    #[test]
+    fn get_str_snake_case_no_regression() {
+        let mut args = serde_json::Map::new();
+        args.insert("query_text".to_string(), json!("world"));
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "query_text"),
+            Some("world".to_string()),
+        );
+    }
+
+    /// `get_str` prefers snake_case when both are present.
+    #[test]
+    fn get_str_prefers_snake_over_camel() {
+        let mut args = serde_json::Map::new();
+        args.insert("my_key".to_string(), json!("snake_value"));
+        args.insert("myKey".to_string(), json!("camel_value"));
+        assert_eq!(
+            ContextPlusServer::get_str(&args, "my_key"),
+            Some("snake_value".to_string()),
+        );
+    }
+
+    /// `get_usize("top_k")` accepts `"topK": 3` sent by MCP client.
+    #[test]
+    fn get_usize_accepts_camel_case_top_k() {
+        let mut args = serde_json::Map::new();
+        args.insert("topK".to_string(), json!(3));
+        assert_eq!(
+            ContextPlusServer::get_usize(&args, "top_k"),
+            Some(3),
+            "topK (camelCase) must be resolved when top_k is absent",
+        );
+    }
+
+    /// `get_usize("top_k")` still works with snake_case key — no regression.
+    #[test]
+    fn get_usize_snake_case_top_k_no_regression() {
+        let mut args = serde_json::Map::new();
+        args.insert("top_k".to_string(), json!(7));
+        assert_eq!(ContextPlusServer::get_usize(&args, "top_k"), Some(7));
+    }
+
+    /// `get_f64("semantic_weight")` accepts `"semanticWeight": 0.9`.
+    #[test]
+    fn get_f64_accepts_camel_case_semantic_weight() {
+        let mut args = serde_json::Map::new();
+        args.insert("semanticWeight".to_string(), json!(0.9));
+        let val = ContextPlusServer::get_f64(&args, "semantic_weight").unwrap();
+        assert!((val - 0.9).abs() < f64::EPSILON);
+    }
+
+    /// `get_f64("min_combined_score")` accepts `"minCombinedScore": 0.4`.
+    #[test]
+    fn get_f64_accepts_camel_case_min_combined_score() {
+        let mut args = serde_json::Map::new();
+        args.insert("minCombinedScore".to_string(), json!(0.4));
+        let val = ContextPlusServer::get_f64(&args, "min_combined_score").unwrap();
+        assert!((val - 0.4).abs() < f64::EPSILON);
+    }
+
+    /// `get_bool("require_keyword_match")` accepts `"requireKeywordMatch": true`.
+    #[test]
+    fn get_bool_accepts_camel_case_require_keyword_match() {
+        let mut args = serde_json::Map::new();
+        args.insert("requireKeywordMatch".to_string(), json!(true));
+        assert_eq!(
+            ContextPlusServer::get_bool(&args, "require_keyword_match"),
+            Some(true),
+        );
+    }
+
+    /// `get_string_array("include_kinds")` accepts `"includeKinds": [...]`.
+    #[test]
+    fn get_string_array_accepts_camel_case_include_kinds() {
+        let mut args = serde_json::Map::new();
+        args.insert("includeKinds".to_string(), json!(["function", "method"]));
+        let result = ContextPlusServer::get_string_array(&args, "include_kinds").unwrap();
+        assert_eq!(result, vec!["function", "method"]);
+    }
+
+    /// `get_string_array("include_kinds")` still works with snake_case — no regression.
+    #[test]
+    fn get_string_array_snake_case_no_regression() {
+        let mut args = serde_json::Map::new();
+        args.insert("include_kinds".to_string(), json!(["class"]));
+        let result = ContextPlusServer::get_string_array(&args, "include_kinds").unwrap();
+        assert_eq!(result, vec!["class"]);
+    }
+
+    /// `get_u32("recency_window_days")` accepts `"recencyWindowDays": 30`.
+    #[test]
+    fn get_u32_accepts_camel_case_recency_window_days() {
+        let mut args = serde_json::Map::new();
+        args.insert("recencyWindowDays".to_string(), json!(30));
+        assert_eq!(
+            ContextPlusServer::get_u32(&args, "recency_window_days"),
+            Some(30),
+        );
     }
 }
