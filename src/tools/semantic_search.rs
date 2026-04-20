@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use regex::Regex;
 
+use crate::core::embeddings::VectorStore;
 use crate::error::{ContextPlusError, Result};
 use crate::tools::scoring::{
     DEFAULT_KEYWORD_WEIGHT, DEFAULT_SEMANTIC_WEIGHT, DEFAULT_TOP_K, clamp01, keyword_coverage,
@@ -21,6 +22,21 @@ use crate::tools::scoring::{
 /// Maximum additive bonus from recency (kept small so it nudges ties, not
 /// dominates relevance).
 const MAX_RECENCY_BOOST: f64 = 0.05;
+
+// ---------------------------------------------------------------------------
+// ANN pre-filter constants
+// ---------------------------------------------------------------------------
+
+/// Corpus size at which `SearchIndex::search` switches from O(N) brute-force
+/// cosine scan to an HNSW approximate-nearest-neighbor pre-filter. Must match
+/// `HNSW_THRESHOLD` in `core/embeddings.rs` (both guard the same boundary).
+const ANN_THRESHOLD: usize = 2_000;
+
+/// How many ANN candidates to fetch per top-k result. The candidate pool is
+/// `top_k * ANN_CANDIDATE_MULTIPLIER`, capped at the corpus size. Larger
+/// values improve recall at the cost of more scoring work. Override at
+/// runtime with `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER`.
+const ANN_CANDIDATE_MULTIPLIER: usize = 10;
 
 /// Type alias for the boxed future returned by embedding functions.
 type EmbedFuture<'a> =
@@ -732,6 +748,8 @@ pub fn sanitize_query(query: &str) -> Cow<'_, str> {
 
 /// In-memory search index holding documents and their embedding vectors.
 /// Vectors are stored in a flat contiguous buffer for cache-friendly SIMD access.
+/// For corpora larger than `ANN_THRESHOLD`, a `VectorStore` is also built so
+/// `search()` can use HNSW ANN pre-filtering instead of a full cosine scan.
 pub struct SearchIndex {
     documents: Vec<SearchDocument>,
     /// Flat buffer: `vector_buffer[i * dims .. (i+1) * dims]` is the vector for doc `i`.
@@ -741,6 +759,10 @@ pub struct SearchIndex {
     has_vector: Vec<bool>,
     /// Dimensions per vector (0 if no vectors indexed yet).
     dims: usize,
+    /// HNSW-backed VectorStore built when the number of embedded docs exceeds
+    /// `ANN_THRESHOLD`. Maps relative file path → embedding vector.
+    /// `None` when the corpus is below threshold or no vectors are available.
+    ann_store: Option<VectorStore>,
 }
 
 impl Default for SearchIndex {
@@ -756,6 +778,7 @@ impl SearchIndex {
             vector_buffer: Vec::new(),
             has_vector: Vec::new(),
             dims: 0,
+            ann_store: None,
         }
     }
 
@@ -789,10 +812,33 @@ impl SearchIndex {
                 None => has_vec.push(false),
             }
         }
+        // Count embedded docs to decide whether to build the ANN store.
+        let embedded_count = has_vec.iter().filter(|&&v| v).count();
+
+        // Build a VectorStore (and therefore the HNSW index) when the corpus
+        // is large enough for ANN pre-filtering to be worthwhile.
+        let ann_store = if dims > 0 && embedded_count >= ANN_THRESHOLD {
+            let mut keys = Vec::with_capacity(embedded_count);
+            let mut hashes: Vec<String> = Vec::with_capacity(embedded_count);
+            let mut flat: Vec<f32> = Vec::with_capacity(embedded_count * dims);
+            for (i, d) in docs.iter().enumerate() {
+                if has_vec[i] {
+                    keys.push(d.path.clone());
+                    hashes.push(String::new()); // hash unused by SearchIndex
+                    let offset = i * dims;
+                    flat.extend_from_slice(&buffer[offset..offset + dims]);
+                }
+            }
+            Some(VectorStore::new(dims as u32, keys, hashes, flat))
+        } else {
+            None
+        };
+
         self.documents = docs;
         self.vector_buffer = buffer;
         self.has_vector = has_vec;
         self.dims = dims;
+        self.ann_store = ann_store;
     }
 
     /// Perform hybrid search against the indexed documents.
@@ -826,6 +872,36 @@ impl SearchIndex {
                     .collect()
             };
 
+        // ANN pre-filter: when the corpus is large and we have an HNSW index,
+        // restrict the cosine scan to a small candidate set instead of O(N).
+        // Docs without embeddings bypass this filter and go through keyword scoring only.
+        let ann_candidate_set: Option<std::collections::HashSet<usize>> =
+            self.ann_store.as_ref().and_then(|store| {
+                // Read optional runtime multiplier override.
+                let multiplier = std::env::var("CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(ANN_CANDIDATE_MULTIPLIER)
+                    .max(1);
+                let candidate_count = (opts.top_k * multiplier).min(store.count());
+                if candidate_count == 0 {
+                    return None;
+                }
+                let hits = store.find_nearest(query_vec, candidate_count);
+                // Build a set of *document* indices from the path→doc lookup.
+                let path_to_idx: std::collections::HashMap<&str, usize> = self
+                    .documents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| (d.path.as_str(), i))
+                    .collect();
+                let indices: std::collections::HashSet<usize> = hits
+                    .iter()
+                    .filter_map(|(path, _)| path_to_idx.get(path.as_str()).copied())
+                    .collect();
+                Some(indices)
+            });
+
         #[allow(clippy::type_complexity)]
         let mut scored: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = self
             .documents
@@ -833,6 +909,18 @@ impl SearchIndex {
             .enumerate()
             .filter_map(|(i, doc)| {
                 if !self.has_vector[i] {
+                    // No embedding: skip semantic scoring entirely, but still
+                    // let docs pass to keyword scoring below (they will receive
+                    // semantic_score = 0.0 which is handled by existing filters).
+                    // We return None here to keep the ANN path clean; keyword-only
+                    // docs are collected separately after this iterator.
+                    return None;
+                }
+                // ANN pre-filter: skip docs not in the candidate set when ANN is active.
+                if ann_candidate_set
+                    .as_ref()
+                    .is_some_and(|c| !c.contains(&i))
+                {
                     return None;
                 }
                 if !path_passes_filters(&doc.path, opts) {
@@ -899,6 +987,82 @@ impl SearchIndex {
                 ))
             })
             .collect();
+
+        // Keyword-only pass for docs that have NO embedding vector.
+        // These are never reached by the ANN path (which only covers embedded docs),
+        // so we score them separately and merge into `scored` before the final sort.
+        // This preserves the fallback guarantee: a doc with no embedding but a strong
+        // keyword match can still surface via `require_keyword_match`-compatible queries.
+        #[allow(clippy::type_complexity)]
+        let keyword_only: Vec<(usize, f64, f64, f64, Vec<String>, Vec<String>)> = self
+            .documents
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, doc)| {
+                if self.has_vector[i] {
+                    return None; // already handled above
+                }
+                if !path_passes_filters(&doc.path, opts) {
+                    return None;
+                }
+                // Semantic score is 0 for docs with no embedding.
+                let semantic_score: f64 = 0.0;
+
+                let matched_entries = get_matched_symbol_entries(
+                    &doc.symbol_entries,
+                    &doc.symbol_entry_tokens,
+                    &query_terms,
+                );
+                let matched_symbols = if !matched_entries.is_empty() {
+                    matched_entries.iter().map(|e| e.name.clone()).collect()
+                } else {
+                    get_matched_symbols(&doc.symbols, &doc.symbol_tokens, &query_terms)
+                };
+                let matched_symbol_locations: Vec<String> = matched_entries
+                    .iter()
+                    .map(|e| format!("{}@{}", e.name, format_line_range(e.line, e.end_line)))
+                    .collect();
+
+                let raw_keyword_score =
+                    compute_keyword_score(&query_lower, &query_terms, doc, &matched_symbols);
+                let best_kind = matched_entries.first().and_then(|e| e.kind.as_deref());
+                let keyword_score =
+                    clamp01(raw_keyword_score * query_kind_boost(query_kind, best_kind));
+                let base_combined = compute_combined_score(semantic_score, keyword_score, opts);
+                let recency = recency_by_path
+                    .get(doc.path.as_str())
+                    .copied()
+                    .unwrap_or(0.0);
+                let combined_score = clamp01(base_combined + recency);
+
+                if opts.require_semantic_match {
+                    return None; // no embedding → semantic_score == 0
+                }
+                if opts.require_keyword_match && keyword_score <= 0.0 {
+                    return None;
+                }
+                if opts.min_semantic_score > 0.0 {
+                    return None; // semantic_score == 0.0 < any positive threshold
+                }
+                if keyword_score < opts.min_keyword_score {
+                    return None;
+                }
+                if combined_score < opts.min_combined_score {
+                    return None;
+                }
+
+                Some((
+                    i,
+                    combined_score,
+                    semantic_score,
+                    keyword_score,
+                    matched_symbols,
+                    matched_symbol_locations,
+                ))
+            })
+            .collect();
+
+        scored.extend(keyword_only);
 
         // Partial sort: O(N) partition to top_k, then sort only the small slice.
         let k = opts.top_k.min(scored.len());
@@ -2082,5 +2246,173 @@ mod tests {
         }];
         let out = format_search_results_with_freshness("q", &results, None);
         assert!(!out.contains("Index:"));
+    }
+
+    // -- ANN pre-filter tests --
+
+    /// Helper: build a unit vector in R^4 with x≈1 and small perturbation.
+    fn unit_vec(x: f32, y: f32) -> Vec<f32> {
+        let norm = (x * x + y * y).sqrt();
+        vec![x / norm, y / norm, 0.0, 0.0]
+    }
+
+    /// Build `n` SearchDocuments with synthetic embeddings in R^4.
+    fn make_ann_corpus(n: usize) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>) {
+        let docs: Vec<SearchDocument> = (0..n)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/file_{i}.ts"),
+                    format!("file {i}"),
+                    vec![format!("sym_{i}")],
+                    vec![],
+                    format!("content {i}"),
+                )
+            })
+            .collect();
+        // Each doc gets a unique direction: higher index → slightly more orthogonal.
+        let vectors: Vec<Option<Vec<f32>>> = (0..n)
+            .map(|i| {
+                let x = 1.0_f32 - i as f32 * (0.9 / n as f32);
+                let y = (1.0_f32 - x * x).max(0.0).sqrt();
+                Some(unit_vec(x, y))
+            })
+            .collect();
+        (docs, vectors)
+    }
+
+    #[test]
+    fn test_ann_path_triggers_above_threshold() {
+        // Build a corpus just above the ANN threshold.
+        let n = ANN_THRESHOLD + 50;
+        let (docs, vectors) = make_ann_corpus(n);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        // The ANN store must have been built.
+        assert!(
+            index.ann_store.is_some(),
+            "VectorStore should be Some for corpus size {n} >= ANN_THRESHOLD {ANN_THRESHOLD}"
+        );
+
+        // Query pointing at doc 0's direction: top result must be file_0.
+        let query_vec = unit_vec(1.0, 0.001);
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+
+        let results = index.search("file", &query_vec, &opts);
+        assert_eq!(results.len(), 5, "should return top_k=5 results");
+        assert_eq!(
+            results[0].path, "src/file_0.ts",
+            "ANN path must return doc_0 as the nearest neighbour"
+        );
+    }
+
+    #[test]
+    fn test_brute_force_path_below_threshold() {
+        // Corpus below ANN_THRESHOLD → ann_store must be None.
+        let n = ANN_THRESHOLD - 1;
+        let (docs, vectors) = make_ann_corpus(n);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        assert!(
+            index.ann_store.is_none(),
+            "VectorStore should be None for corpus size {n} < ANN_THRESHOLD {ANN_THRESHOLD}"
+        );
+
+        // Brute-force path must still return correct top-k.
+        let query_vec = unit_vec(1.0, 0.001);
+        let opts = ResolvedSearchOptions {
+            top_k: 3,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+
+        let results = index.search("file", &query_vec, &opts);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].path, "src/file_0.ts");
+    }
+
+    #[test]
+    fn test_no_embedding_doc_surfaces_via_keyword() {
+        // Mix: 3 docs with vectors, 1 doc without. The no-vector doc has a
+        // strong keyword match. It must appear in results even when semantic
+        // scoring would filter it out.
+        let docs = vec![
+            SearchDocument::new(
+                "src/alpha.ts".to_string(),
+                "alpha module".to_string(),
+                vec!["alpha".to_string()],
+                vec![],
+                "alpha content".to_string(),
+            ),
+            SearchDocument::new(
+                "src/beta.ts".to_string(),
+                "beta module".to_string(),
+                vec!["beta".to_string()],
+                vec![],
+                "beta content".to_string(),
+            ),
+            SearchDocument::new(
+                "src/gamma.ts".to_string(),
+                "gamma module".to_string(),
+                vec!["gamma".to_string()],
+                vec![],
+                "gamma content".to_string(),
+            ),
+            // No embedding — pure keyword match.
+            SearchDocument::new(
+                "src/special.ts".to_string(),
+                "special module".to_string(),
+                vec!["findSpecial".to_string()],
+                vec![],
+                "findSpecial implementation".to_string(),
+            ),
+        ];
+
+        let vectors: Vec<Option<Vec<f32>>> = vec![
+            Some(vec![0.9, 0.1, 0.0, 0.0]),
+            Some(vec![0.5, 0.5, 0.0, 0.0]),
+            Some(vec![0.1, 0.9, 0.0, 0.0]),
+            None, // no embedding for special.ts
+        ];
+
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let query_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 0.5,
+            keyword_weight: 0.5,
+            min_semantic_score: 0.0, // allow zero semantic score
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+
+        let results = index.search("findSpecial", &query_vec, &opts);
+        let paths: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.contains(&"src/special.ts"),
+            "no-embedding doc with keyword match must appear in results; got: {paths:?}"
+        );
     }
 }
