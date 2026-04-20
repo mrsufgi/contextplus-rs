@@ -751,24 +751,33 @@ pub fn sanitize_query(query: &str) -> Cow<'_, str> {
 
 /// Cheap fingerprint used to decide whether the `SearchIndex` is still valid.
 /// Computed from the walk result without any extra I/O.
+///
+/// Uses `std::hash::DefaultHasher` (SipHash with a fixed zero seed — deterministic
+/// across processes) over each document's path + content bytes. This closes the
+/// collision window that a plain `content.len()` sum left open: swap-balanced
+/// edits (one file grows by N bytes while another shrinks by N) would previously
+/// collide; the path+content hash will not.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IndexFingerprint {
     /// Number of documents returned by the walker.
     pub n_docs: usize,
-    /// Wrapping sum of each document's content byte length.
-    /// Changes whenever a file is added, removed, or modified.
-    pub content_len_sum: u64,
+    /// SipHash over `(path, content)` for each document, order-dependent.
+    pub content_hash: u64,
 }
 
 impl IndexFingerprint {
     /// Compute a fingerprint from a slice of `SearchDocument`s.
     pub fn from_docs(docs: &[SearchDocument]) -> Self {
-        let content_len_sum = docs
-            .iter()
-            .fold(0u64, |acc, d| acc.wrapping_add(d.content.len() as u64));
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        docs.len().hash(&mut hasher);
+        for d in docs {
+            d.path.hash(&mut hasher);
+            d.content.hash(&mut hasher);
+        }
         Self {
             n_docs: docs.len(),
-            content_len_sum,
+            content_hash: hasher.finish(),
         }
     }
 }
@@ -778,8 +787,10 @@ impl IndexFingerprint {
 pub struct CachedSearchIndex {
     pub index: SearchIndex,
     pub fingerprint: IndexFingerprint,
-    /// Number of times this cached entry has been reused (for observability / tests).
-    pub reuse_count: std::sync::atomic::AtomicU64,
+    /// Number of times this cached entry has been reused (observability / tests).
+    /// Wraps silently on `u64` overflow — only meaningful for monitoring deltas,
+    /// not as an absolute counter.
+    pub(crate) reuse_count: std::sync::atomic::AtomicU64,
 }
 
 impl CachedSearchIndex {
