@@ -425,7 +425,10 @@ export function startApp() {
         ]);
         // Tokens: nothing references anything cross-file.
         let tokens = HashMap::from([
-            (html_path.clone(), HashSet::from(["html".to_string(), "head".to_string()])),
+            (
+                html_path.clone(),
+                HashSet::from(["html".to_string(), "head".to_string()]),
+            ),
             (rs_path.clone(), HashSet::from(["unused_fn".to_string()])),
         ]);
 
@@ -451,12 +454,12 @@ export function startApp() {
         let path = PathBuf::from("weird.rs");
         let symbols = HashMap::from([(
             path.clone(),
-            vec![
-                sym("body", "element", 1),
-                sym("real_fn", "function", 10),
-            ],
+            vec![sym("body", "element", 1), sym("real_fn", "function", 10)],
         )]);
-        let tokens = HashMap::from([(path.clone(), HashSet::from(["body".to_string(), "real_fn".to_string()]))]);
+        let tokens = HashMap::from([(
+            path.clone(),
+            HashSet::from(["body".to_string(), "real_fn".to_string()]),
+        )]);
 
         let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
         // "body" has kind "element" → skipped; "real_fn" has no external users → flagged.
