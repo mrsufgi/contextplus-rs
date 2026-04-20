@@ -479,9 +479,7 @@ pub async fn tool_delete_memory_node(
         Some((label, node_type, edges_removed)) => {
             store.persist(root_dir).await?;
 
-            let stats = store
-                .get_graph(root_dir, |graph| graph.stats())
-                .await?;
+            let stats = store.get_graph(root_dir, |graph| graph.stats()).await?;
 
             Ok(format!(
                 "Deleted: '{}' (type: {}, id: {})\n  Edges removed: {}\n\nGraph: {} nodes, {} edges",
@@ -2545,16 +2543,12 @@ mod tests {
             .await
             .expect("seed ok");
 
-        let result =
-            tool_delete_memory_node(&store, &root, "mn-does-not-exist-abcdef")
-                .await
-                .expect("tool ok");
+        let result = tool_delete_memory_node(&store, &root, "mn-does-not-exist-abcdef")
+            .await
+            .expect("tool ok");
 
         assert!(result.contains("Not found"), "got: {result}");
-        assert!(
-            result.contains("mn-does-not-exist-abcdef"),
-            "got: {result}"
-        );
+        assert!(result.contains("mn-does-not-exist-abcdef"), "got: {result}");
 
         // Graph still has the original node
         let stats = store
@@ -2563,5 +2557,4 @@ mod tests {
             .expect("stats ok");
         assert_eq!(stats.nodes, 1);
     }
-
 }

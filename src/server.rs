@@ -1253,8 +1253,7 @@ impl ContextPlusServer {
 
         let store = &self.state.memory_graph;
         let result =
-            crate::tools::memory_tools::tool_delete_memory_node(store, &root_dir, &node_id)
-                .await?;
+            crate::tools::memory_tools::tool_delete_memory_node(store, &root_dir, &node_id).await?;
 
         Ok(Self::ok_text(result))
     }
