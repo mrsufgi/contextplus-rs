@@ -463,6 +463,37 @@ pub async fn tool_retrieve_with_traversal(
     Ok(sections.join("\n"))
 }
 
+/// Delete a memory node by ID and all its edges.
+/// Idempotent: deleting a non-existent ID returns a clear "not found" message.
+pub async fn tool_delete_memory_node(
+    store: &GraphStore,
+    root_dir: &str,
+    node_id: &str,
+) -> Result<String> {
+    let result = store
+        .get_graph(root_dir, |graph| graph.delete_node(node_id))
+        .await?;
+
+    match result {
+        None => Ok(format!("Not found: '{}' — nothing deleted.", node_id)),
+        Some((label, node_type, edges_removed)) => {
+            store.persist(root_dir).await?;
+
+            let stats = store.get_graph(root_dir, |graph| graph.stats()).await?;
+
+            Ok(format!(
+                "Deleted: '{}' (type: {}, id: {})\n  Edges removed: {}\n\nGraph: {} nodes, {} edges",
+                label,
+                node_type.as_str(),
+                node_id,
+                edges_removed,
+                stats.nodes,
+                stats.edges
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2353,5 +2384,177 @@ mod tests {
             .expect("ok");
 
         assert!(results.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // delete_node (MemoryGraph unit tests — edge-cleanup internals)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn delete_node_removes_all_incident_edges() {
+        use crate::core::memory_graph::{MemoryGraph, RelationType};
+
+        let mut graph = MemoryGraph::new();
+        let a = graph
+            .upsert_node(NodeType::Concept, "A", "a", make_embedding(0.2), None)
+            .id;
+        let b = graph
+            .upsert_node(NodeType::Concept, "B", "b", make_embedding(0.4), None)
+            .id;
+        let c = graph
+            .upsert_node(NodeType::Concept, "C", "c", make_embedding(0.6), None)
+            .id;
+
+        // A -> B and C -> B (two incoming edges to B)
+        graph.create_relation(&a, &b, RelationType::RelatesTo, None, None);
+        graph.create_relation(&c, &b, RelationType::DependsOn, None, None);
+        assert_eq!(graph.stats().edges, 2);
+
+        let result = graph.delete_node(&b);
+        assert!(result.is_some());
+        let (label, node_type, edges_removed) = result.unwrap();
+        assert_eq!(label, "B");
+        assert_eq!(node_type, NodeType::Concept);
+        assert_eq!(edges_removed, 2);
+
+        // Only A and C remain; no edges
+        assert_eq!(graph.stats().nodes, 2);
+        assert_eq!(graph.stats().edges, 0);
+    }
+
+    #[test]
+    fn delete_node_with_only_outgoing_edges() {
+        use crate::core::memory_graph::{MemoryGraph, RelationType};
+
+        let mut graph = MemoryGraph::new();
+        let a = graph
+            .upsert_node(NodeType::Concept, "A", "a", make_embedding(0.1), None)
+            .id;
+        let b = graph
+            .upsert_node(NodeType::Concept, "B", "b", make_embedding(0.5), None)
+            .id;
+        let c = graph
+            .upsert_node(NodeType::Concept, "C", "c", make_embedding(0.9), None)
+            .id;
+
+        // A -> B and A -> C (two outgoing edges from A)
+        graph.create_relation(&a, &b, RelationType::RelatesTo, None, None);
+        graph.create_relation(&a, &c, RelationType::RelatesTo, None, None);
+        assert_eq!(graph.stats().edges, 2);
+
+        let result = graph.delete_node(&a);
+        assert!(result.is_some());
+        let (_, _, edges_removed) = result.unwrap();
+        assert_eq!(edges_removed, 2, "both outgoing edges should be removed");
+
+        assert_eq!(graph.stats().nodes, 2, "B and C should remain");
+        assert_eq!(graph.stats().edges, 0);
+    }
+
+    #[test]
+    fn delete_node_then_reupsert_succeeds() {
+        use crate::core::memory_graph::MemoryGraph;
+
+        let mut graph = MemoryGraph::new();
+        let node = graph.upsert_node(
+            NodeType::Note,
+            "transient",
+            "first content",
+            make_embedding(0.5),
+            None,
+        );
+        let first_id = node.id.clone();
+
+        graph.delete_node(&first_id);
+        assert!(!graph.node_exists(&first_id));
+
+        // Re-upsert with same label+type — must not panic or reuse ghost index
+        let new_node = graph.upsert_node(
+            NodeType::Note,
+            "transient",
+            "second content",
+            make_embedding(0.6),
+            None,
+        );
+        assert!(graph.node_exists(&new_node.id));
+        assert_eq!(graph.stats().nodes, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // tool_delete_memory_node (GraphStore integration tests)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_delete_existing_node_returns_success_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Seed a node directly
+        let node_id = store
+            .get_graph(&root, |graph| {
+                graph
+                    .upsert_node(
+                        NodeType::Note,
+                        "cp-smoketest-42",
+                        "to be deleted",
+                        make_embedding(0.7),
+                        None,
+                    )
+                    .id
+            })
+            .await
+            .expect("seed ok");
+
+        let result = tool_delete_memory_node(&store, &root, &node_id)
+            .await
+            .expect("tool ok");
+
+        assert!(result.contains("Deleted"), "got: {result}");
+        assert!(result.contains("cp-smoketest-42"), "got: {result}");
+        assert!(result.contains(&node_id), "got: {result}");
+        assert!(result.contains("note"), "got: {result}");
+
+        // Verify node is gone
+        let exists = store
+            .get_graph(&root, |graph| graph.node_exists(&node_id))
+            .await
+            .expect("check ok");
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn tool_delete_nonexistent_node_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let store = GraphStore::new();
+
+        // Seed one node so graph is non-empty
+        store
+            .get_graph(&root, |graph| {
+                graph.upsert_node(
+                    NodeType::Concept,
+                    "keeper",
+                    "stays",
+                    make_embedding(0.3),
+                    None,
+                );
+            })
+            .await
+            .expect("seed ok");
+
+        let result = tool_delete_memory_node(&store, &root, "mn-does-not-exist-abcdef")
+            .await
+            .expect("tool ok");
+
+        assert!(result.contains("Not found"), "got: {result}");
+        assert!(result.contains("mn-does-not-exist-abcdef"), "got: {result}");
+
+        // Graph still has the original node
+        let stats = store
+            .get_graph(&root, |graph| graph.stats())
+            .await
+            .expect("stats ok");
+        assert_eq!(stats.nodes, 1);
     }
 }

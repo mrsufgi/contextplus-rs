@@ -787,6 +787,40 @@ impl MemoryGraph {
         }
     }
 
+    /// Delete a node by ID along with all edges that reference it.
+    /// Returns `Some((label, node_type, edges_removed))` if the node existed,
+    /// or `None` if the ID was not found (idempotent — not an error).
+    pub fn delete_node(&mut self, node_id: &str) -> Option<(String, NodeType, usize)> {
+        let &idx = self.id_index.get(node_id)?;
+
+        // Collect all edge indices touching this node (incoming + outgoing).
+        // Two separate collects avoid holding a borrow across the chain.
+        let mut edges_to_remove: Vec<_> = self
+            .graph
+            .edges_directed(idx, Direction::Incoming)
+            .map(|e| e.id())
+            .collect();
+        edges_to_remove.extend(
+            self.graph
+                .edges_directed(idx, Direction::Outgoing)
+                .map(|e| e.id()),
+        );
+
+        let edge_count = edges_to_remove.len();
+        for eid in edges_to_remove {
+            self.graph.remove_edge(eid);
+        }
+
+        // Remove the node itself and clean up the two lookup indices.
+        let node = self.graph.remove_node(idx).expect("index must exist");
+        self.id_index.remove(node_id);
+        self.node_index
+            .remove(&(node.label.clone(), node.node_type.as_str().to_string()));
+
+        self.dirty = true;
+        Some((node.label, node.node_type, edge_count))
+    }
+
     /// Get statistics about the graph.
     pub fn stats(&self) -> GraphStats {
         let mut types: HashMap<String, usize> = HashMap::new();

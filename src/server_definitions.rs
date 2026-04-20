@@ -500,6 +500,16 @@ fn build_tool_definitions() -> Vec<Tool> {
                 ),
             ],
         ),
+        make_tool(
+            "delete_memory_node",
+            "Delete a memory node by ID, removing the node and all edges that reference it. Idempotent: deleting a non-existent ID returns a clear not-found message rather than an error.",
+            &[(
+                "node_id",
+                "string",
+                true,
+                "ID of the memory node to delete (e.g. \"mn-1776703023028-af5174\").",
+            )],
+        ),
     ]
 }
 

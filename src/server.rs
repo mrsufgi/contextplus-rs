@@ -722,6 +722,7 @@ impl ContextPlusServer {
             "prune_stale_links" => self.handle_prune_stale_links(args).await,
             "add_interlinked_context" => self.handle_add_interlinked_context(args).await,
             "retrieve_with_traversal" => self.handle_retrieve_with_traversal(args).await,
+            "delete_memory_node" => self.handle_delete_memory_node(args).await,
             "find_dead_code" => self.handle_find_dead_code(args).await,
             "review_pr_diff" => self.handle_review_pr_diff(args).await,
             "detect_dependency_loops" => self.handle_detect_dependency_loops(args).await,
@@ -1242,6 +1243,21 @@ impl ContextPlusServer {
         Ok(Self::ok_text(result))
     }
 
+    async fn handle_delete_memory_node(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        let root_dir = self.root_dir().to_string_lossy().into_owned();
+        let node_id = Self::get_str(&args, "node_id")
+            .ok_or_else(|| ContextPlusError::Other("node_id is required".into()))?;
+
+        let store = &self.state.memory_graph;
+        let result =
+            crate::tools::memory_tools::tool_delete_memory_node(store, &root_dir, &node_id).await?;
+
+        Ok(Self::ok_text(result))
+    }
+
     // --- Helpers ---
 
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
@@ -1742,9 +1758,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_22_tools() {
+    fn tool_definitions_returns_all_23_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 22, "expected 22 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 23, "expected 23 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -1777,6 +1793,7 @@ mod tests {
             "prune_stale_links",
             "add_interlinked_context",
             "retrieve_with_traversal",
+            "delete_memory_node",
             "find_dead_code",
             "review_pr_diff",
             "detect_dependency_loops",
