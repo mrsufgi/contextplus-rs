@@ -176,8 +176,14 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
 
         let target_str = target_path.to_string_lossy().to_string();
         // Build args: static slice + optional target path appended for file-targeted linters.
+        // For TypeScript files, --build treats its argument as a project directory and appends
+        // /tsconfig.json, causing TS5083 when given a file path. Use --noEmit <file> instead.
         let result = match ext.as_str() {
-            ".js" | ".ts" | ".tsx" | ".py" => {
+            ".ts" | ".tsx" => {
+                let args: Vec<&str> = vec!["tsc", "--noEmit", target_str.as_str()];
+                run_command(linter.cmd, &args, &options.root_dir).await
+            }
+            ".js" | ".py" => {
                 let mut args: Vec<&str> = linter.args.to_vec();
                 args.push(target_str.as_str());
                 run_command(linter.cmd, &args, &options.root_dir).await
@@ -328,6 +334,40 @@ mod tests {
         };
         let result = run_static_analysis(options).await.unwrap();
         assert!(result.contains("No linter configured"));
+    }
+
+    /// Regression test: passing a single .tsx file must NOT invoke `tsc --build <file>`,
+    /// which treats the path as a project directory and crashes with TS5083
+    /// ("Cannot read file '.../Foo.tsx/tsconfig.json'").
+    /// The fix uses `tsc --noEmit <file>` for single-file TS/TSX targets.
+    #[tokio::test]
+    async fn test_ts_single_file_does_not_use_build_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create tsconfig.json so the linter is considered available.
+        tokio::fs::write(dir.path().join("tsconfig.json"), "{}")
+            .await
+            .unwrap();
+        // Create a minimal valid .tsx file.
+        tokio::fs::write(dir.path().join("Component.tsx"), "export const x: number = 1;\n")
+            .await
+            .unwrap();
+
+        let options = StaticAnalysisOptions {
+            root_dir: dir.path().to_path_buf(),
+            target_path: Some("Component.tsx".to_string()),
+        };
+        let result = run_static_analysis(options).await.unwrap();
+        // The result must NOT contain the TS5083 error that indicates tsc was invoked
+        // with --build on a file path (treating it as a directory).
+        assert!(
+            !result.contains("TS5083"),
+            "Got TS5083 error — tsc --build was incorrectly used on a file path: {result}"
+        );
+        assert!(
+            !result.contains("tsconfig.json'.")
+                || !result.contains("Component.tsx/tsconfig.json"),
+            "Unexpected tsconfig path error: {result}"
+        );
     }
 
     #[tokio::test]
