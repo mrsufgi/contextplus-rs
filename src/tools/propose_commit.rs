@@ -1,44 +1,11 @@
 // Code commit gatekeeper enforcing 2-line headers and abstraction limits
 // Validates file content and creates shadow restore points before writing
 
-use crate::error::{ContextPlusError, Result};
+use crate::core::safe_path::resolve_safe_path;
+use crate::error::Result;
 use crate::git::shadow::create_restore_point;
 use std::path::Path;
 use tokio::fs;
-
-/// Validates that a user-provided path stays within the root directory.
-fn validate_path(root: &Path, user_path: &str) -> Result<std::path::PathBuf> {
-    let joined = root.join(user_path);
-    // Normalize without requiring the file to exist (no canonicalize)
-    let mut normalized = std::path::PathBuf::new();
-    for component in joined.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(ContextPlusError::Other(format!(
-                        "Path traversal detected: {user_path}"
-                    )));
-                }
-            }
-            std::path::Component::Normal(c) => normalized.push(c),
-            std::path::Component::RootDir => normalized.push("/"),
-            std::path::Component::Prefix(p) => normalized.push(p.as_os_str()),
-            std::path::Component::CurDir => {}
-        }
-    }
-    // Verify it's still under root
-    let root_canonical = if root.is_absolute() {
-        root.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(root)
-    };
-    if !normalized.starts_with(&root_canonical) {
-        return Err(ContextPlusError::Other(format!(
-            "Path traversal detected: {user_path}"
-        )));
-    }
-    Ok(normalized)
-}
 
 const MAX_NESTING_DEPTH: usize = 6;
 const MAX_LINE_COUNT: usize = 1000;
@@ -236,7 +203,7 @@ pub async fn propose_commit(
     let rp = create_restore_point(root_dir, &[file_path], desc).await?;
 
     // Validate path stays within root
-    let full_path = validate_path(root_dir, file_path)?;
+    let full_path = resolve_safe_path(root_dir, file_path)?;
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -584,17 +551,58 @@ mod tests {
     }
 
     #[test]
-    fn validate_path_blocks_traversal() {
-        let root = Path::new("/tmp/project");
-        assert!(validate_path(root, "../../etc/passwd").is_err());
-        assert!(validate_path(root, "../../../root/.ssh/id_rsa").is_err());
+    fn resolve_safe_path_blocks_traversal() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(resolve_safe_path(&root, "../../etc/passwd").is_err());
+        assert!(resolve_safe_path(&root, "../../../root/.ssh/id_rsa").is_err());
     }
 
     #[test]
-    fn validate_path_allows_normal_paths() {
-        let root = Path::new("/tmp/project");
-        assert!(validate_path(root, "src/main.rs").is_ok());
-        assert!(validate_path(root, "nested/deep/file.ts").is_ok());
+    fn resolve_safe_path_rejects_absolute_path() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // BUG (pre-fix): validate_path accepted "/etc/passwd" because Path::join
+        // silently replaced the base but the uncanonicalized starts_with check
+        // could be defeated by a symlinked root.  resolve_safe_path explicitly
+        // rejects is_absolute() before any join, so this must always be an error.
+        let result = resolve_safe_path(&root, "/etc/passwd");
+        assert!(
+            result.is_err(),
+            "absolute user_path must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_safe_path_rejects_symlink_escape() {
+        // Create a real directory that lives outside the "project root".
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+
+        // Create the project root and plant a symlink inside it that points outside.
+        let project = TempDir::new().unwrap();
+        let link = project.path().join("escape-link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let root = project.path().canonicalize().unwrap();
+
+        // "escape-link/secret.txt" resolves to outside/secret.txt via canonicalize.
+        // resolve_safe_path must detect that the resolved path escapes the root.
+        let result = resolve_safe_path(&root, "escape-link/secret.txt");
+        assert!(
+            result.is_err(),
+            "symlink escape must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_safe_path_allows_normal_paths() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(resolve_safe_path(&root, "src/main.rs").is_ok());
+        assert!(resolve_safe_path(&root, "nested/deep/file.ts").is_ok());
     }
 
     #[tokio::test]
@@ -604,6 +612,19 @@ mod tests {
         let content = "// header\n// line2\nmalicious content";
         let result = propose_commit(root, "../../etc/evil", content, None).await;
         assert!(result.is_err() || result.unwrap().contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn propose_commit_rejects_absolute_file_path() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let content = "// header\n// FEATURE: Test\ncode here";
+        let result = propose_commit(root, "/etc/passwd", content, None).await;
+        assert!(
+            result.is_err(),
+            "propose_commit must reject absolute file_path, got: {:?}",
+            result
+        );
     }
     #[tokio::test]
     async fn success_output_starts_with_checkmark_emoji() {
