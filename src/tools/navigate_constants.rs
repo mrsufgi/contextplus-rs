@@ -1,6 +1,9 @@
 //! Shared constants and helpers for semantic_navigate and its companion binaries.
 //! Single source of truth — warmup_navigate and debug_eigenvalues import from here.
 
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
 use crate::core::embeddings::content_hash;
 
 /// Maximum files to cluster. Set to usize::MAX to disable sampling.
@@ -35,10 +38,14 @@ pub const MAX_HEADER_LEN: usize = 200;
 const NAV_HASH_VERSION: &str = "nav4:";
 
 /// Directory segments too generic to use as cluster labels.
-pub const GENERIC_SEGMENTS: &[&str] = &[
-    "src", "lib", "dist", "build", "utils", "helpers", "common", "shared", "core", "types",
-    "config", "internal", "cmd", "pkg",
-];
+pub static GENERIC_SEGMENTS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        "src", "lib", "dist", "build", "utils", "helpers", "common", "shared", "core", "types",
+        "config", "internal", "cmd", "pkg",
+    ]
+    .into_iter()
+    .collect()
+});
 
 /// Extensions accepted for semantic navigation (without leading dot).
 pub const NAVIGATE_EXTENSIONS: &[&str] = &[
@@ -76,4 +83,33 @@ pub const IMPORT_BLEND_ALPHA: f64 = 0.9;
 /// (e.g., "unclemusclez/jina-embeddings-v2-base-code" → "navigate-unclemusclez-jina-embeddings-v2-base-code")
 pub fn nav_cache_name(model: &str) -> String {
     format!("navigate-{}", crate::server::sanitize_model_name(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_segments_contains_known_segment() {
+        assert!(
+            GENERIC_SEGMENTS.contains("src"),
+            "expected 'src' to be in GENERIC_SEGMENTS"
+        );
+        assert!(
+            GENERIC_SEGMENTS.contains("utils"),
+            "expected 'utils' to be in GENERIC_SEGMENTS"
+        );
+    }
+
+    #[test]
+    fn generic_segments_does_not_contain_domain_segment() {
+        assert!(
+            !GENERIC_SEGMENTS.contains("billing"),
+            "expected 'billing' to not be in GENERIC_SEGMENTS"
+        );
+        assert!(
+            !GENERIC_SEGMENTS.contains("scheduling"),
+            "expected 'scheduling' to not be in GENERIC_SEGMENTS"
+        );
+    }
 }
