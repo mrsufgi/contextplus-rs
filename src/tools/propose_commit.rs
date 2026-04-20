@@ -111,17 +111,125 @@ fn validate_no_inline_comments(lines: &[&str], ext: &str) -> Vec<ValidationError
     errors
 }
 
+/// Strips string literals, char literals, line comments (`//`, `#`), and block
+/// comments (`/* … */`) from a sequence of lines, returning the stripped text
+/// concatenated with newlines.  Uses a simple char-level state machine so that
+/// braces inside those constructs are not counted.
+///
+/// Deliberately left out: raw strings (`r#"…"#` in Rust), backtick template
+/// literals (JS/Go), heredocs, and `--` Lua line comments — those are edge
+/// cases not worth a full parser for a depth-check heuristic.
+fn strip_strings_and_comments(lines: &[&str]) -> String {
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        InLineComment,
+        InBlockComment,
+        InDouble,
+        InSingle,
+    }
+
+    let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    let mut state = State::Code;
+
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let n = chars.len();
+        let mut i = 0;
+
+        // Line comments reset at the start of each line; block comments persist.
+        if state == State::InLineComment {
+            state = State::Code;
+        }
+
+        while i < n {
+            let c = chars[i];
+            let next = if i + 1 < n { Some(chars[i + 1]) } else { None };
+
+            match state {
+                State::Code => match c {
+                    '/' if next == Some('/') => {
+                        state = State::InLineComment;
+                        i += 2;
+                        continue;
+                    }
+                    '#' => {
+                        state = State::InLineComment;
+                        i += 1;
+                        continue;
+                    }
+                    '/' if next == Some('*') => {
+                        state = State::InBlockComment;
+                        i += 2;
+                        continue;
+                    }
+                    '"' => {
+                        state = State::InDouble;
+                        i += 1;
+                        continue;
+                    }
+                    '\'' => {
+                        state = State::InSingle;
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        out.push(c);
+                    }
+                },
+                State::InLineComment => { /* skip to EOL */ }
+                State::InBlockComment => {
+                    if c == '*' && next == Some('/') {
+                        state = State::Code;
+                        i += 2;
+                        continue;
+                    }
+                }
+                State::InDouble => {
+                    if c == '\\' && next.is_some() {
+                        i += 2; // skip escaped char
+                        continue;
+                    }
+                    if c == '"' {
+                        state = State::Code;
+                    }
+                }
+                State::InSingle => {
+                    if c == '\\' && next.is_some() {
+                        i += 2; // skip escaped char
+                        continue;
+                    }
+                    if c == '\'' {
+                        state = State::Code;
+                    }
+                }
+            }
+            i += 1;
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Validates nesting depth (max 6) and file length (max 1000 lines).
 fn validate_abstraction(lines: &[&str]) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let mut depth: i32 = 0;
     let mut max_depth: i32 = 0;
 
-    for line in lines {
-        depth += line.matches('{').count() as i32;
-        depth -= line.matches('}').count() as i32;
-        if depth > max_depth {
-            max_depth = depth;
+    let stripped = strip_strings_and_comments(lines);
+    for ch in stripped.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                if depth > max_depth {
+                    max_depth = depth;
+                }
+            }
+            '}' => {
+                depth -= 1;
+            }
+            _ => {}
         }
     }
 
@@ -129,8 +237,8 @@ fn validate_abstraction(lines: &[&str]) -> Vec<ValidationError> {
         errors.push(ValidationError {
             rule: "nesting".to_string(),
             message: format!(
-                "Nesting depth of {} detected. Maximum recommended is 3-4 levels. Flatten the structure.",
-                max_depth
+                "Nesting depth of {} detected. Maximum allowed is {} levels. Flatten the structure.",
+                max_depth, MAX_NESTING_DEPTH
             ),
         });
     }
@@ -668,6 +776,146 @@ mod tests {
             result.contains("\u{274C}"),
             "Rejection output should contain cross emoji, got: {}",
             &result[..result.len().min(200)]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Brace-counter correctness: strings, comments, and genuine nesting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn brace_counter_ignores_braces_in_double_quoted_string() {
+        // String literal with many braces must not count toward nesting depth.
+        let lines = vec![r#"let s = "{}{}{}{}{}{";"#];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "braces inside double-quoted string should not be counted"
+        );
+    }
+
+    #[test]
+    fn brace_counter_ignores_braces_in_single_quoted_string() {
+        // Single-quoted string / char literal.
+        let lines = vec!["let c = '{';", "let d = '}';"];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "braces inside single-quoted literals should not be counted"
+        );
+    }
+
+    #[test]
+    fn brace_counter_ignores_braces_in_line_comment() {
+        // `// } } }` must not affect depth.
+        let lines = vec!["fn f() {", "  // } } } fake closing braces", "}"];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "braces inside // comment should not be counted"
+        );
+    }
+
+    #[test]
+    fn brace_counter_ignores_braces_in_hash_comment() {
+        // `# } } }` (Python/Ruby style) must not affect depth.
+        let lines = vec!["def f():", "  # } } } fake", "  pass"];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "braces inside # comment should not be counted"
+        );
+    }
+
+    #[test]
+    fn brace_counter_ignores_braces_in_block_comment() {
+        // Block comment spanning multiple lines with braces inside.
+        let lines = vec!["/*", "}", "}", "}", "*/", "fn f() {}"];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "braces inside /* */ block comment should not be counted"
+        );
+    }
+
+    #[test]
+    fn brace_counter_passes_json_nested_five_deep() {
+        // A JSON object 5 levels deep is within MAX_NESTING_DEPTH=6.
+        let lines = vec![
+            "{",
+            "  \"a\": {",
+            "    \"b\": {",
+            "      \"c\": {",
+            "        \"d\": {",
+            "          \"e\": 1",
+            "        }",
+            "      }",
+            "    }",
+            "  }",
+            "}",
+        ];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "JSON 5-deep should be within the limit: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn brace_counter_fails_genuinely_deep_nesting() {
+        // Real structural nesting of 7 must still be caught.
+        let lines = vec![
+            "fn a() {",             // 1
+            "  fn b() {",           // 2
+            "    fn c() {",         // 3
+            "      fn d() {",       // 4
+            "        fn e() {",     // 5
+            "          fn f() {",   // 6
+            "            fn g() {", // 7
+            "            }",
+            "          }",
+            "        }",
+            "      }",
+            "    }",
+            "  }",
+            "}",
+        ];
+        let errors = validate_abstraction(&lines);
+        assert_eq!(errors.len(), 1, "depth 7 must produce exactly one error");
+        assert_eq!(errors[0].rule, "nesting");
+        assert!(
+            errors[0].message.contains('7'),
+            "error message should mention detected depth 7"
+        );
+    }
+
+    #[test]
+    fn brace_counter_escaped_quote_does_not_end_string_early() {
+        // `"he said \"{\""` — the inner `{` is still inside the string.
+        let lines = vec![r#"let s = "he said \"{\""; "#];
+        let errors = validate_abstraction(&lines);
+        assert!(
+            errors.is_empty(),
+            "escaped quote inside string should not prematurely close it"
+        );
+    }
+
+    #[test]
+    fn error_message_references_max_nesting_depth_constant() {
+        // Cosmetic alignment: error must say "6", not "3-4".
+        let lines: Vec<&str> = std::iter::repeat_n("{", 7).collect();
+        let errors = validate_abstraction(&lines);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].message.contains('6'),
+            "error message must reference MAX_NESTING_DEPTH (6), got: {}",
+            errors[0].message
+        );
+        assert!(
+            !errors[0].message.contains("3-4"),
+            "error message must not say '3-4', got: {}",
+            errors[0].message
         );
     }
 }
