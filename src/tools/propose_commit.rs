@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn error_message_references_max_nesting_depth_constant() {
         // Cosmetic alignment: error must say "6", not "3-4".
-        let lines: Vec<&str> = std::iter::repeat("{").take(7).collect();
+        let lines: Vec<&str> = std::iter::repeat_n("{", 7).collect();
         let errors = validate_abstraction(&lines);
         assert_eq!(errors.len(), 1);
         assert!(
