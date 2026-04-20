@@ -22,6 +22,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_LEN_SINGLE: usize = 5000;
 const MAX_OUTPUT_LEN_MULTI: usize = 2000;
 
+/// TypeScript file extensions that require special single-file handling.
+/// Kept in one place so adding `.mts`/`.cts` later only needs one change.
+const TS_EXTENSIONS: &[&str] = &[".ts", ".tsx"];
+
+/// Returns `true` if `ext` is a TypeScript extension we handle specially.
+fn is_ts_extension(ext: &str) -> bool {
+    TS_EXTENSIONS.contains(&ext)
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -53,12 +62,14 @@ struct LinterConfig {
 }
 
 fn get_linter_config(ext: &str) -> Option<LinterConfig> {
-    match ext {
-        ".ts" | ".tsx" => Some(LinterConfig {
+    if is_ts_extension(ext) {
+        return Some(LinterConfig {
             cmd: "npx",
             args: &["tsc", "--build", "--noEmit", "--pretty"],
             config_file: Some("tsconfig.json"),
-        }),
+        });
+    }
+    match ext {
         ".js" => Some(LinterConfig {
             cmd: "npx",
             args: &[
@@ -175,14 +186,20 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
         };
 
         let target_str = target_path.to_string_lossy().to_string();
-        // Build args: static slice + optional target path appended for file-targeted linters.
-        let result = match ext.as_str() {
-            ".js" | ".ts" | ".tsx" | ".py" => {
-                let mut args: Vec<&str> = linter.args.to_vec();
-                args.push(target_str.as_str());
-                run_command(linter.cmd, &args, &options.root_dir).await
-            }
-            _ => run_command(linter.cmd, linter.args, &options.root_dir).await,
+        // Dispatch strategy varies by extension:
+        //   - TypeScript: use `tsc --noEmit <file>` — NOT `--build`, which treats its argument as
+        //     a project directory and appends /tsconfig.json, causing TS5083 on a file path.
+        //   - JS / Python: append the file path to the linter's static args slice.
+        //   - All others (Rust, Go, …): run the linter's args as-is (project-wide only).
+        let result = if is_ts_extension(ext.as_str()) {
+            let args: Vec<&str> = vec!["tsc", "--noEmit", target_str.as_str()];
+            run_command(linter.cmd, &args, &options.root_dir).await
+        } else if matches!(ext.as_str(), ".js" | ".py") {
+            let mut args: Vec<&str> = linter.args.to_vec();
+            args.push(target_str.as_str());
+            run_command(linter.cmd, &args, &options.root_dir).await
+        } else {
+            run_command(linter.cmd, linter.args, &options.root_dir).await
         };
 
         if result.exit_code == 0 && result.output.is_empty() {
@@ -328,6 +345,48 @@ mod tests {
         };
         let result = run_static_analysis(options).await.unwrap();
         assert!(result.contains("No linter configured"));
+    }
+
+    /// Regression test: passing a single .tsx file must NOT invoke `tsc --build <file>`,
+    /// which treats the path as a project directory and crashes with TS5083
+    /// ("Cannot read file '.../Foo.tsx/tsconfig.json'").
+    /// The fix uses `tsc --noEmit <file>` for single-file TS/TSX targets.
+    #[tokio::test]
+    async fn test_ts_single_file_does_not_use_build_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create tsconfig.json so the linter is considered available.
+        tokio::fs::write(dir.path().join("tsconfig.json"), "{}")
+            .await
+            .unwrap();
+        // Create a minimal valid .tsx file.
+        tokio::fs::write(
+            dir.path().join("Component.tsx"),
+            "export const x: number = 1;\n",
+        )
+        .await
+        .unwrap();
+
+        let options = StaticAnalysisOptions {
+            root_dir: dir.path().to_path_buf(),
+            target_path: Some("Component.tsx".to_string()),
+        };
+        let result = run_static_analysis(options).await.unwrap();
+        // The result must NOT contain the TS5083 error that indicates tsc was invoked
+        // with --build on a file path (treating it as a directory).
+        assert!(
+            !result.contains("TS5083"),
+            "Got TS5083 error — tsc --build was incorrectly used on a file path: {result}"
+        );
+        // Both strings must be absent — the old `||` only required one to be missing,
+        // which meant neither guard could catch the regression on its own.
+        assert!(
+            !result.contains("tsconfig.json'."),
+            "Unexpected tsconfig path error (bare suffix): {result}"
+        );
+        assert!(
+            !result.contains("Component.tsx/tsconfig.json"),
+            "Unexpected tsconfig path error (file-as-dir): {result}"
+        );
     }
 
     #[tokio::test]
