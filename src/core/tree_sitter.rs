@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use tree_sitter::{Language, Node, Parser};
@@ -515,44 +516,54 @@ fn collect_imports_from_node(
     }
 }
 
+// Static regex patterns for the import-fallback path.
+// Compiled once at first use via LazyLock; subsequent calls pay zero allocation cost.
+static RE_ES_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:import|export)\s+.*?from\s+['"]([^'"]+)['"]"#)
+        .expect("RE_ES_IMPORT is a valid regex")
+});
+static RE_CJS_REQUIRE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#).expect("RE_CJS_REQUIRE is a valid regex")
+});
+static RE_PY_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*import\s+([\w.]+)"#).expect("RE_PY_IMPORT is a valid regex")
+});
+static RE_PY_FROM_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*from\s+([\w.]+)\s+import"#).expect("RE_PY_FROM_IMPORT is a valid regex")
+});
+static RE_RUST_USE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*use\s+([\w:]+(?:::\{[^}]+\})?)\s*;"#)
+        .expect("RE_RUST_USE is a valid regex")
+});
+
 /// Regex fallback for extracting imports when tree-sitter parsing fails.
 fn extract_imports_regex(content: &str) -> Vec<String> {
     let mut imports = Vec::new();
 
     // ES imports/exports: import/export ... from 'path'
-    if let Ok(re) = Regex::new(r#"(?:import|export)\s+.*?from\s+['"]([^'"]+)['"]"#) {
-        for cap in re.captures_iter(content) {
-            imports.push(cap[1].to_string());
-        }
+    for cap in RE_ES_IMPORT.captures_iter(content) {
+        imports.push(cap[1].to_string());
     }
 
     // CJS: require('path')
-    if let Ok(re) = Regex::new(r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#) {
-        for cap in re.captures_iter(content) {
-            imports.push(cap[1].to_string());
-        }
+    for cap in RE_CJS_REQUIRE.captures_iter(content) {
+        imports.push(cap[1].to_string());
     }
 
     // Python: import foo / from foo import bar
-    if let Ok(re) = Regex::new(r#"^\s*import\s+([\w.]+)"#) {
-        for cap in re.captures_iter(content) {
-            imports.push(cap[1].to_string());
-        }
+    for cap in RE_PY_IMPORT.captures_iter(content) {
+        imports.push(cap[1].to_string());
     }
-    if let Ok(re) = Regex::new(r#"^\s*from\s+([\w.]+)\s+import"#) {
-        for cap in re.captures_iter(content) {
-            imports.push(cap[1].to_string());
-        }
+    for cap in RE_PY_FROM_IMPORT.captures_iter(content) {
+        imports.push(cap[1].to_string());
     }
 
     // Go: import "path" — skipped in regex fallback due to false positive risk
     // (quoted strings appear everywhere in Go, not just imports)
 
     // Rust: use foo::bar;
-    if let Ok(re) = Regex::new(r#"^\s*use\s+([\w:]+(?:::\{[^}]+\})?)\s*;"#) {
-        for cap in re.captures_iter(content) {
-            imports.push(cap[1].to_string());
-        }
+    for cap in RE_RUST_USE.captures_iter(content) {
+        imports.push(cap[1].to_string());
     }
 
     imports
@@ -1103,6 +1114,52 @@ fn main() {}
         assert!(imports.contains(&"svelte".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify that all five hoisted LazyLock regex statics match their canonical patterns.
+    /// This exercises `extract_imports_regex` directly (bypassing tree-sitter) so it fails
+    /// immediately if a pattern is broken rather than silently using a grammar path.
+    #[test]
+    fn extract_imports_regex_all_patterns() {
+        // ES import + export re-export + CJS require in one JS-ish blob
+        let js_content = "import React from 'react';\nexport { foo } from './utils';\nconst x = require('path');";
+        let js_imports = extract_imports_regex(js_content);
+        assert!(
+            js_imports.contains(&"react".to_string()),
+            "ES default import not captured"
+        );
+        assert!(
+            js_imports.contains(&"./utils".to_string()),
+            "ES re-export not captured"
+        );
+        assert!(
+            js_imports.contains(&"path".to_string()),
+            "CJS require not captured"
+        );
+
+        // Python import + from…import (must be at start of line)
+        let py_content = "import os\nfrom pathlib import Path\n";
+        let py_imports = extract_imports_regex(py_content);
+        assert!(
+            py_imports.contains(&"os".to_string()),
+            "Python bare import not captured"
+        );
+        assert!(
+            py_imports.contains(&"pathlib".to_string()),
+            "Python from-import not captured"
+        );
+
+        // Rust use statement
+        let rs_content = "use std::collections::HashMap;\nuse crate::core::parser::CodeSymbol;\n";
+        let rs_imports = extract_imports_regex(rs_content);
+        assert!(
+            rs_imports.contains(&"std::collections::HashMap".to_string()),
+            "Rust use not captured"
+        );
+        assert!(
+            rs_imports.contains(&"crate::core::parser::CodeSymbol".to_string()),
+            "Rust use (crate path) not captured"
+        );
     }
 
     #[test]
