@@ -14,10 +14,24 @@ use crate::error::{ContextPlusError, Result};
 /// `std::env::current_dir()` with a proper error (no `unwrap_or_default()`).
 pub fn resolve_safe_path(root: &Path, user_path: &str) -> Result<PathBuf> {
     // Resolve the root to an absolute path.
+    //
+    // We canonicalize the root to resolve symlinks — without this, a symlinked
+    // root (e.g. /tmp/link -> /etc) would let a caller write through the link
+    // while the final `starts_with` check compared only the uncanonicalized
+    // prefix. Only NotFound is tolerated as a "root doesn't exist yet" case;
+    // any other IO error (permission denied, broken symlink, etc.) propagates
+    // so we never silently fall through to the weaker raw-prefix comparison.
     let canonical_root = if root.is_absolute() {
-        // Canonicalize removes `.` and `..` components and resolves symlinks.
-        // If root doesn't exist yet, fall back to the path as-is.
-        root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+        match root.canonicalize() {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => root.to_path_buf(),
+            Err(e) => {
+                return Err(ContextPlusError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to canonicalize root '{}': {}", root.display(), e),
+                )));
+            }
+        }
     } else {
         let cwd = std::env::current_dir().map_err(|e| {
             ContextPlusError::Io(std::io::Error::new(
@@ -25,9 +39,17 @@ pub fn resolve_safe_path(root: &Path, user_path: &str) -> Result<PathBuf> {
                 format!("failed to resolve current directory: {}", e),
             ))
         })?;
-        cwd.join(root)
-            .canonicalize()
-            .unwrap_or_else(|_| cwd.join(root))
+        let joined = cwd.join(root);
+        match joined.canonicalize() {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => joined,
+            Err(e) => {
+                return Err(ContextPlusError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to canonicalize root '{}': {}", joined.display(), e),
+                )));
+            }
+        }
     };
 
     // Build the candidate path by joining root with the user-supplied path.
