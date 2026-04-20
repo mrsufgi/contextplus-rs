@@ -917,10 +917,7 @@ impl SearchIndex {
                     return None;
                 }
                 // ANN pre-filter: skip docs not in the candidate set when ANN is active.
-                if ann_candidate_set
-                    .as_ref()
-                    .is_some_and(|c| !c.contains(&i))
-                {
+                if ann_candidate_set.as_ref().is_some_and(|c| !c.contains(&i)) {
                     return None;
                 }
                 if !path_passes_filters(&doc.path, opts) {
