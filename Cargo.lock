@@ -335,6 +335,7 @@ dependencies = [
  "fd-lock",
  "futures",
  "ignore",
+ "indexmap",
  "instant-distance",
  "libc",
  "memmap2",
