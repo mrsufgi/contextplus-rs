@@ -372,7 +372,6 @@ mod tests {
         assert!(out.contains("function bar"));
         assert!(out.contains("1 dead-symbol candidate"));
     }
-<<<<<<< Updated upstream
 
     /// End-to-end: parse TypeScript with a destructure binding, then run the
     /// dead-code heuristic. Names from the destructure LHS (`redis`,
