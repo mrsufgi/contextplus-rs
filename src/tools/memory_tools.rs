@@ -280,11 +280,15 @@ pub async fn tool_search_memory_graph(
 
     let query_embedding = fetch_embedding(ollama, &options.query).await?;
 
-    let result = store
-        .get_graph(&options.root_dir, |graph| {
+    let (result, touched) = store
+        .get_graph_read(&options.root_dir, |graph| {
             graph.search(&query_embedding, max_depth, top_k, edge_filter.as_deref())
         })
         .await?;
+
+    if !touched.is_empty() {
+        store.touch_nodes(&options.root_dir, &touched).await?;
+    }
 
     store.persist(&options.root_dir).await?;
 
@@ -427,11 +431,15 @@ pub async fn tool_retrieve_with_traversal(
     let max_depth = options.max_depth.unwrap_or(2);
     let edge_filter = parse_edge_filter(&options.edge_filter)?;
 
-    let results = store
-        .get_graph(&options.root_dir, |graph| {
+    let (results, touched) = store
+        .get_graph_read(&options.root_dir, |graph| {
             graph.retrieve_with_traversal(&options.node_id, max_depth, edge_filter.as_deref())
         })
         .await?;
+
+    if !touched.is_empty() {
+        store.touch_nodes(&options.root_dir, &touched).await?;
+    }
 
     store.persist(&options.root_dir).await?;
 
@@ -2362,7 +2370,7 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
         let store = GraphStore::new();
 
-        let results = store
+        let (results, touched) = store
             .get_graph(&root, |graph| {
                 graph.retrieve_with_traversal("nonexistent", 2, None)
             })
@@ -2370,6 +2378,7 @@ mod tests {
             .expect("ok");
 
         assert!(results.is_empty());
+        assert!(touched.is_empty());
     }
 
     // ---------------------------------------------------------------
