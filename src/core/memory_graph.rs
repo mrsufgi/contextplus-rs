@@ -554,11 +554,21 @@ impl MemoryGraph {
         let now = now_millis();
         let mut changed = false;
         for id in ids {
-            if let Some(n) = self.get_node_mut(id)
-                && n.last_accessed != now
-            {
-                n.last_accessed = now;
-                changed = true;
+            match self.get_node_mut(id) {
+                Some(n) if n.last_accessed != now => {
+                    n.last_accessed = now;
+                    changed = true;
+                }
+                Some(_) => {} // already stamped this millisecond — nothing to do
+                None => {
+                    // Race: another writer deleted this node between the search
+                    // read-lock releasing and our write-lock acquiring. Safe to
+                    // skip, but log so stale-ID scenarios are observable.
+                    tracing::debug!(
+                        node_id = %id,
+                        "touch_nodes: node not found (likely concurrently deleted)"
+                    );
+                }
             }
         }
         if changed {
@@ -712,8 +722,14 @@ impl MemoryGraph {
     ///
     /// Takes `&self` — no mutation occurs here. Returns the traversal results
     /// together with node IDs to touch (including `start_node_id`). The caller
-    /// should call [`GraphStore::touch_nodes`] to stamp `last_accessed` and
-    /// bump `access_count` for the start node via a short write-lock.
+    /// should call [`GraphStore::touch_nodes`] to stamp `last_accessed` via a
+    /// short write-lock.
+    ///
+    /// **Behavior change vs prior implementation:** the previous `&mut self`
+    /// variant bumped `access_count` on the start node. `touch_nodes` deliberately
+    /// only updates `last_accessed` to keep the read-path contract narrow. If a
+    /// specific consumer needs start-node access counters, call a dedicated
+    /// increment method separately.
     pub fn retrieve_with_traversal(
         &self,
         start_node_id: &str,
