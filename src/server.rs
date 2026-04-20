@@ -1247,15 +1247,14 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        let options = crate::tools::memory_tools::DeleteMemoryNodeOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            node_id: Self::get_str(&args, "node_id")
-                .ok_or_else(|| ContextPlusError::Other("node_id is required".into()))?,
-        };
+        let root_dir = self.root_dir().to_string_lossy().into_owned();
+        let node_id = Self::get_str(&args, "node_id")
+            .ok_or_else(|| ContextPlusError::Other("node_id is required".into()))?;
 
         let store = &self.state.memory_graph;
         let result =
-            crate::tools::memory_tools::tool_delete_memory_node(store, options).await?;
+            crate::tools::memory_tools::tool_delete_memory_node(store, &root_dir, &node_id)
+                .await?;
 
         Ok(Self::ok_text(result))
     }

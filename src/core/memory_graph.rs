@@ -788,9 +788,9 @@ impl MemoryGraph {
     }
 
     /// Delete a node by ID along with all edges that reference it.
-    /// Returns `Some((label, node_type_str, edges_removed))` if the node existed,
+    /// Returns `Some((label, node_type, edges_removed))` if the node existed,
     /// or `None` if the ID was not found (idempotent — not an error).
-    pub fn delete_node(&mut self, node_id: &str) -> Option<(String, String, usize)> {
+    pub fn delete_node(&mut self, node_id: &str) -> Option<(String, NodeType, usize)> {
         let &idx = self.id_index.get(node_id)?;
 
         // Collect all edge indices touching this node (incoming + outgoing).
@@ -818,7 +818,7 @@ impl MemoryGraph {
             .remove(&(node.label.clone(), node.node_type.as_str().to_string()));
 
         self.dirty = true;
-        Some((node.label, node.node_type.as_str().to_string(), edge_count))
+        Some((node.label, node.node_type, edge_count))
     }
 
     /// Get statistics about the graph.
