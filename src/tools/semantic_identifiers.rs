@@ -329,7 +329,7 @@ pub fn rank_call_sites(
                 continue;
             }
             // Skip the symbol's own definition line
-            if *file == &symbol.path && i + 1 == symbol.line {
+            if *file == symbol.path && i + 1 == symbol.line {
                 continue;
             }
             if is_definition_line(line, &symbol.name) {
