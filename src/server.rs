@@ -140,7 +140,7 @@ pub fn cache_name(base: &str, model: &str) -> String {
 
 impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
-        let ollama = OllamaClient::new(&config);
+        let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()));
         let memory_graph = Arc::new(GraphStore::new());
 
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
