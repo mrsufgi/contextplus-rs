@@ -297,27 +297,32 @@ pub fn rank_call_sites(
     // good statistical sample without scanning the entire tail of matches.
     let candidate_cap = embed_budget * 4;
 
-    // Pre-collect (path, lines_vec) so we can index into it by file-index
-    // during the ranked-output phase without re-splitting the content string.
-    // `Vec<&str>` is cheap — it borrows directly from the Arc<String> value.
-    let file_entries: Vec<(&String, Vec<&str>)> = file_content
-        .iter()
-        .map(|(path, content)| (path, content.lines().collect::<Vec<&str>>()))
-        .collect();
+    // Lazy per-file line-split: only files that pass the cheap substring
+    // pre-filter on the full content get split. This avoids splitting every
+    // file in the corpus just to skip files that don't mention the symbol.
+    // (Review #59 F1.)
+    let mut file_entries: Vec<(&String, Vec<&str>)> = Vec::new();
 
     // Collect candidates as (file_index, line_number, line_offset, keyword_score)
     // to avoid cloning file Strings and context Strings in the inner loop.
     let mut candidates: Vec<(usize, usize, usize, f64)> = Vec::new();
     let mut keyword_buf = String::with_capacity(512);
 
-    'outer: for (fi, (file, lines)) in file_entries.iter().enumerate() {
-        // Fast pre-filter: skip files that don't contain the symbol name at all.
-        // This is O(file_content_len) but far cheaper than regex matching every
-        // individual line when there's no match in the file.
-        let has_name = lines.iter().any(|l| l.contains(symbol.name.as_str()));
-        if !has_name {
+    'outer: for (file, content) in file_content.iter() {
+        // Fast pre-filter on the full file content (no allocation, no split):
+        // skip files that don't contain the symbol name at all.
+        if !content.contains(symbol.name.as_str()) {
             continue;
         }
+
+        // Matching file — split into lines once and record it for the
+        // ranked-output phase.
+        let lines: Vec<&str> = content.lines().collect();
+        let fi = file_entries.len();
+        file_entries.push((file, lines));
+        // Use index access (vec doesn't reallocate across this inner loop
+        // because we don't push again inside it).
+        let lines = &file_entries[fi].1;
 
         for (i, line) in lines.iter().enumerate() {
             if !call_pattern.is_match(line) {
