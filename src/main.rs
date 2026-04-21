@@ -311,6 +311,13 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         server.ensure_tracker_started();
     }
 
+    // Warm the SearchIndex cache in the background so the first real query is served
+    // from a hot cache instead of the 30 s cold path.
+    if config.warmup_on_start {
+        tracing::info!("Spawning SearchIndex warmup task (CONTEXTPLUS_WARMUP_ON_START=true)");
+        server.spawn_warmup_task();
+    }
+
     // --- Process lifecycle monitors ---
 
     // Idle shutdown: fires after config.idle_timeout_ms of no tool calls.

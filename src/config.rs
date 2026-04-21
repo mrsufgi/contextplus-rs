@@ -54,6 +54,9 @@ pub struct Config {
     pub parent_poll_ms: u64,
     pub embed_chunk_chars: usize,
     pub query_batch_size: usize,
+    /// Whether to warm the SearchIndex cache at server startup.
+    /// Controlled by `CONTEXTPLUS_WARMUP_ON_START` (default: true).
+    pub warmup_on_start: bool,
 }
 
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
@@ -174,6 +177,14 @@ impl Config {
             )
             .clamp(MIN_EMBED_CHUNK_CHARS, MAX_EMBED_CHUNK_CHARS),
             query_batch_size: env_parse("CONTEXTPLUS_QUERY_BATCH_SIZE", DEFAULT_QUERY_BATCH_SIZE),
+            warmup_on_start: env::var("CONTEXTPLUS_WARMUP_ON_START")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "false" | "0" | "no" | "off"
+                    )
+                })
+                .unwrap_or(true),
         }
     }
 }

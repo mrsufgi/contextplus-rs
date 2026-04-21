@@ -261,6 +261,20 @@ impl ContextPlusServer {
         self.state.ollama.cancel_all_embeddings();
     }
 
+    /// Spawn a background task that runs a trivial semantic search query to
+    /// populate the in-memory `SearchIndex` cache and pre-build the HNSW index.
+    /// After this task completes the first real user query is served from cache
+    /// (warm path, ~1-2 s) instead of the cold path (~30 s).
+    ///
+    /// The task is fire-and-forget: errors are logged as warnings and never
+    /// propagate to the caller.  Server startup is never delayed.
+    pub fn spawn_warmup_task(&self) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            warmup_semantic_search_cache(&state).await;
+        });
+    }
+
     fn root_dir(&self) -> &Path {
         &self.state.root_dir
     }
@@ -1792,6 +1806,59 @@ fn parse_metadata(
 }
 
 // make_tool() is re-exported from server_definitions — see imports at top of this file.
+
+// ---------------------------------------------------------------------------
+// Startup warmup
+// ---------------------------------------------------------------------------
+
+/// Run a trivial semantic search query through the full pipeline to populate
+/// the in-memory `SearchIndex` cache and pre-build the HNSW index.
+///
+/// This is intentionally a module-level (non-`impl`) function so tests can
+/// call it directly with a bare `Arc<SharedState>` without constructing a
+/// full `ContextPlusServer`.
+pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
+    use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
+    use crate::tools::semantic_search::{SemanticSearchOptions, semantic_code_search};
+
+    let t0 = std::time::Instant::now();
+    tracing::info!("SearchIndex warmup starting");
+
+    let options = SemanticSearchOptions {
+        root_dir: state.root_dir.clone(),
+        query: "warmup".to_string(),
+        top_k: Some(1),
+        semantic_weight: None,
+        keyword_weight: None,
+        min_semantic_score: None,
+        min_keyword_score: None,
+        min_combined_score: None,
+        require_keyword_match: None,
+        require_semantic_match: None,
+        include_globs: None,
+        exclude_globs: None,
+        recency_window_days: None,
+    };
+
+    let embedder = OllamaEmbedder(state.ollama.clone());
+    let walker = CachedWalkerIndexer {
+        config: state.config.clone(),
+        ollama: state.ollama.clone(),
+        state: Arc::clone(state),
+    };
+
+    match semantic_code_search(options, &embedder, &walker, Some(&state.search_index_cache)).await {
+        Ok(_) => tracing::info!(
+            elapsed_ms = t0.elapsed().as_millis(),
+            "SearchIndex warmup complete"
+        ),
+        Err(e) => tracing::warn!(
+            elapsed_ms = t0.elapsed().as_millis(),
+            error = %e,
+            "SearchIndex warmup failed (non-fatal)"
+        ),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3587,5 +3654,68 @@ mod tests {
             ContextPlusServer::get_u32(&args, "recency_window_days"),
             Some(30),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Warmup tests
+    // -----------------------------------------------------------------------
+
+    /// `warmup_semantic_search_cache` must not panic when Ollama is unreachable.
+    /// The search will fail (embed call returns Err), which is caught and logged.
+    #[tokio::test]
+    async fn warmup_does_not_panic_on_ollama_error() {
+        // Point at a guaranteed-dead host so the embed call fails immediately.
+        unsafe {
+            std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1");
+        }
+        let server = test_server();
+        // Should return without panicking even when Ollama is unreachable.
+        warmup_semantic_search_cache(&server.state).await;
+        unsafe {
+            std::env::remove_var("OLLAMA_HOST");
+        }
+    }
+
+    /// `spawn_warmup_task` completes without panicking on a bare temp-dir state.
+    #[tokio::test]
+    async fn spawn_warmup_task_does_not_panic() {
+        unsafe {
+            std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1");
+        }
+        let server = test_server();
+        server.spawn_warmup_task();
+        // Brief yield so the spawned task has a chance to run.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::remove_var("OLLAMA_HOST");
+        }
+    }
+
+    // Serialize env-var tests to prevent races between concurrent test threads.
+    static WARMUP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Config: `CONTEXTPLUS_WARMUP_ON_START` defaults to `true`.
+    #[test]
+    fn warmup_on_start_defaults_to_true() {
+        let _guard = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_WARMUP_ON_START");
+        }
+        let cfg = Config::from_env();
+        assert!(cfg.warmup_on_start);
+    }
+
+    /// Config: `CONTEXTPLUS_WARMUP_ON_START=false` disables warmup.
+    #[test]
+    fn warmup_on_start_can_be_disabled() {
+        let _guard = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var("CONTEXTPLUS_WARMUP_ON_START", "false");
+        }
+        let cfg = Config::from_env();
+        assert!(!cfg.warmup_on_start);
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_WARMUP_ON_START");
+        }
     }
 }
