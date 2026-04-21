@@ -63,7 +63,8 @@ pub struct RetrieveWithTraversalOptions {
     pub root_dir: String,
     pub node_id: String,
     pub max_depth: Option<usize>,
-    /// Cap on total BFS-visited nodes. Defaults to [`MemoryGraph::DEFAULT_MAX_NODES`] (200).
+    /// Cap on total BFS-visited nodes. Defaults to
+    /// [`crate::core::memory_graph::MemoryGraph::DEFAULT_MAX_NODES`] (200).
     pub max_nodes: Option<usize>,
     pub edge_filter: Option<Vec<String>>,
 }
