@@ -787,6 +787,14 @@ impl IndexFingerprint {
 pub struct CachedSearchIndex {
     pub index: SearchIndex,
     pub fingerprint: IndexFingerprint,
+    /// Tracker generation counter value at the time this entry was built.
+    ///
+    /// Atomic so it can be updated on the fingerprint-hit fast path (which only
+    /// holds a read-lock). Without this, a tracker-bump followed by an
+    /// unchanged-content fingerprint-hit would leave `generation` stale,
+    /// permanently locking the fast path out — every future request would
+    /// walk + fingerprint until a full rebuild happened.
+    pub generation: std::sync::atomic::AtomicU64,
     /// Number of times this cached entry has been reused (observability / tests).
     /// Wraps silently on `u64` overflow — only meaningful for monitoring deltas,
     /// not as an absolute counter.
@@ -794,10 +802,11 @@ pub struct CachedSearchIndex {
 }
 
 impl CachedSearchIndex {
-    fn new(index: SearchIndex, fingerprint: IndexFingerprint) -> Self {
+    fn new(index: SearchIndex, fingerprint: IndexFingerprint, generation: u64) -> Self {
         Self {
             index,
             fingerprint,
+            generation: std::sync::atomic::AtomicU64::new(generation),
             reuse_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1266,13 +1275,24 @@ pub fn format_search_results_with_freshness(
 /// This is the main entry point that tool handlers should call.
 ///
 /// `index_cache` is optional: when `Some`, the assembled `SearchIndex` is cached across
-/// requests and only rebuilt when the walk fingerprint changes. Concurrent callers that
-/// race on a stale cache use double-check locking so at most one rebuild occurs.
+/// requests and only rebuilt when needed. The cache uses two validity checks in order:
+///
+/// 1. **Generation-based (fast path):** if `cache_generation` is `Some` and the current
+///    generation counter matches `CachedSearchIndex::generation`, the tracker has reported
+///    no file changes since the last build — the filesystem walk is **skipped entirely**.
+/// 2. **Fingerprint-based (fallback):** if the generation differs (tracker fired) *or*
+///    the tracker is disabled (`cache_generation` is `None`), we walk + compute a content
+///    fingerprint. If that matches the cached fingerprint the index is still reused; only
+///    a true content mismatch triggers a full rebuild.
+///
+/// Concurrent callers that race on a stale cache use double-check locking so at most one
+/// rebuild occurs.
 pub async fn semantic_code_search(
     options: SemanticSearchOptions,
     embed_fn: &dyn EmbedFn,
     walk_and_index_fn: &dyn WalkAndIndexFn,
     index_cache: Option<&RwLock<Option<Arc<CachedSearchIndex>>>>,
+    cache_generation: Option<&Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
     if query.is_empty() {
@@ -1293,14 +1313,47 @@ pub async fn semantic_code_search(
     let cached_arc: Arc<CachedSearchIndex> = match index_cache {
         None => {
             // No cache slot provided — always rebuild (unit-test / legacy path).
+            let current_gen = cache_generation
+                .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
+                .unwrap_or(0);
             let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
             let fp = IndexFingerprint::from_docs(&docs);
             let mut idx = SearchIndex::new();
             idx.index_with_vectors(docs, vectors);
-            Arc::new(CachedSearchIndex::new(idx, fp))
+            Arc::new(CachedSearchIndex::new(idx, fp, current_gen))
         }
         Some(lock) => {
-            // Fast path: check under read-lock.
+            // Snapshot the current tracker generation before any locking.
+            let current_gen = cache_generation
+                .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
+                .unwrap_or(0);
+
+            // Fast path: read-lock only. If the tracker generation matches we can
+            // skip the filesystem walk entirely — the tracker guarantees no file
+            // changes have occurred since the cache was last built.
+            if cache_generation.is_some() {
+                let guard = lock.read().await;
+                if let Some(ref cached) = *guard
+                    && cached.generation.load(std::sync::atomic::Ordering::Acquire) == current_gen
+                {
+                    let reuses = cached.record_reuse();
+                    tracing::debug!(
+                        reuses,
+                        generation = current_gen,
+                        "SearchIndex generation hit — skipping walk"
+                    );
+                    let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
+                    return Ok(format_search_results_with_freshness(
+                        query.as_ref(),
+                        &results,
+                        Some(cached.index.document_count()),
+                    ));
+                }
+                // Generation mismatch (or no cache yet) — fall through to walk + fingerprint.
+            }
+
+            // Walk the filesystem and compute fingerprint (tracker-off fallback or
+            // generation mismatch meaning the tracker saw a change).
             let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
             let fp = IndexFingerprint::from_docs(&docs);
 
@@ -1310,7 +1363,20 @@ pub async fn semantic_code_search(
                     && cached.fingerprint == fp
                 {
                     let reuses = cached.record_reuse();
-                    tracing::debug!(reuses, "SearchIndex cache hit — reusing index");
+                    // Content unchanged even though tracker fired — update the cached
+                    // generation so the next request takes the fast path without
+                    // walking. `AtomicU64::store` is safe under a read-lock because
+                    // it's an atomic operation on a `&self` receiver. Without this,
+                    // a tracker-bump → fingerprint-hit cycle would permanently lock
+                    // the fast path out.
+                    cached
+                        .generation
+                        .store(current_gen, std::sync::atomic::Ordering::Release);
+                    tracing::debug!(
+                        reuses,
+                        generation = current_gen,
+                        "SearchIndex fingerprint hit — reusing index, updated generation"
+                    );
                     let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
                     return Ok(format_search_results_with_freshness(
                         query.as_ref(),
@@ -1327,9 +1393,15 @@ pub async fn semantic_code_search(
                 && cached.fingerprint == fp
             {
                 let reuses = cached.record_reuse();
+                // Same fix as the read-lock path: bring the cached generation
+                // forward so the next request takes the fast path.
+                cached
+                    .generation
+                    .store(current_gen, std::sync::atomic::Ordering::Release);
                 tracing::debug!(
                     reuses,
-                    "SearchIndex cache hit (post-write-lock) — reusing index"
+                    generation = current_gen,
+                    "SearchIndex cache hit (post-write-lock) — reusing index, updated generation"
                 );
                 let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
                 return Ok(format_search_results_with_freshness(
@@ -1345,7 +1417,7 @@ pub async fn semantic_code_search(
             );
             let mut idx = SearchIndex::new();
             idx.index_with_vectors(docs, vectors);
-            let arc = Arc::new(CachedSearchIndex::new(idx, fp));
+            let arc = Arc::new(CachedSearchIndex::new(idx, fp, current_gen));
             *guard = Some(Arc::clone(&arc));
             arc
         }
@@ -2639,7 +2711,7 @@ mod tests {
         let fp = IndexFingerprint::from_docs(&docs);
         let mut idx = SearchIndex::new();
         idx.index_with_vectors(docs, vec![None]);
-        let cached = CachedSearchIndex::new(idx, fp);
+        let cached = CachedSearchIndex::new(idx, fp, 0);
 
         assert_eq!(cached.record_reuse(), 1);
         assert_eq!(cached.record_reuse(), 2);
@@ -2727,12 +2799,12 @@ mod tests {
         };
 
         // First call — cache miss, index built.
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
             .await
             .unwrap();
 
         // Second call — cache hit, reuse_count should be 1.
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
             .await
             .unwrap();
 
@@ -2817,10 +2889,10 @@ mod tests {
             recency_window_days: None,
         };
 
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
             .await
             .unwrap();
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache))
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
             .await
             .unwrap();
 
@@ -2903,7 +2975,7 @@ mod tests {
                 let opts = opts.clone();
                 tokio::spawn(async move {
                     let walker = StableWalker { walk_count: wc };
-                    semantic_code_search(opts, &FixedEmbedder, &walker, Some(&*cache_ref))
+                    semantic_code_search(opts, &FixedEmbedder, &walker, Some(&*cache_ref), None)
                         .await
                         .unwrap();
                 })
@@ -2931,6 +3003,259 @@ mod tests {
         assert!(
             reuses >= 7,
             "Expected >= 7 cache reuses from 8 concurrent requests, got {reuses}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Generation-based cache tests
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build a minimal SemanticSearchOptions for tests.
+    fn gen_test_opts() -> SemanticSearchOptions {
+        SemanticSearchOptions {
+            root_dir: std::path::PathBuf::from("/tmp"),
+            query: "anything".to_string(),
+            top_k: None,
+            semantic_weight: None,
+            keyword_weight: None,
+            min_semantic_score: None,
+            min_keyword_score: None,
+            min_combined_score: None,
+            require_keyword_match: None,
+            require_semantic_match: None,
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+        }
+    }
+
+    struct FixedEmbedder2;
+    impl EmbedFn for FixedEmbedder2 {
+        fn embed(
+            &self,
+            _texts: &[String],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>>
+        {
+            Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) })
+        }
+    }
+
+    /// Walker that counts walk_and_index invocations.
+    struct CountWalker(Arc<std::sync::atomic::AtomicU32>);
+    impl WalkAndIndexFn for CountWalker {
+        fn walk_and_index(
+            &self,
+            _root: &Path,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async {
+                let docs = vec![make_doc("a.rs", "stable content")];
+                let vecs = vec![Some(vec![1.0_f32, 0.0])];
+                Ok((docs, vecs))
+            })
+        }
+    }
+
+    /// Cache hit without a file change: when the generation matches, the walk
+    /// should be skipped entirely on the second request.
+    #[tokio::test]
+    async fn test_generation_hit_skips_walk() {
+        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let walker = CountWalker(Arc::clone(&walk_count));
+        let opts = gen_test_opts();
+
+        // First request — cold cache, must walk.
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(&cache),
+            Some(&generation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "first request must walk"
+        );
+
+        // Second request — same generation, cache still valid → walk must be skipped.
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(&cache),
+            Some(&generation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "second request with same generation must NOT walk"
+        );
+
+        // Verify the cache was actually reused (reuse_count == 1).
+        let reuses = {
+            let g = cache.read().await;
+            g.as_ref()
+                .unwrap()
+                .reuse_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(reuses, 1, "cache must have been reused exactly once");
+    }
+
+    /// File-change event (generation bump) forces a walk + rebuild on next request.
+    #[tokio::test]
+    async fn test_generation_bump_triggers_walk() {
+        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let walker = CountWalker(Arc::clone(&walk_count));
+        let opts = gen_test_opts();
+
+        // Prime the cache.
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(&cache),
+            Some(&generation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "first request must walk"
+        );
+
+        // Simulate a tracker file-change event: bump the generation.
+        generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        // Next request — generation mismatch → must walk.
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(&cache),
+            Some(&generation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "request after generation bump must re-walk"
+        );
+    }
+
+    /// When tracker is disabled (generation=None), fingerprint path still works:
+    /// the walk happens every time but the index is reused when content is unchanged.
+    #[tokio::test]
+    async fn test_tracker_off_fingerprint_backstop() {
+        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let walker = CountWalker(Arc::clone(&walk_count));
+        let opts = gen_test_opts();
+
+        // No generation counter — tracker-off mode.
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder2, &walker, Some(&cache), None)
+            .await
+            .unwrap();
+        let _ = semantic_code_search(opts.clone(), &FixedEmbedder2, &walker, Some(&cache), None)
+            .await
+            .unwrap();
+
+        // Walk happens on every request (no generation shortcut).
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "tracker-off: walk on every request"
+        );
+        // But the index is reused (fingerprint matched on second call).
+        let reuses = {
+            let g = cache.read().await;
+            g.as_ref()
+                .unwrap()
+                .reuse_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(
+            reuses, 1,
+            "fingerprint backstop: index reused on second call"
+        );
+    }
+
+    /// Concurrent requests with matching generation: only the first request walks;
+    /// the rest take the generation-hit fast path and skip the walk.
+    #[tokio::test]
+    async fn test_generation_concurrent_no_double_walk() {
+        use std::sync::Arc as StdArc;
+
+        let cache: StdArc<RwLock<Option<Arc<CachedSearchIndex>>>> = StdArc::new(RwLock::new(None));
+        let generation: StdArc<std::sync::atomic::AtomicU64> =
+            StdArc::new(std::sync::atomic::AtomicU64::new(0));
+        let walk_count: StdArc<std::sync::atomic::AtomicU32> =
+            StdArc::new(std::sync::atomic::AtomicU32::new(0));
+
+        // Prime cache with a single synchronous call first.
+        {
+            let walker = CountWalker(StdArc::clone(&walk_count));
+            let opts = gen_test_opts();
+            let _ = semantic_code_search(
+                opts,
+                &FixedEmbedder2,
+                &walker,
+                Some(&*cache),
+                Some(&generation),
+            )
+            .await
+            .unwrap();
+        }
+        // Reset walk counter — we care about post-prime behaviour.
+        walk_count.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Now spawn 8 concurrent requests — all should hit the generation cache.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache_ref = StdArc::clone(&cache);
+                let gen_ref = StdArc::clone(&generation);
+                let wc = StdArc::clone(&walk_count);
+                tokio::spawn(async move {
+                    let walker = CountWalker(wc);
+                    let opts = gen_test_opts();
+                    semantic_code_search(
+                        opts,
+                        &FixedEmbedder2,
+                        &walker,
+                        Some(&*cache_ref),
+                        Some(&gen_ref),
+                    )
+                    .await
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "all 8 concurrent requests must skip the walk on a generation hit"
         );
     }
 }
