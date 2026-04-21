@@ -788,9 +788,13 @@ pub struct CachedSearchIndex {
     pub index: SearchIndex,
     pub fingerprint: IndexFingerprint,
     /// Tracker generation counter value at the time this entry was built.
-    /// If the current generation matches this value the tracker has not reported
-    /// any file changes since the last build — the walk can be skipped entirely.
-    pub generation: u64,
+    ///
+    /// Atomic so it can be updated on the fingerprint-hit fast path (which only
+    /// holds a read-lock). Without this, a tracker-bump followed by an
+    /// unchanged-content fingerprint-hit would leave `generation` stale,
+    /// permanently locking the fast path out — every future request would
+    /// walk + fingerprint until a full rebuild happened.
+    pub generation: std::sync::atomic::AtomicU64,
     /// Number of times this cached entry has been reused (observability / tests).
     /// Wraps silently on `u64` overflow — only meaningful for monitoring deltas,
     /// not as an absolute counter.
@@ -802,7 +806,7 @@ impl CachedSearchIndex {
         Self {
             index,
             fingerprint,
-            generation,
+            generation: std::sync::atomic::AtomicU64::new(generation),
             reuse_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1330,7 +1334,7 @@ pub async fn semantic_code_search(
             if cache_generation.is_some() {
                 let guard = lock.read().await;
                 if let Some(ref cached) = *guard
-                    && cached.generation == current_gen
+                    && cached.generation.load(std::sync::atomic::Ordering::Acquire) == current_gen
                 {
                     let reuses = cached.record_reuse();
                     tracing::debug!(
@@ -1359,13 +1363,20 @@ pub async fn semantic_code_search(
                     && cached.fingerprint == fp
                 {
                     let reuses = cached.record_reuse();
-                    tracing::debug!(reuses, "SearchIndex fingerprint hit — reusing index");
-                    // Opportunistically update the generation so the next request can
-                    // take the fast path without walking again.
-                    // SAFETY: we hold only the read lock here, so we can't mutate the
-                    // Arc in the slot; instead we rely on the next write-lock path to
-                    // persist the updated generation. For now the fingerprint path acts
-                    // as the backstop exactly as documented.
+                    // Content unchanged even though tracker fired — update the cached
+                    // generation so the next request takes the fast path without
+                    // walking. `AtomicU64::store` is safe under a read-lock because
+                    // it's an atomic operation on a `&self` receiver. Without this,
+                    // a tracker-bump → fingerprint-hit cycle would permanently lock
+                    // the fast path out.
+                    cached
+                        .generation
+                        .store(current_gen, std::sync::atomic::Ordering::Release);
+                    tracing::debug!(
+                        reuses,
+                        generation = current_gen,
+                        "SearchIndex fingerprint hit — reusing index, updated generation"
+                    );
                     let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
                     return Ok(format_search_results_with_freshness(
                         query.as_ref(),
@@ -1382,9 +1393,15 @@ pub async fn semantic_code_search(
                 && cached.fingerprint == fp
             {
                 let reuses = cached.record_reuse();
+                // Same fix as the read-lock path: bring the cached generation
+                // forward so the next request takes the fast path.
+                cached
+                    .generation
+                    .store(current_gen, std::sync::atomic::Ordering::Release);
                 tracing::debug!(
                     reuses,
-                    "SearchIndex cache hit (post-write-lock) — reusing index"
+                    generation = current_gen,
+                    "SearchIndex cache hit (post-write-lock) — reusing index, updated generation"
                 );
                 let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
                 return Ok(format_search_results_with_freshness(
