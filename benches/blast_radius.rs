@@ -26,10 +26,7 @@ fn generate_file_content(
 
         for j in 0..lines_per_file {
             if has_symbol && j == lines_per_file / 3 {
-                content.push_str(&format!(
-                    "import {{ {} }} from './module_{}';\n",
-                    symbol, i
-                ));
+                content.push_str(&format!("import {{ {} }} from './module_{}';\n", symbol, i));
             } else if has_symbol && j == lines_per_file * 2 / 3 {
                 content.push_str(&format!("  const result = {}(params);\n", symbol));
             } else {

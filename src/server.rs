@@ -888,7 +888,7 @@ impl ContextPlusServer {
         let content_ref: Option<&str> = cached_content
             .as_deref()
             .map(String::as_str)
-            .or_else(|| disk_content.as_deref());
+            .or(disk_content.as_deref());
 
         let analysis = content_ref.and_then(|c| {
             let ext = file_path.rsplit('.').next().unwrap_or("");
