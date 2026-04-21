@@ -213,14 +213,26 @@ impl OllamaClient {
         // Build default headers — Authorization is injected once at construction
         // time so there is zero per-request cost.
         let mut default_headers = reqwest::header::HeaderMap::new();
-        if let Some(key) = config.ollama_api_key.as_deref().filter(|k| !k.is_empty()) {
-            let bearer = format!("Bearer {key}");
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(&bearer) {
+        if let Some(key) = config
+            .ollama_api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
+        {
+            let bearer = format!("Bearer {}", key.trim());
+            if let Ok(mut val) = reqwest::header::HeaderValue::from_str(&bearer) {
+                // Mark sensitive so reqwest / debug logs redact the bearer token.
+                val.set_sensitive(true);
                 default_headers.insert(reqwest::header::AUTHORIZATION, val);
             }
         }
 
-        let client = reqwest::Client::builder()
+        // HTTP/2 prior-knowledge only for plain-HTTP hosts (localhost Ollama).
+        // For HTTPS endpoints (TLS-proxied Ollama) we let reqwest's ALPN
+        // negotiate h2 normally — calling `http2_prior_knowledge()` there would
+        // cause handshake failures.
+        let use_h2_prior_knowledge = !config.ollama_host.starts_with("https://");
+
+        let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             // Keep idle connections alive for 55 s — safely under the common
             // 60 s idle-eviction window used by reverse proxies and firewalls.
@@ -228,13 +240,18 @@ impl OllamaClient {
             // TCP keepalive pings every 30 s so NAT/firewall state is preserved
             // even when the connection is otherwise silent.
             .tcp_keepalive(std::time::Duration::from_secs(30))
-            // Skip HTTP/1.1 upgrade negotiation; Ollama speaks HTTP/2 on
-            // localhost plain-text (no TLS ALPN required).
-            .http2_prior_knowledge()
+            // HTTP/2 application-level keepalive: ping every 25 s, timeout
+            // after 10 s. Pairs with pool_idle_timeout(55 s) so the connection
+            // isn't evicted between requests under light load.
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(25)))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             .default_headers(default_headers)
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("reqwest client build");
+            .timeout(std::time::Duration::from_secs(120));
+        if use_h2_prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+        let client = builder.build().expect("reqwest client build");
 
         let in_mem_cap = QUERY_CACHE_PERSIST_CAP.max(256);
         let cache = Arc::new(std::sync::Mutex::new(BoundedLruCache::new(in_mem_cap)));
