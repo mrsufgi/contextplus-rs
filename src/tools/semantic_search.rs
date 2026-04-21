@@ -1396,17 +1396,45 @@ pub async fn semantic_code_search(
                 // Spawn background rebuild; swap new index into the cache when done.
                 let lock_clone = Arc::clone(&lock);
                 tokio::spawn(async move {
+                    // RAII guard: always reset `rebuild_in_progress` on scope exit,
+                    // even on panic or task cancellation. Without this, a single
+                    // panic would leave the flag permanently stuck at `true` and
+                    // silently re-enable the 27s synchronous-rebuild cliff with
+                    // zero user-visible error. (Review #54 F1.)
+                    struct ResetOnDrop(Arc<CachedSearchIndex>);
+                    impl Drop for ResetOnDrop {
+                        fn drop(&mut self) {
+                            self.0
+                                .rebuild_in_progress
+                                .store(false, AtomicOrdering::Release);
+                        }
+                    }
+                    let _guard = ResetOnDrop(Arc::clone(&stale_arc));
+
                     let mut new_idx = SearchIndex::new();
                     new_idx.index_with_vectors(docs, vectors);
-                    let new_cached = Arc::new(CachedSearchIndex::new(new_idx, fp));
+                    let new_cached = Arc::new(CachedSearchIndex::new(new_idx, fp.clone()));
                     let mut wguard = lock_clone.write().await;
-                    *wguard = Some(new_cached);
-                    tracing::info!("SearchIndex background rebuild complete — cache swapped");
-                    // Mark the old entry as no longer in-flight (belt-and-suspenders;
-                    // the Arc may already have no other holders at this point).
-                    stale_arc
-                        .rebuild_in_progress
-                        .store(false, AtomicOrdering::Release);
+
+                    // Stale-write guard (Review #54 F2): if another writer already
+                    // installed a fresher index while we were rebuilding (detectable
+                    // by a fingerprint that no longer matches what we expected to
+                    // supersede), skip the swap. Our result is older than what's
+                    // already in the cache. The next query will catch any mismatch
+                    // and trigger a new rebuild if needed.
+                    let should_swap = match &*wguard {
+                        Some(current) => current.fingerprint == stale_arc.fingerprint,
+                        None => true,
+                    };
+                    if should_swap {
+                        *wguard = Some(new_cached);
+                        tracing::info!("SearchIndex background rebuild complete — cache swapped");
+                    } else {
+                        tracing::info!(
+                            "SearchIndex background rebuild complete — skipping swap (cache was updated concurrently)"
+                        );
+                    }
+                    // _guard drops here, resetting rebuild_in_progress.
                 });
 
                 return Ok(format_search_results_with_freshness(
