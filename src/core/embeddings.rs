@@ -361,6 +361,15 @@ impl OllamaClient {
                 // Owner: call Ollama, publish result to all waiters.
                 let embed_result = self.embed_single_query(query).await;
 
+                // Populate LRU BEFORE broadcasting to waiters, so any waiter
+                // that wakes and immediately re-calls `embed` (or any new caller
+                // arriving after broadcast) sees the cache hit rather than
+                // issuing a duplicate Ollama request. (Review #60 F1.)
+                if let Ok(ref v) = embed_result {
+                    let mut cache = self.query_cache.lock().unwrap();
+                    cache.insert(query.clone(), v.clone());
+                }
+
                 // Publish result and remove the in-flight slot atomically.
                 {
                     let mut map = self.in_flight.lock().unwrap();
@@ -376,11 +385,6 @@ impl OllamaClient {
 
                 let v = embed_result?;
 
-                // Populate LRU + trigger background flush.
-                {
-                    let mut cache = self.query_cache.lock().unwrap();
-                    cache.insert(query.clone(), v.clone());
-                }
                 if let Some(ref tx) = self.flush_tx {
                     let _ = tx.send(());
                 }
