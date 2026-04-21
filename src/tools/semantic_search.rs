@@ -1537,6 +1537,12 @@ pub async fn semantic_code_search(
                 let new_fp = fp.clone();
                 let root_dir_clone = options.root_dir.clone();
                 let stale_arc_for_guard = Arc::clone(&stale_arc);
+                // Capture the tracker generation handle (not a snapshot) so the
+                // background task can re-read it at install time. Without this,
+                // a tracker bump during the rebuild would leave the installed
+                // entry stamped with a stale `current_gen`, suppressing a
+                // legitimate walk on the next request. (Review #57 F4.)
+                let cache_gen_for_bg = cache_generation.clone();
                 tracing::info!(
                     old_n_docs = stale_fp.n_docs,
                     new_n_docs = new_fp.n_docs,
@@ -1569,17 +1575,26 @@ pub async fn semantic_code_search(
                         bg_vectors,
                         crate::core::embeddings::HnswTuning::global(),
                     );
-                    let new_entry =
-                        Arc::new(CachedSearchIndex::new(new_idx, new_fp.clone(), current_gen));
-
-                    // Stale-write guard: only install if the cached fingerprint is
-                    // still the one we intended to supersede.
+                    // Stale-write guard + fresh-generation snapshot: acquire the
+                    // write lock FIRST, then re-read `cache_generation` (if any)
+                    // right before constructing the entry. This closes the #57 F4
+                    // window where a tracker bump during rebuild would cause the
+                    // installed entry to carry a stale generation.
                     let mut wguard = lock_clone.write().await;
                     let should_install = match *wguard {
                         Some(ref cur) => cur.fingerprint == stale_fp,
                         None => false,
                     };
                     if should_install {
+                        let install_gen = cache_gen_for_bg
+                            .as_ref()
+                            .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(0);
+                        let new_entry = Arc::new(CachedSearchIndex::new(
+                            new_idx,
+                            new_fp.clone(),
+                            install_gen,
+                        ));
                         *wguard = Some(new_entry);
                         tracing::info!(
                             n_docs = new_fp.n_docs,
