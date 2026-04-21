@@ -1590,11 +1590,8 @@ pub async fn semantic_code_search(
                             .as_ref()
                             .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
                             .unwrap_or(0);
-                        let new_entry = Arc::new(CachedSearchIndex::new(
-                            new_idx,
-                            new_fp.clone(),
-                            install_gen,
-                        ));
+                        let new_entry =
+                            Arc::new(CachedSearchIndex::new(new_idx, new_fp.clone(), install_gen));
                         *wguard = Some(new_entry);
                         tracing::info!(
                             n_docs = new_fp.n_docs,
