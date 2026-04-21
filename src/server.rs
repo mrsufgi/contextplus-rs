@@ -95,7 +95,10 @@ pub struct SharedState {
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
     /// Cached SearchIndex for semantic_code_search — reused when the walk fingerprint
     /// is unchanged, eliminating the per-request HNSW rebuild for large corpora.
-    pub search_index_cache: RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>,
+    /// Wrapped in `Arc` so background rebuild tasks can hold a clone without
+    /// borrowing from `SharedState` across an `await` point.
+    pub search_index_cache:
+        Arc<RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>>,
     /// Cached instructions content — fetched once from remote, then served from memory.
     pub instructions_cache: OnceCell<String>,
     /// Tracker handle for lazy-start mode.
@@ -170,7 +173,7 @@ impl ContextPlusServer {
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
-            search_index_cache: RwLock::new(None),
+            search_index_cache: Arc::new(RwLock::new(None)),
             instructions_cache: OnceCell::new(),
             tracker_handle: std::sync::Mutex::new(None),
             idle_monitor: RwLock::new(None),
@@ -934,7 +937,7 @@ impl ContextPlusServer {
             options,
             &embedder,
             &walker,
-            Some(&self.state.search_index_cache),
+            Some(Arc::clone(&self.state.search_index_cache)),
         )
         .await?;
         Ok(Self::ok_text(result))
