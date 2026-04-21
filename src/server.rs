@@ -95,7 +95,9 @@ pub struct SharedState {
     pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
     /// Cached SearchIndex for semantic_code_search — reused when the walk fingerprint
     /// is unchanged, eliminating the per-request HNSW rebuild for large corpora.
-    pub search_index_cache: RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>,
+    /// Wrapped in `Arc` so background rebuild tasks can hold a clone of the lock.
+    pub search_index_cache:
+        Arc<RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>>,
     /// Monotonic counter incremented by the embedding tracker whenever a file-change
     /// event is processed. `semantic_code_search` compares the counter at request time
     /// against `CachedSearchIndex::generation`; equality means the tracker has seen no
@@ -177,7 +179,7 @@ impl ContextPlusServer {
             project_cache: RwLock::new(None),
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
-            search_index_cache: RwLock::new(None),
+            search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             instructions_cache: OnceCell::new(),
             tracker_handle: std::sync::Mutex::new(None),
@@ -978,8 +980,8 @@ impl ContextPlusServer {
             options,
             &embedder,
             &walker,
-            Some(&self.state.search_index_cache),
-            cache_gen,
+            Some(Arc::clone(&self.state.search_index_cache)),
+            cache_gen.cloned(),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -1851,8 +1853,8 @@ pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
         options,
         &embedder,
         &walker,
-        Some(&state.search_index_cache),
-        Some(&state.cache_generation),
+        Some(Arc::clone(&state.search_index_cache)),
+        Some(Arc::clone(&state.cache_generation)),
     )
     .await
     {
