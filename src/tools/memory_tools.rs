@@ -63,6 +63,8 @@ pub struct RetrieveWithTraversalOptions {
     pub root_dir: String,
     pub node_id: String,
     pub max_depth: Option<usize>,
+    /// Cap on total BFS-visited nodes. Defaults to [`MemoryGraph::DEFAULT_MAX_NODES`] (200).
+    pub max_nodes: Option<usize>,
     pub edge_filter: Option<Vec<String>>,
 }
 
@@ -429,11 +431,17 @@ pub async fn tool_retrieve_with_traversal(
     options: RetrieveWithTraversalOptions,
 ) -> Result<String> {
     let max_depth = options.max_depth.unwrap_or(2);
+    let max_nodes = options.max_nodes;
     let edge_filter = parse_edge_filter(&options.edge_filter)?;
 
-    let (results, touched) = store
+    let (results, touched, truncated) = store
         .get_graph_read(&options.root_dir, |graph| {
-            graph.retrieve_with_traversal(&options.node_id, max_depth, edge_filter.as_deref())
+            graph.retrieve_with_traversal(
+                &options.node_id,
+                max_depth,
+                max_nodes,
+                edge_filter.as_deref(),
+            )
         })
         .await?;
 
@@ -447,10 +455,19 @@ pub async fn tool_retrieve_with_traversal(
         return Ok(format!("\u{274C} Node not found: {}", options.node_id));
     }
 
-    let mut sections = vec![format!(
-        "Traversal from: {} (depth limit: {})\n",
-        results[0].node.label, max_depth
-    )];
+    let cap = max_nodes.unwrap_or(crate::core::memory_graph::MemoryGraph::DEFAULT_MAX_NODES);
+    let header = if truncated {
+        format!(
+            "Traversal from: {} (depth limit: {}, truncated at {} nodes)\n",
+            results[0].node.label, max_depth, cap
+        )
+    } else {
+        format!(
+            "Traversal from: {} (depth limit: {})\n",
+            results[0].node.label, max_depth
+        )
+    };
+    let mut sections = vec![header];
 
     for result in &results {
         sections.push(format_traversal_result(result));
@@ -1304,6 +1321,7 @@ mod tests {
                 root_dir: root,
                 node_id: "nonexistent-id".to_string(),
                 max_depth: None,
+                max_nodes: None,
                 edge_filter: None,
             },
         )
@@ -1347,6 +1365,7 @@ mod tests {
                 root_dir: root,
                 node_id,
                 max_depth: Some(2),
+                max_nodes: None,
                 edge_filter: None,
             },
         )
@@ -1388,6 +1407,7 @@ mod tests {
                 root_dir: root,
                 node_id,
                 max_depth: None, // defaults to 2
+                max_nodes: None,
                 edge_filter: None,
             },
         )
@@ -1422,6 +1442,7 @@ mod tests {
                 root_dir: root,
                 node_id,
                 max_depth: Some(1),
+                max_nodes: None,
                 edge_filter: Some(vec!["depends_on".to_string()]),
             },
         )
@@ -1446,6 +1467,7 @@ mod tests {
                 root_dir: root,
                 node_id: "any-id".to_string(),
                 max_depth: None,
+                max_nodes: None,
                 edge_filter: Some(vec!["not_a_valid_type".to_string()]),
             },
         )
@@ -2346,10 +2368,12 @@ mod tests {
             root_dir: "/tmp/test".to_string(),
             node_id: "mn-12345".to_string(),
             max_depth: Some(4),
+            max_nodes: None,
             edge_filter: None,
         };
         assert_eq!(opts.node_id, "mn-12345");
         assert_eq!(opts.max_depth, Some(4));
+        assert!(opts.max_nodes.is_none());
         assert!(opts.edge_filter.is_none());
     }
 
@@ -2403,15 +2427,16 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
         let store = GraphStore::new();
 
-        let (results, touched) = store
+        let (results, touched, truncated) = store
             .get_graph(&root, |graph| {
-                graph.retrieve_with_traversal("nonexistent", 2, None)
+                graph.retrieve_with_traversal("nonexistent", 2, None, None)
             })
             .await
             .expect("ok");
 
         assert!(results.is_empty());
         assert!(touched.is_empty());
+        assert!(!truncated);
     }
 
     // ---------------------------------------------------------------

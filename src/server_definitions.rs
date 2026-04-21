@@ -411,6 +411,12 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "Maximum traversal depth from start node (default 2)",
                 ),
                 (
+                    "max_nodes",
+                    "integer",
+                    false,
+                    "Cap on total BFS-visited nodes to prevent blowup on dense graphs (default 200)",
+                ),
+                (
                     "edge_filter",
                     "array",
                     false,
