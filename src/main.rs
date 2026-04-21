@@ -407,6 +407,9 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         }
     }
 
+    // Flush outstanding query embeddings to disk before exit.
+    state_for_shutdown.ollama.flush_query_cache();
+
     // Always flush memory graph on exit
     if let Err(e) = memory_graph.flush().await {
         tracing::warn!("Failed to persist memory graph on shutdown: {e}");

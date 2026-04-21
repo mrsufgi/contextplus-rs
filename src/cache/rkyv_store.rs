@@ -493,6 +493,170 @@ pub fn save_vector_store_overwrite(root_dir: &Path, name: &str, store: &VectorSt
     save_cache_overwrite(root_dir, name, &data)
 }
 
+// ---------------------------------------------------------------------------
+// Query embedding cache (persistent, keyed by query text)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of query-embedding entries to persist on disk.
+pub const QUERY_CACHE_MAX: usize = 10_000;
+
+/// Serializable format for the persistent query-embedding cache.
+///
+/// Unlike `CacheData` (which stores file embeddings keyed by path + content
+/// hash), `QueryCacheData` stores embeddings keyed by raw query text. No hash
+/// column is needed — the key itself is the identity.
+///
+/// Layout: parallel arrays (keys[i] → vectors[i*dims..(i+1)*dims]).
+#[derive(Archive, Serialize, Deserialize, Debug)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub struct QueryCacheData {
+    pub dims: u32,
+    pub keys: Vec<String>,
+    pub vectors: Vec<f32>,
+}
+
+/// Build a sanitized model-name slug suitable for use in a filename.
+///
+/// Replaces any character that is not alphanumeric, `-`, or `_` with `-` and
+/// truncates to 64 bytes so the resulting filename stays filesystem-safe.
+pub fn model_slug(model: &str) -> String {
+    let slug: String = model
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug.chars().take(64).collect()
+}
+
+/// Return the cache name (without `.rkyv` extension) for a query cache file.
+///
+/// Example: `model = "snowflake-arctic-embed2"` → `"query-embeddings-snowflake-arctic-embed2"`.
+pub fn query_cache_name(model: &str) -> String {
+    format!("query-embeddings-{}", model_slug(model))
+}
+
+/// Save the in-memory query LRU snapshot to disk.
+///
+/// `entries` is a slice of `(query_text, embedding_vector)` pairs representing
+/// the current LRU state (oldest-first, MRU last). At most `QUERY_CACHE_MAX`
+/// entries are written; if the slice is longer, the MRU tail is kept (we slice
+/// from the end).
+///
+/// Uses an atomic write (tmp → rename) identical to `save_cache_overwrite`.
+/// No merge with the existing file — the caller's in-memory LRU is the single
+/// source of truth for the query cache (only one MCP process writes it).
+pub fn save_query_cache(
+    root_dir: &Path,
+    model: &str,
+    entries: &[(String, Vec<f32>)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    ensure_cache_dir(root_dir)?;
+
+    let entries = if entries.len() > QUERY_CACHE_MAX {
+        &entries[entries.len() - QUERY_CACHE_MAX..]
+    } else {
+        entries
+    };
+
+    let dims = entries[0].1.len() as u32;
+    let mut keys = Vec::with_capacity(entries.len());
+    let mut vectors = Vec::with_capacity(entries.len() * dims as usize);
+    for (k, v) in entries {
+        if v.len() as u32 != dims {
+            continue; // skip dim-mismatched entries
+        }
+        keys.push(k.clone());
+        vectors.extend_from_slice(v);
+    }
+
+    let data = QueryCacheData {
+        dims,
+        keys,
+        vectors,
+    };
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
+        .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize query cache: {e}")))?;
+
+    let name = query_cache_name(model);
+    let path = cache_path(root_dir, &name);
+    let tmp_path = cache_dir(root_dir).join(format!(
+        "{}.rkyv.{}.{}.tmp",
+        name,
+        std::process::id(),
+        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    let mut buf = Vec::with_capacity(HEADER_SIZE + bytes.len());
+    buf.resize(HEADER_SIZE, 0);
+    buf[0] = CACHE_VERSION;
+    buf.extend_from_slice(&bytes);
+
+    if let Err(e) = fs::write(&tmp_path, &buf) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    Ok(())
+}
+
+/// Load the persisted query-embedding cache from disk.
+///
+/// Returns `Ok(vec![])` if the file does not exist or is empty.
+/// Returns `Err` only on format/version errors.
+pub fn load_query_cache(root_dir: &Path, model: &str) -> Result<Vec<(String, Vec<f32>)>> {
+    let name = query_cache_name(model);
+    let path = cache_path(root_dir, &name);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let bytes = fs::read(&path)?;
+    if bytes.len() < HEADER_SIZE {
+        return Ok(vec![]);
+    }
+    if bytes[0] != CACHE_VERSION {
+        return Err(ContextPlusError::Cache(format!(
+            "query cache: unsupported version {} (expected {})",
+            bytes[0], CACHE_VERSION
+        )));
+    }
+
+    let data_bytes = &bytes[HEADER_SIZE..];
+    let data = rkyv::from_bytes::<QueryCacheData, rkyv::rancor::Error>(data_bytes)
+        .map_err(|e| ContextPlusError::Cache(format!("rkyv deserialize query cache: {e}")))?;
+
+    let dim = data.dims as usize;
+    if dim == 0 || data.keys.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut result = Vec::with_capacity(data.keys.len());
+    for (i, key) in data.keys.iter().enumerate() {
+        let off = i * dim;
+        if off + dim > data.vectors.len() {
+            tracing::warn!(key = %key, "load_query_cache: truncated vector entry — skipping");
+            continue;
+        }
+        result.push((key.clone(), data.vectors[off..off + dim].to_vec()));
+    }
+
+    Ok(result)
+}
+
 /// Load cache with mmap for zero-copy read (uses memmap2).
 /// Falls back to regular load on mmap failure.
 pub fn load_cache_mmap(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
@@ -1639,5 +1803,90 @@ mod tests {
             loaded.keys.len() * loaded.dims as usize,
             "vector buffer must stay aligned after sweep"
         );
+    }
+
+    // -- Query cache persistence tests --
+
+    /// Round-trip: queries saved to disk survive a reload.
+    #[test]
+    fn query_cache_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let model = "test-model";
+        let entries = vec![
+            ("what is auth".to_string(), vec![0.1f32, 0.2, 0.3]),
+            ("database connection".to_string(), vec![0.4, 0.5, 0.6]),
+        ];
+
+        save_query_cache(dir.path(), model, &entries).unwrap();
+        let loaded = load_query_cache(dir.path(), model).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        let keys: Vec<&str> = loaded.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"what is auth"));
+        assert!(keys.contains(&"database connection"));
+
+        let v = loaded
+            .iter()
+            .find(|(k, _)| k == "what is auth")
+            .map(|(_, v)| v)
+            .unwrap();
+        assert!((v[0] - 0.1).abs() < 1e-6);
+        assert!((v[2] - 0.3).abs() < 1e-6);
+    }
+
+    /// Missing file → empty result (no error).
+    #[test]
+    fn query_cache_missing_file_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let result = load_query_cache(dir.path(), "no-model").unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// Cap enforcement: saving more than QUERY_CACHE_MAX entries keeps only the
+    /// MRU tail (size == QUERY_CACHE_MAX after the write).
+    #[test]
+    fn query_cache_cap_enforcement() {
+        let dir = TempDir::new().unwrap();
+        let model = "cap-model";
+        let n = QUERY_CACHE_MAX + 50;
+        let entries: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| (format!("query_{i}"), vec![i as f32, i as f32 + 0.1]))
+            .collect();
+
+        save_query_cache(dir.path(), model, &entries).unwrap();
+        let loaded = load_query_cache(dir.path(), model).unwrap();
+
+        assert_eq!(
+            loaded.len(),
+            QUERY_CACHE_MAX,
+            "persisted entries must be capped at QUERY_CACHE_MAX"
+        );
+        // The MRU tail (last QUERY_CACHE_MAX entries) must survive.
+        let last_key = format!("query_{}", n - 1);
+        assert!(
+            loaded.iter().any(|(k, _)| k == &last_key),
+            "MRU entry '{}' must be present after cap enforcement",
+            last_key
+        );
+    }
+
+    /// Different model → different file on disk (no cross-contamination).
+    #[test]
+    fn query_cache_model_in_filename() {
+        let dir = TempDir::new().unwrap();
+        let entries_a = vec![("qa".to_string(), vec![1.0f32, 0.0])];
+        let entries_b = vec![("qb".to_string(), vec![0.0f32, 1.0])];
+
+        save_query_cache(dir.path(), "model-a", &entries_a).unwrap();
+        save_query_cache(dir.path(), "model-b", &entries_b).unwrap();
+
+        let loaded_a = load_query_cache(dir.path(), "model-a").unwrap();
+        let loaded_b = load_query_cache(dir.path(), "model-b").unwrap();
+
+        assert_eq!(loaded_a.len(), 1);
+        assert_eq!(loaded_a[0].0, "qa");
+
+        assert_eq!(loaded_b.len(), 1);
+        assert_eq!(loaded_b[0].0, "qb");
     }
 }

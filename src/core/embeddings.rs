@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::error::{ContextPlusError, Result};
 
@@ -88,6 +90,8 @@ impl EmbedRuntimeOptions {
 struct BoundedLruCache {
     cap: usize,
     map: indexmap::IndexMap<String, Vec<f32>>,
+    /// True when the map has been modified since the last `drain_to_vec` call.
+    dirty: bool,
 }
 
 impl BoundedLruCache {
@@ -95,6 +99,7 @@ impl BoundedLruCache {
         Self {
             cap,
             map: indexmap::IndexMap::with_capacity(cap + 1),
+            dirty: false,
         }
     }
 
@@ -114,12 +119,28 @@ impl BoundedLruCache {
             self.map.shift_remove_index(0);
         }
         self.map.insert(key, val);
+        self.dirty = true;
     }
 
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// Return all (key, vector) pairs in LRU → MRU order and clear the dirty flag.
+    fn drain_to_vec(&mut self) -> Vec<(String, Vec<f32>)> {
+        self.dirty = false;
+        self.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
+
+/// Capacity of the persistent on-disk query-embedding cache.
+const QUERY_CACHE_PERSIST_CAP: usize = 10_000;
+
+/// Debounce window for background query cache flushes (milliseconds).
+const QUERY_CACHE_FLUSH_DEBOUNCE_MS: u64 = 2_000;
 
 #[derive(Clone)]
 pub struct OllamaClient {
@@ -134,6 +155,13 @@ pub struct OllamaClient {
     cancel_token: CancellationToken,
     request_timeout: std::time::Duration,
     query_cache: Arc<std::sync::Mutex<BoundedLruCache>>,
+    /// Root directory used to locate the persistent query-embedding cache file.
+    /// `None` when the client was constructed without a project root (e.g. in
+    /// unit tests that do not want on-disk I/O).
+    root_dir: Option<Arc<PathBuf>>,
+    /// Sender half of the debounce channel.  Sending a unit triggers a
+    /// background task to flush the in-memory LRU to disk after a short delay.
+    flush_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<()>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -156,11 +184,70 @@ struct EmbedResponse {
 
 impl OllamaClient {
     pub fn new(config: &Config) -> Self {
+        Self::new_with_root(config, None)
+    }
+
+    /// Construct an `OllamaClient` with an optional project root directory.
+    ///
+    /// When `root_dir` is `Some`, the client:
+    /// 1. Loads any previously persisted query-embedding cache from
+    ///    `<root_dir>/.mcp_data/query-embeddings-<model>.rkyv` into the
+    ///    in-memory LRU on construction.
+    /// 2. Spawns a background Tokio task that debounce-flushes the LRU to disk
+    ///    whenever a new query embedding is inserted.
+    pub fn new_with_root(config: &Config, root_dir: Option<PathBuf>) -> Self {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("reqwest client build");
+
+        let in_mem_cap = QUERY_CACHE_PERSIST_CAP.max(256);
+        let cache = Arc::new(std::sync::Mutex::new(BoundedLruCache::new(in_mem_cap)));
+
+        // Load persisted entries into the in-memory LRU.
+        if let Some(ref dir) = root_dir {
+            match rkyv_store::load_query_cache(dir, &config.ollama_embed_model) {
+                Ok(entries) => {
+                    let mut lru = cache.lock().unwrap();
+                    for (k, v) in entries {
+                        lru.insert(k, v);
+                    }
+                    lru.dirty = false; // freshly loaded — nothing new to flush yet
+                    tracing::debug!(count = lru.len(), "Loaded persistent query embedding cache");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load query embedding cache: {e}");
+                }
+            }
+        }
+
+        // Spawn debounce flush task when we have a root dir AND a Tokio runtime
+        // is available (unit tests that construct OllamaClient outside of any
+        // async context must not panic here).
+        let flush_tx_arc = if let Some(ref dir) = root_dir {
+            let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let cache_clone = Arc::clone(&cache);
+            let model_clone = config.ollama_embed_model.clone();
+            let dir_clone = dir.clone();
+            // `tokio::runtime::Handle::try_current()` returns Err when there is
+            // no active runtime (sync test threads).  In that case we skip the
+            // background task — `flush_query_cache()` on shutdown still works.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(query_cache_flush_task(
+                    flush_rx,
+                    cache_clone,
+                    dir_clone,
+                    model_clone,
+                ));
+                Some(Arc::new(flush_tx))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
             client,
             host: config.ollama_host.clone(),
@@ -172,7 +259,27 @@ impl OllamaClient {
             embed_chunk_chars: config.embed_chunk_chars,
             cancel_token: CancellationToken::new(),
             request_timeout: EMBED_REQUEST_TIMEOUT,
-            query_cache: Arc::new(std::sync::Mutex::new(BoundedLruCache::new(256))),
+            query_cache: cache,
+            root_dir: root_dir.map(Arc::new),
+            flush_tx: flush_tx_arc,
+        }
+    }
+
+    /// Flush the in-memory query-embedding LRU to disk synchronously.
+    ///
+    /// Call this on clean shutdown to ensure no entries are lost between the
+    /// last debounce flush and process exit.
+    pub fn flush_query_cache(&self) {
+        let Some(ref dir) = self.root_dir else { return };
+        let entries = {
+            let mut lru = self.query_cache.lock().unwrap();
+            if !lru.dirty {
+                return; // nothing new since last flush
+            }
+            lru.drain_to_vec()
+        };
+        if let Err(e) = rkyv_store::save_query_cache(dir, &self.model, &entries) {
+            tracing::warn!("Failed to flush query embedding cache on shutdown: {e}");
         }
     }
 
@@ -250,8 +357,14 @@ impl OllamaClient {
         if texts.len() == 1
             && let Some(v) = results.first()
         {
-            let mut cache = self.query_cache.lock().unwrap();
-            cache.insert(texts[0].clone(), v.clone());
+            {
+                let mut cache = self.query_cache.lock().unwrap();
+                cache.insert(texts[0].clone(), v.clone());
+            }
+            // Signal the background flush task to persist the updated LRU.
+            if let Some(ref tx) = self.flush_tx {
+                let _ = tx.send(());
+            }
         }
 
         Ok(results)
@@ -425,6 +538,56 @@ impl OllamaClient {
                     deadline.as_millis()
                 ))),
             },
+        }
+    }
+}
+
+/// Background task that debounce-flushes the query-embedding LRU to disk.
+///
+/// Receives flush trigger signals via `rx`. After receiving a signal it waits
+/// `QUERY_CACHE_FLUSH_DEBOUNCE_MS` before writing, absorbing any further signals
+/// that arrive during the wait window. The task exits when `rx` is closed (i.e.
+/// when the `OllamaClient` is dropped).
+async fn query_cache_flush_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    cache: Arc<std::sync::Mutex<BoundedLruCache>>,
+    root_dir: PathBuf,
+    model: String,
+) {
+    loop {
+        // Wait for the first trigger.
+        if rx.recv().await.is_none() {
+            break; // channel closed — client dropped
+        }
+
+        // Debounce: drain any additional signals that arrive during the window.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(QUERY_CACHE_FLUSH_DEBOUNCE_MS);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                msg = rx.recv() => {
+                    if msg.is_none() { return; } // channel closed
+                    // more signals arrived — keep draining until deadline
+                }
+            }
+        }
+
+        // Flush snapshot to disk.
+        let entries = {
+            let mut lru = cache.lock().unwrap();
+            if !lru.dirty {
+                continue;
+            }
+            lru.drain_to_vec()
+        };
+        if let Err(e) = rkyv_store::save_query_cache(&root_dir, &model, &entries) {
+            tracing::warn!("query cache background flush failed: {e}");
+        } else {
+            tracing::debug!(
+                count = entries.len(),
+                "Flushed query embedding cache to disk"
+            );
         }
     }
 }
