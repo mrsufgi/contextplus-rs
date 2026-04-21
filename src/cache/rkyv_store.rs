@@ -506,7 +506,7 @@ pub const QUERY_CACHE_MAX: usize = 10_000;
 /// hash), `QueryCacheData` stores embeddings keyed by raw query text. No hash
 /// column is needed — the key itself is the identity.
 ///
-/// Layout: parallel arrays (keys[i] → vectors[i*dims..(i+1)*dims]).
+/// Layout: parallel arrays (`keys[i]` → `vectors[i*dims..(i+1)*dims]`).
 #[derive(Archive, Serialize, Deserialize, Debug)]
 #[rkyv(compare(PartialEq), derive(Debug))]
 pub struct QueryCacheData {
