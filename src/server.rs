@@ -573,49 +573,62 @@ impl ContextPlusServer {
 
         // Step 1: Parse symbols (CPU-bound)
         let identifier_docs = tokio::task::spawn_blocking(move || {
-            let mut docs = Vec::new();
-            for entry in &cache_clone.file_entries {
-                if entry.is_directory {
-                    continue;
-                }
-                if let Some(content) = cache_clone.file_content.get(&entry.relative_path) {
+            use rayon::prelude::*;
+            cache_clone
+                .file_entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory)
+                .filter_map(|entry| {
+                    let content = cache_clone.file_content.get(&entry.relative_path)?;
                     let content = Arc::clone(content);
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                        let header = crate::core::parser::extract_header(&content);
-                        for sym in crate::core::parser::flatten_symbols(&symbols, None) {
-                            let sig = sym.signature.clone().unwrap_or_default();
-                            let parent = sym.parent_name.as_deref().unwrap_or("");
-                            let text = format!(
-                                "{} {} {} {} {} {}",
-                                sym.name, sym.kind, sig, entry.relative_path, header, parent
-                            );
-                            let token_set =
-                                crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
-                                    &sym.name,
-                                    &sig,
-                                    &entry.relative_path,
-                                    &header,
+                    let symbols = parse_with_tree_sitter(&content, ext).ok()?;
+                    let header = crate::core::parser::extract_header(&content);
+                    let local_docs: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                        crate::core::parser::flatten_symbols(&symbols, None)
+                            .into_iter()
+                            .map(|sym| {
+                                let sig = sym.signature.clone().unwrap_or_default();
+                                let parent = sym.parent_name.as_deref().unwrap_or("");
+                                let text = format!(
+                                    "{} {} {} {} {} {}",
+                                    sym.name,
+                                    sym.kind,
+                                    sig,
+                                    entry.relative_path,
+                                    header,
+                                    parent
                                 );
-                            docs.push(crate::tools::semantic_identifiers::IdentifierDoc {
-                                id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
-                                path: entry.relative_path.clone(),
-                                header: header.clone(),
-                                name: sym.name.clone(),
-                                kind_lower: sym.kind.to_lowercase(),
-                                kind: sym.kind.clone(),
-                                line: sym.line,
-                                end_line: sym.end_line,
-                                signature: sig,
-                                parent_name: sym.parent_name.clone(),
-                                text,
-                                token_set,
-                            });
-                        }
-                    }
-                }
-            }
-            docs
+                                let token_set =
+                                    crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
+                                        &sym.name,
+                                        &sig,
+                                        &entry.relative_path,
+                                        &header,
+                                    );
+                                crate::tools::semantic_identifiers::IdentifierDoc {
+                                    id: format!(
+                                        "{}:{}:{}",
+                                        entry.relative_path, sym.name, sym.line
+                                    ),
+                                    path: entry.relative_path.clone(),
+                                    header: header.clone(),
+                                    name: sym.name.clone(),
+                                    kind_lower: sym.kind.to_lowercase(),
+                                    kind: sym.kind.clone(),
+                                    line: sym.line,
+                                    end_line: sym.end_line,
+                                    signature: sig,
+                                    parent_name: sym.parent_name.clone(),
+                                    text,
+                                    token_set,
+                                }
+                            })
+                            .collect();
+                    Some(local_docs)
+                })
+                .flatten()
+                .collect::<Vec<_>>()
         })
         .await
         .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;

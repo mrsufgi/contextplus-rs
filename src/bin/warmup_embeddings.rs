@@ -20,8 +20,10 @@ use contextplus_rs::core::tree_sitter::get_supported_extensions;
 use contextplus_rs::core::walker;
 use contextplus_rs::server::cache_name;
 use futures::future;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::main]
 async fn main() {
@@ -46,41 +48,41 @@ async fn main() {
     println!("Scanning workspace: {}", root.display());
     let entries = walker::walk_with_config(root, &config);
 
-    // (rel_path, content_hash, content)
-    let mut docs: Vec<(String, String, String)> = Vec::new();
-    let mut skipped_size = 0usize;
-    let mut skipped_unsupported = 0usize;
+    // (rel_path, content_hash, content) — built in parallel (blocking file I/O + hash).
+    let skipped_size = AtomicUsize::new(0);
+    let skipped_unsupported = AtomicUsize::new(0);
 
-    for entry in &entries {
-        if entry.is_directory {
-            continue;
-        }
-        let ext_with_dot = entry
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default();
-        if !supported.contains(ext_with_dot.as_str()) {
-            skipped_unsupported += 1;
-            continue;
-        }
-        if let Ok(meta) = std::fs::metadata(&entry.path)
-            && meta.len() > max_size
-        {
-            skipped_size += 1;
-            continue;
-        }
-        let content = match std::fs::read_to_string(&entry.path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if content.trim().is_empty() {
-            continue;
-        }
-        let hash = hash_content(&content);
-        docs.push((entry.relative_path.clone(), hash, content));
-    }
+    let docs: Vec<(String, String, String)> = entries
+        .par_iter()
+        .filter(|entry| !entry.is_directory)
+        .filter_map(|entry| {
+            let ext_with_dot = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{}", e))
+                .unwrap_or_default();
+            if !supported.contains(ext_with_dot.as_str()) {
+                skipped_unsupported.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            if let Ok(meta) = std::fs::metadata(&entry.path)
+                && meta.len() > max_size
+            {
+                skipped_size.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let content = std::fs::read_to_string(&entry.path).ok()?;
+            if content.trim().is_empty() {
+                return None;
+            }
+            let hash = hash_content(&content);
+            Some((entry.relative_path.clone(), hash, content))
+        })
+        .collect();
+
+    let skipped_size = skipped_size.into_inner();
+    let skipped_unsupported = skipped_unsupported.into_inner();
 
     println!(
         "Found {} embeddable files (skipped: {} oversized, {} unsupported)",
