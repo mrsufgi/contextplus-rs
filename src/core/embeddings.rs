@@ -605,6 +605,29 @@ impl Default for HnswTuning {
     }
 }
 
+impl HnswTuning {
+    /// Build a tuning snapshot from the current `Config`'s env-var-parsed values.
+    /// This is the intended bridge from operator-configured env knobs
+    /// (`CONTEXTPLUS_HNSW_EF_CONSTRUCTION`, `CONTEXTPLUS_HNSW_EF_SEARCH`) to
+    /// runtime `VectorStore` / `SearchIndex` construction.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            ef_construction: config.hnsw_ef_construction,
+            ef_search: config.hnsw_ef_search,
+        }
+    }
+
+    /// Return a process-wide tuning, parsed from env vars on first call.
+    /// Runtime code that constructs a default `SearchIndex` / `VectorStore`
+    /// should prefer this over `HnswTuning::default()` so operator env overrides
+    /// actually take effect. Tests and isolated callers can still use
+    /// `HnswTuning::default()` or pass an explicit tuning.
+    pub fn global() -> Self {
+        static GLOBAL: std::sync::OnceLock<HnswTuning> = std::sync::OnceLock::new();
+        *GLOBAL.get_or_init(|| HnswTuning::from_config(&crate::config::Config::load()))
+    }
+}
+
 /// In-memory flat vector store with cosine similarity search via simsimd.
 /// Uses brute-force SIMD+rayon scan for stores ≤ `HNSW_THRESHOLD` vectors;
 /// lazily builds an HNSW approximate nearest-neighbor index above that threshold.

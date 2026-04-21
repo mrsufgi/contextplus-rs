@@ -869,10 +869,27 @@ impl SearchIndex {
 
     /// Index documents using pre-computed vectors.
     /// `vectors` must be the same length as `docs`.
+    /// Uses default HNSW tuning; callers needing custom tuning should use
+    /// [`Self::index_with_vectors_and_tuning`].
     pub fn index_with_vectors(
         &mut self,
         docs: Vec<SearchDocument>,
         vectors: Vec<Option<Vec<f32>>>,
+    ) {
+        self.index_with_vectors_and_tuning(
+            docs,
+            vectors,
+            crate::core::embeddings::HnswTuning::default(),
+        );
+    }
+
+    /// Index documents using pre-computed vectors with explicit HNSW tuning.
+    /// Use `HnswTuning::from_config(&config)` to respect env-var overrides.
+    pub fn index_with_vectors_and_tuning(
+        &mut self,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        hnsw_tuning: crate::core::embeddings::HnswTuning,
     ) {
         debug_assert_eq!(docs.len(), vectors.len());
         // Determine dims from first non-None vector
@@ -914,7 +931,13 @@ impl SearchIndex {
                     flat.extend_from_slice(&buffer[offset..offset + dims]);
                 }
             }
-            Some(VectorStore::new(dims as u32, keys, hashes, flat))
+            Some(VectorStore::new_with_tuning(
+                dims as u32,
+                keys,
+                hashes,
+                flat,
+                hnsw_tuning,
+            ))
         } else {
             None
         };
@@ -1358,7 +1381,11 @@ pub async fn semantic_code_search(
             let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
             let fp = IndexFingerprint::from_docs(&docs);
             let mut idx = SearchIndex::new();
-            idx.index_with_vectors(docs, vectors);
+            idx.index_with_vectors_and_tuning(
+                docs,
+                vectors,
+                crate::core::embeddings::HnswTuning::global(),
+            );
             Arc::new(CachedSearchIndex::new(idx, fp, current_gen))
         }
         Some(lock) => {
@@ -1455,7 +1482,11 @@ pub async fn semantic_code_search(
                 "SearchIndex cache miss — rebuilding index"
             );
             let mut idx = SearchIndex::new();
-            idx.index_with_vectors(docs, vectors);
+            idx.index_with_vectors_and_tuning(
+                docs,
+                vectors,
+                crate::core::embeddings::HnswTuning::global(),
+            );
             let arc = Arc::new(CachedSearchIndex::new(idx, fp, current_gen));
             *guard = Some(Arc::clone(&arc));
             arc

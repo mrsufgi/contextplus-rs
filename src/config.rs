@@ -68,11 +68,15 @@ pub struct Config {
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
 
 /// Default `efConstruction` passed to `instant_distance::Builder`.
-/// Higher values improve index quality at the cost of build time.
+/// Matches `instant_distance::Builder::default()` (100). Higher values
+/// improve index quality at the cost of build time.
 pub const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 100;
 /// Default `ef_search` passed to `instant_distance::Builder`.
-/// Higher values improve recall at the cost of query latency.
-pub const DEFAULT_HNSW_EF_SEARCH: usize = 100;
+/// Matches `instant_distance::Builder::default()` (32) to preserve the
+/// prior implicit behavior — callers needing higher recall should set
+/// `CONTEXTPLUS_HNSW_EF_SEARCH` explicitly rather than pay the latency
+/// cost globally by default.
+pub const DEFAULT_HNSW_EF_SEARCH: usize = 32;
 
 // Note: the `M` parameter (number of bi-directional links per layer) in
 // `instant-distance 0.6.1` is a private compile-time constant (`const M: usize = 32`)
