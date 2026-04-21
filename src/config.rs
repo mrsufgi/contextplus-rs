@@ -57,9 +57,31 @@ pub struct Config {
     /// Whether to warm the SearchIndex cache at server startup.
     /// Controlled by `CONTEXTPLUS_WARMUP_ON_START` (default: true).
     pub warmup_on_start: bool,
+    /// HNSW `efConstruction` — quality/speed trade-off at index build time.
+    /// Controlled by `CONTEXTPLUS_HNSW_EF_CONSTRUCTION` (default: 100).
+    pub hnsw_ef_construction: usize,
+    /// HNSW `ef_search` — recall/latency trade-off at query time.
+    /// Controlled by `CONTEXTPLUS_HNSW_EF_SEARCH` (default: 100).
+    pub hnsw_ef_search: usize,
 }
 
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
+
+/// Default `efConstruction` passed to `instant_distance::Builder`.
+/// Matches `instant_distance::Builder::default()` (100). Higher values
+/// improve index quality at the cost of build time.
+pub const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 100;
+/// Default `ef_search` passed to `instant_distance::Builder`.
+/// Matches `instant_distance::Builder::default()` (32) to preserve the
+/// prior implicit behavior — callers needing higher recall should set
+/// `CONTEXTPLUS_HNSW_EF_SEARCH` explicitly rather than pay the latency
+/// cost globally by default.
+pub const DEFAULT_HNSW_EF_SEARCH: usize = 32;
+
+// Note: the `M` parameter (number of bi-directional links per layer) in
+// `instant-distance 0.6.1` is a private compile-time constant (`const M: usize = 32`)
+// and is not exposed through the public Builder API. The `CONTEXTPLUS_HNSW_M` knob
+// cannot be implemented without forking the crate.
 
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 const DEFAULT_EMBED_MODEL: &str = "snowflake-arctic-embed2";
@@ -95,6 +117,25 @@ const BASE_IGNORE_DIRS: &[&str] = &[
     ".turbo",
     ".parcel-cache",
 ];
+
+/// Parse a `usize` env var, emitting a `tracing::warn` and returning `default` on invalid input.
+fn parse_usize_env_warn(key: &str, default: usize) -> usize {
+    match env::var(key) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    key,
+                    raw,
+                    default,
+                    "invalid value for {key}; falling back to default {default}"
+                );
+                default
+            }
+        },
+    }
+}
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -185,6 +226,14 @@ impl Config {
                     )
                 })
                 .unwrap_or(true),
+            hnsw_ef_construction: parse_usize_env_warn(
+                "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
+                DEFAULT_HNSW_EF_CONSTRUCTION,
+            ),
+            hnsw_ef_search: parse_usize_env_warn(
+                "CONTEXTPLUS_HNSW_EF_SEARCH",
+                DEFAULT_HNSW_EF_SEARCH,
+            ),
         }
     }
 }
@@ -250,6 +299,8 @@ mod tests {
                 "CONTEXTPLUS_IDLE_TIMEOUT_MS",
                 "CONTEXTPLUS_PARENT_POLL_MS",
                 "CONTEXTPLUS_EMBED_CHUNK_CHARS",
+                "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
+                "CONTEXTPLUS_HNSW_EF_SEARCH",
             ],
             || {
                 let cfg = Config::from_env();
@@ -268,6 +319,8 @@ mod tests {
                 assert_eq!(cfg.idle_timeout_ms, 900_000); // 15 min default
                 assert_eq!(cfg.parent_poll_ms, 5_000); // 5s default
                 assert_eq!(cfg.embed_chunk_chars, 2000);
+                assert_eq!(cfg.hnsw_ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
+                assert_eq!(cfg.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
             },
         );
     }
@@ -578,6 +631,51 @@ mod tests {
             || {
                 let c = Config::from_env();
                 assert!(c.embed_num_gpu.is_none() && c.embed_low_vram.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn hnsw_knobs_defaults() {
+        with_cleared_env(
+            &[
+                "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
+                "CONTEXTPLUS_HNSW_EF_SEARCH",
+            ],
+            || {
+                let c = Config::from_env();
+                assert_eq!(c.hnsw_ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
+                assert_eq!(c.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
+            },
+        );
+    }
+
+    #[test]
+    fn hnsw_knobs_overrides() {
+        with_env(
+            &[
+                ("CONTEXTPLUS_HNSW_EF_CONSTRUCTION", "200"),
+                ("CONTEXTPLUS_HNSW_EF_SEARCH", "256"),
+            ],
+            || {
+                let c = Config::from_env();
+                assert_eq!(c.hnsw_ef_construction, 200);
+                assert_eq!(c.hnsw_ef_search, 256);
+            },
+        );
+    }
+
+    #[test]
+    fn hnsw_knobs_invalid_falls_back_to_default() {
+        with_env(
+            &[
+                ("CONTEXTPLUS_HNSW_EF_CONSTRUCTION", "not_a_number"),
+                ("CONTEXTPLUS_HNSW_EF_SEARCH", ""),
+            ],
+            || {
+                let c = Config::from_env();
+                assert_eq!(c.hnsw_ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
+                assert_eq!(c.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
             },
         );
     }

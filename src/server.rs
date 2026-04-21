@@ -1847,7 +1847,15 @@ pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
         state: Arc::clone(state),
     };
 
-    match semantic_code_search(options, &embedder, &walker, Some(&state.search_index_cache)).await {
+    match semantic_code_search(
+        options,
+        &embedder,
+        &walker,
+        Some(&state.search_index_cache),
+        Some(&state.cache_generation),
+    )
+    .await
+    {
         Ok(_) => tracing::info!(
             elapsed_ms = t0.elapsed().as_millis(),
             "SearchIndex warmup complete"

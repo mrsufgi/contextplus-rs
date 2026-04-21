@@ -1498,6 +1498,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1555,6 +1557,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1623,6 +1627,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1697,6 +1703,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1761,6 +1769,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1850,6 +1860,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1925,6 +1937,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1991,6 +2005,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2062,6 +2078,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2132,6 +2150,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2198,6 +2218,8 @@ mod tests {
             embed_chunk_chars: 2000,
             query_batch_size: 1,
             warmup_on_start: true,
+            hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
         };
         let ollama = OllamaClient::new(&config);
 

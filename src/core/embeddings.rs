@@ -579,6 +579,55 @@ impl instant_distance::Point for HnswPoint {
 /// Lazily-built HNSW map: maps HnswPoint → original key index (usize stored as String).
 type HnswIndex = instant_distance::HnswMap<HnswPoint, usize>;
 
+/// Runtime-tunable HNSW parameters.
+///
+/// Populated from [`crate::config::Config`] fields; defaults mirror the
+/// `instant-distance` crate defaults so existing behaviour is preserved.
+///
+/// Note: the `M` parameter (bi-directional links per layer) in
+/// `instant-distance 0.6.1` is a private compile-time `const M: usize = 32`
+/// and is not exposed through the public `Builder` API.  The
+/// `CONTEXTPLUS_HNSW_M` knob is therefore not implemented.
+#[derive(Debug, Clone, Copy)]
+pub struct HnswTuning {
+    /// `efConstruction` — quality/speed trade-off at index build time.
+    pub ef_construction: usize,
+    /// `ef_search` — recall/latency trade-off at query time.
+    pub ef_search: usize,
+}
+
+impl Default for HnswTuning {
+    fn default() -> Self {
+        Self {
+            ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+            ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+        }
+    }
+}
+
+impl HnswTuning {
+    /// Build a tuning snapshot from the current `Config`'s env-var-parsed values.
+    /// This is the intended bridge from operator-configured env knobs
+    /// (`CONTEXTPLUS_HNSW_EF_CONSTRUCTION`, `CONTEXTPLUS_HNSW_EF_SEARCH`) to
+    /// runtime `VectorStore` / `SearchIndex` construction.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            ef_construction: config.hnsw_ef_construction,
+            ef_search: config.hnsw_ef_search,
+        }
+    }
+
+    /// Return a process-wide tuning, parsed from env vars on first call.
+    /// Runtime code that constructs a default `SearchIndex` / `VectorStore`
+    /// should prefer this over `HnswTuning::default()` so operator env overrides
+    /// actually take effect. Tests and isolated callers can still use
+    /// `HnswTuning::default()` or pass an explicit tuning.
+    pub fn global() -> Self {
+        static GLOBAL: std::sync::OnceLock<HnswTuning> = std::sync::OnceLock::new();
+        *GLOBAL.get_or_init(|| HnswTuning::from_config(&crate::config::Config::from_env()))
+    }
+}
+
 /// In-memory flat vector store with cosine similarity search via simsimd.
 /// Uses brute-force SIMD+rayon scan for stores ≤ `HNSW_THRESHOLD` vectors;
 /// lazily builds an HNSW approximate nearest-neighbor index above that threshold.
@@ -591,11 +640,24 @@ pub struct VectorStore {
     key_index: HashMap<String, usize>,
     /// Lazily-built HNSW index, constructed on first call to `find_nearest_hnsw`.
     hnsw_index: OnceLock<HnswIndex>,
+    /// HNSW build/search tuning knobs (from env-var config).
+    hnsw_tuning: HnswTuning,
 }
 
 impl VectorStore {
     /// Build a VectorStore from parallel arrays of keys, hashes, and vectors.
     pub fn new(dims: u32, keys: Vec<String>, hashes: Vec<String>, vectors: Vec<f32>) -> Self {
+        Self::new_with_tuning(dims, keys, hashes, vectors, HnswTuning::default())
+    }
+
+    /// Like [`Self::new`] but with explicit HNSW tuning knobs.
+    pub fn new_with_tuning(
+        dims: u32,
+        keys: Vec<String>,
+        hashes: Vec<String>,
+        vectors: Vec<f32>,
+        hnsw_tuning: HnswTuning,
+    ) -> Self {
         let count = keys.len() as u32;
         let mut key_index = HashMap::with_capacity(keys.len());
         for (i, key) in keys.iter().enumerate() {
@@ -609,6 +671,7 @@ impl VectorStore {
             hashes,
             key_index,
             hnsw_index: OnceLock::new(),
+            hnsw_tuning,
         }
     }
 
@@ -631,6 +694,33 @@ impl VectorStore {
         vectors_ptr: *const f32,
         vectors_len: usize,
         mmap: Arc<memmap2::Mmap>,
+    ) -> Self {
+        // SAFETY: caller upholds the same invariants required by from_mmap_with_tuning.
+        unsafe {
+            Self::from_mmap_with_tuning(
+                dims,
+                keys,
+                hashes,
+                vectors_ptr,
+                vectors_len,
+                mmap,
+                HnswTuning::default(),
+            )
+        }
+    }
+
+    /// Like [`Self::from_mmap`] but with explicit HNSW tuning knobs.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::from_mmap`].
+    pub unsafe fn from_mmap_with_tuning(
+        dims: u32,
+        keys: Vec<String>,
+        hashes: Vec<String>,
+        vectors_ptr: *const f32,
+        vectors_len: usize,
+        mmap: Arc<memmap2::Mmap>,
+        hnsw_tuning: HnswTuning,
     ) -> Self {
         // Debug-mode bounds check: pointer must lie within the mmap region.
         debug_assert!(
@@ -660,12 +750,21 @@ impl VectorStore {
             hashes,
             key_index,
             hnsw_index: OnceLock::new(),
+            hnsw_tuning,
         }
     }
 
     /// Build from an EmbeddingCache (HashMap of path -> (hash, vector)).
     /// Single pass over the cache — no redundant HashMap lookups.
     pub fn from_cache(cache: &HashMap<String, CacheEntry>) -> Option<Self> {
+        Self::from_cache_with_tuning(cache, HnswTuning::default())
+    }
+
+    /// Like [`Self::from_cache`] but with explicit HNSW tuning knobs.
+    pub fn from_cache_with_tuning(
+        cache: &HashMap<String, CacheEntry>,
+        hnsw_tuning: HnswTuning,
+    ) -> Option<Self> {
         if cache.is_empty() {
             return None;
         }
@@ -679,7 +778,13 @@ impl VectorStore {
             hashes.push(entry.hash.clone());
             vectors.extend_from_slice(&entry.vector);
         }
-        Some(Self::new(dims, keys, hashes, vectors))
+        Some(Self::new_with_tuning(
+            dims,
+            keys,
+            hashes,
+            vectors,
+            hnsw_tuning,
+        ))
     }
 
     /// Number of vectors stored.
@@ -764,6 +869,7 @@ impl VectorStore {
         }
 
         // Build HNSW index lazily — only once for the lifetime of this VectorStore.
+        let tuning = self.hnsw_tuning;
         let index = self.hnsw_index.get_or_init(|| {
             let vectors = self.vectors.as_slice();
             let dims = self.dims as usize;
@@ -778,7 +884,10 @@ impl VectorStore {
             // values[i] = original index i — lets us map PointId → key
             let values: Vec<usize> = (0..n).collect();
 
-            instant_distance::Builder::default().build(points, values)
+            instant_distance::Builder::default()
+                .ef_construction(tuning.ef_construction)
+                .ef_search(tuning.ef_search)
+                .build(points, values)
         });
 
         let query_point = HnswPoint(query.to_vec());
@@ -1827,6 +1936,25 @@ mod tests {
         VectorStore::new(dims as u32, keys, hashes, vectors)
     }
 
+    /// Build two large (>2000) identical stores: one via `new`, one via `new_with_tuning`
+    /// with default knobs — so tests can compare their outputs.
+    fn make_large_identical_stores() -> (VectorStore, VectorStore) {
+        let n = 2001_usize;
+        let dims = 3_u32;
+        let keys: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+        let hashes: Vec<String> = keys.clone();
+        let vectors: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let v = (i as f32) * 0.001;
+                vec![v, v + 0.5, 1.0 - v]
+            })
+            .collect();
+        let store_default = VectorStore::new(dims, keys.clone(), hashes.clone(), vectors.clone());
+        let store_tuned =
+            VectorStore::new_with_tuning(dims, keys, hashes, vectors, HnswTuning::default());
+        (store_default, store_tuned)
+    }
+
     #[test]
     fn hnsw_find_nearest_returns_correct_top_k() {
         // 20 known 4-dim vectors; query close to index 0 (angle=0 → (1,0,…))
@@ -1881,6 +2009,62 @@ mod tests {
             "Repeated HNSW calls must return consistent results (OnceLock)"
         );
         assert!(!r1.is_empty());
+    }
+
+    /// Verify that `HnswTuning::default()` matches the expected defaults.
+    #[test]
+    fn hnsw_tuning_default_values() {
+        let t = HnswTuning::default();
+        assert_eq!(
+            t.ef_construction,
+            crate::config::DEFAULT_HNSW_EF_CONSTRUCTION
+        );
+        assert_eq!(t.ef_search, crate::config::DEFAULT_HNSW_EF_SEARCH);
+    }
+
+    /// Verify that `new_with_tuning` produces a store that answers HNSW queries
+    /// identically to `new` when using default knob values.
+    #[test]
+    fn hnsw_tuning_default_matches_new() {
+        let (store_default, store_tuned) = make_large_identical_stores();
+        let query = vec![1.0_f32; 3];
+        let r1 = store_default.find_nearest_hnsw(&query, 5);
+        let r2 = store_tuned.find_nearest_hnsw(&query, 5);
+        // Both should find results; key sets must match (order may vary for HNSW ties).
+        let keys1: std::collections::HashSet<_> = r1.iter().map(|(k, _)| k.clone()).collect();
+        let keys2: std::collections::HashSet<_> = r2.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys1, keys2, "default tuning should match new() results");
+    }
+
+    /// Verify that a custom ef_search setting is accepted without panic.
+    #[test]
+    fn hnsw_tuning_custom_ef_search_no_panic() {
+        let tuning = HnswTuning {
+            ef_construction: 50,
+            ef_search: 256,
+        };
+        let (store, _) = {
+            let n = 2001_usize;
+            let dims = 3_u32;
+            let keys: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+            let hashes: Vec<String> = keys.to_vec();
+            let vectors: Vec<f32> = (0..n)
+                .flat_map(|i| {
+                    let v = i as f32;
+                    vec![v, v + 1.0, v + 2.0]
+                })
+                .collect();
+            (
+                VectorStore::new_with_tuning(dims, keys, hashes, vectors, tuning),
+                (),
+            )
+        };
+        let query = vec![1.0_f32, 2.0, 3.0];
+        let results = store.find_nearest_hnsw(&query, 5);
+        assert!(
+            !results.is_empty(),
+            "custom ef_search=256 should still return results"
+        );
     }
 }
 
