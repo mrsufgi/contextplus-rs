@@ -624,7 +624,7 @@ impl HnswTuning {
     /// `HnswTuning::default()` or pass an explicit tuning.
     pub fn global() -> Self {
         static GLOBAL: std::sync::OnceLock<HnswTuning> = std::sync::OnceLock::new();
-        *GLOBAL.get_or_init(|| HnswTuning::from_config(&crate::config::Config::load()))
+        *GLOBAL.get_or_init(|| HnswTuning::from_config(&crate::config::Config::from_env()))
     }
 }
 
