@@ -121,6 +121,57 @@ impl CacheData {
         )
     }
 
+    /// Remove cache entries whose keys would be excluded by the walker's path
+    /// filter (dot-segment hidden-path rule).
+    ///
+    /// This is the hygiene sweep that clears stale entries accumulated before
+    /// the dot-segment exclusion was enforced — e.g. `.claude/worktrees/…`
+    /// paths written when the MCP server was mistakenly run from inside a
+    /// worktree directory, or leftovers from an older code version that did not
+    /// apply `should_track` during initial indexing.
+    ///
+    /// The sweep is cheap (single linear pass, no allocation when nothing is
+    /// removed) and is called unconditionally on every `load_cache` so the
+    /// on-disk file self-heals on the next `save_cache` write.
+    ///
+    /// Returns the number of entries removed (for logging).
+    pub fn sweep_excluded_keys(&mut self) -> usize {
+        let dim = self.dims as usize;
+        if dim == 0 || self.keys.is_empty() {
+            return 0;
+        }
+
+        let mut keep_new_keys: Vec<String> = Vec::with_capacity(self.keys.len());
+        let mut keep_new_hashes: Vec<String> = Vec::with_capacity(self.hashes.len());
+        let mut keep_new_vectors: Vec<f32> = Vec::with_capacity(self.vectors.len());
+        let mut removed = 0usize;
+
+        for (i, key) in self.keys.iter().enumerate() {
+            if crate::core::walker::should_track(key, &Default::default()) {
+                keep_new_keys.push(key.clone());
+                if let Some(h) = self.hashes.get(i) {
+                    keep_new_hashes.push(h.clone());
+                } else {
+                    keep_new_hashes.push(String::new());
+                }
+                let off = i * dim;
+                if off + dim <= self.vectors.len() {
+                    keep_new_vectors.extend_from_slice(&self.vectors[off..off + dim]);
+                }
+            } else {
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            self.keys = keep_new_keys;
+            self.hashes = keep_new_hashes;
+            self.vectors = keep_new_vectors;
+        }
+
+        removed
+    }
+
     /// Build from a cache map.
     pub fn from_cache_map(cache: &HashMap<String, CacheEntry>) -> Option<Self> {
         if cache.is_empty() {
@@ -346,8 +397,21 @@ pub fn load_cache(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
 
     let data_bytes = &bytes[HEADER_SIZE..];
 
-    let data = rkyv::from_bytes::<CacheData, rkyv::rancor::Error>(data_bytes)
+    let mut data = rkyv::from_bytes::<CacheData, rkyv::rancor::Error>(data_bytes)
         .map_err(|e| ContextPlusError::Cache(format!("rkyv deserialize: {}", e)))?;
+
+    // Hygiene sweep: drop any entries whose key would be excluded by the
+    // walker's dot-segment rule (e.g. stale `.claude/worktrees/…` paths that
+    // were indexed before the exclusion was enforced).
+    let removed = data.sweep_excluded_keys();
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            cache = name,
+            "load_cache: swept {} excluded-path entries (stale worktree/hidden paths)",
+            removed
+        );
+    }
 
     Ok(Some(data))
 }
@@ -1424,5 +1488,141 @@ mod tests {
             }
             other => panic!("expected Err(Cache(_)), got {:?}", other),
         }
+    }
+
+    // -- sweep_excluded_keys / load_cache hygiene sweep --
+
+    /// `sweep_excluded_keys` must remove entries whose keys contain a dot-prefixed
+    /// path segment (the walker's hidden-file rule), while leaving valid paths
+    /// untouched.
+    #[test]
+    fn sweep_excluded_keys_removes_dot_segment_paths() {
+        let mut data = CacheData {
+            dims: 2,
+            keys: vec![
+                "src/main.rs".into(),
+                ".claude/worktrees/agent-abc/src/main.rs".into(),
+                ".claude/worktrees/agent-xyz/packages/foo.ts".into(),
+                "packages/lib/index.ts".into(),
+            ],
+            hashes: vec!["h1".into(), "h2".into(), "h3".into(), "h4".into()],
+            vectors: vec![
+                1.0, 1.1, // src/main.rs
+                2.0, 2.1, // .claude/worktrees/agent-abc/...
+                3.0, 3.1, // .claude/worktrees/agent-xyz/...
+                4.0, 4.1, // packages/lib/index.ts
+            ],
+        };
+
+        let removed = data.sweep_excluded_keys();
+
+        assert_eq!(removed, 2, "two worktree entries should be removed");
+        assert_eq!(data.keys.len(), 2);
+        assert!(
+            data.keys.iter().any(|k| k == "src/main.rs"),
+            "src/main.rs must survive"
+        );
+        assert!(
+            data.keys.iter().any(|k| k == "packages/lib/index.ts"),
+            "packages/lib/index.ts must survive"
+        );
+        assert!(
+            !data.keys.iter().any(|k| k.contains(".claude")),
+            ".claude/… paths must be removed"
+        );
+        // Vector data must be consistent with remaining keys
+        assert_eq!(
+            data.vectors.len(),
+            data.keys.len() * data.dims as usize,
+            "vectors must stay aligned after sweep"
+        );
+    }
+
+    /// `sweep_excluded_keys` must be a no-op when all paths are valid.
+    #[test]
+    fn sweep_excluded_keys_noop_on_clean_data() {
+        let mut data = CacheData {
+            dims: 2,
+            keys: vec!["src/a.rs".into(), "lib/b.ts".into()],
+            hashes: vec!["ha".into(), "hb".into()],
+            vectors: vec![1.0, 1.1, 2.0, 2.1],
+        };
+
+        let removed = data.sweep_excluded_keys();
+
+        assert_eq!(removed, 0);
+        assert_eq!(data.keys.len(), 2);
+        assert_eq!(data.vectors.len(), 4);
+    }
+
+    /// `sweep_excluded_keys` on empty CacheData must not panic.
+    #[test]
+    fn sweep_excluded_keys_empty_data_is_noop() {
+        let mut data = CacheData {
+            dims: 0,
+            keys: vec![],
+            hashes: vec![],
+            vectors: vec![],
+        };
+        assert_eq!(data.sweep_excluded_keys(), 0);
+    }
+
+    /// Integration: `load_cache` must automatically drop `.claude/worktrees/…`
+    /// entries that were present in the on-disk file from a previous (buggy)
+    /// indexing run — the caller must never see them in the returned CacheData.
+    #[test]
+    fn load_cache_sweeps_worktree_entries_from_disk() {
+        let dir = TempDir::new().unwrap();
+
+        // Write a cache file that contains a mix of valid and worktree paths,
+        // simulating a cache produced by an older code version.
+        let dirty = CacheData {
+            dims: 2,
+            keys: vec![
+                "src/server.rs".into(),
+                ".claude/worktrees/agent-a30a5dbd/packages/libs/types/generated/foo.ts".into(),
+                ".claude/worktrees/fix-121-lint/src/lib.rs".into(),
+                "packages/api/index.ts".into(),
+            ],
+            hashes: vec!["h1".into(), "h2".into(), "h3".into(), "h4".into()],
+            vectors: vec![
+                0.1, 0.2, // src/server.rs
+                0.3, 0.4, // .claude/worktrees/agent-a30a5dbd/…
+                0.5, 0.6, // .claude/worktrees/fix-121-lint/…
+                0.7, 0.8, // packages/api/index.ts
+            ],
+        };
+        // Bypass the hygiene sweep by writing directly via save_cache_overwrite
+        // (which is a raw write with no sweep).
+        save_cache_overwrite(dir.path(), "test-dirty", &dirty).unwrap();
+
+        // Now load through the public API — sweep must have fired.
+        let loaded = load_cache(dir.path(), "test-dirty").unwrap().unwrap();
+
+        assert_eq!(
+            loaded.keys.len(),
+            2,
+            "only the two valid keys must survive; got {:?}",
+            loaded.keys
+        );
+        assert!(
+            loaded.keys.iter().any(|k| k == "src/server.rs"),
+            "src/server.rs must be present"
+        );
+        assert!(
+            loaded.keys.iter().any(|k| k == "packages/api/index.ts"),
+            "packages/api/index.ts must be present"
+        );
+        assert!(
+            !loaded.keys.iter().any(|k| k.contains(".claude")),
+            ".claude/worktrees/… entries must be swept on load; remaining keys={:?}",
+            loaded.keys
+        );
+        // Vector buffer must be consistent with the remaining key count.
+        assert_eq!(
+            loaded.vectors.len(),
+            loaded.keys.len() * loaded.dims as usize,
+            "vector buffer must stay aligned after sweep"
+        );
     }
 }
