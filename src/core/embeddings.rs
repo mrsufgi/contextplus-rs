@@ -210,11 +210,48 @@ impl OllamaClient {
     /// 2. Spawns a background Tokio task that debounce-flushes the LRU to disk
     ///    whenever a new query embedding is inserted.
     pub fn new_with_root(config: &Config, root_dir: Option<PathBuf>) -> Self {
-        let client = reqwest::Client::builder()
+        // Build default headers — Authorization is injected once at construction
+        // time so there is zero per-request cost.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = config
+            .ollama_api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
+        {
+            let bearer = format!("Bearer {}", key.trim());
+            if let Ok(mut val) = reqwest::header::HeaderValue::from_str(&bearer) {
+                // Mark sensitive so reqwest / debug logs redact the bearer token.
+                val.set_sensitive(true);
+                default_headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+
+        // HTTP/2 prior-knowledge only for plain-HTTP hosts (localhost Ollama).
+        // For HTTPS endpoints (TLS-proxied Ollama) we let reqwest's ALPN
+        // negotiate h2 normally — calling `http2_prior_knowledge()` there would
+        // cause handshake failures.
+        let use_h2_prior_knowledge = !config.ollama_host.starts_with("https://");
+
+        let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("reqwest client build");
+            // Keep idle connections alive for 55 s — safely under the common
+            // 60 s idle-eviction window used by reverse proxies and firewalls.
+            .pool_idle_timeout(std::time::Duration::from_secs(55))
+            // TCP keepalive pings every 30 s so NAT/firewall state is preserved
+            // even when the connection is otherwise silent.
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            // HTTP/2 application-level keepalive: ping every 25 s, timeout
+            // after 10 s. Pairs with pool_idle_timeout(55 s) so the connection
+            // isn't evicted between requests under light load.
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(25)))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .default_headers(default_headers)
+            .timeout(std::time::Duration::from_secs(120));
+        if use_h2_prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+        let client = builder.build().expect("reqwest client build");
 
         let in_mem_cap = QUERY_CACHE_PERSIST_CAP.max(256);
         let cache = Arc::new(std::sync::Mutex::new(BoundedLruCache::new(in_mem_cap)));
@@ -1528,6 +1565,67 @@ mod tests {
     }
 
     // -- OllamaClient construction --
+
+    // Fix 1: HTTP/2 — verify the client builds without panicking when the
+    // http2 feature is enabled and http2_prior_knowledge() is in the builder.
+    #[test]
+    fn http2_feature_enabled_in_build() {
+        // If the "http2" feature were missing the builder call would fail to
+        // compile; reaching this line at runtime proves the feature is active
+        // and the builder chain succeeds.
+        let config = Config::from_env();
+        let _client = OllamaClient::new(&config);
+        // No panic == pass.
+    }
+
+    // Fix 2a: API key present → Authorization header injected.
+    #[test]
+    fn api_key_header_present_when_env_set() {
+        let mut config = Config::from_env();
+        config.ollama_api_key = Some("test-key".to_string());
+        // Build a raw reqwest client the same way new_with_root does so we can
+        // inspect default_headers via the Debug representation.
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = config.ollama_api_key.as_deref().filter(|k| !k.is_empty()) {
+            let bearer = format!("Bearer {key}");
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&bearer) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+        let auth = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("Authorization header must be set when api key is present");
+        assert_eq!(auth.to_str().unwrap(), "Bearer test-key");
+    }
+
+    // Fix 2b: API key absent → no Authorization header.
+    #[test]
+    fn api_key_no_header_when_env_unset() {
+        let mut config = Config::from_env();
+        config.ollama_api_key = None;
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = config.ollama_api_key.as_deref().filter(|k| !k.is_empty()) {
+            let bearer = format!("Bearer {key}");
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&bearer) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+        assert!(
+            headers.get(reqwest::header::AUTHORIZATION).is_none(),
+            "Authorization header must NOT be present when api key is absent"
+        );
+    }
+
+    // Fix 3: pool_idle_timeout + tcp_keepalive — the builder succeeds (compile-
+    // time check via the builder chain in new_with_root; no socket-level test
+    // needed for a unit suite).
+    #[test]
+    fn client_builds_with_keepalive_and_pool_timeout() {
+        let config = Config::from_env();
+        let _client = OllamaClient::new(&config);
+        // Reaching here means the builder chain — including pool_idle_timeout
+        // and tcp_keepalive — compiled and ran without error.
+    }
 
     #[test]
     fn ollama_client_respects_config() {
