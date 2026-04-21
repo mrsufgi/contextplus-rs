@@ -210,6 +210,61 @@ The `get_context_tree` tool supports two parameters for controlling output size:
   - **Level 1:** Headers only (symbols pruned)
   - **Level 0:** File names only (headers + symbols pruned)
 
+## Configuration Reference
+
+All runtime knobs are read from environment variables by `Config::from_env()` (`src/config.rs`).
+
+### Ollama / embedding
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
+| `OLLAMA_EMBED_MODEL` | `snowflake-arctic-embed2` | Embedding model |
+| `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model for cluster labels |
+| `OLLAMA_API_KEY` | _(none)_ | Optional API key |
+| `CONTEXTPLUS_EMBED_BATCH_SIZE` | `50` | Document embedding batch size (clamped 5–512) |
+| `CONTEXTPLUS_QUERY_BATCH_SIZE` | `1` | Query embedding batch size per Ollama request |
+| `CONTEXTPLUS_EMBED_CHUNK_CHARS` | `2000` | Max chars per embedding input (clamped 256–8000) |
+| `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `51200` (50 KB) | Skip files larger than this (bytes) for embedding |
+| `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated) |
+| `CONTEXTPLUS_CACHE_TTL_SECS` | `300` | Embedding cache TTL in seconds |
+| `CONTEXTPLUS_EMBED_NUM_GPU` | _(none)_ | Ollama `num_gpu` option |
+| `CONTEXTPLUS_EMBED_MAIN_GPU` | _(none)_ | Ollama `main_gpu` option |
+| `CONTEXTPLUS_EMBED_NUM_THREAD` | _(none)_ | Ollama `num_thread` option |
+| `CONTEXTPLUS_EMBED_NUM_BATCH` | _(none)_ | Ollama `num_batch` option |
+| `CONTEXTPLUS_EMBED_NUM_CTX` | _(none)_ | Ollama `num_ctx` option |
+| `CONTEXTPLUS_EMBED_LOW_VRAM` | _(none)_ | Ollama `low_vram` option (`true`/`false`) |
+
+### Search / indexing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_HNSW_EF_CONSTRUCTION` | `100` | HNSW `efConstruction` — index build quality vs. time |
+| `CONTEXTPLUS_HNSW_EF_SEARCH` | `32` | HNSW `ef_search` — recall vs. query latency |
+| `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` | `10` | ANN candidate pool = `top_k × N`; applies when corpus > 2,000 files |
+
+### Warmup
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_WARMUP_ON_START` | `true` | Warm `SearchIndex` cache at server startup |
+| `CONTEXTPLUS_WARMUP_CONCURRENCY` | `1` | Parallel Ollama requests during warmup binaries |
+
+### Tracker (file-watcher)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_EMBED_TRACKER` | `lazy` | Tracker mode: `lazy`, `eager`/`startup`, `off`/`false` |
+| `CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS` | `700` | File-watcher debounce window (ms) |
+| `CONTEXTPLUS_EMBED_TRACKER_MAX_FILES` | `8` | Max files re-embedded per watcher tick |
+
+### Process lifecycle
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_IDLE_TIMEOUT_MS` | `900000` | Auto-shutdown after idle ms (0 or `off` to disable) |
+| `CONTEXTPLUS_PARENT_POLL_MS` | `5000` | Parent PID poll interval (ms) |
+
 ## Adding a New Tool
 
 1. **Create the tool module** -- Add `src/tools/my_tool.rs` with your pure logic functions and

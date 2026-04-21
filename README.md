@@ -83,7 +83,7 @@ ollama pull qwen3.5:9b                # chat (for cluster labeling)
 
 ## Configuration
 
-Same environment variables as the TypeScript version:
+### Ollama / embedding
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -91,22 +91,48 @@ Same environment variables as the TypeScript version:
 | `OLLAMA_EMBED_MODEL` | `snowflake-arctic-embed2` | Embedding model |
 | `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model for cluster labels |
 | `OLLAMA_API_KEY` | _(none)_ | Optional API key |
-| `CONTEXTPLUS_EMBED_BATCH_SIZE` | `50` | Embedding batch size (clamped 5–512) |
-| `CONTEXTPLUS_EMBED_TRACKER` | `lazy` | Tracker mode: `lazy` (start on first search), `eager` (start at boot), `off` |
-| `CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS` | `700` | File watcher debounce |
-| `CONTEXTPLUS_EMBED_TRACKER_MAX_FILES` | `8` | Max files per watcher tick |
+| `CONTEXTPLUS_EMBED_BATCH_SIZE` | `50` | Document embedding batch size (clamped 5–512) |
+| `CONTEXTPLUS_QUERY_BATCH_SIZE` | `1` | Query embedding batch size (number of query vectors sent per Ollama request) |
 | `CONTEXTPLUS_EMBED_CHUNK_CHARS` | `2000` | Max chars per embedding input (clamped 256–8000). Oversized inputs are chunked and merged |
-| `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `50KB` | Skip files larger than this for embedding (min 1KB) |
-| `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated) |
+| `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `51200` (50 KB) | Skip files larger than this (bytes) for embedding. Min 1 KB |
+| `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated), appended to the built-in list |
 | `CONTEXTPLUS_CACHE_TTL_SECS` | `300` | Embedding cache TTL in seconds |
-| `CONTEXTPLUS_IDLE_TIMEOUT_MS` | `900000` | Auto-shutdown after idle period (0 or `off` to disable, min 60s) |
-| `CONTEXTPLUS_PARENT_POLL_MS` | `5000` | Poll interval for parent PID monitor (min 1s) |
 | `CONTEXTPLUS_EMBED_NUM_GPU` | _(none)_ | Ollama `num_gpu` option (GPU layer count) |
 | `CONTEXTPLUS_EMBED_MAIN_GPU` | _(none)_ | Ollama `main_gpu` option (primary GPU index) |
 | `CONTEXTPLUS_EMBED_NUM_THREAD` | _(none)_ | Ollama `num_thread` option |
 | `CONTEXTPLUS_EMBED_NUM_BATCH` | _(none)_ | Ollama `num_batch` option |
 | `CONTEXTPLUS_EMBED_NUM_CTX` | _(none)_ | Ollama `num_ctx` option |
 | `CONTEXTPLUS_EMBED_LOW_VRAM` | _(none)_ | Ollama `low_vram` option (`true`/`false`) |
+
+### Search / indexing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_HNSW_EF_CONSTRUCTION` | `100` | HNSW `efConstruction` — higher values improve index quality at the cost of build time |
+| `CONTEXTPLUS_HNSW_EF_SEARCH` | `32` | HNSW `ef_search` — higher values improve recall at the cost of query latency. Set explicitly when higher recall is needed |
+| `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` | `10` | ANN candidate pool multiplier: fetches `top_k × N` HNSW candidates before re-ranking. Larger values improve recall; only applies when corpus exceeds 2,000 files |
+
+### Warmup
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_WARMUP_ON_START` | `true` | Warm the `SearchIndex` cache at server startup. Set to `false` / `0` / `no` / `off` to disable |
+| `CONTEXTPLUS_WARMUP_CONCURRENCY` | `1` | Number of parallel Ollama embed requests during `warmup_embeddings` / `warmup_identifiers`. Set to match `OLLAMA_NUM_PARALLEL` on the host |
+
+### Tracker (file-watcher)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_EMBED_TRACKER` | `lazy` | Tracker mode: `lazy` (start on first search), `eager` / `startup` (start at boot), `off` / `false` (disabled) |
+| `CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS` | `700` | File-watcher debounce window in milliseconds |
+| `CONTEXTPLUS_EMBED_TRACKER_MAX_FILES` | `8` | Max files re-embedded per watcher tick |
+
+### Process lifecycle
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_IDLE_TIMEOUT_MS` | `900000` | Auto-shutdown after this many ms idle (0 or `off` to disable, min 60 s) |
+| `CONTEXTPLUS_PARENT_POLL_MS` | `5000` | Poll interval for parent PID orphan detection in milliseconds (min 1 s) |
 
 ## Usage
 
