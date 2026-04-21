@@ -141,23 +141,38 @@ impl CacheData {
             return 0;
         }
 
+        // A well-formed CacheData has keys.len() == hashes.len() and
+        // vectors.len() == keys.len() * dim. If these invariants are violated
+        // (partially-written file, older version with different schema, etc.),
+        // treat it as corruption: skip the entire entry rather than silently
+        // producing misaligned keys/hashes/vectors. Downstream `to_store()`
+        // would otherwise panic on misalignment.
         let mut keep_new_keys: Vec<String> = Vec::with_capacity(self.keys.len());
         let mut keep_new_hashes: Vec<String> = Vec::with_capacity(self.hashes.len());
         let mut keep_new_vectors: Vec<f32> = Vec::with_capacity(self.vectors.len());
         let mut removed = 0usize;
 
         for (i, key) in self.keys.iter().enumerate() {
+            let off = i * dim;
+            let hash_ok = self.hashes.get(i).is_some();
+            let vector_ok = off + dim <= self.vectors.len();
+
+            if !hash_ok || !vector_ok {
+                // Corrupt or truncated entry — drop it entirely.
+                tracing::warn!(
+                    key = %key,
+                    hash_present = hash_ok,
+                    vector_in_bounds = vector_ok,
+                    "sweep_excluded_keys: misaligned cache entry — dropping"
+                );
+                removed += 1;
+                continue;
+            }
+
             if crate::core::walker::should_track(key, &Default::default()) {
                 keep_new_keys.push(key.clone());
-                if let Some(h) = self.hashes.get(i) {
-                    keep_new_hashes.push(h.clone());
-                } else {
-                    keep_new_hashes.push(String::new());
-                }
-                let off = i * dim;
-                if off + dim <= self.vectors.len() {
-                    keep_new_vectors.extend_from_slice(&self.vectors[off..off + dim]);
-                }
+                keep_new_hashes.push(self.hashes[i].clone());
+                keep_new_vectors.extend_from_slice(&self.vectors[off..off + dim]);
             } else {
                 removed += 1;
             }
