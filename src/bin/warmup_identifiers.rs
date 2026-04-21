@@ -73,17 +73,21 @@ async fn main() {
                     "{} {} {} {} {} {}",
                     sym.name, sym.kind, sig, entry.relative_path, header, parent
                 );
+                let token_set =
+                    IdentifierDoc::build_token_set(&sym.name, &sig, &entry.relative_path, &header);
                 identifier_docs.push(IdentifierDoc {
                     id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
                     path: entry.relative_path.clone(),
                     header: header.clone(),
                     name: sym.name.clone(),
+                    kind_lower: sym.kind.to_lowercase(),
                     kind: sym.kind.clone(),
                     line: sym.line,
                     end_line: sym.end_line,
                     signature: sig,
                     parent_name: sym.parent_name.clone(),
                     text,
+                    token_set,
                 });
             }
             files_parsed += 1;
