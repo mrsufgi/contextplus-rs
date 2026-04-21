@@ -96,6 +96,13 @@ pub struct SharedState {
     /// Cached SearchIndex for semantic_code_search — reused when the walk fingerprint
     /// is unchanged, eliminating the per-request HNSW rebuild for large corpora.
     pub search_index_cache: RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>,
+    /// Monotonic counter incremented by the embedding tracker whenever a file-change
+    /// event is processed. `semantic_code_search` compares the counter at request time
+    /// against `CachedSearchIndex::generation`; equality means the tracker has seen no
+    /// changes since the last build and the filesystem walk can be skipped entirely.
+    /// When the tracker is disabled the counter stays at 0 and the fingerprint-based
+    /// fallback takes over.
+    pub cache_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Cached instructions content — fetched once from remote, then served from memory.
     pub instructions_cache: OnceCell<String>,
     /// Tracker handle for lazy-start mode.
@@ -171,6 +178,7 @@ impl ContextPlusServer {
             embedding_cache: RwLock::new(initial_cache),
             identifier_index: RwLock::new(None),
             search_index_cache: RwLock::new(None),
+            cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             instructions_cache: OnceCell::new(),
             tracker_handle: std::sync::Mutex::new(None),
             idle_monitor: RwLock::new(None),
@@ -193,6 +201,19 @@ impl ContextPlusServer {
                     skipped,
                     "Incremental re-embedding for {} changed files",
                     changed_files.len()
+                );
+                // Invalidate the search-index cache by bumping the generation counter.
+                // Any in-flight or subsequent `semantic_code_search` request will see a
+                // generation mismatch and re-walk + rebuild instead of reusing the stale
+                // cached index.
+                let new_gen = srv
+                    .state
+                    .cache_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Release)
+                    + 1;
+                tracing::debug!(
+                    generation = new_gen,
+                    "cache_generation bumped after tracker event"
                 );
                 (updated, skipped)
             })
@@ -930,11 +951,21 @@ impl ContextPlusServer {
             state: self.state.clone(),
         };
 
+        // Pass the generation counter when the tracker is active so
+        // `semantic_code_search` can skip the walk on a generation hit.
+        // When the tracker is Off the counter stays at 0 and the
+        // fingerprint-based fallback is used instead.
+        let cache_gen = if self.state.config.embed_tracker_mode != crate::config::TrackerMode::Off {
+            Some(&self.state.cache_generation)
+        } else {
+            None
+        };
         let result = crate::tools::semantic_search::semantic_code_search(
             options,
             &embedder,
             &walker,
             Some(&self.state.search_index_cache),
+            cache_gen,
         )
         .await?;
         Ok(Self::ok_text(result))
