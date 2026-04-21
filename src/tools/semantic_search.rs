@@ -818,10 +818,18 @@ impl CachedSearchIndex {
 /// Vectors are stored in a flat contiguous buffer for cache-friendly SIMD access.
 /// For corpora larger than `ANN_THRESHOLD`, a `VectorStore` is also built so
 /// `search()` can use HNSW ANN pre-filtering instead of a full cosine scan.
+///
+/// Memory optimisation: when `ann_store` is `Some` (corpus ≥ `ANN_THRESHOLD`),
+/// `vector_buffer` is released (`capacity() == 0`) because the `VectorStore`
+/// already owns an identical copy. The cosine-scoring path then retrieves
+/// per-document vectors from `ann_store` via `get_vector`. Below threshold the
+/// buffer is kept for the brute-force O(N) scan.
 pub struct SearchIndex {
     documents: Vec<SearchDocument>,
     /// Flat buffer: `vector_buffer[i * dims .. (i+1) * dims]` is the vector for doc `i`.
     /// Docs without vectors have `has_vector[i] == false` and zeros in the buffer.
+    /// **Dropped (capacity 0) when `ann_store.is_some()`** — vectors live in the
+    /// store instead, avoiding the double-allocation.
     vector_buffer: Vec<f32>,
     /// Which docs have valid embedding vectors.
     has_vector: Vec<bool>,
@@ -901,6 +909,14 @@ impl SearchIndex {
         } else {
             None
         };
+
+        // When the ANN store owns the vectors, release the flat buffer to avoid
+        // carrying two identical copies of the embedding data in memory.
+        // The brute-force scoring path (corpus < ANN_THRESHOLD) still needs the
+        // buffer, so it is only dropped when ann_store is Some.
+        if ann_store.is_some() {
+            buffer = Vec::new();
+        }
 
         self.documents = docs;
         self.vector_buffer = buffer;
@@ -991,8 +1007,19 @@ impl SearchIndex {
                 if !path_passes_filters(&doc.path, opts) {
                     return None;
                 }
-                let offset = i * self.dims;
-                let vec_slice = &self.vector_buffer[offset..offset + self.dims];
+                // When ann_store owns the vectors (corpus ≥ ANN_THRESHOLD) the
+                // flat buffer has been dropped to save memory; retrieve via the
+                // store's key→index map.  Below threshold the buffer is used
+                // directly for cache-friendly sequential access.
+                let vec_slice: &[f32] = if let Some(store) = self.ann_store.as_ref() {
+                    match store.get_vector(&doc.path) {
+                        Some(v) => v,
+                        None => return None, // doc not in store — skip
+                    }
+                } else {
+                    let offset = i * self.dims;
+                    &self.vector_buffer[offset..offset + self.dims]
+                };
                 let semantic_score = cosine(query_vec, vec_slice);
 
                 let matched_entries = get_matched_symbol_entries(
@@ -2590,6 +2617,109 @@ mod tests {
         assert!(
             !paths.contains(&"src/noise.ts"),
             "no-embedding doc with zero keyword match must not pollute results; got: {paths:?}"
+        );
+    }
+
+    // -- Memory-efficiency tests --
+
+    /// Helper: build a corpus of `n` docs with `dims`-dimensional unit vectors.
+    fn make_small_dim_corpus(
+        n: usize,
+        dims: usize,
+    ) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>) {
+        let docs: Vec<SearchDocument> = (0..n)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/file_{i}.rs"),
+                    format!("file {i}"),
+                    vec![format!("sym_{i}")],
+                    vec![],
+                    format!("content {i}"),
+                )
+            })
+            .collect();
+        let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut v = vec![0.0f32; dims];
+            v[i % dims] = 1.0;
+            vectors.push(Some(v));
+        }
+        (docs, vectors)
+    }
+
+    /// When the corpus exceeds ANN_THRESHOLD the flat `vector_buffer` must be
+    /// released (capacity == 0) because the `VectorStore` already owns the data.
+    /// This guards the fix for the double-allocation identified in PR #48 review F2.
+    #[test]
+    fn test_vector_buffer_dropped_when_ann_store_present() {
+        // Use small dims (16) to keep the test fast even at 2050 docs.
+        let n = ANN_THRESHOLD + 50;
+        let dims = 16;
+        let (docs, vectors) = make_small_dim_corpus(n, dims);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        assert!(
+            index.ann_store.is_some(),
+            "ann_store must be Some for n={n} >= ANN_THRESHOLD"
+        );
+        assert_eq!(
+            index.vector_buffer.capacity(),
+            0,
+            "vector_buffer must be released (capacity 0) when ann_store owns the vectors; \
+             double-allocation detected"
+        );
+    }
+
+    /// Below ANN_THRESHOLD the buffer is retained for the brute-force path.
+    #[test]
+    fn test_vector_buffer_retained_below_threshold() {
+        let n = ANN_THRESHOLD - 1;
+        let dims = 16;
+        let (docs, vectors) = make_small_dim_corpus(n, dims);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        assert!(index.ann_store.is_none());
+        assert!(
+            index.vector_buffer.capacity() > 0,
+            "vector_buffer must be retained below ANN_THRESHOLD"
+        );
+    }
+
+    /// Correctness: search still returns results after vector_buffer is dropped (ANN path).
+    /// Uses make_ann_corpus (unique R^4 directions) to guarantee a clear nearest neighbour.
+    #[test]
+    fn test_search_correct_after_buffer_drop() {
+        // Reuse make_ann_corpus which assigns unique monotonically-rotating unit
+        // vectors in R^4. File_0 is the closest match to query (1,0,0,0).
+        let n = ANN_THRESHOLD + 50;
+        let (docs, vectors) = make_ann_corpus(n);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        // Buffer must be gone.
+        assert_eq!(index.vector_buffer.capacity(), 0);
+
+        let query_vec = unit_vec(1.0, 0.001);
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+
+        let results = index.search("file", &query_vec, &opts);
+        assert_eq!(results.len(), 5, "should return top_k results");
+        // File_0 is the most aligned with query (1,~0,0,0).
+        assert_eq!(
+            results[0].path, "src/file_0.ts",
+            "nearest doc must be file_0.ts after buffer drop"
         );
     }
 
