@@ -12,6 +12,7 @@ use contextplus_rs::core::tree_sitter::{get_supported_extensions, parse_with_tre
 use contextplus_rs::core::walker;
 use contextplus_rs::server::cache_name;
 use contextplus_rs::tools::semantic_identifiers::IdentifierDoc;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -38,61 +39,69 @@ async fn main() {
     println!("Scanning workspace: {}", root.display());
     let entries = walker::walk_with_config(root, &config);
 
-    let mut identifier_docs: Vec<IdentifierDoc> = Vec::new();
-    let mut files_parsed = 0usize;
-
-    for entry in &entries {
-        if entry.is_directory {
-            continue;
-        }
-        let ext_with_dot = entry
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default();
-        if !supported.contains(ext_with_dot.as_str()) {
-            continue;
-        }
-        if let Ok(meta) = std::fs::metadata(&entry.path)
-            && meta.len() > max_size
-        {
-            continue;
-        }
-        let content = match std::fs::read_to_string(&entry.path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        if let Ok(symbols) = parse_with_tree_sitter(&content, &ext_with_dot) {
-            let header = extract_header(&content);
-            for sym in flatten_symbols(&symbols, None) {
-                let sig = sym.signature.clone().unwrap_or_default();
-                let parent = sym.parent_name.as_deref().unwrap_or("");
-                let text = format!(
-                    "{} {} {} {} {} {}",
-                    sym.name, sym.kind, sig, entry.relative_path, header, parent
-                );
-                let token_set =
-                    IdentifierDoc::build_token_set(&sym.name, &sig, &entry.relative_path, &header);
-                identifier_docs.push(IdentifierDoc {
-                    id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
-                    path: entry.relative_path.clone(),
-                    header: header.clone(),
-                    name: sym.name.clone(),
-                    kind_lower: sym.kind.to_lowercase(),
-                    kind: sym.kind.clone(),
-                    line: sym.line,
-                    end_line: sym.end_line,
-                    signature: sig,
-                    parent_name: sym.parent_name.clone(),
-                    text,
-                    token_set,
-                });
+    // Parse symbols in parallel (CPU-bound tree-sitter + blocking file I/O).
+    // Each entry is independent; collect per-file vecs then flatten.
+    let parse_results: Vec<(usize, Vec<IdentifierDoc>)> = entries
+        .par_iter()
+        .filter(|entry| !entry.is_directory)
+        .filter_map(|entry| {
+            let ext_with_dot = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{}", e))
+                .unwrap_or_default();
+            if !supported.contains(ext_with_dot.as_str()) {
+                return None;
             }
-            files_parsed += 1;
-        }
-    }
+            if let Ok(meta) = std::fs::metadata(&entry.path)
+                && meta.len() > max_size
+            {
+                return None;
+            }
+            let content = std::fs::read_to_string(&entry.path).ok()?;
+            let symbols = parse_with_tree_sitter(&content, &ext_with_dot).ok()?;
+            let header = extract_header(&content);
+            let docs: Vec<IdentifierDoc> = flatten_symbols(&symbols, None)
+                .into_iter()
+                .map(|sym| {
+                    let sig = sym.signature.clone().unwrap_or_default();
+                    let parent = sym.parent_name.as_deref().unwrap_or("");
+                    let text = format!(
+                        "{} {} {} {} {} {}",
+                        sym.name, sym.kind, sig, entry.relative_path, header, parent
+                    );
+                    let token_set = IdentifierDoc::build_token_set(
+                        &sym.name,
+                        &sig,
+                        &entry.relative_path,
+                        &header,
+                    );
+                    IdentifierDoc {
+                        id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
+                        path: entry.relative_path.clone(),
+                        header: header.clone(),
+                        name: sym.name.clone(),
+                        kind_lower: sym.kind.to_lowercase(),
+                        kind: sym.kind.clone(),
+                        line: sym.line,
+                        end_line: sym.end_line,
+                        signature: sig,
+                        parent_name: sym.parent_name.clone(),
+                        text,
+                        token_set,
+                    }
+                })
+                .collect();
+            Some((1usize, docs))
+        })
+        .collect();
+
+    let files_parsed: usize = parse_results.iter().map(|(n, _)| n).sum();
+    let identifier_docs: Vec<IdentifierDoc> = parse_results
+        .into_iter()
+        .flat_map(|(_, docs)| docs)
+        .collect();
 
     println!(
         "Parsed {} files, found {} identifiers",

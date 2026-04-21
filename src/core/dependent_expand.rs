@@ -16,6 +16,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::core::import_resolver;
 use crate::core::tree_sitter as ts;
 
@@ -53,18 +55,28 @@ pub struct ExpansionHit {
 /// project's tracked source files). Files outside this set won't appear in the
 /// graph even if they're imported.
 pub fn build_reverse_graph(all_files: &[PathBuf]) -> HashMap<PathBuf, HashSet<PathBuf>> {
-    let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
     let in_set: HashSet<&Path> = all_files.iter().map(|p| p.as_path()).collect();
 
-    for file in all_files {
-        let imports = ts::extract_imports(file);
-        for (importing, imported) in import_resolver::resolve_file_imports(file, &imports) {
+    // Parse imports in parallel (each file is independent CPU + blocking I/O).
+    // Collect per-file edge lists, then merge sequentially into the final map.
+    let edge_lists: Vec<Vec<(PathBuf, PathBuf)>> = all_files
+        .par_iter()
+        .map(|file| {
+            let imports = ts::extract_imports(file);
+            import_resolver::resolve_file_imports(file, &imports)
+                .into_iter()
+                .filter(|(_, imported)| in_set.contains(imported.as_path()))
+                .collect()
+        })
+        .collect();
+
+    let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+    for edges in edge_lists {
+        for (importing, imported) in edges {
             // Only record edges where both endpoints are in the project set;
             // an external dependency or a path outside the project would only
             // pollute the reverse graph.
-            if in_set.contains(imported.as_path()) {
-                reverse.entry(imported).or_default().insert(importing);
-            }
+            reverse.entry(imported).or_default().insert(importing);
         }
     }
     reverse
@@ -362,5 +374,64 @@ mod tests {
         assert!(names.contains(&"util.ts".to_string())); // seed
         assert!(names.contains(&"svc.ts".to_string())); // hop 1
         assert!(names.contains(&"api.ts".to_string())); // hop 2
+    }
+
+    /// Parallel parity: build_reverse_graph on ≥100 files must produce the
+    /// same edge set as a sequential reference built from the same inputs.
+    #[test]
+    fn build_reverse_graph_parallel_matches_sequential_100_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // 100 leaf files (no imports)
+        for i in 0..100usize {
+            fs::write(dir.join(format!("leaf{i}.ts")), "export const x = 1;").unwrap();
+        }
+        // 10 hub files each importing 10 leaves
+        for h in 0..10usize {
+            let imports: String = (0..10)
+                .map(|i| format!("import {{ x }} from './leaf{}';", h * 10 + i))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(dir.join(format!("hub{h}.ts")), imports).unwrap();
+        }
+
+        let mut all_files: Vec<PathBuf> = (0..100)
+            .map(|i| dir.join(format!("leaf{i}.ts")))
+            .chain((0..10).map(|h| dir.join(format!("hub{h}.ts"))))
+            .collect();
+        all_files.sort(); // deterministic order for both runs
+
+        // Parallel (new implementation)
+        let parallel_result = build_reverse_graph(&all_files);
+
+        // Sequential reference
+        let mut seq_result: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        let in_set: HashSet<&std::path::Path> = all_files.iter().map(|p| p.as_path()).collect();
+        for file in &all_files {
+            let imports = crate::core::tree_sitter::extract_imports(file);
+            for (importing, imported) in
+                crate::core::import_resolver::resolve_file_imports(file, &imports)
+            {
+                if in_set.contains(imported.as_path()) {
+                    seq_result.entry(imported).or_default().insert(importing);
+                }
+            }
+        }
+
+        // Both graphs must have the same keys
+        let mut par_keys: Vec<&PathBuf> = parallel_result.keys().collect();
+        let mut seq_keys: Vec<&PathBuf> = seq_result.keys().collect();
+        par_keys.sort();
+        seq_keys.sort();
+        assert_eq!(par_keys, seq_keys, "reverse graph keys must match");
+
+        // Each key must have the same importer set
+        for key in par_keys {
+            assert_eq!(
+                parallel_result[key], seq_result[key],
+                "importer set for {key:?} must match"
+            );
+        }
     }
 }
