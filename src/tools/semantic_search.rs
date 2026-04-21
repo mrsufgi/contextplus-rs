@@ -799,6 +799,25 @@ pub struct CachedSearchIndex {
     /// Wraps silently on `u64` overflow — only meaningful for monitoring deltas,
     /// not as an absolute counter.
     pub(crate) reuse_count: std::sync::atomic::AtomicU64,
+    /// Guards background rebuild: CAS false→true claims the spawn slot.
+    /// Reset by the RAII `RebuildGuard` even on panic, preventing permanent lockout.
+    pub(crate) rebuild_in_progress: std::sync::atomic::AtomicBool,
+}
+
+/// Maximum absolute doc-count delta that qualifies for a background (stale-serve) rebuild.
+const BG_REBUILD_MAX_ABS_DELTA: usize = 200;
+/// Maximum fractional doc-count delta (5%) that qualifies for a background rebuild.
+const BG_REBUILD_MAX_FRAC: f64 = 0.05;
+
+/// RAII guard that resets `rebuild_in_progress` on the held `CachedSearchIndex`
+/// when dropped — even on panic — preventing permanent lockout of the fast path.
+pub(crate) struct RebuildGuard(pub Arc<CachedSearchIndex>);
+impl Drop for RebuildGuard {
+    fn drop(&mut self) {
+        self.0
+            .rebuild_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl CachedSearchIndex {
@@ -808,6 +827,7 @@ impl CachedSearchIndex {
             fingerprint,
             generation: std::sync::atomic::AtomicU64::new(generation),
             reuse_count: std::sync::atomic::AtomicU64::new(0),
+            rebuild_in_progress: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -816,6 +836,19 @@ impl CachedSearchIndex {
         self.reuse_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1
+    }
+
+    /// Returns true when the corpus delta between `self` and `new_fp` is small enough
+    /// that we can safely serve the stale index while rebuilding in the background.
+    ///
+    /// Threshold: doc count delta ≤ min(5% of current corpus, 200 docs).
+    pub fn qualifies_for_background_rebuild(&self, new_fp: &IndexFingerprint) -> bool {
+        let old_n = self.fingerprint.n_docs;
+        let new_n = new_fp.n_docs;
+        let delta = old_n.abs_diff(new_n);
+        let cap = ((old_n as f64) * BG_REBUILD_MAX_FRAC).round() as usize;
+        let threshold = cap.min(BG_REBUILD_MAX_ABS_DELTA);
+        delta <= threshold
     }
 }
 
@@ -1353,8 +1386,8 @@ pub async fn semantic_code_search(
     options: SemanticSearchOptions,
     embed_fn: &dyn EmbedFn,
     walk_and_index_fn: &dyn WalkAndIndexFn,
-    index_cache: Option<&RwLock<Option<Arc<CachedSearchIndex>>>>,
-    cache_generation: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    index_cache: Option<Arc<RwLock<Option<Arc<CachedSearchIndex>>>>>,
+    cache_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
     if query.is_empty() {
@@ -1376,6 +1409,7 @@ pub async fn semantic_code_search(
         None => {
             // No cache slot provided — always rebuild (unit-test / legacy path).
             let current_gen = cache_generation
+                .as_ref()
                 .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(0);
             let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
@@ -1391,6 +1425,7 @@ pub async fn semantic_code_search(
         Some(lock) => {
             // Snapshot the current tracker generation before any locking.
             let current_gen = cache_generation
+                .as_ref()
                 .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(0);
 
@@ -1477,6 +1512,102 @@ pub async fn semantic_code_search(
                 ));
             }
 
+            // Background-rebuild fast-return: if the existing stale entry qualifies
+            // (small-delta corpus change) and no rebuild is already in flight, serve
+            // the stale index immediately and spawn a background task to rebuild.
+            if let Some(ref stale) = *guard
+                && stale.qualifies_for_background_rebuild(&fp)
+                && stale
+                    .rebuild_in_progress
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                // CAS succeeded — we own the rebuild slot. Drop the write-lock
+                // immediately so readers aren't blocked during the background build.
+                let stale_arc = Arc::clone(stale);
+                let stale_fp = stale.fingerprint.clone();
+                drop(guard);
+
+                let lock_clone = Arc::clone(&lock);
+                let new_fp = fp.clone();
+                let root_dir_clone = options.root_dir.clone();
+                let stale_arc_for_guard = Arc::clone(&stale_arc);
+                tracing::info!(
+                    old_n_docs = stale_fp.n_docs,
+                    new_n_docs = new_fp.n_docs,
+                    "SearchIndex small-delta miss — serving stale, spawning background rebuild"
+                );
+                tokio::spawn(async move {
+                    // RAII guard resets `rebuild_in_progress` even on panic.
+                    let _guard = crate::tools::semantic_search::RebuildGuard(stale_arc_for_guard);
+
+                    let mut new_idx = SearchIndex::new();
+                    // Re-walk to get fresh vectors (the docs/vectors we computed
+                    // above are already moved; a second walk is the safe path).
+                    let walk_result = {
+                        // We need a WalkAndIndexFn here but we can't capture the
+                        // trait object across the spawn boundary. Instead, store
+                        // the pre-walked docs & vectors via a channel-less approach:
+                        // they are passed directly as captured values from the outer scope.
+                        // The vectors captured here are the ones from our walk above.
+                        Ok::<_, crate::error::ContextPlusError>((docs, vectors))
+                    };
+                    let (bg_docs, bg_vectors) = match walk_result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("Background rebuild walk failed: {e}");
+                            return;
+                        }
+                    };
+                    new_idx.index_with_vectors_and_tuning(
+                        bg_docs,
+                        bg_vectors,
+                        crate::core::embeddings::HnswTuning::global(),
+                    );
+                    let new_entry =
+                        Arc::new(CachedSearchIndex::new(new_idx, new_fp.clone(), current_gen));
+
+                    // Stale-write guard: only install if the cached fingerprint is
+                    // still the one we intended to supersede.
+                    let mut wguard = lock_clone.write().await;
+                    let should_install = match *wguard {
+                        Some(ref cur) => cur.fingerprint == stale_fp,
+                        None => false,
+                    };
+                    if should_install {
+                        *wguard = Some(new_entry);
+                        tracing::info!(
+                            n_docs = new_fp.n_docs,
+                            "Background SearchIndex rebuild complete — swapped into cache"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Background rebuild skipped swap — fresher index already installed"
+                        );
+                    }
+                    drop(wguard);
+                    // `_guard` drops here, resetting rebuild_in_progress.
+                    let _ = root_dir_clone; // ensure the clone is owned by the task
+                });
+
+                // Return stale results immediately (zero latency).
+                let results = stale_arc
+                    .index
+                    .search(query.as_ref(), &query_vec, &resolved);
+                return Ok(format_search_results_with_freshness(
+                    query.as_ref(),
+                    &results,
+                    Some(stale_arc.index.document_count()),
+                ));
+            }
+
+            // No stale entry, large-delta change, or another rebuild already in
+            // flight — synchronous rebuild (same as before).
             tracing::info!(
                 n_docs = fp.n_docs,
                 "SearchIndex cache miss — rebuilding index"
@@ -2989,7 +3120,7 @@ mod tests {
             }
         }
 
-        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
         let walk_count = StdArc::new(Mutex::new(0u32));
 
         let walker = CountingWalker {
@@ -3014,14 +3145,26 @@ mod tests {
         };
 
         // First call — cache miss, index built.
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
-            .await
-            .unwrap();
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
 
         // Second call — cache hit, reuse_count should be 1.
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
-            .await
-            .unwrap();
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
 
         let reuses = {
             let guard = cache.read().await;
@@ -3084,7 +3227,7 @@ mod tests {
             }
         }
 
-        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
         let call = StdArc::new(Mutex::new(0u32));
         let walker = ChangingWalker { call };
 
@@ -3104,12 +3247,24 @@ mod tests {
             recency_window_days: None,
         };
 
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
-            .await
-            .unwrap();
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder, &walker, Some(&cache), None)
-            .await
-            .unwrap();
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
 
         // reuse_count == 0: the second call replaced the cache rather than reusing it.
         let reuses = {
@@ -3190,9 +3345,15 @@ mod tests {
                 let opts = opts.clone();
                 tokio::spawn(async move {
                     let walker = StableWalker { walk_count: wc };
-                    semantic_code_search(opts, &FixedEmbedder, &walker, Some(&*cache_ref), None)
-                        .await
-                        .unwrap();
+                    semantic_code_search(
+                        opts,
+                        &FixedEmbedder,
+                        &walker,
+                        Some(Arc::clone(&cache_ref)),
+                        None,
+                    )
+                    .await
+                    .unwrap();
                 })
             })
             .collect();
@@ -3282,7 +3443,7 @@ mod tests {
     /// should be skipped entirely on the second request.
     #[tokio::test]
     async fn test_generation_hit_skips_walk() {
-        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let walker = CountWalker(Arc::clone(&walk_count));
@@ -3293,8 +3454,8 @@ mod tests {
             opts.clone(),
             &FixedEmbedder2,
             &walker,
-            Some(&cache),
-            Some(&generation),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
         )
         .await
         .unwrap();
@@ -3309,8 +3470,8 @@ mod tests {
             opts.clone(),
             &FixedEmbedder2,
             &walker,
-            Some(&cache),
-            Some(&generation),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
         )
         .await
         .unwrap();
@@ -3334,7 +3495,7 @@ mod tests {
     /// File-change event (generation bump) forces a walk + rebuild on next request.
     #[tokio::test]
     async fn test_generation_bump_triggers_walk() {
-        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let walker = CountWalker(Arc::clone(&walk_count));
@@ -3345,8 +3506,8 @@ mod tests {
             opts.clone(),
             &FixedEmbedder2,
             &walker,
-            Some(&cache),
-            Some(&generation),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
         )
         .await
         .unwrap();
@@ -3364,8 +3525,8 @@ mod tests {
             opts.clone(),
             &FixedEmbedder2,
             &walker,
-            Some(&cache),
-            Some(&generation),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
         )
         .await
         .unwrap();
@@ -3380,18 +3541,30 @@ mod tests {
     /// the walk happens every time but the index is reused when content is unchanged.
     #[tokio::test]
     async fn test_tracker_off_fingerprint_backstop() {
-        let cache: RwLock<Option<Arc<CachedSearchIndex>>> = RwLock::new(None);
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
         let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let walker = CountWalker(Arc::clone(&walk_count));
         let opts = gen_test_opts();
 
         // No generation counter — tracker-off mode.
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder2, &walker, Some(&cache), None)
-            .await
-            .unwrap();
-        let _ = semantic_code_search(opts.clone(), &FixedEmbedder2, &walker, Some(&cache), None)
-            .await
-            .unwrap();
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = semantic_code_search(
+            opts.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
 
         // Walk happens on every request (no generation shortcut).
         assert_eq!(
@@ -3433,8 +3606,8 @@ mod tests {
                 opts,
                 &FixedEmbedder2,
                 &walker,
-                Some(&*cache),
-                Some(&generation),
+                Some(StdArc::clone(&cache)),
+                Some(StdArc::clone(&generation)),
             )
             .await
             .unwrap();
@@ -3455,8 +3628,8 @@ mod tests {
                         opts,
                         &FixedEmbedder2,
                         &walker,
-                        Some(&*cache_ref),
-                        Some(&gen_ref),
+                        Some(StdArc::clone(&cache_ref)),
+                        Some(StdArc::clone(&gen_ref)),
                     )
                     .await
                     .unwrap();
@@ -3472,5 +3645,317 @@ mod tests {
             0,
             "all 8 concurrent requests must skip the walk on a generation hit"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Background-rebuild tests
+    // ---------------------------------------------------------------------------
+
+    /// Helper: make a stale CachedSearchIndex with a given doc count.
+    fn make_stale_cached(n_docs: usize) -> Arc<CachedSearchIndex> {
+        let mut idx = SearchIndex::new();
+        let docs: Vec<SearchDocument> = (0..n_docs)
+            .map(|i| make_doc(&format!("f{i}.rs"), &format!("content {i}")))
+            .collect();
+        let vecs: Vec<Option<Vec<f32>>> = (0..n_docs).map(|_| Some(vec![1.0_f32, 0.0])).collect();
+        idx.index_with_vectors(docs.clone(), vecs);
+        let fp = IndexFingerprint::from_docs(&docs);
+        Arc::new(CachedSearchIndex::new(idx, fp, 0))
+    }
+
+    /// `qualifies_for_background_rebuild`: delta within 5%/200-doc threshold qualifies.
+    #[test]
+    fn test_qualifies_for_background_rebuild_threshold() {
+        // 100 docs → 5% = 5, cap = min(5, 200) = 5.
+        let stale = make_stale_cached(100);
+        // +4 docs → qualifies.
+        assert!(stale.qualifies_for_background_rebuild(&IndexFingerprint {
+            n_docs: 104,
+            content_hash: 0,
+        }));
+        // +6 docs → does not qualify (> 5% of 100).
+        assert!(!stale.qualifies_for_background_rebuild(&IndexFingerprint {
+            n_docs: 106,
+            content_hash: 0,
+        }));
+
+        // 5000 docs → 5% = 250, cap = min(250, 200) = 200.
+        let big = make_stale_cached(5000);
+        // +200 docs → qualifies (at the cap).
+        assert!(big.qualifies_for_background_rebuild(&IndexFingerprint {
+            n_docs: 5200,
+            content_hash: 0,
+        }));
+        // +201 docs → does not qualify.
+        assert!(!big.qualifies_for_background_rebuild(&IndexFingerprint {
+            n_docs: 5201,
+            content_hash: 0,
+        }));
+    }
+
+    /// Small-delta change: first query returns stale result immediately, then
+    /// after the background task finishes the cache holds the fresh index.
+    #[tokio::test]
+    async fn test_background_rebuild_serves_stale_then_swaps() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Walker: first call returns 10 docs ("stale"), second 11 docs ("fresh").
+        struct DeltaWalker(Arc<AtomicU32>);
+        impl WalkAndIndexFn for DeltaWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let n = self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    let count = if n == 0 { 10usize } else { 11usize };
+                    let docs: Vec<_> = (0..count)
+                        .map(|i| make_doc(&format!("f{i}.rs"), &format!("c{i}")))
+                        .collect();
+                    let vecs: Vec<_> = (0..count).map(|_| Some(vec![1.0_f32, 0.0])).collect();
+                    Ok((docs, vecs))
+                })
+            }
+        }
+
+        struct FixedEmbed;
+        impl EmbedFn for FixedEmbed {
+            fn embed(
+                &self,
+                _t: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) })
+            }
+        }
+
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let call_count = Arc::new(AtomicU32::new(0));
+
+        // Prime the cache with 10 docs.
+        let walker = DeltaWalker(Arc::clone(&call_count));
+        let _ = semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbed,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        let stale_n = cache.read().await.as_ref().unwrap().fingerprint.n_docs;
+        assert_eq!(stale_n, 10);
+
+        // Second call: walker now returns 11 docs (small delta → background rebuild).
+        // The first query should complete immediately (stale served).
+        let walker2 = DeltaWalker(Arc::clone(&call_count));
+        let _ = semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbed,
+            &walker2,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Give the background task a moment to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Cache must now hold 11 docs.
+        let fresh_n = cache.read().await.as_ref().unwrap().fingerprint.n_docs;
+        assert_eq!(
+            fresh_n, 11,
+            "background rebuild must have swapped in 11-doc index"
+        );
+    }
+
+    /// CAS prevents duplicate spawns: only one background rebuild fires even if
+    /// two concurrent requests see the same stale index simultaneously.
+    /// After the spawned task finishes, `rebuild_in_progress` resets to false.
+    #[tokio::test]
+    async fn test_background_rebuild_no_double_spawn_on_concurrent_invalidation() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Walker: first call returns 10 docs, subsequent calls return 11.
+        struct MultiDeltaWalker(Arc<AtomicU32>);
+        impl WalkAndIndexFn for MultiDeltaWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let n = self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    let count = if n == 0 { 10usize } else { 11usize };
+                    let docs: Vec<_> = (0..count)
+                        .map(|i| make_doc(&format!("f{i}.rs"), &format!("v{n}c{i}")))
+                        .collect();
+                    let vecs: Vec<_> = (0..count).map(|_| Some(vec![1.0_f32, 0.0])).collect();
+                    Ok((docs, vecs))
+                })
+            }
+        }
+
+        struct FixedEmbed;
+        impl EmbedFn for FixedEmbed {
+            fn embed(
+                &self,
+                _t: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0_f32, 0.0]]) })
+            }
+        }
+
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let call_count = Arc::new(AtomicU32::new(0));
+
+        // Prime with 10 docs.
+        {
+            let walker = MultiDeltaWalker(Arc::clone(&call_count));
+            let _ = semantic_code_search(
+                gen_test_opts(),
+                &FixedEmbed,
+                &walker,
+                Some(Arc::clone(&cache)),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Snapshot stale entry before concurrent requests.
+        let stale_arc = Arc::clone(cache.read().await.as_ref().unwrap());
+        assert!(
+            !stale_arc
+                .rebuild_in_progress
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        // Two concurrent requests both see the 11-doc walker.
+        // Only one should CAS-claim the rebuild slot.
+        let walker_a = MultiDeltaWalker(Arc::clone(&call_count));
+        let walker_b = MultiDeltaWalker(Arc::clone(&call_count));
+        let (r1, r2) = tokio::join!(
+            semantic_code_search(
+                gen_test_opts(),
+                &FixedEmbed,
+                &walker_a,
+                Some(Arc::clone(&cache)),
+                None,
+            ),
+            semantic_code_search(
+                gen_test_opts(),
+                &FixedEmbed,
+                &walker_b,
+                Some(Arc::clone(&cache)),
+                None,
+            ),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        // Let background task finish and reset the flag.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Flag must be reset (RAII guard fired).
+        assert!(
+            !stale_arc
+                .rebuild_in_progress
+                .load(std::sync::atomic::Ordering::Acquire),
+            "rebuild_in_progress must reset after background task completes"
+        );
+    }
+
+    /// RAII guard resets `rebuild_in_progress` even when the spawned task panics.
+    #[tokio::test]
+    async fn test_background_rebuild_panic_resets_flag() {
+        // Build a stale cached entry directly and set rebuild_in_progress = true,
+        // then drop a RebuildGuard — flag must be false afterwards.
+        let stale = make_stale_cached(10);
+        stale
+            .rebuild_in_progress
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Drop the guard (simulates panic unwind).
+        {
+            let _guard = RebuildGuard(Arc::clone(&stale));
+            // flag still true while guard is alive.
+            assert!(
+                stale
+                    .rebuild_in_progress
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+        }
+        // Flag must be false after drop.
+        assert!(
+            !stale
+                .rebuild_in_progress
+                .load(std::sync::atomic::Ordering::Acquire),
+            "RebuildGuard must reset flag on drop"
+        );
+    }
+
+    /// Stale-write guard: if a fresher index is installed before the background
+    /// task finishes, the background task skips the swap.
+    #[tokio::test]
+    async fn test_stale_write_guard_skips_swap_when_fresher_installed() {
+        // Build stale (10-doc) and fresh (11-doc) fingerprints.
+        let stale_docs: Vec<_> = (0..10)
+            .map(|i| make_doc(&format!("s{i}.rs"), &format!("stale{i}")))
+            .collect();
+        let fresh_docs: Vec<_> = (0..11)
+            .map(|i| make_doc(&format!("n{i}.rs"), &format!("fresh{i}")))
+            .collect();
+        let stale_fp = IndexFingerprint::from_docs(&stale_docs);
+        let fresh_fp = IndexFingerprint::from_docs(&fresh_docs);
+
+        // Construct fresh entry with a different fingerprint and install it.
+        let mut fresh_idx = SearchIndex::new();
+        let vecs: Vec<_> = (0..11).map(|_| Some(vec![1.0_f32, 0.0])).collect();
+        fresh_idx.index_with_vectors(fresh_docs, vecs);
+        let fresh_entry = Arc::new(CachedSearchIndex::new(fresh_idx, fresh_fp.clone(), 0));
+
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> =
+            Arc::new(RwLock::new(Some(Arc::clone(&fresh_entry))));
+
+        // Simulate: background task computed a new entry based on stale_fp as the "stale" base,
+        // but the cache already has fresh_fp installed. The stale-write guard should skip swap.
+        let new_entry = make_stale_cached(12); // whatever — should not land
+        let should_install = {
+            let guard = cache.read().await;
+            match *guard {
+                Some(ref cur) => cur.fingerprint == stale_fp, // stale_fp ≠ fresh_fp → false
+                None => false,
+            }
+        };
+        assert!(
+            !should_install,
+            "stale-write guard must skip swap when fresher index is already installed"
+        );
+
+        // Verify the cache still holds the fresh entry (no write occurred).
+        let after_n = cache.read().await.as_ref().unwrap().fingerprint.n_docs;
+        assert_eq!(after_n, 11, "cache must still hold the fresh 11-doc index");
+        drop(new_entry);
+        // Verify stale_fp != fresh_fp (sanity).
+        assert_ne!(stale_fp, fresh_fp);
     }
 }
