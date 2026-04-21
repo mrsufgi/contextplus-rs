@@ -142,6 +142,12 @@ const QUERY_CACHE_PERSIST_CAP: usize = 10_000;
 /// Debounce window for background query cache flushes (milliseconds).
 const QUERY_CACHE_FLUSH_DEBOUNCE_MS: u64 = 2_000;
 
+/// In-flight result for a single-text embed coalescing slot.
+///
+/// The owner of a slot sends `Ok(vec)` on success or `Err(msg)` on failure.
+/// Waiters subscribe to the `watch::Receiver` and block until the owner sends.
+type InFlightResult = std::result::Result<Vec<f32>, String>;
+
 #[derive(Clone)]
 pub struct OllamaClient {
     client: reqwest::Client,
@@ -162,6 +168,14 @@ pub struct OllamaClient {
     /// Sender half of the debounce channel.  Sending a unit triggers a
     /// background task to flush the in-memory LRU to disk after a short delay.
     flush_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<()>>>,
+    /// In-flight coalescing map for single-text embed requests.
+    ///
+    /// When a caller is the *first* to request a query embedding it inserts a
+    /// `watch::Sender` here and owns the Ollama call.  Concurrent callers with
+    /// the same query string subscribe to the sender's `watch::Receiver` and
+    /// wait for the result instead of issuing their own HTTP request.
+    in_flight:
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<Option<InFlightResult>>>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -262,6 +276,7 @@ impl OllamaClient {
             query_cache: cache,
             root_dir: root_dir.map(Arc::new),
             flush_tx: flush_tx_arc,
+            in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -313,16 +328,86 @@ impl OllamaClient {
             return Ok(Vec::new());
         }
 
-        // Cache check: single-text (query) path only.
+        // ----------------------------------------------------------------
+        // Single-text (query) path: LRU cache + in-flight coalescing.
+        // ----------------------------------------------------------------
         if texts.len() == 1 {
-            let cached = {
+            let query = &texts[0];
+
+            // 1. Fast path: LRU cache hit — no lock contention with Ollama.
+            {
                 let mut cache = self.query_cache.lock().unwrap();
-                cache.get(&texts[0]).cloned()
+                if let Some(v) = cache.get(query) {
+                    return Ok(vec![v.clone()]);
+                }
+            }
+
+            // 2. Coalescing: check if another task is already calling Ollama
+            //    for this exact query.
+            let (owner, mut rx) = {
+                let mut map = self.in_flight.lock().unwrap();
+                if let Some(tx) = map.get(query) {
+                    // Become a waiter: subscribe before releasing the lock.
+                    (false, tx.subscribe())
+                } else {
+                    // Become the owner: insert a slot and do the Ollama call.
+                    let (tx, rx) = tokio::sync::watch::channel(None::<InFlightResult>);
+                    map.insert(query.clone(), tx);
+                    (true, rx)
+                }
             };
-            if let Some(vec) = cached {
-                return Ok(vec![vec]);
+
+            if owner {
+                // Owner: call Ollama, publish result to all waiters.
+                let embed_result = self.embed_single_query(query).await;
+
+                // Publish result and remove the in-flight slot atomically.
+                {
+                    let mut map = self.in_flight.lock().unwrap();
+                    if let Some(tx) = map.remove(query) {
+                        let payload = match &embed_result {
+                            Ok(v) => Ok(v.clone()),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        // Ignore send error: receivers may have been dropped.
+                        let _ = tx.send(Some(payload));
+                    }
+                }
+
+                let v = embed_result?;
+
+                // Populate LRU + trigger background flush.
+                {
+                    let mut cache = self.query_cache.lock().unwrap();
+                    cache.insert(query.clone(), v.clone());
+                }
+                if let Some(ref tx) = self.flush_tx {
+                    let _ = tx.send(());
+                }
+
+                return Ok(vec![v]);
+            } else {
+                // Waiter: block until the owner publishes.
+                rx.changed().await.map_err(|_| {
+                    ContextPlusError::Ollama(
+                        "in-flight coalescing channel closed unexpectedly".into(),
+                    )
+                })?;
+
+                let result = rx.borrow().clone().ok_or_else(|| {
+                    ContextPlusError::Ollama("in-flight slot produced no result".into())
+                })?;
+
+                return match result {
+                    Ok(v) => Ok(vec![v]),
+                    Err(msg) => Err(ContextPlusError::Ollama(msg)),
+                };
             }
         }
+
+        // ----------------------------------------------------------------
+        // Multi-text (batch / indexing) path — unchanged.
+        // ----------------------------------------------------------------
 
         // Split each input into chunks; short inputs produce a single chunk.
         let chunked_inputs: Vec<Vec<&str>> = texts
@@ -353,21 +438,26 @@ impl OllamaClient {
             offset += chunks.len();
         }
 
-        // Cache population: single-text (query) path only.
-        if texts.len() == 1
-            && let Some(v) = results.first()
-        {
-            {
-                let mut cache = self.query_cache.lock().unwrap();
-                cache.insert(texts[0].clone(), v.clone());
-            }
-            // Signal the background flush task to persist the updated LRU.
-            if let Some(ref tx) = self.flush_tx {
-                let _ = tx.send(());
-            }
+        Ok(results)
+    }
+
+    /// Embed a single query string via Ollama (no caching, no coalescing).
+    ///
+    /// Used internally by the single-text path in [`Self::embed`] after the
+    /// LRU cache miss.  Delegates to the same chunking + adaptive-batch
+    /// machinery used by the multi-text path.
+    async fn embed_single_query(&self, query: &str) -> Result<Vec<f32>> {
+        let chunks = split_embedding_input(query, self.embed_chunk_chars);
+        let flattened: Vec<String> = chunks.iter().map(|s| (*s).to_string()).collect();
+
+        let mut flat_embeddings = Vec::with_capacity(flattened.len());
+        for batch in flattened.chunks(self.batch_size) {
+            let batch_result = self.embed_batch_adaptive(batch).await?;
+            flat_embeddings.extend(batch_result);
         }
 
-        Ok(results)
+        let weights: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+        merge_embedding_vectors(&flat_embeddings, &weights)
     }
 
     /// Get the configured batch size (used for warmup/indexing).
@@ -2076,6 +2166,199 @@ mod tests {
             0,
             "cache should be empty after multi-text calls"
         );
+    }
+
+    // -- in-flight coalescing tests --
+
+    /// 10 tasks calling `embed("hello")` concurrently must produce exactly 1
+    /// Ollama HTTP call.  A `Barrier` synchronises all tasks at the point just
+    /// before they call `embed` so they all arrive in the same scheduler tick.
+    #[tokio::test]
+    async fn concurrent_same_query_coalesces() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |_req: &wiremock::Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}))
+                    // small delay so the in-flight window is wide enough for all
+                    // 10 tasks to subscribe before the owner completes
+                    .set_delay(std::time::Duration::from_millis(50))
+            })
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(OllamaClient::new(&config_with_host(&server.uri())));
+        let n = 10;
+        let barrier = Arc::new(tokio::sync::Barrier::new(n));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let c = Arc::clone(&client);
+                let b = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    b.wait().await;
+                    c.embed(&["hello".to_string()]).await
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let res = h.await.unwrap();
+            assert!(res.is_ok(), "all tasks should succeed: {res:?}");
+            assert_eq!(res.unwrap(), vec![vec![0.1f32, 0.2, 0.3]]);
+        }
+
+        let actual = call_count.load(Ordering::SeqCst);
+        assert_eq!(actual, 1, "expected exactly 1 Ollama call, got {actual}");
+    }
+
+    /// 10 different queries must each produce their own Ollama call — coalescing
+    /// must not merge distinct queries.
+    #[tokio::test]
+    async fn different_queries_do_not_coalesce() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |_req: &wiremock::Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}))
+            })
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(OllamaClient::new(&config_with_host(&server.uri())));
+        let n = 10usize;
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let c = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let q = format!("query_{i}");
+                    c.embed(&[q]).await
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        let actual = call_count.load(Ordering::SeqCst);
+        assert_eq!(actual, n, "expected {n} Ollama calls, got {actual}");
+    }
+
+    /// When Ollama returns an error, all concurrent waiters for the same query
+    /// must receive an `Err`, not hang.
+    #[tokio::test]
+    async fn error_propagates_to_all_waiters() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("ollama internal error")
+                    .set_delay(std::time::Duration::from_millis(50)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(OllamaClient::new(&config_with_host(&server.uri())));
+        let n = 10;
+        let barrier = Arc::new(tokio::sync::Barrier::new(n));
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let c = Arc::clone(&client);
+                let b = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    b.wait().await;
+                    c.embed(&["hello".to_string()]).await
+                })
+            })
+            .collect();
+
+        let mut err_count = 0usize;
+        for h in handles {
+            let res = h.await.unwrap();
+            if res.is_err() {
+                err_count += 1;
+            }
+        }
+        assert_eq!(err_count, n, "all {n} waiters should receive an Err");
+    }
+
+    /// After a coalesced embed completes, the result is in the LRU cache, so
+    /// a subsequent same-query call returns immediately without an Ollama call.
+    #[tokio::test]
+    async fn coalesced_waiter_sees_cached_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let counter = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |_req: &wiremock::Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}))
+                    .set_delay(std::time::Duration::from_millis(50))
+            })
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(OllamaClient::new(&config_with_host(&server.uri())));
+        let n = 5;
+        let barrier = Arc::new(tokio::sync::Barrier::new(n));
+
+        // First wave: coalesced — should produce exactly 1 Ollama call.
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let c = Arc::clone(&client);
+                let b = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    b.wait().await;
+                    c.embed(&["hello".to_string()]).await
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "first wave: 1 call");
+
+        // Second call after coalescing completes — should hit LRU (no new call).
+        client.embed(&["hello".to_string()]).await.unwrap();
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "cache hit after coalescing: still 1 Ollama call"
+        );
+        assert_eq!(client.query_cache_len(), 1, "result in LRU");
     }
 
     // -- HNSW index tests --
