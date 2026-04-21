@@ -1014,7 +1014,19 @@ impl SearchIndex {
                 let vec_slice: &[f32] = if let Some(store) = self.ann_store.as_ref() {
                     match store.get_vector(&doc.path) {
                         Some(v) => v,
-                        None => return None, // doc not in store — skip
+                        None => {
+                            // Should be unreachable for well-formed input: every
+                            // has_vector=true doc was pushed into ann_store by path
+                            // at index_with_vectors time. The only way this fires
+                            // in practice is a duplicate path that got overwritten
+                            // during VectorStore construction — a latent bug at a
+                            // different layer. Log so the silent-drop is visible.
+                            tracing::warn!(
+                                path = %doc.path,
+                                "ann_store missing vector for has_vector=true doc — excluding from results"
+                            );
+                            return None;
+                        }
                     }
                 } else {
                     let offset = i * self.dims;
@@ -2684,6 +2696,43 @@ mod tests {
         assert!(
             index.vector_buffer.capacity() > 0,
             "vector_buffer must be retained below ANN_THRESHOLD"
+        );
+    }
+
+    /// Regression guard for PR #51 review F2: verify search still returns
+    /// correct results via the brute-force + vector_buffer path below ANN_THRESHOLD.
+    #[test]
+    fn test_search_correct_below_threshold_via_buffer() {
+        // Use make_ann_corpus's deterministic R^4 layout but sized below threshold
+        // so the brute-force path runs.
+        let n = ANN_THRESHOLD - 50;
+        let (docs, vectors) = make_ann_corpus(n);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        assert!(index.ann_store.is_none(), "below threshold: ann_store=None");
+        assert!(
+            index.vector_buffer.capacity() > 0,
+            "below threshold: vector_buffer must be retained"
+        );
+
+        let query_vec = unit_vec(1.0, 0.001);
+        let opts = ResolvedSearchOptions {
+            top_k: 3,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+        let results = index.search("anything", &query_vec, &opts);
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].path, "src/file_0.ts",
+            "brute-force path must still rank file_0 (unit vec 1,0,0,0) top"
         );
     }
 
