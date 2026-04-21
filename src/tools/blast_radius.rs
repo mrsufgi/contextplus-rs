@@ -8,15 +8,16 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use regex::Regex;
 
 use crate::error::Result;
 use crate::tools::semantic_identifiers::{escape_regex, is_definition_line};
 
-/// Type alias for the boxed future returned by file-line providers.
-type FileLinesFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<HashMap<String, Vec<String>>>> + Send + 'a>,
+/// Type alias for the boxed future returned by file-content providers.
+type FileContentFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<HashMap<String, Arc<String>>>> + Send + 'a>,
 >;
 
 // ---------------------------------------------------------------------------
@@ -59,13 +60,13 @@ impl BlastRadiusResult {
 // Core logic
 // ---------------------------------------------------------------------------
 
-/// Search for all usages of a symbol across provided file lines.
-/// `file_lines` maps relative_path -> lines of the file.
+/// Search for all usages of a symbol across provided file content.
+/// `file_content` maps relative_path -> raw file content (`Arc<String>`).
 /// Returns usages grouped by file.
 pub fn find_symbol_usages(
     symbol_name: &str,
     file_context: Option<&str>,
-    file_lines: &HashMap<String, Vec<String>>,
+    file_content: &HashMap<String, Arc<String>>,
 ) -> BlastRadiusResult {
     let escaped = escape_regex(symbol_name);
     // \b only works at word-character boundaries. For symbols with non-word
@@ -86,8 +87,8 @@ pub fn find_symbol_usages(
 
     let mut by_file: HashMap<String, Vec<SymbolUsage>> = HashMap::new();
 
-    for (relative_path, lines) in file_lines {
-        for (i, line) in lines.iter().enumerate() {
+    for (relative_path, content) in file_content {
+        for (i, line) in content.lines().enumerate() {
             if !symbol_pattern.is_match(line) {
                 continue;
             }
@@ -163,25 +164,27 @@ pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> Str
 // High-level entry point
 // ---------------------------------------------------------------------------
 
-/// Trait for providing file lines. Implementations can use cached file lines
-/// from the identifier index or read files from disk.
-pub trait FileLineProvider: Send + Sync {
-    fn get_file_lines(&self, root_dir: &Path) -> FileLinesFuture<'_>;
+/// Trait for providing file content. Implementations can use the cached
+/// `ProjectCache.file_content` map or read files from disk.
+pub trait FileContentProvider: Send + Sync {
+    fn get_file_content(&self, root_dir: &Path) -> FileContentFuture<'_>;
 }
 
 /// Run blast radius analysis.
 pub async fn get_blast_radius(
     options: BlastRadiusOptions,
-    file_line_provider: &dyn FileLineProvider,
+    file_content_provider: &dyn FileContentProvider,
 ) -> Result<String> {
     let symbol_name = options.symbol_name.trim();
     if symbol_name.is_empty() {
         return Ok("Symbol name is empty.".to_string());
     }
 
-    let file_lines = file_line_provider.get_file_lines(&options.root_dir).await?;
+    let file_content = file_content_provider
+        .get_file_content(&options.root_dir)
+        .await?;
 
-    let result = find_symbol_usages(symbol_name, options.file_context.as_deref(), &file_lines);
+    let result = find_symbol_usages(symbol_name, options.file_context.as_deref(), &file_content);
 
     Ok(format_blast_radius(symbol_name, &result))
 }
@@ -194,20 +197,18 @@ pub async fn get_blast_radius(
 mod tests {
     use super::*;
 
-    fn make_file_lines(data: Vec<(&str, Vec<&str>)>) -> HashMap<String, Vec<String>> {
+    /// Build a `HashMap<String, Arc<String>>` from `(path, lines)` pairs.
+    /// Lines are joined with `\n` to match the on-disk raw content stored in
+    /// `ProjectCache.file_content`.
+    fn make_file_content(data: Vec<(&str, Vec<&str>)>) -> HashMap<String, Arc<String>> {
         data.into_iter()
-            .map(|(path, lines)| {
-                (
-                    path.to_string(),
-                    lines.into_iter().map(|l| l.to_string()).collect(),
-                )
-            })
+            .map(|(path, lines)| (path.to_string(), Arc::new(lines.join("\n"))))
             .collect()
     }
 
     #[test]
     fn test_find_usages_basic() {
-        let file_lines = make_file_lines(vec![
+        let file_content = make_file_content(vec![
             (
                 "src/user.ts",
                 vec![
@@ -226,7 +227,7 @@ mod tests {
             ),
         ]);
 
-        let result = find_symbol_usages("getUserById", Some("src/user.ts"), &file_lines);
+        let result = find_symbol_usages("getUserById", Some("src/user.ts"), &file_content);
 
         // Definition in user.ts should be excluded
         // Usage in handler.ts should be included (import + call)
@@ -242,49 +243,49 @@ mod tests {
 
     #[test]
     fn test_find_usages_no_file_context() {
-        let file_lines = make_file_lines(vec![(
+        let file_content = make_file_content(vec![(
             "src/user.ts",
             vec!["export function myFunc() {", "  myFunc();"],
         )]);
 
         // Without file_context, definition is not excluded
-        let result = find_symbol_usages("myFunc", None, &file_lines);
+        let result = find_symbol_usages("myFunc", None, &file_content);
         assert_eq!(result.total_usages(), 2);
     }
 
     #[test]
     fn test_find_usages_no_matches() {
-        let file_lines = make_file_lines(vec![(
+        let file_content = make_file_content(vec![(
             "src/app.ts",
             vec!["const x = 42;", "console.log(x);"],
         )]);
 
-        let result = find_symbol_usages("nonExistent", None, &file_lines);
+        let result = find_symbol_usages("nonExistent", None, &file_content);
         assert_eq!(result.total_usages(), 0);
     }
 
     #[test]
     fn test_find_usages_word_boundary() {
-        let file_lines = make_file_lines(vec![(
+        let file_content = make_file_content(vec![(
             "src/app.ts",
             vec!["getUserById(1);", "getUser(2);", "getUserByIdAndName(3);"],
         )]);
 
         // "getUser" should match "getUser(2);" but NOT "getUserById" or "getUserByIdAndName"
-        let result = find_symbol_usages("getUser", None, &file_lines);
+        let result = find_symbol_usages("getUser", None, &file_content);
         assert_eq!(result.total_usages(), 1);
         assert_eq!(result.by_file.values().next().unwrap()[0].line, 2);
     }
 
     #[test]
     fn test_find_usages_special_chars() {
-        let file_lines = make_file_lines(vec![(
+        let file_content = make_file_content(vec![(
             "src/app.ts",
             vec!["$transaction.commit();", "const $transaction = db.begin();"],
         )]);
 
         // Dollar sign should be escaped properly
-        let result = find_symbol_usages("$transaction", None, &file_lines);
+        let result = find_symbol_usages("$transaction", None, &file_content);
         assert_eq!(result.total_usages(), 2);
     }
 
@@ -353,13 +354,13 @@ mod tests {
     #[test]
     fn test_context_truncation() {
         let long_line = "a".repeat(200);
-        let file_lines: HashMap<String, Vec<String>> = [(
+        let file_content: HashMap<String, Arc<String>> = [(
             "src/app.ts".to_string(),
-            vec![format!("myFunc {}", long_line)],
+            Arc::new(format!("myFunc {}", long_line)),
         )]
         .into_iter()
         .collect();
-        let result = find_symbol_usages("myFunc", None, &file_lines);
+        let result = find_symbol_usages("myFunc", None, &file_content);
         assert_eq!(result.total_usages(), 1);
         assert!(result.by_file.values().next().unwrap()[0].context.len() <= MAX_CONTEXT_LEN);
     }

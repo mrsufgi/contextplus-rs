@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use regex::Regex;
@@ -281,15 +282,15 @@ fn normalize_kinds(kinds: &Option<Vec<String>>) -> Option<HashSet<String>> {
 // Call-site ranking
 // ---------------------------------------------------------------------------
 
-/// Find and rank call-sites for a given symbol across all file lines.
-/// `file_lines` maps relative_path -> lines of the file.
+/// Find and rank call-sites for a given symbol across all file content.
+/// `file_content` maps relative_path -> raw file content (`Arc<String>`).
 /// `query_vec` and `query_terms` are from the user query.
 /// Returns the top `limit` call-sites ranked by hybrid score.
 pub fn rank_call_sites(
     query_terms: &HashSet<String>,
     query_vec: &[f32],
     symbol: &IdentifierDoc,
-    file_lines: &HashMap<String, Vec<String>>,
+    file_content: &HashMap<String, Arc<String>>,
     limit: usize,
     // Optional: pre-computed vectors for call-site text. If None, only keyword score is used.
     callsite_vectors: Option<&dyn CallSiteVectorProvider>,
@@ -319,27 +320,39 @@ pub fn rank_call_sites(
     // good statistical sample without scanning the entire tail of matches.
     let candidate_cap = embed_budget * 4;
 
+    // Lazy per-file line-split: only files that pass the cheap substring
+    // pre-filter on the full content get split. This avoids splitting every
+    // file in the corpus just to skip files that don't mention the symbol.
+    // (Review #59 F1.)
+    let mut file_entries: Vec<(&String, Vec<&str>)> = Vec::new();
+
     // Collect candidates as (file_index, line_number, line_offset, keyword_score)
     // to avoid cloning file Strings and context Strings in the inner loop.
-    let file_entries: Vec<(&String, &Vec<String>)> = file_lines.iter().collect();
     let mut candidates: Vec<(usize, usize, usize, f64)> = Vec::new();
     let mut keyword_buf = String::with_capacity(512);
 
-    'outer: for (fi, (file, lines)) in file_entries.iter().enumerate() {
-        // Fast pre-filter: skip files that don't contain the symbol name at all.
-        // This is O(file_content_len) but far cheaper than regex matching every
-        // individual line when there's no match in the file.
-        let has_name = lines.iter().any(|l| l.contains(symbol.name.as_str()));
-        if !has_name {
+    'outer: for (file, content) in file_content.iter() {
+        // Fast pre-filter on the full file content (no allocation, no split):
+        // skip files that don't contain the symbol name at all.
+        if !content.contains(symbol.name.as_str()) {
             continue;
         }
+
+        // Matching file — split into lines once and record it for the
+        // ranked-output phase.
+        let lines: Vec<&str> = content.lines().collect();
+        let fi = file_entries.len();
+        file_entries.push((file, lines));
+        // Use index access (vec doesn't reallocate across this inner loop
+        // because we don't push again inside it).
+        let lines = &file_entries[fi].1;
 
         for (i, line) in lines.iter().enumerate() {
             if !call_pattern.is_match(line) {
                 continue;
             }
             // Skip the symbol's own definition line
-            if *file == &symbol.path && i + 1 == symbol.line {
+            if *file == symbol.path && i + 1 == symbol.line {
                 continue;
             }
             if is_definition_line(line, &symbol.name) {
@@ -386,7 +399,7 @@ pub fn rank_call_sites(
         .iter()
         .map(|(fi, line_num, line_idx, keyword_score)| {
             let (file, lines) = &file_entries[*fi];
-            let raw_line = &lines[*line_idx];
+            let raw_line = lines[*line_idx];
             let context = raw_line.trim();
             let context = if context.len() > 220 {
                 &context[..220]
@@ -596,7 +609,7 @@ pub async fn semantic_identifier_search(
     identifier_docs: &[IdentifierDoc],
     vector_buffer: &[f32],
     vector_dims: usize,
-    file_lines: &HashMap<String, Vec<String>>,
+    file_content: &HashMap<String, Arc<String>>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
     if query.is_empty() {
@@ -643,7 +656,7 @@ pub async fn semantic_identifier_search(
     }
 
     // Rank call-sites for each top identifier — parallel across identifiers.
-    // Each call scans the full file_lines corpus; doing them in parallel via rayon
+    // Each call scans the full file_content corpus; doing them in parallel via rayon
     // reduces wall time from O(top_k × corpus_lines) to O(corpus_lines) on
     // machines with ≥ top_k cores.
     let call_results: Vec<CallSiteResult> = top
@@ -653,7 +666,7 @@ pub async fn semantic_identifier_search(
                 &query_terms,
                 &query_vec,
                 &item.doc,
-                file_lines,
+                file_content,
                 top_calls,
                 None,
             )
@@ -931,24 +944,18 @@ mod tests {
             token_set: HashSet::new(),
         };
 
-        let file_lines: HashMap<String, Vec<String>> = [
+        let file_content: HashMap<String, Arc<String>> = [
             (
                 "src/user.ts".to_string(),
-                vec![
-                    "import something".to_string(),
-                    "// user service".to_string(),
-                    "export function getUserById(id: string): User {".to_string(), // L3 = definition at line 10? No, idx 2 -> line 3
-                    "  return db.query(id);".to_string(),
-                    "}".to_string(),
-                ],
+                Arc::new(
+                    "import something\n// user service\nexport function getUserById(id: string): User {\n  return db.query(id);\n}".to_string(),
+                ),
             ),
             (
                 "src/handler.ts".to_string(),
-                vec![
-                    "import { getUserById } from './user';".to_string(),
-                    "const user = getUserById(req.params.id);".to_string(),
-                    "console.log(user);".to_string(),
-                ],
+                Arc::new(
+                    "import { getUserById } from './user';\nconst user = getUserById(req.params.id);\nconsole.log(user);".to_string(),
+                ),
             ),
         ]
         .into_iter()
@@ -957,7 +964,7 @@ mod tests {
         let query_terms: HashSet<String> = ["user", "get"].iter().map(|s| s.to_string()).collect();
         let query_vec = vec![1.0, 0.0, 0.0];
 
-        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
+        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_content, 10, None);
 
         // Should find the call in handler.ts (not the definition in user.ts)
         assert!(result.total > 0);
@@ -982,13 +989,9 @@ mod tests {
             token_set: HashSet::new(),
         };
 
-        let file_lines: HashMap<String, Vec<String>> = [(
+        let file_content: HashMap<String, Arc<String>> = [(
             "src/user.ts".to_string(),
-            vec![
-                "function myFunc() {".to_string(), // L1 = definition, should be skipped
-                "  return 42;".to_string(),
-                "}".to_string(),
-            ],
+            Arc::new("function myFunc() {\n  return 42;\n}".to_string()),
         )]
         .into_iter()
         .collect();
@@ -996,7 +999,7 @@ mod tests {
         let query_terms = HashSet::new();
         let query_vec = vec![1.0];
 
-        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
+        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_content, 10, None);
         assert_eq!(result.total, 0);
     }
 
@@ -1016,14 +1019,16 @@ mod tests {
             text: "noMatch".to_string(),
             token_set: HashSet::new(),
         };
-        let file_lines: HashMap<String, Vec<String>> =
-            [("other.ts".to_string(), vec!["const x = 42;".to_string()])]
-                .into_iter()
-                .collect();
+        let file_content: HashMap<String, Arc<String>> = [(
+            "other.ts".to_string(),
+            Arc::new("const x = 42;".to_string()),
+        )]
+        .into_iter()
+        .collect();
         let query_terms = HashSet::new();
         let query_vec = vec![1.0];
 
-        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_lines, 10, None);
+        let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_content, 10, None);
         assert_eq!(result.total, 0);
         assert!(result.sites.is_empty());
     }
@@ -1164,7 +1169,7 @@ mod tests {
         // Every 10th line calls "syncStripeQuantity(" so there are ~2000 matches.
         let num_files = 200usize;
         let lines_per_file = 100usize;
-        let mut file_lines: HashMap<String, Vec<String>> = HashMap::new();
+        let mut file_content: HashMap<String, Arc<String>> = HashMap::new();
         for fi in 0..num_files {
             let mut lines = Vec::with_capacity(lines_per_file);
             for li in 0..lines_per_file {
@@ -1178,7 +1183,7 @@ mod tests {
                     ));
                 }
             }
-            file_lines.insert(format!("src/module_{fi}.ts"), lines);
+            file_content.insert(format!("src/module_{fi}.ts"), Arc::new(lines.join("\n")));
         }
 
         // Build 500 fake identifier docs (only a handful will be top-ranked,
@@ -1252,7 +1257,9 @@ mod tests {
         let start = Instant::now();
         let call_results: Vec<CallSiteResult> = top
             .par_iter()
-            .map(|item| rank_call_sites(&query_terms, &query_vec, &item.doc, &file_lines, 10, None))
+            .map(|item| {
+                rank_call_sites(&query_terms, &query_vec, &item.doc, &file_content, 10, None)
+            })
             .collect();
         let elapsed = start.elapsed();
 
