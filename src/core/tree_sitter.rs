@@ -46,9 +46,14 @@ fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
 }
 
 /// AST node types that represent definitions, mapped to our symbol kinds.
-fn definition_types(grammar_name: &str) -> HashMap<&'static str, &'static str> {
+///
+/// Returns a static slice for the given grammar — zero heap allocation per
+/// call. Linear scan is O(n) but n ≤ 7 for every grammar here, which is
+/// faster in practice than a `HashMap` lookup (hash + equality) and avoids
+/// the per-parse alloc that previously occurred on every cold build.
+fn definition_types(grammar_name: &str) -> &'static [(&'static str, &'static str)] {
     match grammar_name {
-        "typescript" | "tsx" => HashMap::from([
+        "typescript" | "tsx" => &[
             ("function_declaration", "function"),
             ("method_definition", "method"),
             ("class_declaration", "class"),
@@ -56,18 +61,18 @@ fn definition_types(grammar_name: &str) -> HashMap<&'static str, &'static str> {
             ("enum_declaration", "enum"),
             ("type_alias_declaration", "type"),
             ("lexical_declaration", "const"),
-        ]),
-        "javascript" => HashMap::from([
+        ],
+        "javascript" => &[
             ("function_declaration", "function"),
             ("method_definition", "method"),
             ("class_declaration", "class"),
             ("variable_declaration", "const"),
-        ]),
-        "python" => HashMap::from([
+        ],
+        "python" => &[
             ("function_definition", "function"),
             ("class_definition", "class"),
-        ]),
-        "rust" => HashMap::from([
+        ],
+        "rust" => &[
             ("function_item", "function"),
             ("struct_item", "struct"),
             ("enum_item", "enum"),
@@ -75,66 +80,66 @@ fn definition_types(grammar_name: &str) -> HashMap<&'static str, &'static str> {
             ("impl_item", "impl"),
             ("mod_item", "module"),
             ("macro_definition", "macro"),
-        ]),
-        "go" => HashMap::from([
+        ],
+        "go" => &[
             ("function_declaration", "function"),
             ("method_declaration", "method"),
             ("type_spec", "type"),
-        ]),
-        "java" => HashMap::from([
+        ],
+        "java" => &[
             ("method_declaration", "method"),
             ("class_declaration", "class"),
             ("interface_declaration", "interface"),
             ("enum_declaration", "enum"),
-        ]),
-        "c" => HashMap::from([
+        ],
+        "c" => &[
             ("function_definition", "function"),
             ("struct_specifier", "struct"),
             ("enum_specifier", "enum"),
-        ]),
-        "cpp" => HashMap::from([
+        ],
+        "cpp" => &[
             ("function_definition", "function"),
             ("class_specifier", "class"),
             ("struct_specifier", "struct"),
             ("enum_specifier", "enum"),
-        ]),
-        "bash" => HashMap::from([("function_definition", "function")]),
-        "ruby" => HashMap::from([
+        ],
+        "bash" => &[("function_definition", "function")],
+        "ruby" => &[
             ("method", "function"),
             ("singleton_method", "function"),
             ("class", "class"),
             ("module", "module"),
-        ]),
-        "php" => HashMap::from([
+        ],
+        "php" => &[
             ("function_definition", "function"),
             ("method_declaration", "method"),
             ("class_declaration", "class"),
             ("interface_declaration", "interface"),
             ("enum_declaration", "enum"),
-        ]),
-        "c_sharp" => HashMap::from([
+        ],
+        "c_sharp" => &[
             ("method_declaration", "method"),
             ("class_declaration", "class"),
             ("interface_declaration", "interface"),
             ("enum_declaration", "enum"),
             ("struct_declaration", "struct"),
-        ]),
-        "kotlin" => HashMap::from([
+        ],
+        "kotlin" => &[
             ("function_declaration", "function"),
             ("class_declaration", "class"),
             ("object_declaration", "class"),
-        ]),
-        "html" => HashMap::from([
+        ],
+        "html" => &[
             ("element", "element"),
             ("script_element", "script"),
             ("style_element", "style"),
-        ]),
-        "css" => HashMap::from([
+        ],
+        "css" => &[
             ("rule_set", "rule"),
             ("media_statement", "media"),
             ("keyframes_statement", "keyframes"),
-        ]),
-        _ => HashMap::new(),
+        ],
+        _ => &[],
     }
 }
 
@@ -238,7 +243,7 @@ fn is_destructure_binding(node: &Node) -> bool {
 fn collect_symbols(
     node: &Node,
     source: &[u8],
-    def_types: &HashMap<&str, &str>,
+    def_types: &[(&'static str, &'static str)],
     depth: usize,
     max_depth: usize,
 ) -> Vec<CodeSymbol> {
@@ -248,7 +253,7 @@ fn collect_symbols(
 
     let mut results = Vec::new();
 
-    if let Some(&kind) = def_types.get(node.kind()) {
+    if let Some(&(_, kind)) = def_types.iter().find(|(k, _)| *k == node.kind()) {
         // Skip destructure-binding declarations — they are not true symbol
         // definitions and would produce false-positive dead-code candidates.
         if is_destructure_binding(node) {
@@ -316,7 +321,7 @@ pub fn parse_with_tree_sitter(content: &str, ext: &str) -> Result<Vec<CodeSymbol
 
         let root = tree.root_node();
         let source = content.as_bytes();
-        let symbols = collect_symbols(&root, source, &def_types, 0, 3);
+        let symbols = collect_symbols(&root, source, def_types, 0, 3);
         Ok(symbols)
     })
 }
