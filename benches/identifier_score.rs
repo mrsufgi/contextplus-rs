@@ -17,29 +17,26 @@ fn generate_docs(n: usize) -> Vec<IdentifierDoc> {
         .map(|i| {
             let kind = kinds[i % kinds.len()];
             let name = format!("symbol_{}", i);
+            let sig = format!("{}(arg: string): Result", name);
+            let path = format!("src/mod_{}/file_{}.ts", i / 50, i);
+            let header = format!("module {}", i / 50);
             IdentifierDoc {
-                id: format!("src/mod_{}/file_{}.ts:{}:{}", i / 50, i, name, i * 10 + 1),
-                path: format!("src/mod_{}/file_{}.ts", i / 50, i),
-                header: format!("module {}", i / 50),
+                id: format!("{}:{}:{}", path, name, i * 10 + 1),
+                path: path.clone(),
+                header: header.clone(),
                 name: name.clone(),
                 kind: kind.to_string(),
+                kind_lower: kind.to_lowercase(),
                 line: i * 10 + 1,
                 end_line: i * 10 + 20,
-                signature: format!("{}(arg: string): Result", name),
+                signature: sig.clone(),
                 parent_name: if i % 3 == 0 {
                     Some(format!("Service_{}", i / 10))
                 } else {
                     None
                 },
-                text: format!(
-                    "{} {} {}(arg: string): Result src/mod_{}/file_{}.ts module {}",
-                    kind,
-                    name,
-                    name,
-                    i / 50,
-                    i,
-                    i / 50
-                ),
+                text: format!("{kind} {name} {sig} {path} {header}"),
+                token_set: IdentifierDoc::build_token_set(&name, &sig, &path, &header),
             }
         })
         .collect()

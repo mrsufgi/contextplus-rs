@@ -60,11 +60,34 @@ pub struct IdentifierDoc {
     pub header: String,
     pub name: String,
     pub kind: String,
+    /// Lowercased `kind` — pre-computed at index time to avoid per-query
+    /// `.to_lowercase()` allocations inside `score_identifiers`.
+    pub kind_lower: String,
     pub line: usize,
     pub end_line: usize,
     pub signature: String,
     pub parent_name: Option<String>,
     pub text: String,
+    /// Pre-computed token set over `name + signature + path + header`.
+    ///
+    /// Built once at index time via `split_camel_case`; eliminates one
+    /// `format!` allocation and one re-tokenization per doc per query in
+    /// the hot `score_identifiers` loop.
+    pub token_set: HashSet<String>,
+}
+
+impl IdentifierDoc {
+    /// Build the pre-computed `token_set` from the four fields used in keyword
+    /// scoring.  Call this once at index time; never call inside a query loop.
+    pub fn build_token_set(
+        name: &str,
+        signature: &str,
+        path: &str,
+        header: &str,
+    ) -> HashSet<String> {
+        let combined = format!("{name} {signature} {path} {header}");
+        split_camel_case(&combined).into_iter().collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -438,7 +461,7 @@ pub fn score_identifiers(
         .enumerate()
         .filter_map(|(i, doc)| {
             if let Some(kinds) = include_kinds
-                && !kinds.contains(&doc.kind.to_lowercase())
+                && !kinds.contains(&doc.kind_lower)
             {
                 return None;
             }
@@ -452,9 +475,7 @@ pub fn score_identifiers(
                 crate::core::embeddings::cosine_similarity_simsimd(query_vec, vec_slice).max(0.0)
                     as f64;
 
-            let keyword_input =
-                format!("{} {} {} {}", doc.name, doc.signature, doc.path, doc.header);
-            let keyword_score = get_keyword_coverage(query_terms, &keyword_input);
+            let keyword_score = keyword_coverage(query_terms, &doc.token_set);
 
             let total_weight = semantic_weight + keyword_weight;
             let score = if total_weight > 0.0 {
@@ -788,12 +809,14 @@ mod tests {
                 header: "user service".to_string(),
                 name: "getUserById".to_string(),
                 kind: "function".to_string(),
+                kind_lower: "function".to_string(),
                 line: 10,
                 end_line: 25,
                 signature: "getUserById(id: string): User".to_string(),
                 parent_name: None,
                 text: "getUserById function getUserById(id: string): User src/user.ts user service"
                     .to_string(),
+                token_set: HashSet::new(),
             },
             IdentifierDoc {
                 id: "src/db.ts:connect:5".to_string(),
@@ -801,11 +824,13 @@ mod tests {
                 header: "database".to_string(),
                 name: "connect".to_string(),
                 kind: "function".to_string(),
+                kind_lower: "function".to_string(),
                 line: 5,
                 end_line: 15,
                 signature: "connect(): Connection".to_string(),
                 parent_name: None,
                 text: "connect function connect(): Connection src/db.ts database".to_string(),
+                token_set: HashSet::new(),
             },
         ];
 
@@ -842,11 +867,13 @@ mod tests {
                 header: "types".to_string(),
                 name: "User".to_string(),
                 kind: "class".to_string(),
+                kind_lower: "class".to_string(),
                 line: 1,
                 end_line: 20,
                 signature: "class User".to_string(),
                 parent_name: None,
                 text: "User class".to_string(),
+                token_set: HashSet::new(),
             },
             IdentifierDoc {
                 id: "src/user.ts:getUser:25".to_string(),
@@ -854,11 +881,13 @@ mod tests {
                 header: "types".to_string(),
                 name: "getUser".to_string(),
                 kind: "function".to_string(),
+                kind_lower: "function".to_string(),
                 line: 25,
                 end_line: 30,
                 signature: "getUser(): User".to_string(),
                 parent_name: None,
                 text: "getUser function".to_string(),
+                token_set: HashSet::new(),
             },
         ];
 
@@ -893,11 +922,13 @@ mod tests {
             header: "user service".to_string(),
             name: "getUserById".to_string(),
             kind: "function".to_string(),
+            kind_lower: "function".to_string(),
             line: 10,
             end_line: 25,
             signature: "getUserById(id: string): User".to_string(),
             parent_name: None,
             text: "getUserById function".to_string(),
+            token_set: HashSet::new(),
         };
 
         let file_lines: HashMap<String, Vec<String>> = [
@@ -942,11 +973,13 @@ mod tests {
             header: "".to_string(),
             name: "myFunc".to_string(),
             kind: "function".to_string(),
+            kind_lower: "function".to_string(),
             line: 1,
             end_line: 5,
             signature: "myFunc()".to_string(),
             parent_name: None,
             text: "myFunc function".to_string(),
+            token_set: HashSet::new(),
         };
 
         let file_lines: HashMap<String, Vec<String>> = [(
@@ -975,11 +1008,13 @@ mod tests {
             header: "".to_string(),
             name: "noMatch".to_string(),
             kind: "function".to_string(),
+            kind_lower: "function".to_string(),
             line: 1,
             end_line: 5,
             signature: "noMatch()".to_string(),
             parent_name: None,
             text: "noMatch".to_string(),
+            token_set: HashSet::new(),
         };
         let file_lines: HashMap<String, Vec<String>> =
             [("other.ts".to_string(), vec!["const x = 42;".to_string()])]
@@ -1013,11 +1048,13 @@ mod tests {
                 header: "user service".to_string(),
                 name: "getUser".to_string(),
                 kind: "function".to_string(),
+                kind_lower: "function".to_string(),
                 line: 10,
                 end_line: 25,
                 signature: "getUser(id: string): User".to_string(),
                 parent_name: Some("UserService".to_string()),
                 text: "getUser function".to_string(),
+                token_set: HashSet::new(),
             },
             semantic_score: 0.85,
             keyword_score: 0.65,
@@ -1056,11 +1093,13 @@ mod tests {
             header: "user service module".to_string(),
             name: "getUserById".to_string(),
             kind: "function".to_string(),
+            kind_lower: "function".to_string(),
             line: 10,
             end_line: 25,
             signature: "getUserById(id: string): User".to_string(),
             parent_name: Some("UserService".to_string()),
             text: "getUserById function getUserById(id: string): User src/user.ts user service module UserService".to_string(),
+            token_set: HashSet::new(),
         };
         assert!(doc.text.contains("getUserById"));
         assert!(doc.text.contains("function"));
@@ -1078,11 +1117,13 @@ mod tests {
             header: "database module".to_string(),
             name: "connect".to_string(),
             kind: "function".to_string(),
+            kind_lower: "function".to_string(),
             line: 5,
             end_line: 15,
             signature: "connect(): Connection".to_string(),
             parent_name: None,
             text: "connect function connect(): Connection src/db.ts database module ".to_string(),
+            token_set: HashSet::new(),
         };
         assert!(doc.text.contains("connect"));
         assert!(doc.text.contains("database module"));
@@ -1158,6 +1199,7 @@ mod tests {
                 header: "stripe billing".to_string(),
                 name: name.clone(),
                 kind: "function".to_string(),
+                kind_lower: "function".to_string(),
                 line: i * 3 + 1,
                 end_line: i * 3 + 5,
                 signature: format!("{name}(orgId: string, seats: number): void"),
@@ -1165,6 +1207,12 @@ mod tests {
                 text: format!(
                     "{name} function {name}(orgId: string, seats: number): void \
                      src/mod_{i}.ts stripe billing"
+                ),
+                token_set: IdentifierDoc::build_token_set(
+                    &name,
+                    &format!("{name}(orgId: string, seats: number): void"),
+                    &format!("src/mod_{i}.ts"),
+                    "stripe billing",
                 ),
             };
             docs.push(doc);
@@ -1224,5 +1272,98 @@ mod tests {
             "rank_call_sites for 5 identifiers over 200-file corpus took {:.2}s (limit: 2s)",
             elapsed.as_secs_f64()
         );
+    }
+
+    // -- precomputed token-set tests --
+
+    /// The `token_set` stored in an `IdentifierDoc` must be identical to what
+    /// `split_camel_case(format!(...))` would have produced at query time.
+    /// This guards against drift between the build-time helper and the old
+    /// inline tokenization path.
+    #[test]
+    fn precomputed_token_set_matches_live_tokenization() {
+        let name = "getUserById";
+        let signature = "getUserById(id: string): User";
+        let path = "src/user.ts";
+        let header = "user service module";
+
+        // Pre-computed path (new).
+        let precomputed = IdentifierDoc::build_token_set(name, signature, path, header);
+
+        // Live path (old — what score_identifiers used to do on every query).
+        let keyword_input = format!("{name} {signature} {path} {header}");
+        let live: HashSet<String> = split_camel_case(&keyword_input).into_iter().collect();
+
+        assert_eq!(
+            precomputed, live,
+            "precomputed token_set diverges from live tokenization"
+        );
+    }
+
+    /// Regression: `score_identifiers` must return the same ranked order when
+    /// using the pre-computed `token_set` as it did with inline tokenization.
+    #[test]
+    fn score_identifiers_results_unchanged() {
+        // Two docs: one is a strong keyword + semantic match; the other is weak.
+        let make_doc =
+            |name: &str, sig: &str, path: &str, header: &str, kind: &str| IdentifierDoc {
+                id: format!("{path}:{name}:1"),
+                path: path.to_string(),
+                header: header.to_string(),
+                name: name.to_string(),
+                kind: kind.to_string(),
+                kind_lower: kind.to_lowercase(),
+                line: 1,
+                end_line: 5,
+                signature: sig.to_string(),
+                parent_name: None,
+                text: format!("{name} {kind} {sig} {path} {header}"),
+                token_set: IdentifierDoc::build_token_set(name, sig, path, header),
+            };
+
+        let docs = vec![
+            make_doc(
+                "getUserById",
+                "getUserById(id: string): User",
+                "src/user.ts",
+                "user service",
+                "function",
+            ),
+            make_doc(
+                "connectDatabase",
+                "connectDatabase(): Connection",
+                "src/db.ts",
+                "database layer",
+                "function",
+            ),
+        ];
+
+        // Vector favours getUserById (index 0).
+        let query_vec = vec![1.0f32, 0.0, 0.0];
+        let vector_buffer = vec![
+            0.9f32, 0.1, 0.0, // getUserById
+            0.1, 0.9, 0.0, // connectDatabase
+        ];
+        let query_terms: HashSet<String> = ["user", "get"].iter().map(|s| s.to_string()).collect();
+
+        let results = score_identifiers(
+            &docs,
+            &query_vec,
+            &query_terms,
+            &vector_buffer,
+            3,
+            &None,
+            0.78,
+            0.22,
+            5,
+        );
+
+        assert_eq!(results.len(), 2);
+        // getUserById must rank first (higher semantic + keyword coverage).
+        assert_eq!(
+            results[0].doc.name, "getUserById",
+            "ranking changed after precompute refactor"
+        );
+        assert_eq!(results[1].doc.name, "connectDatabase");
     }
 }
