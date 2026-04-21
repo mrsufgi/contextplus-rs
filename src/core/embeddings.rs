@@ -226,13 +226,15 @@ impl OllamaClient {
             }
         }
 
-        // HTTP/2 prior-knowledge only for plain-HTTP hosts (localhost Ollama).
-        // For HTTPS endpoints (TLS-proxied Ollama) we let reqwest's ALPN
-        // negotiate h2 normally — calling `http2_prior_knowledge()` there would
-        // cause handshake failures.
-        let use_h2_prior_knowledge = !config.ollama_host.starts_with("https://");
-
-        let mut builder = reqwest::Client::builder()
+        // NOTE: we deliberately do NOT call `.http2_prior_knowledge()`.
+        // Ollama (as of 0.3.x and earlier) serves HTTP/1.1 only — sending an
+        // h2 preface upfront produces "Remote peer returned unexpected data
+        // while we expected SETTINGS frame" and breaks every request.
+        // Leaving the `http2` cargo feature enabled is harmless: reqwest will
+        // speak h1 by default and only negotiate h2 via ALPN (TLS) if both
+        // sides support it. Opt-in for h2-speaking proxied deployments can
+        // come in a future `CONTEXTPLUS_OLLAMA_FORCE_HTTP2` env knob.
+        let client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             // Keep idle connections alive for 55 s — safely under the common
             // 60 s idle-eviction window used by reverse proxies and firewalls.
@@ -240,18 +242,10 @@ impl OllamaClient {
             // TCP keepalive pings every 30 s so NAT/firewall state is preserved
             // even when the connection is otherwise silent.
             .tcp_keepalive(std::time::Duration::from_secs(30))
-            // HTTP/2 application-level keepalive: ping every 25 s, timeout
-            // after 10 s. Pairs with pool_idle_timeout(55 s) so the connection
-            // isn't evicted between requests under light load.
-            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(25)))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
-            .http2_keep_alive_while_idle(true)
             .default_headers(default_headers)
-            .timeout(std::time::Duration::from_secs(120));
-        if use_h2_prior_knowledge {
-            builder = builder.http2_prior_knowledge();
-        }
-        let client = builder.build().expect("reqwest client build");
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("reqwest client build");
 
         let in_mem_cap = QUERY_CACHE_PERSIST_CAP.max(256);
         let cache = Arc::new(std::sync::Mutex::new(BoundedLruCache::new(in_mem_cap)));
