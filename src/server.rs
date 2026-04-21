@@ -25,11 +25,16 @@ use crate::error::{ContextPlusError, Result};
 use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
 pub use crate::server_definitions::{make_tool, tool_definitions};
 
-/// Cached project state: walked file entries and their line contents.
+/// Cached project state: walked file entries and their raw file contents.
 /// Built lazily on first tool call, invalidated by file watcher or TTL expiry.
+/// Content is stored as `Arc<String>` so call-sites can clone the pointer
+/// (cheap) and use `content.lines()` when line iteration is needed, avoiding
+/// the `Vec<String>` split + `join("\n")` round-trip on every access.
 pub struct ProjectCache {
     pub file_entries: Vec<crate::core::walker::FileEntry>,
-    pub file_lines: HashMap<String, Vec<String>>,
+    /// Maps relative_path → raw file content. Clone the Arc (pointer-sized)
+    /// at each call-site; do not reconstruct from lines.
+    pub file_content: HashMap<String, Arc<String>>,
     pub last_refresh: Instant,
 }
 
@@ -377,20 +382,19 @@ impl ContextPlusServer {
             use rayon::prelude::*;
 
             let entries = walk_with_config(&root, &config);
-            let file_lines: HashMap<String, Vec<String>> = entries
+            let file_content: HashMap<String, Arc<String>> = entries
                 .par_iter()
                 .filter(|entry| !entry.is_directory)
                 .filter_map(|entry| {
                     let full_path = root.join(&entry.relative_path);
-                    std::fs::read_to_string(&full_path).ok().map(|content| {
-                        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-                        (entry.relative_path.clone(), lines)
-                    })
+                    std::fs::read_to_string(&full_path)
+                        .ok()
+                        .map(|content| (entry.relative_path.clone(), Arc::new(content)))
                 })
                 .collect();
             ProjectCache {
                 file_entries: entries,
-                file_lines,
+                file_content,
                 last_refresh: Instant::now(),
             }
         })
@@ -574,8 +578,8 @@ impl ContextPlusServer {
                 if entry.is_directory {
                     continue;
                 }
-                if let Some(lines) = cache_clone.file_lines.get(&entry.relative_path) {
-                    let content = lines.join("\n");
+                if let Some(content) = cache_clone.file_content.get(&entry.relative_path) {
+                    let content = Arc::clone(content);
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                     if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
                         let header = crate::core::parser::extract_header(&content);
@@ -811,8 +815,8 @@ impl ContextPlusServer {
                 if entry.is_directory {
                     continue;
                 }
-                if let Some(lines) = cache.file_lines.get(&entry.relative_path) {
-                    let content = lines.join("\n");
+                if let Some(content) = cache.file_content.get(&entry.relative_path) {
+                    let content = Arc::clone(content);
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                     if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
                         let header = crate::core::parser::extract_header(&content);
@@ -862,14 +866,11 @@ impl ContextPlusServer {
         let root = self.resolve_root(&args);
         let full_path = root.join(&file_path);
 
-        // Round 10B: check ProjectCache.file_lines first to avoid a disk read on warm cache.
-        let cached_content: Option<String> = {
+        // Check ProjectCache.file_content first to avoid a disk read on warm cache.
+        let cached_content: Option<Arc<String>> = {
             let cache_guard = self.state.project_cache.read().await;
             if let Some(ref cache) = *cache_guard {
-                cache
-                    .file_lines
-                    .get(&file_path)
-                    .map(|lines| lines.join("\n"))
+                cache.file_content.get(&file_path).map(Arc::clone)
             } else {
                 None
             }
@@ -881,8 +882,13 @@ impl ContextPlusServer {
             None
         };
 
-        let content = cached_content.or(disk_content);
-        let content_ref = content.as_deref();
+        // Prefer cached Arc content; fall back to freshly read string.
+        // `cached_content` is `Option<Arc<String>>` — deref to `&str` via `as_str()`.
+        // `disk_content` is `Option<String>` — deref to `&str` via `as_deref()`.
+        let content_ref: Option<&str> = cached_content
+            .as_deref()
+            .map(String::as_str)
+            .or_else(|| disk_content.as_deref());
 
         let analysis = content_ref.and_then(|c| {
             let ext = file_path.rsplit('.').next().unwrap_or("");
@@ -920,12 +926,12 @@ impl ContextPlusServer {
 
         let cache = self.ensure_project_cache().await?;
 
-        // find_symbol_usages scans all file lines — CPU-bound, run in blocking thread pool.
+        // find_symbol_usages scans all file content — CPU-bound, run in blocking thread pool.
         let formatted = tokio::task::spawn_blocking(move || {
             let result = crate::tools::blast_radius::find_symbol_usages(
                 &symbol_name,
                 file_context.as_deref(),
-                &cache.file_lines,
+                &cache.file_content,
             );
             crate::tools::blast_radius::format_blast_radius(&symbol_name, &result)
         })
@@ -1025,7 +1031,7 @@ impl ContextPlusServer {
             &idx.docs,
             &idx.vector_buffer,
             idx.dims,
-            &cache.file_lines,
+            &cache.file_content,
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -1371,9 +1377,9 @@ impl ContextPlusServer {
             let mut tokens_by_file: HashMap<PathBuf, std::collections::HashSet<String>> =
                 HashMap::new();
 
-            for (rel_path, lines) in &cache.file_lines {
-                let content = lines.join("\n");
+            for (rel_path, content) in &cache.file_content {
                 let tokens: std::collections::HashSet<String> = content
+                    .as_str()
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .filter(|t| !t.is_empty())
                     .map(|t| t.to_string())
@@ -1432,7 +1438,7 @@ impl ContextPlusServer {
             let symbols_by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
                 build_symbols_by_file(&cache, |rel| rel.to_string());
             let all_abs_paths: Vec<PathBuf> = cache
-                .file_lines
+                .file_content
                 .keys()
                 .map(|rel_path| root.join(rel_path))
                 .collect();
@@ -1486,8 +1492,11 @@ impl ContextPlusServer {
         let root = self.state.root_dir.clone();
 
         let formatted = tokio::task::spawn_blocking(move || {
-            let all_abs_paths: Vec<PathBuf> =
-                cache.file_lines.keys().map(|rel| root.join(rel)).collect();
+            let all_abs_paths: Vec<PathBuf> = cache
+                .file_content
+                .keys()
+                .map(|rel| root.join(rel))
+                .collect();
 
             // build_reverse_graph gives reverse edges (imported -> {importers}).
             // Invert to forward graph (importer -> {imported}) for cycle detection.
@@ -1597,10 +1606,10 @@ impl ContextPlusServer {
                 .iter()
                 .filter(|e| !e.is_directory)
                 .map(|e| {
-                    let content = cache
-                        .file_lines
+                    let content: String = cache
+                        .file_content
                         .get(&e.relative_path)
-                        .map(|lines| lines.join("\n"))
+                        .map(|arc| arc.as_str().to_owned())
                         .unwrap_or_default();
                     let ext = e.relative_path.rsplit('.').next().unwrap_or("");
                     let symbols: Vec<String> = parse_with_tree_sitter(&content, ext)
@@ -1785,10 +1794,9 @@ where
     F: Fn(&str) -> K,
 {
     let mut symbols_by_file: HashMap<K, Vec<crate::core::parser::CodeSymbol>> = HashMap::new();
-    for (rel_path, lines) in &cache.file_lines {
-        let content = lines.join("\n");
+    for (rel_path, content) in &cache.file_content {
         let ext = rel_path.rsplit('.').next().unwrap_or("");
-        if let Ok(syms) = parse_with_tree_sitter(&content, ext) {
+        if let Ok(syms) = parse_with_tree_sitter(content, ext) {
             symbols_by_file.insert(key_fn(rel_path), syms);
         }
     }
@@ -2141,19 +2149,33 @@ mod tests {
             "file_entries should not be empty"
         );
         assert!(
-            !cache.file_lines.is_empty(),
-            "file_lines should not be empty"
+            !cache.file_content.is_empty(),
+            "file_content should not be empty"
         );
 
-        // Verify specific files are in file_lines
-        let has_hello = cache.file_lines.contains_key("hello.txt");
-        let has_world = cache.file_lines.contains_key("world.rs");
+        // Verify specific files are in file_content
+        let has_hello = cache.file_content.contains_key("hello.txt");
+        let has_world = cache.file_content.contains_key("world.rs");
         assert!(has_hello, "cache should contain hello.txt");
         assert!(has_world, "cache should contain world.rs");
 
-        // Verify content
-        let hello_lines = &cache.file_lines["hello.txt"];
-        assert_eq!(hello_lines, &["line1", "line2", "line3"]);
+        // Verify content: the raw string should contain all three lines
+        let hello = cache.file_content["hello.txt"].as_str();
+        let hello_lines: Vec<&str> = hello.lines().collect();
+        assert_eq!(hello_lines, ["line1", "line2", "line3"]);
+
+        // Arc refcount test: after 3 clones the strong count should be 4
+        let arc = Arc::clone(&cache.file_content["hello.txt"]);
+        let arc2 = Arc::clone(&arc);
+        let arc3 = Arc::clone(&arc2);
+        assert_eq!(
+            Arc::strong_count(&arc3),
+            4,
+            "expected strong_count == 4 after 3 extra clones"
+        );
+        drop(arc);
+        drop(arc2);
+        drop(arc3);
 
         // Cache should now be populated in shared state
         {
@@ -2253,11 +2275,11 @@ mod tests {
 
         // Rebuilt cache should still find the same files
         assert!(
-            cache2.file_lines.contains_key("hello.txt"),
+            cache2.file_content.contains_key("hello.txt"),
             "rebuilt cache should contain hello.txt"
         );
         assert!(
-            cache2.file_lines.contains_key("world.rs"),
+            cache2.file_content.contains_key("world.rs"),
             "rebuilt cache should contain world.rs"
         );
     }
@@ -3457,18 +3479,13 @@ mod tests {
                 depth: 0,
             })
             .collect();
-        let file_lines: HashMap<String, Vec<String>> = files
+        let file_content: HashMap<String, Arc<String>> = files
             .into_iter()
-            .map(|(path, content)| {
-                (
-                    path.to_string(),
-                    content.lines().map(|l| l.to_string()).collect(),
-                )
-            })
+            .map(|(path, content)| (path.to_string(), Arc::new(content.to_string())))
             .collect();
         ProjectCache {
             file_entries: entries,
-            file_lines,
+            file_content,
             last_refresh: Instant::now(),
         }
     }
