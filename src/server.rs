@@ -1327,6 +1327,7 @@ impl ContextPlusServer {
             node_id: Self::get_str(&args, "start_node_id")
                 .ok_or_else(|| ContextPlusError::Other("start_node_id is required".into()))?,
             max_depth: Self::get_usize(&args, "max_depth"),
+            max_nodes: Self::get_usize(&args, "max_nodes"),
             edge_filter: Self::get_string_array(&args, "edge_filter"),
         };
 

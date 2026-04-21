@@ -730,15 +730,28 @@ impl MemoryGraph {
     /// only updates `last_accessed` to keep the read-path contract narrow. If a
     /// specific consumer needs start-node access counters, call a dedicated
     /// increment method separately.
+    /// Default cap on visited nodes for [`Self::retrieve_with_traversal`] to
+    /// prevent O(N²) blowup on dense or accidentally-cyclic graphs.
+    pub const DEFAULT_MAX_NODES: usize = 200;
+
+    /// Retrieve a node and its BFS neighborhood up to `max_depth` hops.
+    ///
+    /// The `max_nodes` parameter (default [`Self::DEFAULT_MAX_NODES`]) caps the
+    /// total number of nodes visited, preventing pathological blowup on dense
+    /// graphs.  When the cap is hit the BFS stops early and `truncated` is set
+    /// to `true` in the returned tuple.
     pub fn retrieve_with_traversal(
         &self,
         start_node_id: &str,
         max_depth: usize,
+        max_nodes: Option<usize>,
         edge_filter: Option<&[RelationType]>,
-    ) -> (Vec<TraversalResult>, Vec<String>) {
+    ) -> (Vec<TraversalResult>, Vec<String>, bool) {
+        let cap = max_nodes.unwrap_or(Self::DEFAULT_MAX_NODES);
+
         let start_node = match self.get_node(start_node_id) {
             Some(n) => n.clone(),
-            None => return (Vec::new(), Vec::new()),
+            None => return (Vec::new(), Vec::new(), false),
         };
 
         let mut touched_ids = vec![start_node_id.to_string()];
@@ -753,10 +766,11 @@ impl MemoryGraph {
         let mut visited = HashSet::new();
         visited.insert(start_node_id.to_string());
 
-        self.collect_traversal(
+        let truncated = self.collect_traversal(
             start_node_id,
             1,
             max_depth,
+            cap,
             std::slice::from_ref(&start_node.label),
             &mut visited,
             &mut results,
@@ -764,31 +778,46 @@ impl MemoryGraph {
             edge_filter,
         );
 
-        (results, touched_ids)
+        if truncated {
+            tracing::warn!(
+                node_id = start_node_id,
+                cap,
+                "BFS traversal truncated: visited node cap reached"
+            );
+        }
+
+        (results, touched_ids, truncated)
     }
 
     /// BFS traversal collecting nodes with depth-penalized scoring.
     /// Appends visited node IDs to `touched_ids` for deferred `last_accessed`
     /// stamping via [`Self::touch_nodes`].
+    ///
+    /// Returns `true` if the node cap was reached (truncated), `false` otherwise.
     #[allow(clippy::too_many_arguments)]
     fn collect_traversal(
         &self,
         node_id: &str,
         depth: usize,
         max_depth: usize,
+        max_nodes: usize,
         path_labels: &[String],
         visited: &mut HashSet<String>,
         results: &mut Vec<TraversalResult>,
         touched_ids: &mut Vec<String>,
         edge_filter: Option<&[RelationType]>,
-    ) {
+    ) -> bool {
         if depth > max_depth {
-            return;
+            return false;
         }
 
         let edges = self.edges_for_node(node_id);
 
         for (edge, source_id, target_id) in edges {
+            if visited.len() >= max_nodes {
+                return true;
+            }
+
             if let Some(filter) = edge_filter
                 && !filter.contains(&edge.relation)
             {
@@ -823,17 +852,23 @@ impl MemoryGraph {
                 relevance_score: (score * 10.0).round() / 10.0,
             });
 
-            self.collect_traversal(
+            let sub_truncated = self.collect_traversal(
                 &neighbor_id,
                 depth + 1,
                 max_depth,
+                max_nodes,
                 &new_path,
                 visited,
                 results,
                 touched_ids,
                 edge_filter,
             );
+            if sub_truncated {
+                return true;
+            }
         }
+
+        false
     }
 
     /// Delete a node by ID along with all edges that reference it.
@@ -1630,7 +1665,7 @@ mod tests {
         );
         graph.create_relation(&a.id, &b.id, RelationType::Contains, None, None);
 
-        let (results, touched) = graph.retrieve_with_traversal(&a.id, 2, None);
+        let (results, touched, truncated) = graph.retrieve_with_traversal(&a.id, 2, None, None);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].node.label, "root");
         assert_eq!(results[0].depth, 0);
@@ -1638,14 +1673,17 @@ mod tests {
         assert_eq!(results[1].depth, 1);
         assert!(touched.contains(&a.id));
         assert!(touched.contains(&b.id));
+        assert!(!truncated);
     }
 
     #[test]
     fn retrieve_with_traversal_missing_node() {
         let graph = MemoryGraph::new();
-        let (results, touched) = graph.retrieve_with_traversal("nonexistent", 2, None);
+        let (results, touched, truncated) =
+            graph.retrieve_with_traversal("nonexistent", 2, None, None);
         assert!(results.is_empty());
         assert!(touched.is_empty());
+        assert!(!truncated);
     }
 
     #[test]
@@ -1657,8 +1695,8 @@ mod tests {
         graph.create_relation(&a.id, &b.id, RelationType::DependsOn, None, None);
         graph.create_relation(&a.id, &c.id, RelationType::Contains, None, None);
 
-        let (results, _touched) =
-            graph.retrieve_with_traversal(&a.id, 2, Some(&[RelationType::DependsOn]));
+        let (results, _touched, _truncated) =
+            graph.retrieve_with_traversal(&a.id, 2, None, Some(&[RelationType::DependsOn]));
         // Should only find A -> B (depends_on), not A -> C (contains)
         assert_eq!(results.len(), 2);
         assert_eq!(results[1].node.label, "B");
@@ -2141,5 +2179,74 @@ mod tests {
             .await
             .expect("dirty check");
         assert!(!is_dirty, "graph should remain clean after empty touch");
+    }
+
+    // --- max_nodes BFS cap tests ---
+
+    /// Build a star graph: one root connected to `n` leaves, each leaf connected
+    /// to `n` further nodes — total 1 + n + n² addressable nodes at depth ≤ 2.
+    fn build_dense_graph(n: usize) -> (MemoryGraph, String) {
+        let mut graph = MemoryGraph::new();
+        let root = graph.upsert_node(NodeType::Concept, "root", "root", make_embedding(0.5), None);
+        for i in 0..n {
+            let mid = graph.upsert_node(
+                NodeType::Concept,
+                &format!("mid-{i}"),
+                "mid",
+                make_embedding(0.4),
+                None,
+            );
+            graph.create_relation(&root.id, &mid.id, RelationType::Contains, None, None);
+            for j in 0..n {
+                let leaf = graph.upsert_node(
+                    NodeType::Concept,
+                    &format!("leaf-{i}-{j}"),
+                    "leaf",
+                    make_embedding(0.3),
+                    None,
+                );
+                graph.create_relation(&mid.id, &leaf.id, RelationType::Contains, None, None);
+            }
+        }
+        let root_id = root.id.clone();
+        (graph, root_id)
+    }
+
+    #[test]
+    fn traversal_stops_at_max_nodes() {
+        // 6 mid-nodes × 6 leaves = 36 + 1 root + 6 mid = 43 total; cap at 10
+        let (graph, root_id) = build_dense_graph(6);
+        let cap = 10_usize;
+        let (results, _touched, _truncated) =
+            graph.retrieve_with_traversal(&root_id, 3, Some(cap), None);
+        assert!(
+            results.len() <= cap,
+            "expected at most {cap} results, got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn traversal_truncated_flag_set_when_capped() {
+        let (graph, root_id) = build_dense_graph(6);
+        let cap = 5_usize;
+        let (_results, _touched, truncated) =
+            graph.retrieve_with_traversal(&root_id, 3, Some(cap), None);
+        assert!(truncated, "expected truncated=true when graph exceeds cap");
+    }
+
+    #[test]
+    fn traversal_small_graph_not_truncated() {
+        let mut graph = MemoryGraph::new();
+        let a = graph.upsert_node(NodeType::Concept, "A", "a", make_embedding(0.1), None);
+        let b = graph.upsert_node(NodeType::Concept, "B", "b", make_embedding(0.5), None);
+        let c = graph.upsert_node(NodeType::Concept, "C", "c", make_embedding(0.9), None);
+        graph.create_relation(&a.id, &b.id, RelationType::Contains, None, None);
+        graph.create_relation(&b.id, &c.id, RelationType::Contains, None, None);
+
+        // 3 nodes, cap = 200 default
+        let (results, _touched, truncated) = graph.retrieve_with_traversal(&a.id, 5, None, None);
+        assert!(!truncated, "small graph should not be truncated");
+        assert_eq!(results.len(), 3, "all 3 nodes should be visited");
     }
 }
