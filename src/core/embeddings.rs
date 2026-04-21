@@ -1258,13 +1258,24 @@ impl VectorStore {
     }
 
     /// Convert to a cache map.
+    ///
+    /// Applies the same dot-segment exclusion rule as the walker so that
+    /// stale entries from pre-#50 caches (e.g. `.claude/worktrees/…` paths
+    /// indexed when the server was once run from inside a worktree dir)
+    /// are dropped on load. Mirrors `CacheData::sweep_excluded_keys` for
+    /// the mmap/VectorStore load path that bypasses `load_cache`.
     pub fn to_cache(&self) -> HashMap<String, CacheEntry> {
         let vectors = self.vectors.as_slice();
         let mut cache = HashMap::with_capacity(self.count as usize);
+        let empty_ignore = std::collections::HashSet::new();
         for i in 0..self.count as usize {
+            let key = &self.keys[i];
+            if !crate::core::walker::should_track(key, &empty_ignore) {
+                continue;
+            }
             let offset = i * self.dims as usize;
             cache.insert(
-                self.keys[i].clone(),
+                key.clone(),
                 CacheEntry {
                     hash: self.hashes[i].clone(),
                     vector: vectors[offset..offset + self.dims as usize].to_vec(),
