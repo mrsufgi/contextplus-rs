@@ -513,3 +513,89 @@ fn test_agent_target_config_paths() {
         );
     }
 }
+
+// ===========================================================================
+// Category: Graceful drain on parent death
+// ===========================================================================
+
+#[tokio::test]
+async fn drain_flag_rejects_new_calls_but_lets_inflight_finish() {
+    use std::sync::atomic::Ordering;
+
+    let dir = TempDir::new().unwrap();
+    let server = test_server_in(dir.path());
+
+    // Kick off an "in-flight" call: list_restore_points with no draining set.
+    // This proves the call path completes after the drain flag flips _during_
+    // a separate later call. We can't easily pause dispatch mid-flight without
+    // a sleep tool, so we approximate the spec's requirement by:
+    //   1. Running one call to completion before drain (succeeds).
+    //   2. Flipping drain.
+    //   3. Asserting the next call is rejected with the shutdown error.
+    // The "in-flight survives" property is exercised by the unit test in
+    // process_lifecycle::tests::drain_watcher_exits_when_inflight_hits_zero.
+    let r1 = server
+        .dispatch("list_restore_points", serde_json::Map::new())
+        .await;
+    assert_eq!(r1.is_error, Some(false), "pre-drain call should succeed");
+    assert_eq!(
+        server.state.inflight.load(Ordering::Acquire),
+        0,
+        "inflight must return to zero after dispatch"
+    );
+
+    // Simulate parent death.
+    server.state.draining.store(true, Ordering::Release);
+
+    let r2 = server
+        .dispatch("list_restore_points", serde_json::Map::new())
+        .await;
+    assert_eq!(
+        r2.is_error,
+        Some(true),
+        "post-drain call should be rejected"
+    );
+    let text = extract_text(&r2);
+    assert!(
+        text.contains("shutting down"),
+        "expected drain error, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn drain_watcher_exits_after_concurrent_inflight_completes() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let server = Arc::new(test_server_in(dir.path()));
+
+    // Hold a fake in-flight count so the watcher can't exit immediately.
+    server.state.inflight.fetch_add(1, Ordering::AcqRel);
+
+    let exited = Arc::new(std::sync::Mutex::new(None));
+    let exited_clone = exited.clone();
+    let handle = contextplus_rs::core::process_lifecycle::start_drain_watcher(
+        Arc::clone(&server.state.draining),
+        Arc::clone(&server.state.inflight),
+        Duration::from_secs(5),
+        move |reason| {
+            *exited_clone.lock().unwrap() = Some(reason);
+        },
+    );
+
+    // Trigger drain.
+    server.state.draining.store(true, Ordering::Release);
+
+    // Watcher must NOT have fired yet — we still hold inflight=1.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(exited.lock().unwrap().is_none());
+
+    // Release the in-flight call — watcher should fire.
+    server.state.inflight.fetch_sub(1, Ordering::AcqRel);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    assert!(matches!(
+        *exited.lock().unwrap(),
+        Some(contextplus_rs::core::process_lifecycle::DrainReason::AllInflightCompleted)
+    ));
+}

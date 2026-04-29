@@ -116,6 +116,14 @@ pub struct SharedState {
     pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
     /// Idle monitor handle — tool handlers touch this to reset the idle timer.
     pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
+    /// Drain flag — set when the parent process dies (or another graceful
+    /// shutdown trigger fires). Once true, `dispatch` rejects new tool calls
+    /// with a clean error so in-flight calls can finish before exit.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Counter of currently in-flight tool dispatches. Incremented at the top
+    /// of `dispatch_inner` via an `InflightGuard`; decremented on drop. The
+    /// drain watcher exits the process once draining is true and this hits 0.
+    pub inflight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The MCP server exposing context+ tools.
@@ -189,6 +197,8 @@ impl ContextPlusServer {
             instructions_cache: OnceCell::new(),
             tracker_handle: std::sync::Mutex::new(None),
             idle_monitor: RwLock::new(None),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         Self { state }
     }
@@ -830,6 +840,20 @@ impl ContextPlusServer {
         name: &str,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        use std::sync::atomic::Ordering;
+
+        // Reject new calls once we're draining — let in-flight ones finish.
+        if self.state.draining.load(Ordering::Acquire) {
+            return Ok(Self::err_text(
+                "server is shutting down — please retry".to_string(),
+            ));
+        }
+
+        // Track in-flight dispatches via RAII so the drain watcher knows when
+        // it's safe to exit. Decrement happens on drop, including panic paths.
+        let _inflight =
+            crate::core::process_lifecycle::InflightGuard::new(Arc::clone(&self.state.inflight));
+
         match name {
             "get_context_tree" => self.handle_context_tree(args).await,
             "get_file_skeleton" => self.handle_file_skeleton(args).await,
@@ -3816,5 +3840,65 @@ mod tests {
         unsafe {
             std::env::remove_var("CONTEXTPLUS_WARMUP_ON_START");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Drain mode dispatch behavior
+    // -----------------------------------------------------------------------
+
+    fn extract_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| match &c.raw {
+                RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_new_calls_when_draining() {
+        use std::sync::atomic::Ordering;
+
+        let server = test_server();
+        server.state.draining.store(true, Ordering::Release);
+
+        let result = server
+            .dispatch("get_context_tree", serde_json::Map::new())
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("shutting down"),
+            "expected shutdown message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_inflight_count_returns_to_zero_after_call() {
+        use std::sync::atomic::Ordering;
+
+        let server = test_server();
+        let _ = server
+            .dispatch("list_restore_points", serde_json::Map::new())
+            .await;
+        assert_eq!(server.state.inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_drain_rejects_unknown_tool_too() {
+        use std::sync::atomic::Ordering;
+
+        // Drain check must run before name dispatch so even unknown tools
+        // get the consistent shutdown error during drain.
+        let server = test_server();
+        server.state.draining.store(true, Ordering::Release);
+        let result = server
+            .dispatch("nonexistent_tool", serde_json::Map::new())
+            .await;
+        let text = extract_text(&result);
+        assert!(text.contains("shutting down"), "got: {text}");
     }
 }

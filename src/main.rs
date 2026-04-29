@@ -343,22 +343,49 @@ async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()>
         *guard = Some(idle_monitor.clone());
     }
 
-    // Parent PID monitor: detect orphaned process.
+    // Parent PID monitor: detect orphaned process. On detection we transition
+    // to graceful drain mode (reject new calls, let in-flight ones finish)
+    // rather than exiting immediately — see the drain watcher below.
     #[cfg(unix)]
     let _parent_monitor = {
         let parent_pid = std::os::unix::process::parent_id();
+        let draining = Arc::clone(&server.state.draining);
+        let inflight = Arc::clone(&server.state.inflight);
+
+        // Start the drain watcher upfront — it polls the draining flag and
+        // either waits for inflight==0 or hits the grace-deadline ceiling.
+        let drain_grace_secs = process_lifecycle::get_drain_grace_secs(
+            std::env::var("CONTEXTPLUS_DRAIN_GRACE_SECS")
+                .ok()
+                .as_deref(),
+        );
+        let _drain_watcher = process_lifecycle::start_drain_watcher(
+            Arc::clone(&draining),
+            inflight,
+            std::time::Duration::from_secs(drain_grace_secs),
+            move |reason| {
+                tracing::info!(
+                    ?reason,
+                    "drain watcher fired — exiting cleanly after parent death",
+                );
+                std::process::exit(0);
+            },
+        );
+
         let handle =
             process_lifecycle::start_parent_monitor(parent_pid, config.parent_poll_ms, move || {
                 tracing::info!(
-                    "Parent process (pid={}) exited — initiating shutdown",
-                    parent_pid
+                    "parent process (pid={}) exited — entering drain mode (grace={}s)",
+                    parent_pid,
+                    drain_grace_secs,
                 );
-                std::process::exit(0);
+                draining.store(true, std::sync::atomic::Ordering::Release);
             });
         tracing::info!(
-            "Parent PID monitor started (pid={}, poll={}ms)",
+            "parent PID monitor started (pid={}, poll={}ms, drain_grace={}s)",
             parent_pid,
-            config.parent_poll_ms
+            config.parent_poll_ms,
+            drain_grace_secs,
         );
         handle
     };
