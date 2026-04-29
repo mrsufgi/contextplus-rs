@@ -1258,17 +1258,36 @@ impl VectorStore {
     }
 
     /// Convert to a cache map.
+    ///
+    /// Applies the same dot-segment exclusion rule as the walker so that
+    /// stale entries from pre-#50 caches (e.g. `.claude/worktrees/…` paths
+    /// indexed when the server was once run from inside a worktree dir)
+    /// are dropped on load. Mirrors `CacheData::sweep_excluded_keys` for
+    /// the mmap/VectorStore load path that bypasses `load_cache`.
     pub fn to_cache(&self) -> HashMap<String, CacheEntry> {
         let vectors = self.vectors.as_slice();
         let mut cache = HashMap::with_capacity(self.count as usize);
+        let mut dropped = 0usize;
         for i in 0..self.count as usize {
+            let key = &self.keys[i];
+            if !crate::core::walker::should_keep_cache_key(key) {
+                dropped += 1;
+                continue;
+            }
             let offset = i * self.dims as usize;
             cache.insert(
-                self.keys[i].clone(),
+                key.clone(),
                 CacheEntry {
                     hash: self.hashes[i].clone(),
                     vector: vectors[offset..offset + self.dims as usize].to_vec(),
                 },
+            );
+        }
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                total = self.count,
+                "VectorStore::to_cache: dropped excluded keys (stale worktree/hidden paths)"
             );
         }
         cache
@@ -2606,6 +2625,50 @@ mod tests {
         assert!(
             !results.is_empty(),
             "custom ef_search=256 should still return results"
+        );
+    }
+
+    // -- VectorStore::to_cache hygiene sweep --
+
+    /// `VectorStore::to_cache` must drop entries with dot-prefixed path segments
+    /// (stale worktree / hidden paths) and retain only valid keys.
+    /// Mirrors `sweep_excluded_keys_removes_dot_segment_paths` for the mmap path.
+    #[test]
+    fn to_cache_drops_excluded_keys() {
+        // Keys: two excluded paths (.claude/worktrees, .git) and two clean paths.
+        let keys = vec![
+            "src/lib.rs".to_string(),
+            ".claude/worktrees/agent-x/foo.ts".to_string(),
+            ".git/HEAD".to_string(),
+            "packages/utils/index.ts".to_string(),
+        ];
+        let hashes: Vec<String> = keys.iter().map(|k| format!("hash-{}", k)).collect();
+        // dims=2, 4 entries → 8 floats
+        let vectors: Vec<f32> = (0..8).map(|i| i as f32).collect();
+
+        let store = VectorStore::new(2, keys, hashes, vectors);
+        let cache = store.to_cache();
+
+        // Only the two clean keys must survive.
+        assert_eq!(
+            cache.len(),
+            2,
+            "expected 2 entries, got {}: {:?}",
+            cache.len(),
+            cache.keys().collect::<Vec<_>>()
+        );
+        assert!(cache.contains_key("src/lib.rs"), "src/lib.rs must be kept");
+        assert!(
+            cache.contains_key("packages/utils/index.ts"),
+            "packages/utils/index.ts must be kept"
+        );
+        assert!(
+            !cache.contains_key(".claude/worktrees/agent-x/foo.ts"),
+            "worktree path must be dropped"
+        );
+        assert!(
+            !cache.contains_key(".git/HEAD"),
+            ".git/HEAD must be dropped"
         );
     }
 }

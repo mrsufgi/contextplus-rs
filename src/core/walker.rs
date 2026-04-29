@@ -43,6 +43,17 @@ pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
     true
 }
 
+/// Returns `true` when a cache key should be retained during cache hygiene
+/// sweeps (both `VectorStore::to_cache` and `CacheData::sweep_excluded_keys`).
+///
+/// This is a thin wrapper around [`should_track`] with an empty ignore-dirs
+/// set — the single source of truth for the dot-segment exclusion rule so
+/// both sweep paths stay in sync.
+#[inline]
+pub fn should_keep_cache_key(key: &str) -> bool {
+    should_track(key, &Default::default())
+}
+
 /// Walk a directory respecting .gitignore rules and configured ignore dirs.
 /// Uses the `ignore` crate (from ripgrep) for high-performance gitignore-aware walking.
 pub fn walk_directory(opts: &WalkOptions) -> Vec<FileEntry> {

@@ -169,7 +169,7 @@ impl CacheData {
                 continue;
             }
 
-            if crate::core::walker::should_track(key, &Default::default()) {
+            if crate::core::walker::should_keep_cache_key(key) {
                 keep_new_keys.push(key.clone());
                 keep_new_hashes.push(self.hashes[i].clone());
                 keep_new_vectors.extend_from_slice(&self.vectors[off..off + dim]);
