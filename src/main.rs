@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use contextplus_rs::config::Config;
-use contextplus_rs::transport::dispatch::{resolve_transport_mode, run_implicit_default, run_mcp_server};
+use contextplus_rs::transport::dispatch::{
+    resolve_transport_mode, run_implicit_default, run_mcp_server,
+};
 
 #[derive(Parser)]
 #[command(
