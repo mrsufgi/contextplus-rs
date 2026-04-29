@@ -3,7 +3,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
 
@@ -15,6 +15,11 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 15 * 60 * 1000; // 15 min
 pub const MIN_IDLE_TIMEOUT_MS: u64 = 60 * 1000; // 1 min
 pub const DEFAULT_PARENT_POLL_MS: u64 = 5 * 1000; // 5 s
 pub const MIN_PARENT_POLL_MS: u64 = 1_000; // 1 s
+/// Default hard ceiling for drain mode — after this, force-exit even if calls
+/// are still in flight. Override via `CONTEXTPLUS_DRAIN_GRACE_SECS`.
+pub const DEFAULT_DRAIN_GRACE_SECS: u64 = 30;
+/// Poll interval for the drain watcher when checking if inflight has reached 0.
+const DRAIN_POLL_MS: u64 = 100;
 
 const DISABLED_VALUES: &[&str] = &["0", "false", "off", "disabled", "none"];
 
@@ -231,6 +236,88 @@ where
     });
 
     ParentMonitorHandle { stopped }
+}
+
+// ---------------------------------------------------------------------------
+// Drain watcher
+// ---------------------------------------------------------------------------
+
+/// Parse drain grace seconds from an env-var string. Falls back to
+/// `DEFAULT_DRAIN_GRACE_SECS` for missing/invalid values.
+pub fn get_drain_grace_secs(value: Option<&str>) -> u64 {
+    match value {
+        Some(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_DRAIN_GRACE_SECS),
+        None => DEFAULT_DRAIN_GRACE_SECS,
+    }
+}
+
+/// Watch the drain flag + inflight counter. When `draining == true` and either
+/// `inflight == 0` or the grace deadline elapses, invoke `on_drained` and stop.
+///
+/// Run as a background tokio task; returns immediately. The callback is the
+/// terminal action — typically `process::exit`. In tests, pass a closure that
+/// records the trigger reason instead.
+pub fn start_drain_watcher<F>(
+    draining: Arc<AtomicBool>,
+    inflight: Arc<AtomicUsize>,
+    grace: Duration,
+    on_drained: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce(DrainReason) + Send + 'static,
+{
+    let poll = Duration::from_millis(DRAIN_POLL_MS);
+    tokio::spawn(async move {
+        // Wait until draining is set (cheap polling — only this task spins).
+        while !draining.load(Ordering::Acquire) {
+            sleep(poll).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if inflight.load(Ordering::Acquire) == 0 {
+                on_drained(DrainReason::AllInflightCompleted);
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let remaining = inflight.load(Ordering::Acquire);
+                on_drained(DrainReason::GraceExpired {
+                    inflight: remaining,
+                });
+                return;
+            }
+            sleep(poll).await;
+        }
+    })
+}
+
+/// Why the drain watcher decided it was time to exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainReason {
+    /// All in-flight calls finished before the grace deadline.
+    AllInflightCompleted,
+    /// Grace deadline expired with `inflight` calls still running.
+    GraceExpired { inflight: usize },
+}
+
+/// RAII guard that increments `inflight` on construction and decrements on
+/// drop. Hold one of these for the duration of every tool dispatch so the
+/// drain watcher knows when it is safe to exit.
+pub struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InflightGuard {
+    pub fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +563,89 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(handle.stopped.load(Ordering::Relaxed));
+    }
+
+    // -----------------------------------------------------------------------
+    // Drain watcher / inflight guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_grace_defaults() {
+        assert_eq!(get_drain_grace_secs(None), DEFAULT_DRAIN_GRACE_SECS);
+    }
+
+    #[test]
+    fn drain_grace_parses_value() {
+        assert_eq!(get_drain_grace_secs(Some("5")), 5);
+        assert_eq!(get_drain_grace_secs(Some("60")), 60);
+    }
+
+    #[test]
+    fn drain_grace_invalid_uses_default() {
+        assert_eq!(get_drain_grace_secs(Some("abc")), DEFAULT_DRAIN_GRACE_SECS);
+    }
+
+    #[test]
+    fn inflight_guard_increments_and_decrements() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let _g1 = InflightGuard::new(counter.clone());
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+            {
+                let _g2 = InflightGuard::new(counter.clone());
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
+            }
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_watcher_exits_when_inflight_hits_zero() {
+        let draining = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let reason = Arc::new(std::sync::Mutex::new(None));
+        let r = reason.clone();
+        let handle = start_drain_watcher(
+            draining.clone(),
+            inflight.clone(),
+            Duration::from_secs(10),
+            move |why| {
+                *r.lock().unwrap() = Some(why);
+            },
+        );
+
+        // Trigger drain — watcher should now spin waiting for inflight==0.
+        draining.store(true, Ordering::Release);
+        sleep(Duration::from_millis(150)).await;
+        // Still inflight=1 → no exit.
+        assert!(reason.lock().unwrap().is_none());
+
+        // Drain the call — watcher should fire.
+        inflight.store(0, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(
+            *reason.lock().unwrap(),
+            Some(DrainReason::AllInflightCompleted)
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_watcher_force_exits_on_grace_expiry() {
+        let draining = Arc::new(AtomicBool::new(true));
+        let inflight = Arc::new(AtomicUsize::new(3));
+        let reason = Arc::new(std::sync::Mutex::new(None));
+        let r = reason.clone();
+        let handle =
+            start_drain_watcher(draining, inflight, Duration::from_millis(150), move |why| {
+                *r.lock().unwrap() = Some(why);
+            });
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(
+            *reason.lock().unwrap(),
+            Some(DrainReason::GraceExpired { inflight: 3 })
+        );
     }
 
     #[tokio::test]
