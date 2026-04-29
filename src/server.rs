@@ -434,6 +434,10 @@ impl ContextPlusServer {
         let max_file_size = self.state.config.max_embed_file_size as u64;
 
         let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
+        // Keys evicted from the in-memory cache because the source file was deleted.
+        // Must be plumbed through to `save_vector_store_merged_with_deletions` —
+        // a plain merged save would re-populate them from disk on the next save.
+        let mut deletions: Vec<String> = Vec::new();
 
         for file_path in files {
             let rel_path = match file_path.strip_prefix(&self.state.root_dir) {
@@ -451,9 +455,11 @@ impl ContextPlusServer {
             let content = match tokio::fs::read_to_string(file_path).await {
                 Ok(c) => c,
                 Err(_) => {
-                    // File deleted — remove from cache
+                    // File deleted — remove from cache and record so the save
+                    // path can evict the same key from disk.
                     let mut cache = self.state.embedding_cache.write().await;
                     cache.remove(&rel_path);
+                    deletions.push(rel_path.clone());
                     updated += 1;
                     continue;
                 }
@@ -482,55 +488,96 @@ impl ContextPlusServer {
             texts_to_embed.push((rel_path, hash, text));
         }
 
-        if texts_to_embed.is_empty() {
+        // Nothing to embed and nothing to delete → skip the save entirely.
+        if texts_to_embed.is_empty() && deletions.is_empty() {
             return (updated, skipped);
         }
 
-        let embed_texts: Vec<String> = texts_to_embed.iter().map(|(_, _, t)| t.clone()).collect();
-        match self.state.ollama.embed(&embed_texts).await {
-            Ok(vectors) => {
-                let mut cache = self.state.embedding_cache.write().await;
-                for (i, (rel_path, hash, _)) in texts_to_embed.iter().enumerate() {
-                    if i < vectors.len() {
-                        cache.insert(
-                            rel_path.clone(),
-                            CacheEntry {
-                                hash: hash.clone(),
-                                vector: vectors[i].clone(),
-                            },
-                        );
-                        updated += 1;
+        // Embed any pending texts (may be empty if this batch was deletion-only).
+        let mut embed_failed = false;
+        if !texts_to_embed.is_empty() {
+            let embed_texts: Vec<String> =
+                texts_to_embed.iter().map(|(_, _, t)| t.clone()).collect();
+            match self.state.ollama.embed(&embed_texts).await {
+                Ok(vectors) => {
+                    let mut cache = self.state.embedding_cache.write().await;
+                    for (i, (rel_path, hash, _)) in texts_to_embed.iter().enumerate() {
+                        if i < vectors.len() {
+                            cache.insert(
+                                rel_path.clone(),
+                                CacheEntry {
+                                    hash: hash.clone(),
+                                    vector: vectors[i].clone(),
+                                },
+                            );
+                            updated += 1;
+                        }
                     }
                 }
-
-                // Persist to disk outside the write lock scope. The save path
-                // takes a blocking fd-lock + does sync I/O, so move it off the
-                // Tokio worker via spawn_blocking.
-                let store = crate::core::embeddings::VectorStore::from_cache(&cache);
-                drop(cache);
-                let embed_cache_name =
-                    cache_name("embeddings", &self.state.config.ollama_embed_model);
-                if let Some(s) = store {
-                    let root = self.state.root_dir.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        // Single-writer live path: overwrite without merge to avoid
-                        // the ~146 MB read + clone overhead of save_vector_store.
-                        rkyv_store::save_vector_store_overwrite(&root, &embed_cache_name, &s)
-                    })
-                    .await;
-                    match result {
-                        Ok(Err(e)) => {
-                            tracing::warn!("Failed to save incremental embedding cache: {e}")
-                        }
-                        Err(join_err) => tracing::warn!(
-                            "save_vector_store spawn_blocking join failed: {join_err}"
-                        ),
-                        Ok(Ok(())) => {}
-                    }
+                Err(e) => {
+                    tracing::warn!("Incremental re-embed failed: {e}");
+                    embed_failed = true;
                 }
             }
-            Err(e) => {
-                tracing::warn!("Incremental re-embed failed: {e}");
+        }
+
+        // Persist on every successful pass — even pure-deletion ones — so the
+        // on-disk cache evicts the deleted keys. A plain merged save would
+        // silently re-populate them from disk and the cache would grow without
+        // bound. Build the snapshot inside the write-guard scope, drop the
+        // guard, then run the save off the Tokio worker via spawn_blocking.
+        if !embed_failed {
+            let store_to_save = {
+                let cache = self.state.embedding_cache.read().await;
+                let store = crate::core::embeddings::VectorStore::from_cache(&cache);
+                drop(cache);
+                store
+            };
+
+            let embed_cache_name = cache_name("embeddings", &self.state.config.ollama_embed_model);
+            let root = self.state.root_dir.clone();
+            let deletions_owned = std::mem::take(&mut deletions);
+            let result = tokio::task::spawn_blocking(move || {
+                // Merge with disk under fd-lock: the runtime in-memory store
+                // only covers keys this session has touched, so an overwrite
+                // would silently drop entries written by a concurrent warmup
+                // binary or a second MCP instance. Pass `deletions_owned` so
+                // keys we evicted from memory also get evicted from disk.
+                match store_to_save {
+                    Some(s) => rkyv_store::save_vector_store_merged_with_deletions(
+                        &root,
+                        &embed_cache_name,
+                        &s,
+                        &deletions_owned,
+                    ),
+                    None => {
+                        // No in-memory entries (e.g. only deletions, and the
+                        // cache was emptied). Build an empty store so the
+                        // deletions still get applied on disk.
+                        let empty = crate::core::embeddings::VectorStore::new(
+                            0,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                        rkyv_store::save_vector_store_merged_with_deletions(
+                            &root,
+                            &embed_cache_name,
+                            &empty,
+                            &deletions_owned,
+                        )
+                    }
+                }
+            })
+            .await;
+            match result {
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to save incremental embedding cache: {e}")
+                }
+                Err(join_err) => {
+                    tracing::warn!("save_vector_store spawn_blocking join failed: {join_err}")
+                }
+                Ok(Ok(())) => {}
             }
         }
 
@@ -720,8 +767,10 @@ impl ContextPlusServer {
                     let root = self.state.root_dir.clone();
                     let cache_name_owned = id_cache_name.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        // Single-writer live path: overwrite without merge.
-                        rkyv_store::save_vector_store_overwrite(&root, &cache_name_owned, &store)
+                        // Merge with disk under fd-lock so we preserve identifier
+                        // entries written by warmup_identifiers / a second MCP that
+                        // this session never loaded into memory.
+                        rkyv_store::save_vector_store_merged(&root, &cache_name_owned, &store)
                     })
                     .await;
                     match result {

@@ -10,6 +10,13 @@ readme = "README.md"
 keywords = ["mcp", "code-analysis", "semantic-search", "tree-sitter"]
 categories = ["development-tools", "command-line-utilities"]
 
+[features]
+default = []
+# LAPACK backstop for dense symmetric eigendecomposition. Not wired into the
+# runtime path — exposed for benchmarks and users who want LAPACK perf on the
+# fallback path. Pulls in nalgebra-lapack + system OpenBLAS.
+lapack = ["dep:nalgebra-lapack", "dep:openblas-src"]
+
 [lib]
 name = "contextplus_rs"
 path = "src/lib.rs"
@@ -58,6 +65,20 @@ notify-debouncer-full = "0.7"
 
 # Spectral clustering
 nalgebra = "0.33"
+
+# (Top-k Lanczos lives inline in src/core/clustering.rs — see lanczos_smallest_eigen.
+# The upstream `lanczos` crate seeded with a random vector and broke run-to-run
+# determinism, scrambling the navigate-labels.json cache key.)
+
+# Optional LAPACK-backed dense eigendecomposition. Off by default — opt-in via
+# `--features lapack`. Requires a system OpenBLAS (libopenblas-dev) at link time.
+# Use `lapack-custom` so we can plug in a system-linked openblas-src below
+# without dragging openblas-build (which transitively pulls in openssl-sys).
+nalgebra-lapack = { version = "0.27", optional = true, default-features = false, features = ["lapack-custom"] }
+# When `lapack` is enabled, link against the system-installed OpenBLAS rather
+# than building it from source. Requires libopenblas-dev (or equivalent)
+# to be present at link time.
+openblas-src = { version = "0.10", optional = true, default-features = false, features = ["system"] }
 
 # Graph
 petgraph = "0.7"

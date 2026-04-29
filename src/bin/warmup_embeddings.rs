@@ -219,7 +219,7 @@ async fn main() {
         // Flush once per group.
         let store = VectorStore::from_cache(&cache_map);
         if let Some(s) = store
-            && let Err(e) = rkyv_store::save_vector_store(root, &cache_name_str, &s)
+            && let Err(e) = rkyv_store::save_vector_store_merged(root, &cache_name_str, &s)
         {
             eprintln!("WARN: failed to flush cache after group: {}", e);
         }

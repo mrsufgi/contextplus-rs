@@ -4,7 +4,7 @@ use contextplus_rs::config::Config;
 use contextplus_rs::core::embeddings::{CacheEntry, OllamaClient, VectorStore};
 use contextplus_rs::core::walker;
 use contextplus_rs::tools::navigate_constants::{
-    MAX_CONTENT_CHARS, MAX_NAVIGATE_FILES, NAVIGATE_EXTENSIONS, nav_cache_name, nav_content_hash,
+    MAX_CONTENT_CHARS, NAVIGATE_EXTENSIONS, max_navigate_files, nav_cache_name, nav_content_hash,
     nav_embed_text,
 };
 use std::collections::{HashMap, HashSet};
@@ -54,12 +54,12 @@ async fn main() {
 
     println!("Found {} files", files.len());
 
-    // Sample if needed
-    #[allow(clippy::absurd_extreme_comparisons)]
-    if files.len() > MAX_NAVIGATE_FILES {
+    // Sample if needed (env-overridable cap)
+    let max_files = max_navigate_files();
+    if files.len() > max_files {
         let total = files.len();
-        let step = total as f64 / MAX_NAVIGATE_FILES as f64;
-        files = (0..MAX_NAVIGATE_FILES)
+        let step = total as f64 / max_files as f64;
+        files = (0..max_files)
             .map(|i| {
                 let idx = (i as f64 * step).floor() as usize;
                 files[idx.min(total - 1)].clone()
@@ -158,7 +158,7 @@ async fn main() {
         // Save after each batch
         let store = VectorStore::from_cache(&cache);
         if let Some(s) = store
-            && let Err(e) = rkyv_store::save_vector_store(root, &cache_name, &s)
+            && let Err(e) = rkyv_store::save_vector_store_merged(root, &cache_name, &s)
         {
             eprintln!("Failed to save cache: {}", e);
         }

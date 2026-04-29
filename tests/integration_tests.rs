@@ -169,7 +169,7 @@ fn test_cache_save_load_search_round_trip() {
     let store = make_test_store();
 
     // Save
-    rkyv_store::save_vector_store(dir.path(), "test-round-trip", &store).unwrap();
+    rkyv_store::save_vector_store_merged(dir.path(), "test-round-trip", &store).unwrap();
 
     // Load via standard path
     let loaded = rkyv_store::load_vector_store(dir.path(), "test-round-trip")
@@ -206,7 +206,7 @@ fn test_mmap_cache_search_round_trip() {
     let dir = TempDir::new().unwrap();
     let store = make_test_store();
 
-    rkyv_store::save_vector_store(dir.path(), "mmap-rt", &store).unwrap();
+    rkyv_store::save_vector_store_merged(dir.path(), "mmap-rt", &store).unwrap();
 
     // Load via mmap path
     let loaded = rkyv_store::mmap_vector_store(dir.path(), "mmap-rt")
@@ -245,7 +245,7 @@ fn test_cache_survives_process_restart_simulation() {
     // Phase 1: build and save
     {
         let store = make_test_store();
-        rkyv_store::save_vector_store(dir.path(), cache_name, &store).unwrap();
+        rkyv_store::save_vector_store_merged(dir.path(), cache_name, &store).unwrap();
         // store is dropped here — simulates process exit
     }
 

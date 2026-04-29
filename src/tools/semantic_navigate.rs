@@ -12,8 +12,10 @@ use crate::core::embeddings::{CacheEntry, OllamaClient};
 use crate::core::walker;
 use crate::error::Result;
 use futures::stream::{self, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 
@@ -23,6 +25,117 @@ use super::modes::hybrid::{build_labeled_tree, group_by_directory};
 use super::modes::imports::extract_all_import_edges;
 use super::modes::semantic::build_semantic_hierarchy;
 use super::navigate_constants::*;
+
+/// Quality marker for a cached cluster label. Heuristic labels are produced
+/// instantly from path/symbol signal; LLM labels are produced by the chat model
+/// and considered higher quality. The on-disk cache progressively heals from
+/// `Heuristic` to `Llm` as the background labeler runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LabelQuality {
+    Heuristic,
+    Llm,
+}
+
+/// On-disk representation of a cluster label, with its quality.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CachedLabel {
+    pub label: String,
+    pub quality: LabelQuality,
+}
+
+impl CachedLabel {
+    pub(crate) fn heuristic(label: String) -> Self {
+        Self {
+            label,
+            quality: LabelQuality::Heuristic,
+        }
+    }
+
+    pub(crate) fn llm(label: String) -> Self {
+        Self {
+            label,
+            quality: LabelQuality::Llm,
+        }
+    }
+}
+
+/// Backward-compatible deserializer: accepts either the legacy `String` form
+/// (treated as `quality: "llm"`) or the new `{ "label": ..., "quality": ... }`
+/// form. Existing `navigate-labels.json` files in the wild MUST keep loading.
+fn deserialize_label_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, CachedLabel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct EntryVisitor;
+    impl<'de> Visitor<'de> for EntryVisitor {
+        type Value = HashMap<String, CachedLabel>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a map from cache key to label string or {label, quality} object")
+        }
+        fn visit_map<M>(self, mut access: M) -> std::result::Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum Either {
+                Legacy(String),
+                Modern(CachedLabel),
+            }
+            let mut out: HashMap<String, CachedLabel> = HashMap::new();
+            while let Some((k, v)) = access.next_entry::<String, Either>()? {
+                let entry = match v {
+                    Either::Legacy(label) => CachedLabel::llm(label),
+                    Either::Modern(c) => c,
+                };
+                out.insert(k, entry);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(EntryVisitor)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct LabelCacheFile {
+    #[serde(deserialize_with = "deserialize_label_map")]
+    entries: HashMap<String, CachedLabel>,
+}
+
+/// Process-wide set of cluster cache keys with an in-flight LLM heal in
+/// progress. A second `semantic_navigate` call that hits the same cluster
+/// before the background task completes will skip enqueuing it.
+static IN_FLIGHT_HEAL_KEYS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Mark these cache keys as in-flight. Returns the subset that was NOT already
+/// in-flight — the caller should heal exactly those keys.
+pub(crate) fn claim_in_flight_keys(keys: &[String]) -> Vec<String> {
+    let mut guard = IN_FLIGHT_HEAL_KEYS.lock().expect("heal lock poisoned");
+    let mut claimed = Vec::with_capacity(keys.len());
+    for k in keys {
+        if guard.insert(k.clone()) {
+            claimed.push(k.clone());
+        }
+    }
+    claimed
+}
+
+/// Release a set of cache keys after the background heal completes (or fails).
+pub(crate) fn release_in_flight_keys(keys: &[String]) {
+    let mut guard = IN_FLIGHT_HEAL_KEYS.lock().expect("heal lock poisoned");
+    for k in keys {
+        guard.remove(k);
+    }
+}
 
 /// Load cached LLM labels from disk. Returns a map of cluster_hash -> label.
 /// Find the .mcp_data directory by walking up from the given path.
@@ -51,25 +164,90 @@ fn get_label_cache_dir(start: &Path) -> PathBuf {
     })
 }
 
-/// Load label cache from disk. Uses the SERVER root (not scoped rootDir)
-/// so cached labels are shared across all scoped navigate calls.
-pub(crate) fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
+/// Load the quality-aware label cache from disk. Backward-compatible with the
+/// legacy `{ "<hash>": "<label>" }` form (legacy entries are treated as
+/// `quality: Llm`).
+pub(crate) fn load_label_cache_full(root_dir: &Path) -> HashMap<String, CachedLabel> {
     let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
     if let Ok(data) = std::fs::read_to_string(&cache_path) {
-        serde_json::from_str(&data).unwrap_or_default()
+        match serde_json::from_str::<LabelCacheFile>(&data) {
+            Ok(file) => file.entries,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "navigate-labels.json: failed to deserialize, starting empty"
+                );
+                HashMap::new()
+            }
+        }
     } else {
         HashMap::new()
     }
 }
 
-/// Save LLM label cache to disk. Uses the workspace root's .mcp_data.
-pub(crate) fn save_label_cache(root_dir: &Path, cache: &HashMap<String, String>) {
+/// Load label cache from disk as a flat `key -> label` map (label string only).
+/// Used by call sites that only consume the label text. Uses the SERVER root
+/// (not scoped rootDir) so cached labels are shared across all scoped navigate
+/// calls.
+#[allow(dead_code)] // legacy helper retained for tests/external warmup tools
+pub(crate) fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
+    load_label_cache_full(root_dir)
+        .into_iter()
+        .map(|(k, v)| (k, v.label))
+        .collect()
+}
+
+/// Save the (full quality-aware) label cache to disk. Uses the workspace root's
+/// `.mcp_data`.
+pub(crate) fn save_label_cache_full(root_dir: &Path, cache: &HashMap<String, CachedLabel>) {
     let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
-    if let Ok(json) = serde_json::to_string_pretty(cache) {
+    let file = LabelCacheFile {
+        entries: cache.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(&cache_path, json);
     }
+}
+
+/// Merge-write helper: load existing cache, overlay `incoming` entries (with
+/// the rule that an incoming `Llm` entry replaces a `Heuristic` one, but a
+/// `Heuristic` entry never overwrites an existing `Llm` entry), and save.
+///
+/// This is critical for the stale-while-revalidate flow: a foreground call
+/// writes a heuristic, then a background task writes the LLM upgrade. We must
+/// not clobber the LLM upgrade with a parallel heuristic write for a different
+/// key, and we must not regress an LLM label back to a heuristic.
+pub(crate) fn save_label_cache_merged(root_dir: &Path, incoming: &HashMap<String, CachedLabel>) {
+    let mut existing = load_label_cache_full(root_dir);
+    for (k, new_entry) in incoming {
+        match existing.get(k) {
+            Some(prev)
+                if prev.quality == LabelQuality::Llm
+                    && new_entry.quality == LabelQuality::Heuristic =>
+            {
+                // Don't regress an LLM label back to heuristic.
+            }
+            _ => {
+                existing.insert(k.clone(), new_entry.clone());
+            }
+        }
+    }
+    save_label_cache_full(root_dir, &existing);
+}
+
+/// Save the legacy `key -> label_string` map. Preserves quality of existing
+/// entries on disk: if the entry was already `Llm`, stays `Llm`; if not, the
+/// incoming label is recorded as `Llm` (call sites that use this API are
+/// uniformly the LLM-result writers — see `label_clusters_with_cache`).
+#[allow(dead_code)] // legacy helper retained for hybrid tests + external warmup tools
+pub(crate) fn save_label_cache(root_dir: &Path, cache: &HashMap<String, String>) {
+    let upgraded: HashMap<String, CachedLabel> = cache
+        .iter()
+        .map(|(k, v)| (k.clone(), CachedLabel::llm(v.clone())))
+        .collect();
+    save_label_cache_merged(root_dir, &upgraded);
 }
 
 /// Hash a cluster's file paths to create a stable cache key.
@@ -150,13 +328,19 @@ pub async fn semantic_navigate(
 
     // Cap file count to keep spectral clustering tractable.
     // Sample evenly across the sorted file list to preserve directory diversity.
-    // MAX_NAVIGATE_FILES may be usize::MAX (no limit) — allow the always-false comparison.
-    #[allow(clippy::absurd_extreme_comparisons)]
-    let sampled = files.len() > MAX_NAVIGATE_FILES;
+    // Cap is env-overridable via `CONTEXTPLUS_NAVIGATE_MAX_FILES`.
+    let max_files = max_navigate_files();
+    let sampled = files.len() > max_files;
     if sampled {
         let total = files.len();
-        let step = total as f64 / MAX_NAVIGATE_FILES as f64;
-        let sampled_files: Vec<FileInfo> = (0..MAX_NAVIGATE_FILES)
+        tracing::warn!(
+            total_files = total,
+            sampled_files = max_files,
+            "semantic_navigate: file count exceeds cap, using even-spaced sampling \
+             (override via CONTEXTPLUS_NAVIGATE_MAX_FILES)"
+        );
+        let step = total as f64 / max_files as f64;
+        let sampled_files: Vec<FileInfo> = (0..max_files)
             .map(|i| {
                 let idx = (i as f64 * step).floor() as usize;
                 std::mem::take(&mut files[idx.min(total - 1)])
@@ -344,7 +528,7 @@ pub async fn semantic_navigate(
 
     let tree_text = render_cluster_tree(&root_node, 0);
     let sampled_note = if sampled {
-        format!(" (sampled {} of total)", MAX_NAVIGATE_FILES)
+        format!(" (sampled {} of total)", max_files)
     } else {
         String::new()
     };
@@ -356,56 +540,132 @@ pub async fn semantic_navigate(
     ))
 }
 
-/// Label clusters with disk cache: loads cache, sends only uncached clusters to LLM,
-/// merges results back, saves cache, and deduplicates sibling labels.
-/// Used by both imports mode and semantic mode where the pattern is identical.
+/// Owned snapshot of a cluster's labelable data, suitable for moving across
+/// task boundaries (cannot use `Vec<&FileInfo>` since that lifetime won't
+/// outlive a `tokio::spawn`).
+#[derive(Clone)]
+pub(crate) struct OwnedClusterSnapshot {
+    pub(crate) cache_key: String,
+    pub(crate) files: Vec<FileInfo>,
+    pub(crate) parent: Option<String>,
+}
+
+/// Label clusters with stale-while-revalidate semantics:
+///   - Cache hit (heuristic OR llm) → return cached label.
+///   - Cache miss → write a heuristic immediately, return it, queue an LLM heal.
+///
+/// After collecting heals, spawn a single background task that runs the LLM
+/// batch and merge-writes the upgraded labels. Process-wide in-flight dedup
+/// prevents a second concurrent call from re-enqueuing the same cluster.
 pub(crate) async fn label_clusters_with_cache(
     label_input: &[(Vec<&FileInfo>, Option<String>)],
     ollama: &OllamaClient,
     root_dir: &Path,
 ) -> Vec<String> {
-    let label_cache = load_label_cache(root_dir);
+    let label_cache = load_label_cache_full(root_dir);
     let mut labels: Vec<String> = Vec::with_capacity(label_input.len());
-    let mut uncached_indices: Vec<usize> = Vec::new();
-    let mut cache_keys: Vec<String> = Vec::new();
+    let mut cache_keys: Vec<String> = Vec::with_capacity(label_input.len());
+    let mut heal_queue: Vec<OwnedClusterSnapshot> = Vec::new();
+    let mut heuristic_writes: HashMap<String, CachedLabel> = HashMap::new();
 
-    for (i, (cluster_files, _)) in label_input.iter().enumerate() {
+    for (cluster_files, parent) in label_input.iter() {
         let paths: Vec<&str> = cluster_files
             .iter()
             .map(|f| f.relative_path.as_str())
             .collect();
         let key = cluster_cache_key(&paths);
         cache_keys.push(key.clone());
-        if let Some(cached_label) = label_cache.get(&key) {
-            labels.push(cached_label.clone());
+
+        if let Some(cached) = label_cache.get(&key) {
+            labels.push(cached.label.clone());
         } else {
-            uncached_indices.push(i);
-            labels.push(String::new()); // placeholder
+            let heuristic = heuristic_label(cluster_files);
+            labels.push(heuristic.clone());
+            heuristic_writes.insert(key.clone(), CachedLabel::heuristic(heuristic));
+            heal_queue.push(OwnedClusterSnapshot {
+                cache_key: key,
+                files: cluster_files.iter().map(|f| (*f).clone()).collect(),
+                parent: parent.clone(),
+            });
         }
     }
 
-    if !uncached_indices.is_empty() {
-        let uncached_input: Vec<(Vec<&FileInfo>, Option<String>)> = uncached_indices
-            .iter()
-            .map(|&i| label_input[i].clone())
-            .collect();
-        let llm_labels =
-            super::modes::semantic::label_clusters_for_semantic_mode(&uncached_input, ollama).await;
+    // Persist heuristics immediately so a crash before the LLM heal still leaves
+    // a usable label on disk.
+    if !heuristic_writes.is_empty() {
+        save_label_cache_merged(root_dir, &heuristic_writes);
+    }
 
-        let mut updated_cache = label_cache;
-        for (j, &orig_idx) in uncached_indices.iter().enumerate() {
-            if let Some(label) = llm_labels.get(j)
-                && !label.is_empty()
-            {
-                labels[orig_idx] = label.clone();
-                updated_cache.insert(cache_keys[orig_idx].clone(), label.clone());
-            }
-        }
-        save_label_cache(root_dir, &updated_cache);
+    // Fire-and-forget background heal. Caller does not await this future.
+    if !heal_queue.is_empty() {
+        spawn_background_heal(heal_queue, ollama.clone(), root_dir.to_path_buf());
     }
 
     deduplicate_sibling_labels(&mut labels, label_input);
     labels
+}
+
+/// Spawn a `tokio::spawn` background task that LLM-labels the uncached
+/// clusters and merge-writes upgrades to the on-disk cache. Survives the
+/// originating handler's response. Process-wide dedup ensures the same
+/// cache_key never has two heals in flight.
+pub(crate) fn spawn_background_heal(
+    queue: Vec<OwnedClusterSnapshot>,
+    ollama: OllamaClient,
+    root_dir: PathBuf,
+) {
+    let keys: Vec<String> = queue.iter().map(|s| s.cache_key.clone()).collect();
+    let claimed = claim_in_flight_keys(&keys);
+    if claimed.is_empty() {
+        return;
+    }
+    let to_heal: Vec<OwnedClusterSnapshot> = queue
+        .into_iter()
+        .filter(|s| claimed.contains(&s.cache_key))
+        .collect();
+
+    tokio::spawn(async move {
+        let result = run_llm_heal(&to_heal, &ollama, &root_dir).await;
+        if let Err(e) = result {
+            tracing::warn!(
+                error = %e,
+                count = to_heal.len(),
+                "semantic_navigate: background LLM heal failed (heuristics retained)"
+            );
+        }
+        let claimed_keys: Vec<String> = to_heal.iter().map(|s| s.cache_key.clone()).collect();
+        release_in_flight_keys(&claimed_keys);
+    });
+}
+
+async fn run_llm_heal(
+    queue: &[OwnedClusterSnapshot],
+    ollama: &OllamaClient,
+    root_dir: &Path,
+) -> Result<()> {
+    if queue.is_empty() {
+        return Ok(());
+    }
+    // Build the borrowed input shape that the existing batched-LLM helper expects.
+    let mut input: Vec<(Vec<&FileInfo>, Option<String>)> = Vec::with_capacity(queue.len());
+    for snap in queue {
+        let refs: Vec<&FileInfo> = snap.files.iter().collect();
+        input.push((refs, snap.parent.clone()));
+    }
+    let llm_labels = super::modes::semantic::label_clusters_for_semantic_mode(&input, ollama).await;
+
+    let mut upgrades: HashMap<String, CachedLabel> = HashMap::new();
+    for (i, snap) in queue.iter().enumerate() {
+        if let Some(label) = llm_labels.get(i)
+            && !label.is_empty()
+        {
+            upgrades.insert(snap.cache_key.clone(), CachedLabel::llm(label.clone()));
+        }
+    }
+    if !upgrades.is_empty() {
+        save_label_cache_merged(root_dir, &upgrades);
+    }
+    Ok(())
 }
 
 /// Walk the directory using shared walker infrastructure and collect source file information.
@@ -579,7 +839,8 @@ async fn resolve_embeddings(
 
         // Persist after each chunk so progress survives a timeout on the next batch.
         if let Some(store) = store_to_save
-            && let Err(e) = rkyv_store::save_vector_store(root_dir, &embed_cache_name, &store)
+            && let Err(e) =
+                rkyv_store::save_vector_store_merged(root_dir, &embed_cache_name, &store)
         {
             tracing::warn!("Failed to save embedding cache to disk: {e}");
         }
@@ -1859,5 +2120,247 @@ mod tests {
             "Should skip 'apps' prefix, got {:?}",
             labels
         );
+    }
+
+    // ── Stale-while-revalidate label cache schema tests ──────────────────
+
+    /// Existing `navigate-labels.json` files in the wild were `{ "<hash>": "<label>" }`.
+    /// They MUST keep loading after the schema upgrade.
+    #[test]
+    fn cache_load_accepts_legacy_string_format() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mcp_data = tempdir.path().join(".mcp_data");
+        std::fs::create_dir_all(&mcp_data).expect("mkdir");
+        let cache_path = mcp_data.join(LABEL_CACHE_FILE);
+        std::fs::write(
+            &cache_path,
+            r#"{"abc123": "old-llm-label", "def456": "another"}"#,
+        )
+        .expect("write legacy cache");
+
+        let cache = load_label_cache_full(tempdir.path());
+        assert_eq!(cache.len(), 2);
+        let entry = cache.get("abc123").expect("abc123 present");
+        assert_eq!(entry.label, "old-llm-label");
+        assert_eq!(entry.quality, LabelQuality::Llm);
+    }
+
+    /// New schema: `{ "<hash>": { "label": "...", "quality": "heuristic" | "llm" } }`.
+    #[test]
+    fn cache_load_accepts_quality_format() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mcp_data = tempdir.path().join(".mcp_data");
+        std::fs::create_dir_all(&mcp_data).expect("mkdir");
+        let cache_path = mcp_data.join(LABEL_CACHE_FILE);
+        std::fs::write(
+            &cache_path,
+            r#"{
+                "h1": {"label": "fast-label", "quality": "heuristic"},
+                "h2": {"label": "rich-label", "quality": "llm"}
+            }"#,
+        )
+        .expect("write modern cache");
+
+        let cache = load_label_cache_full(tempdir.path());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache["h1"].label, "fast-label");
+        assert_eq!(cache["h1"].quality, LabelQuality::Heuristic);
+        assert_eq!(cache["h2"].label, "rich-label");
+        assert_eq!(cache["h2"].quality, LabelQuality::Llm);
+    }
+
+    /// A cache with mixed legacy + modern entries must round-trip through one
+    /// load + save cycle, ending up uniformly in modern form on disk.
+    #[test]
+    fn cache_load_save_roundtrip_normalizes_mixed_schema() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mcp_data = tempdir.path().join(".mcp_data");
+        std::fs::create_dir_all(&mcp_data).expect("mkdir");
+        let cache_path = mcp_data.join(LABEL_CACHE_FILE);
+        std::fs::write(
+            &cache_path,
+            r#"{
+                "legacy_key": "old-style",
+                "modern_key": {"label": "new-style", "quality": "heuristic"}
+            }"#,
+        )
+        .expect("write mixed cache");
+
+        let loaded = load_label_cache_full(tempdir.path());
+        save_label_cache_full(tempdir.path(), &loaded);
+
+        let on_disk = std::fs::read_to_string(&cache_path).expect("read");
+        // Must now be valid modern JSON (not raw strings) for both keys.
+        let parsed: HashMap<String, CachedLabel> = serde_json::from_str::<LabelCacheFile>(&on_disk)
+            .expect("modern parse")
+            .entries;
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["legacy_key"].quality, LabelQuality::Llm);
+        assert_eq!(parsed["modern_key"].quality, LabelQuality::Heuristic);
+    }
+
+    /// Heuristic-then-LLM merge must end on disk with `quality=Llm` and the
+    /// LLM-supplied label, even when the heuristic save came first.
+    #[test]
+    fn heuristic_then_llm_overwrite_persists() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let key = "k1".to_string();
+
+        let mut h_writes: HashMap<String, CachedLabel> = HashMap::new();
+        h_writes.insert(key.clone(), CachedLabel::heuristic("auth/* ".to_string()));
+        save_label_cache_merged(tempdir.path(), &h_writes);
+
+        // Verify heuristic landed.
+        let after_h = load_label_cache_full(tempdir.path());
+        assert_eq!(after_h[&key].quality, LabelQuality::Heuristic);
+        assert_eq!(after_h[&key].label, "auth/* ");
+
+        // Now upgrade.
+        let mut l_writes: HashMap<String, CachedLabel> = HashMap::new();
+        l_writes.insert(
+            key.clone(),
+            CachedLabel::llm("Authentication Flow".to_string()),
+        );
+        save_label_cache_merged(tempdir.path(), &l_writes);
+
+        let after_l = load_label_cache_full(tempdir.path());
+        assert_eq!(after_l[&key].quality, LabelQuality::Llm);
+        assert_eq!(after_l[&key].label, "Authentication Flow");
+    }
+
+    /// A heuristic write MUST NOT regress an existing LLM label back down.
+    /// This protects against e.g. a freshly-evicted cluster being relabeled
+    /// while a stale background heal also lands.
+    #[test]
+    fn heuristic_does_not_regress_existing_llm_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let key = "k1".to_string();
+
+        let mut llm: HashMap<String, CachedLabel> = HashMap::new();
+        llm.insert(key.clone(), CachedLabel::llm("Good Label".to_string()));
+        save_label_cache_merged(tempdir.path(), &llm);
+
+        let mut heur: HashMap<String, CachedLabel> = HashMap::new();
+        heur.insert(key.clone(), CachedLabel::heuristic("auth/* ".to_string()));
+        save_label_cache_merged(tempdir.path(), &heur);
+
+        let after = load_label_cache_full(tempdir.path());
+        assert_eq!(after[&key].quality, LabelQuality::Llm);
+        assert_eq!(after[&key].label, "Good Label");
+    }
+
+    /// In-flight dedup: claiming the same key twice gives it once.
+    #[test]
+    fn claim_in_flight_keys_dedups_within_one_call() {
+        let k = format!("dedup-test-{}", uuid_like_suffix());
+        let claimed1 = claim_in_flight_keys(&[k.clone(), k.clone()]);
+        assert_eq!(claimed1.len(), 1);
+        // Second claim while the first is still in flight returns nothing.
+        let claimed2 = claim_in_flight_keys(std::slice::from_ref(&k));
+        assert!(claimed2.is_empty());
+        // After release, claim succeeds again.
+        release_in_flight_keys(std::slice::from_ref(&k));
+        let claimed3 = claim_in_flight_keys(std::slice::from_ref(&k));
+        assert_eq!(claimed3, vec![k.clone()]);
+        release_in_flight_keys(&[k]);
+    }
+
+    fn uuid_like_suffix() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}", nanos)
+    }
+
+    /// Loading a real-world legacy `navigate-labels.json` (captured from
+    /// /workspace/.mcp_data) must succeed without error and treat every
+    /// entry as `quality=Llm`.
+    #[test]
+    fn cache_load_accepts_real_world_legacy_fixture() {
+        let fixture = include_str!("../../tests/fixtures/legacy-navigate-labels.json");
+        let parsed: LabelCacheFile =
+            serde_json::from_str(fixture).expect("legacy fixture must parse");
+        assert!(!parsed.entries.is_empty(), "fixture should have entries");
+        for entry in parsed.entries.values() {
+            assert_eq!(
+                entry.quality,
+                LabelQuality::Llm,
+                "legacy entries must deserialize as Llm quality"
+            );
+        }
+    }
+
+    /// Stale-while-revalidate end-to-end: first call returns heuristic
+    /// labels and persists them with `quality=Heuristic`; the background
+    /// task then upgrades to `quality=Llm` once the stub LLM responds.
+    #[tokio::test]
+    async fn label_clusters_with_cache_stale_while_revalidate() {
+        use crate::config::Config;
+        use crate::core::embeddings::OllamaClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tempdir.path().join(".mcp_data")).unwrap();
+
+        // Stub Ollama: the chat endpoint returns deterministic labels.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "content": r#"["Authentication Services"]"#
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = Config::from_env();
+        config.ollama_host = server.uri();
+        config.ollama_chat_model = "test-model".to_string();
+        let client = OllamaClient::new(&config);
+
+        let f1 = FileInfo {
+            relative_path: "src/auth/login.rs".to_string(),
+            header: "login flow".to_string(),
+            ..Default::default()
+        };
+        let f2 = FileInfo {
+            relative_path: "src/auth/session.rs".to_string(),
+            header: "session lifecycle".to_string(),
+            ..Default::default()
+        };
+        let cluster: Vec<&FileInfo> = vec![&f1, &f2];
+        let input: Vec<(Vec<&FileInfo>, Option<String>)> = vec![(cluster, None)];
+
+        // First call: should return heuristic immediately.
+        let labels = label_clusters_with_cache(&input, &client, tempdir.path()).await;
+        assert_eq!(labels.len(), 1);
+
+        // On-disk cache should now hold a Heuristic entry for this cluster.
+        let key = cluster_cache_key(&["src/auth/login.rs", "src/auth/session.rs"]);
+        let after_first = load_label_cache_full(tempdir.path());
+        let entry = after_first
+            .get(&key)
+            .expect("heuristic entry persisted before background heal");
+        assert_eq!(entry.quality, LabelQuality::Heuristic);
+        assert_eq!(labels[0], entry.label);
+
+        // Wait for the background heal to land. Poll up to ~5 seconds.
+        let mut upgraded = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let cache = load_label_cache_full(tempdir.path());
+            if let Some(e) = cache.get(&key)
+                && e.quality == LabelQuality::Llm
+            {
+                assert_eq!(e.label, "Authentication Services");
+                upgraded = true;
+                break;
+            }
+        }
+        assert!(upgraded, "background heal did not upgrade label to Llm");
     }
 }
