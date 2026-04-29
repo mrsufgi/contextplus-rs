@@ -770,3 +770,523 @@ fn socket_override_env_affects_all_helpers() {
         std::env::remove_var(paths::SOCKET_PATH_ENV);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Subprocess-based integration tests — fork a real `contextplus-rs` binary.
+//
+// These tests exercise code paths that are genuinely hard to cover without a
+// subprocess: `client::run`, `client::bridge`, `client::spawn_daemon`,
+// `daemon::run` accept loop + signal listener, and the `main.rs` Daemon /
+// Client subcommand handlers.
+//
+// Each test gets its own TempDir. A `ProcessGuard` drop-cleans child processes
+// so SIGTERM is always sent, even if an assertion panics.
+// ---------------------------------------------------------------------------
+
+/// RAII guard: SIGTERM + wait the child on drop so we never leave orphan
+/// daemon processes behind, even when a test assertion fails.
+#[cfg(unix)]
+struct ProcessGuard {
+    child: std::process::Child,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        // Best-effort kill — ignore errors (child may have already exited).
+        let pid = self.child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        // Give it up to 2 s to exit cleanly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                _ => {
+                    if std::time::Instant::now() >= deadline {
+                        // Hard kill if it won't die.
+                        let _ = self.child.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        let _ = self.child.wait();
+    }
+}
+
+/// Return the path to the `contextplus-rs` binary built by cargo. Uses the
+/// `CARGO_BIN_EXE_contextplus-rs` env var that cargo sets at test compile time,
+/// which is the correct approach for custom build-dirs (replaces the deprecated
+/// `assert_cmd::cargo::cargo_bin` function).
+#[cfg(unix)]
+fn subprocess_bin() -> std::path::PathBuf {
+    // CARGO_BIN_EXE_<name> is injected by cargo for each [[bin]] in the same
+    // workspace when building integration tests. The hyphen in the binary name
+    // is preserved verbatim in the env key.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_contextplus-rs"))
+}
+
+/// Poll `path` for existence up to `timeout`. Returns `true` when found.
+#[cfg(unix)]
+fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Poll until a Unix socket at `path` accepts connections, up to `timeout`.
+/// This is stricter than `wait_for_path`: it proves the socket is listening,
+/// not just that a file exists at that path (which could be a stale file).
+#[cfg(unix)]
+fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if StdUnixStream::connect(path).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Send a JSON-RPC `initialize` request over a synchronous `UnixStream` and
+/// return the raw JSON line response. Uses `std::os::unix::net::UnixStream`
+/// (blocking I/O) for simplicity in non-async tests.
+#[cfg(unix)]
+fn rpc_initialize_sync(stream: &mut std::os::unix::net::UnixStream) -> String {
+    use std::io::{BufRead, BufReader, Write};
+
+    let msg = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":"2024-11-05","capabilities":{},"#,
+        r#""clientInfo":{"name":"test","version":"0.0.0"}}}"#,
+        "\n"
+    );
+    stream.write_all(msg.as_bytes()).expect("write initialize");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream.try_clone().expect("try_clone"));
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response line");
+    assert!(
+        !line.is_empty(),
+        "daemon closed connection without responding"
+    );
+    line
+}
+
+// ---------------------------------------------------------------------------
+// Test 1: daemon subcommand binds socket, serves MCP initialize, then exits
+//         cleanly after SIGTERM.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn daemon_subcommand_binds_socket_then_shuts_down_on_sigterm() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Spawn `contextplus-rs daemon --root-dir <tempdir>` as a subprocess.
+    let child = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "daemon"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn daemon subprocess");
+
+    let mut guard = ProcessGuard { child };
+
+    // Poll until the socket is listening (up to 10 s; generous for CI load).
+    let socket_path = paths::daemon_socket_path(root);
+    assert!(
+        wait_for_socket(&socket_path, Duration::from_secs(10)),
+        "daemon never became connectable at {}",
+        socket_path.display()
+    );
+
+    // Connect and send MCP initialize — confirms the daemon is serving.
+    let mut stream = StdUnixStream::connect(&socket_path).expect("connect to daemon socket");
+    let response = rpc_initialize_sync(&mut stream);
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("response is valid JSON");
+    assert!(
+        parsed.get("result").is_some() || parsed.get("error").is_some(),
+        "expected a JSON-RPC result or error, got: {response}"
+    );
+    drop(stream);
+
+    // SIGTERM the daemon.
+    let pid = guard.child.id() as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    // Wait up to 5 s for clean exit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match guard.child.try_wait().expect("try_wait") {
+            Some(status) => {
+                // On Unix a process killed by a signal exits with a signal
+                // status, which is neither "success" nor a normal exit code.
+                // We just verify it *did* exit.
+                let _ = status;
+                break;
+            }
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            None => panic!("daemon did not exit within 5 s of SIGTERM"),
+        }
+    }
+
+    // Socket should have been unlinked during shutdown cleanup.
+    // (Best-effort check — tmpfs timing can be tight; give it 500 ms.)
+    let socket_gone_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        if !socket_path.exists() {
+            break;
+        }
+        if std::time::Instant::now() >= socket_gone_deadline {
+            // Not fatal — the guard will clean up the tempdir. Just note it.
+            eprintln!(
+                "WARN: socket file still present after daemon exit: {}",
+                socket_path.display()
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Suppress the guard's SIGTERM (child already dead).
+    std::mem::forget(guard);
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: stale socket file is recovered by a fresh daemon.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn stale_socket_file_is_recovered_by_fresh_daemon() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Create the .mcp_data directory and plant a stale (non-listening) file.
+    let mcp_data = root.join(paths::MCP_DATA_DIR);
+    std::fs::create_dir_all(&mcp_data).unwrap();
+    let socket_path = paths::daemon_socket_path(root);
+    std::fs::write(&socket_path, b"stale-bytes").expect("write stale socket file");
+    assert!(
+        socket_path.exists(),
+        "stale file should exist before daemon start"
+    );
+
+    // Spawn a fresh daemon — it should clean up the stale file and rebind.
+    let child = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "daemon"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn daemon subprocess");
+
+    let guard = ProcessGuard { child };
+
+    // Poll until the socket is actually connectable (not just present as a
+    // file). The stale file was there from the start, so we must wait for
+    // the daemon to replace it with a real listening socket.
+    // Use a generous 10 s timeout for CI environments under load.
+    assert!(
+        wait_for_socket(&socket_path, Duration::from_secs(10)),
+        "daemon never became connectable at {}",
+        socket_path.display()
+    );
+
+    // Connecting to the socket proves it's a real listener (not the stale file).
+    let mut stream = StdUnixStream::connect(&socket_path).expect("connect to daemon socket");
+    let response = rpc_initialize_sync(&mut stream);
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("valid JSON from daemon");
+    assert!(
+        parsed.get("result").is_some() || parsed.get("error").is_some(),
+        "expected JSON-RPC envelope, got: {response}"
+    );
+    drop(stream);
+
+    // Clean up: SIGTERM via guard's Drop.
+    drop(guard);
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: two clients sharing one daemon — daemon process count stays at 1.
+// ---------------------------------------------------------------------------
+
+/// Drive one synchronous MCP initialize exchange over stdin/stdout of a
+/// `client` subprocess. Writes to child stdin, reads one line from stdout.
+#[cfg(unix)]
+fn drive_client_initialize(child: &mut std::process::Child) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+
+    let stdin = child.stdin.as_mut().expect("stdin piped");
+    let msg = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+        r#""params":{"protocolVersion":"2024-11-05","capabilities":{},"#,
+        r#""clientInfo":{"name":"test","version":"0.0.0"}}}"#,
+        "\n"
+    );
+    stdin
+        .write_all(msg.as_bytes())
+        .expect("write to client stdin");
+    stdin.flush().expect("flush stdin");
+
+    let stdout = child.stdout.as_mut().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read line from client stdout");
+    assert!(!line.is_empty(), "client sent empty response");
+    serde_json::from_str(line.trim()).expect("client response is valid JSON")
+}
+
+#[test]
+#[cfg(unix)]
+fn two_clients_share_one_daemon() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Start the daemon directly (no client auto-spawn).
+    let daemon_child = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "daemon"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+
+    let daemon_guard = ProcessGuard {
+        child: daemon_child,
+    };
+
+    // Wait for the socket to be listening. Use a generous timeout (10 s) so
+    // the test is robust under a heavily loaded CI environment where spawning
+    // a subprocess can take a few seconds.
+    let socket_path = paths::daemon_socket_path(root);
+    assert!(
+        wait_for_socket(&socket_path, Duration::from_secs(10)),
+        "daemon socket never became connectable"
+    );
+
+    // Capture the socket inode before any clients connect.
+    use std::os::unix::fs::MetadataExt;
+    let inode_before = std::fs::metadata(&socket_path).unwrap().ino();
+
+    // Spawn client 1.
+    let mut client1 = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "client"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn client 1");
+
+    let resp1 = drive_client_initialize(&mut client1);
+    assert!(
+        resp1.get("result").is_some() || resp1.get("error").is_some(),
+        "client 1 got no JSON-RPC envelope: {resp1}"
+    );
+
+    // Spawn client 2.
+    let mut client2 = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "client"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn client 2");
+
+    let resp2 = drive_client_initialize(&mut client2);
+    assert!(
+        resp2.get("result").is_some() || resp2.get("error").is_some(),
+        "client 2 got no JSON-RPC envelope: {resp2}"
+    );
+
+    // Socket inode must be unchanged — a second daemon bind would replace it.
+    let inode_after = std::fs::metadata(&socket_path).unwrap().ino();
+    assert_eq!(
+        inode_before, inode_after,
+        "daemon socket was unexpectedly replaced — a second daemon may have spawned"
+    );
+
+    // Close stdin → clients exit.
+    drop(client1.stdin.take());
+    drop(client2.stdin.take());
+    let _ = client1.wait();
+    let _ = client2.wait();
+
+    // Daemon guard SIGTERMs on drop.
+    drop(daemon_guard);
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: client subcommand auto-spawns a daemon when socket is missing.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn client_subcommand_auto_spawns_daemon_when_socket_missing() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // No daemon pre-started. Spawn the client — it should auto-spawn a daemon.
+    let mut client = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "client"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn client subprocess");
+
+    // Send MCP initialize over client's stdin.
+    {
+        let stdin = client.stdin.as_mut().expect("stdin piped");
+        let msg = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+            r#""params":{"protocolVersion":"2024-11-05","capabilities":{},"#,
+            r#""clientInfo":{"name":"test","version":"0.0.0"}}}"#,
+            "\n"
+        );
+        stdin.write_all(msg.as_bytes()).expect("write initialize");
+        stdin.flush().expect("flush");
+    }
+
+    // Read one JSON-RPC response line from client stdout (bridged from the
+    // auto-spawned daemon). Timeout via a thread so the test doesn't hang.
+    let stdout = client.stdout.take().expect("stdout piped");
+    let response = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for client response")
+    };
+
+    assert!(
+        !response.trim().is_empty(),
+        "client returned empty response"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("client response is valid JSON");
+    assert!(
+        parsed.get("result").is_some() || parsed.get("error").is_some(),
+        "expected JSON-RPC envelope from bridged daemon, got: {response}"
+    );
+
+    // Close stdin → client exits.
+    drop(client.stdin.take());
+
+    // The daemon socket should now exist (auto-spawned by client).
+    let socket_path = paths::daemon_socket_path(root);
+    assert!(
+        socket_path.exists() || {
+            // Give the daemon a moment if it's still starting.
+            wait_for_path(&socket_path, Duration::from_secs(2))
+        },
+        "daemon socket should exist after client auto-spawn"
+    );
+
+    // Wait for client to exit.
+    let _ = client.wait();
+
+    // SIGTERM the auto-spawned daemon to clean up.
+    // Read its PID from the pid file.
+    let pid_path = paths::daemon_pid_path(root);
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
+        && let Ok(pid) = pid_str.trim().parse::<libc::pid_t>()
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        // Give it a moment to clean up.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: SIGHUP drains the daemon (covers spawn_signal_listener SIGHUP arm).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn sighup_drains_daemon() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Spawn daemon subprocess.
+    let child = std::process::Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap(), "daemon"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+
+    let mut guard = ProcessGuard { child };
+
+    // Wait for the socket to be listening (not just the file to exist).
+    // 10 s timeout to tolerate CI environments under load.
+    let socket_path = paths::daemon_socket_path(root);
+    assert!(
+        wait_for_socket(&socket_path, Duration::from_secs(10)),
+        "daemon socket never became connectable"
+    );
+
+    // Connect once to prove it's alive.
+    let mut stream = StdUnixStream::connect(&socket_path).expect("connect to daemon");
+    let response = rpc_initialize_sync(&mut stream);
+    let parsed: serde_json::Value = serde_json::from_str(response.trim()).expect("valid JSON");
+    assert!(
+        parsed.get("result").is_some() || parsed.get("error").is_some(),
+        "daemon did not serve initialize before SIGHUP: {response}"
+    );
+    drop(stream);
+
+    // Send SIGHUP to the daemon — it should drain and exit.
+    let pid = guard.child.id() as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+
+    // Wait up to 5 s for the daemon to exit cleanly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let exited = loop {
+        match guard.child.try_wait().expect("try_wait") {
+            Some(_status) => break true,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            None => break false,
+        }
+    };
+
+    assert!(exited, "daemon did not exit within 5 s of SIGHUP");
+
+    // Suppress double-kill in guard Drop since child already exited.
+    std::mem::forget(guard);
+}
