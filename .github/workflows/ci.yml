@@ -41,14 +41,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      # System deps for the optional `lapack` feature (nalgebra-lapack +
-      # openblas-src). `cargo test --all-features` activates it.
-      - name: Install LAPACK system deps (Linux)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gfortran libopenblas-dev liblapack-dev liblapacke-dev \
-            pkg-config libssl-dev
       - run: cargo test --all-features
 
   test:
@@ -61,21 +53,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # System deps for the optional `lapack` feature, activated by
-      # `cargo llvm-cov --all-features`.
-      - name: Install LAPACK system deps (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gfortran libopenblas-dev liblapack-dev liblapacke-dev \
-            pkg-config libssl-dev
-      - name: Install LAPACK system deps (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install openblas pkg-config
-          echo "OPENBLAS=$(brew --prefix openblas)" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=$(brew --prefix openblas)/lib/pkgconfig" >> $GITHUB_ENV
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run tests with coverage

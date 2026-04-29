@@ -114,29 +114,6 @@ pub fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     (eigenvalues, eigenvectors)
 }
 
-/// LAPACK-backed full symmetric eigendecomposition (backstop). Off by default;
-/// build with `--features lapack` to enable. Not used by the runtime path —
-/// exposed for benchmarks and users who want LAPACK on the dense fallback.
-///
-/// Returns `(eigenvalues_ascending, eigenvectors)` matching `full_eigen`'s shape.
-#[cfg(feature = "lapack")]
-pub fn full_eigen_lapack(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
-    use nalgebra_lapack::SymmetricEigen as LapackSymmetricEigen;
-    let eigen = LapackSymmetricEigen::new(matrix);
-    // nalgebra-lapack returns unsorted eigenvalues — sort ascending to match
-    // pure-Rust SymmetricEigen behavior expected by find_optimal_k.
-    let mut indexed: Vec<(usize, f64)> = eigen.eigenvalues.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let eigenvalues: Vec<f64> = indexed.iter().map(|(_, v)| *v).collect();
-    let n = eigen.eigenvectors.nrows();
-    let mut eigenvectors = DMatrix::zeros(n, indexed.len());
-    for (new_col, &(old_col, _)) in indexed.iter().enumerate() {
-        let src = eigen.eigenvectors.column(old_col);
-        eigenvectors.column_mut(new_col).copy_from(&src);
-    }
-    (eigenvalues, eigenvectors)
-}
-
 /// Deterministic Lanczos iteration for the `k` smallest eigenpairs of a real
 /// symmetric matrix. Vendored inline to keep the result bit-identical run-to-run
 /// (the upstream `lanczos` crate seeds with a random starting vector, which
