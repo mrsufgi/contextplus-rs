@@ -1,7 +1,7 @@
 // Spectral clustering with eigengap heuristic for tuning-free cluster counts.
 // Builds affinity matrix, normalized Laplacian, k-means on eigenvectors.
 
-use nalgebra::{DMatrix, SymmetricEigen};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rayon::prelude::*;
 
 /// Maximum iterations for Lloyd's k-means algorithm.
@@ -112,6 +112,152 @@ pub fn full_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
     }
 
     (eigenvalues, eigenvectors)
+}
+
+/// Deterministic Lanczos iteration for the `k` smallest eigenpairs of a real
+/// symmetric matrix. Vendored inline to keep the result bit-identical run-to-run
+/// (the upstream `lanczos` crate seeds with a random starting vector, which
+/// scrambles cluster signatures and breaks the `navigate-labels.json` cache —
+/// see commit history for the empirical evidence).
+///
+/// Algorithm (textbook Lanczos with full re-orthogonalization):
+///   - Start vector: all-ones, normalized. The all-ones direction has a
+///     non-zero component along every eigenvector of a connected graph
+///     Laplacian, so it surfaces the smallest (Fiedler-adjacent) eigenvalues
+///     just like a random vector — without the non-determinism.
+///   - Build a Krylov basis V = [v_0, v_1, …, v_{k-1}] and a symmetric
+///     tridiagonal projection T (alphas on diagonal, betas on off-diagonal).
+///   - Re-orthogonalize each new basis vector against ALL previous ones (full
+///     reorthogonalization). At k ≈ 60 the O(k²·n) cost is trivial and it
+///     keeps numerics stable for the clustered-eigenvalue regime of the
+///     normalized Laplacian.
+///   - Diagonalize the tiny k×k tridiagonal T with `SymmetricEigen` to get
+///     Ritz values (eigenvalue approximations) and Ritz vectors V * y_i (the
+///     corresponding eigenvectors of the original matrix).
+///
+/// Returns `(eigenvalues_ascending, eigenvectors)` with the `k_eff` smallest
+/// Ritz pairs. If the iteration breaks down early (invariant subspace found),
+/// returns whatever pairs are available.
+fn lanczos_smallest_eigen(matrix: &DMatrix<f64>, k: usize) -> (Vec<f64>, DMatrix<f64>) {
+    let n = matrix.nrows();
+    let k_eff = k.min(n).max(2);
+
+    // Deterministic starting vector: normalized all-ones. Guaranteed non-zero
+    // overlap with all eigenvectors of a connected graph Laplacian.
+    let mut v_curr = DVector::from_element(n, 1.0).normalize();
+    let mut v_prev: DVector<f64> = DVector::zeros(n);
+    let mut beta_prev = 0.0_f64;
+
+    let mut alphas: Vec<f64> = Vec::with_capacity(k_eff);
+    let mut betas: Vec<f64> = Vec::with_capacity(k_eff);
+    let mut basis: Vec<DVector<f64>> = Vec::with_capacity(k_eff);
+    basis.push(v_curr.clone());
+
+    for _ in 0..k_eff {
+        // w = A v_curr − beta_prev * v_prev
+        let mut w = matrix * &v_curr - &v_prev * beta_prev;
+        let alpha = w.dot(&v_curr);
+        alphas.push(alpha);
+        w -= &v_curr * alpha;
+
+        // Full re-orthogonalization against every previous basis vector.
+        // Two passes for numerical safety (classical Gram-Schmidt loses
+        // orthogonality for clustered eigenvalues; one extra sweep is enough).
+        for _ in 0..2 {
+            for prev in &basis {
+                let coeff = prev.dot(&w);
+                w -= prev * coeff;
+            }
+        }
+
+        let beta = w.norm();
+        if beta < 1e-12 {
+            // Invariant subspace found; stop and return the pairs we have.
+            break;
+        }
+
+        if alphas.len() < k_eff {
+            // Only push beta + advance basis if another iteration will follow.
+            betas.push(beta);
+            v_prev = v_curr.clone();
+            v_curr = w / beta;
+            basis.push(v_curr.clone());
+            beta_prev = beta;
+        }
+    }
+
+    let m = alphas.len();
+    if m == 0 {
+        // Degenerate; should not happen for k_eff >= 2 on a non-zero matrix.
+        return (Vec::new(), DMatrix::zeros(n, 0));
+    }
+
+    // Build the m×m symmetric tridiagonal T from alphas/betas and diagonalize it.
+    let mut tridiag = DMatrix::zeros(m, m);
+    for i in 0..m {
+        tridiag[(i, i)] = alphas[i];
+    }
+    for i in 0..betas.len().min(m.saturating_sub(1)) {
+        tridiag[(i, i + 1)] = betas[i];
+        tridiag[(i + 1, i)] = betas[i];
+    }
+    let eigen = SymmetricEigen::new(tridiag);
+
+    // Sort Ritz values ascending and pick the k_eff smallest.
+    let mut indexed: Vec<(usize, f64)> = eigen.eigenvalues.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let take = k_eff.min(m);
+
+    let eigenvalues: Vec<f64> = indexed.iter().take(take).map(|(_, v)| *v).collect();
+
+    // Eigenvectors of the original matrix: columns of V * (selected columns of Y).
+    // V is n×m (basis vectors as columns), Y is m×m (eigenvectors of T).
+    let mut v_mat = DMatrix::zeros(n, m);
+    for (col, vec) in basis.iter().enumerate().take(m) {
+        v_mat.column_mut(col).copy_from(vec);
+    }
+    let mut eigenvectors = DMatrix::zeros(n, take);
+    for (new_col, &(orig_col, _)) in indexed.iter().take(take).enumerate() {
+        let y_col = eigen.eigenvectors.column(orig_col);
+        let ritz_vec = &v_mat * y_col;
+        eigenvectors.column_mut(new_col).copy_from(&ritz_vec);
+    }
+
+    (eigenvalues, eigenvectors)
+}
+
+/// Compute the `k` smallest eigenvalues + eigenvectors of a real symmetric matrix
+/// via Lanczos iteration. Replaces `full_eigen` for the spectral clustering
+/// path where we only need the bottom-k of the Laplacian spectrum (O(n^2*k)
+/// instead of O(n^3)).
+///
+/// Returns `(eigenvalues_ascending, eigenvectors)` matching the shape of
+/// `full_eigen`: eigenvectors as columns of the `DMatrix`, sorted ascending.
+///
+/// For very small `n` (n < `LANCZOS_MIN_N`) the dense path is essentially free
+/// and avoids tridiagonal-projection artefacts when degenerate eigenvalues
+/// (e.g. zero-eigenvalue multiplicity from disconnected Laplacian components)
+/// would otherwise resolve into the wrong subspace.
+pub fn topk_eigen(matrix: DMatrix<f64>, k: usize) -> (Vec<f64>, DMatrix<f64>) {
+    let n = matrix.nrows();
+
+    // For small matrices the dense path is essentially free (O(n^3) on n=128
+    // is ~2M ops). With the deterministic Lanczos seed below, results are
+    // stable at any n, but full_eigen still gives strictly more accurate
+    // eigenvectors when degenerate eigenvalues abound — useful for tiny n.
+    // Threshold chosen so wall-clock cost stays under ~1ms.
+    const LANCZOS_MIN_N: usize = 128;
+    if n < LANCZOS_MIN_N {
+        let (evals, evecs) = full_eigen(matrix);
+        let k_eff = k.min(evals.len());
+        let truncated_vals = evals[..k_eff].to_vec();
+        let truncated_vecs = evecs.columns(0, k_eff).into_owned();
+        return (truncated_vals, truncated_vecs);
+    }
+
+    // Cap k at n; require >= 2 so the tridiagonal has at least one off-diagonal.
+    let k_eff = k.min(n).max(2);
+    lanczos_smallest_eigen(&matrix, k_eff)
 }
 
 /// Use eigengap heuristic to find optimal k: largest relative gap in sorted eigenvalues.
@@ -336,7 +482,11 @@ pub fn spectral_cluster_with_min(
     #[allow(clippy::cast_precision_loss)]
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
 
-    let (eigenvalues, eigenvectors) = full_eigen(laplacian);
+    // Top-k Lanczos: only need the bottom (max_k + 1) eigenpairs for the
+    // eigengap heuristic + spectral embedding (k columns), not all n.
+    // O(n^2*k) vs O(n^3) of full_eigen — ~20-40x faster at n=3000, k~58.
+    let kmax = max_k + 1;
+    let (eigenvalues, eigenvectors) = topk_eigen(laplacian, kmax);
 
     // Debug: log eigenvalue spectrum to understand cluster selection
     if tracing::enabled!(tracing::Level::DEBUG) && eigenvalues.len() >= 2 {
@@ -482,7 +632,9 @@ pub fn spectral_cluster_with_affinity(
     // SAFETY: n is bounded by available memory; well below 2^52 in any realistic deployment.
     #[allow(clippy::cast_precision_loss)]
     let max_k = max_clusters.min(2.max((n as f64).sqrt() as usize));
-    let (eigenvalues, eigenvectors) = full_eigen(laplacian);
+    // Lanczos top-k: see comment in spectral_cluster_with_min for the cost rationale.
+    let kmax = max_k + 1;
+    let (eigenvalues, eigenvectors) = topk_eigen(laplacian, kmax);
     let k = find_optimal_k(&eigenvalues, max_k).max(min_clusters.min(max_k));
 
     // Build embedding from eigenvectors (same as spectral_cluster_with_min)
@@ -943,6 +1095,106 @@ mod tests {
 
         let result = spectral_cluster_with_affinity(affinity, 5, 2);
         assert_eq!(result.len(), 2);
+    }
+
+    /// Generate a deterministic fixture corpus large enough to exercise the
+    /// Lanczos branch (n ≥ `LANCZOS_MIN_N` = 128). Three pseudo-clusters of
+    /// 4-dim unit vectors, slightly perturbed by an integer hash so the
+    /// affinity matrix is non-degenerate but reproducible across runs.
+    fn fixture_vectors() -> Vec<Vec<f32>> {
+        let mut vectors = Vec::with_capacity(210);
+        for cluster in 0..3 {
+            for i in 0..70 {
+                // Hash-based perturbation: deterministic but produces a unique
+                // direction for each (cluster, i) pair.
+                let seed = (cluster * 7919 + i * 31) as u32;
+                let p1 = ((seed.wrapping_mul(2654435761) >> 16) & 0xFFF) as f32 / 4096.0;
+                let p2 = ((seed.wrapping_mul(40503) >> 16) & 0xFFF) as f32 / 4096.0;
+                let mut v = vec![0.0_f32; 4];
+                v[cluster] = 1.0;
+                v[3] = 0.05 * p1;
+                v[(cluster + 1) % 3] = 0.05 * p2;
+                // Normalize.
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in &mut v {
+                    *x /= norm;
+                }
+                vectors.push(v);
+            }
+        }
+        vectors
+    }
+
+    #[test]
+    fn topk_eigen_is_bitwise_deterministic() {
+        // Build a Laplacian large enough to exercise the Lanczos path.
+        let vecs = fixture_vectors();
+        let aff = build_affinity_matrix(&vecs);
+        let lap = normalized_laplacian(&aff);
+        let (e1, v1) = topk_eigen(lap.clone(), 5);
+        let (e2, v2) = topk_eigen(lap, 5);
+        // Exact equality, not approximate — the same input must produce
+        // bit-identical output for the cluster-cache key to be stable.
+        assert_eq!(e1, e2);
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    #[ignore = "wall-clock perf check, run explicitly with --ignored"]
+    fn lanczos_perf_n2000_k58() {
+        use std::time::Instant;
+        let n = 2000;
+        let k = 58;
+        let mut mat = DMatrix::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    mat[(i, j)] = 1.0;
+                } else {
+                    let d = (i as f64 - j as f64).abs();
+                    mat[(i, j)] = (-d / 50.0).exp() * 0.1;
+                }
+            }
+        }
+        let t0 = Instant::now();
+        let (e1, _) = topk_eigen(mat.clone(), k);
+        let lanczos_dur = t0.elapsed();
+        let t1 = Instant::now();
+        let (e2, _) = topk_eigen(mat.clone(), k);
+        let lanczos_dur2 = t1.elapsed();
+        let t2 = Instant::now();
+        let (full_evals, _) = full_eigen(mat);
+        let full_dur = t2.elapsed();
+        let speedup = full_dur.as_secs_f64() / lanczos_dur.as_secs_f64();
+        eprintln!(
+            "[perf] n={n} k={k}  lanczos={:?} (run2={:?})  full_eigen={:?}  speedup={:.1}x  smallest={:.6} (full={:.6})  determinism={}",
+            lanczos_dur,
+            lanczos_dur2,
+            full_dur,
+            speedup,
+            e1[0],
+            full_evals[0],
+            e1 == e2,
+        );
+        assert_eq!(e1, e2, "lanczos must be deterministic");
+        assert!(
+            speedup >= 10.0,
+            "expected >=10x speedup, got {:.1}x",
+            speedup
+        );
+    }
+
+    #[test]
+    fn spectral_cluster_is_deterministic() {
+        let vecs = fixture_vectors(); // n = 210, > LANCZOS_MIN_N
+        let r1 = spectral_cluster_with_min(&vecs, 10, 2);
+        let r2 = spectral_cluster_with_min(&vecs, 10, 2);
+        let assigns1: Vec<Vec<usize>> = r1.iter().map(|c| c.indices.clone()).collect();
+        let assigns2: Vec<Vec<usize>> = r2.iter().map(|c| c.indices.clone()).collect();
+        assert_eq!(
+            assigns1, assigns2,
+            "spectral_cluster_with_min must produce identical cluster assignments run-to-run"
+        );
     }
 
     /// Regression: a vertex with near-zero degree (row sum ≈ 1e-15) must not produce

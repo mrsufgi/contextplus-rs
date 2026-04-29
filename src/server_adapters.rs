@@ -192,8 +192,13 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     }
                 }
 
-                // Store new vectors in cache and fill result
-                {
+                // Store new vectors in cache and build the snapshot to persist.
+                // Critical: build the VectorStore inside the write-guard scope,
+                // then drop the guard BEFORE the disk save. The merging save
+                // takes a blocking fd-lock and does ~146 MB of sync I/O — if we
+                // held the in-memory write lock across that, every concurrent
+                // request waiting on `embedding_cache.read().await` would stall.
+                let store_to_save = {
                     let mut cache_write = embedding_cache.write().await;
                     for (j, &idx) in uncached_indices.iter().enumerate() {
                         if j < new_vectors.len() && !new_vectors[j].is_empty() {
@@ -208,22 +213,30 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                             vectors[idx] = Some(new_vectors[j].clone());
                         }
                     }
+                    let store = crate::core::embeddings::VectorStore::from_cache(&cache_write);
+                    drop(cache_write);
+                    store
+                };
 
-                    // Persist to disk with model-qualified name (lock dropped after block).
-                    // Single-writer overwrite path: this adapter and the server
-                    // background flush both target the same cache file, so using the
-                    // merging variant here would race with the overwrite path and
-                    // silently drop entries. See PR #42.
+                // Persist to disk off the Tokio worker via spawn_blocking — the
+                // merging save acquires a blocking fd-lock and does sync I/O.
+                // Merge with disk under fd-lock: this adapter's in-memory cache
+                // only covers keys touched in this session, so an overwrite would
+                // silently drop entries written by warmup_embeddings or a second
+                // MCP instance racing on the same cache file.
+                if let Some(store) = store_to_save {
                     let code_cache_name = cache_name("embeddings", &config.ollama_embed_model);
-                    if let Some(store) =
-                        crate::core::embeddings::VectorStore::from_cache(&cache_write)
-                        && let Err(e) = rkyv_store::save_vector_store_overwrite(
-                            store_root,
-                            &code_cache_name,
-                            &store,
-                        )
-                    {
-                        tracing::warn!("Failed to save embedding cache: {e}");
+                    let root = store_root.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        rkyv_store::save_vector_store_merged(&root, &code_cache_name, &store)
+                    })
+                    .await;
+                    match result {
+                        Ok(Err(e)) => tracing::warn!("Failed to save embedding cache: {e}"),
+                        Err(join_err) => tracing::warn!(
+                            "save_vector_store spawn_blocking join failed: {join_err}"
+                        ),
+                        Ok(Ok(())) => {}
                     }
                 }
             }

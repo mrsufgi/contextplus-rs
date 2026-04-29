@@ -192,7 +192,7 @@ async fn main() {
             let hashes: Vec<String> = keys.iter().map(|k| hash_content(k)).collect();
             let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
             let store = VectorStore::new(dims, keys, hashes, flat);
-            if let Err(e) = rkyv_store::save_vector_store(root, &id_cache_name, &store) {
+            if let Err(e) = rkyv_store::save_vector_store_merged(root, &id_cache_name, &store) {
                 eprintln!("Failed to save cache: {}", e);
             }
         }

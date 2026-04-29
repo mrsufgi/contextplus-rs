@@ -240,19 +240,37 @@ pub(crate) async fn build_labeled_tree(
     children
 }
 
-/// Build LLM prompt and get labels for sub-clusters.
+/// Owned snapshot of a sub-cluster, suitable for moving across `tokio::spawn`.
+struct OwnedSubcluster {
+    cache_key: String,
+    parent_label: String,
+    files: Vec<FileInfo>,
+}
+
+/// Resolve labels for sub-clusters with stale-while-revalidate semantics.
+///
+/// - cache hit (any quality): return cached label.
+/// - cache miss: return a heuristic now, persist it, queue an LLM heal.
+///
+/// Returns the (gi, ci) -> label_to_use_now map. The background task fires
+/// off via `tokio::spawn` and survives the foreground response.
 pub(crate) async fn label_subclusters_with_llm(
     pending_groups: &[PendingGroup],
     files: &[FileInfo],
     ollama: &OllamaClient,
     root_dir: &Path,
 ) -> HashMap<(usize, usize), String> {
-    let mut llm_label_map: HashMap<(usize, usize), String> = HashMap::new();
+    use super::super::labels::heuristic_label;
+    use super::super::semantic_navigate::{
+        CachedLabel, cluster_cache_key, load_label_cache_full, save_label_cache_merged,
+    };
 
-    // Load existing label cache
-    let label_cache = super::super::semantic_navigate::load_label_cache(root_dir);
+    let mut label_map: HashMap<(usize, usize), String> = HashMap::new();
 
-    // Collect all sub-cluster file lists for one batched LLM call
+    // Load existing label cache (with quality)
+    let label_cache = load_label_cache_full(root_dir);
+
+    // Collect all sub-cluster file lists
     let mut all_sublabels: Vec<(usize, usize, Vec<&FileInfo>)> = Vec::new(); // (group_idx, cluster_idx, files)
     for (gi, group) in pending_groups.iter().enumerate() {
         if group.cluster_results.len() <= 1 {
@@ -268,234 +286,253 @@ pub(crate) async fn label_subclusters_with_llm(
         }
     }
 
-    // Check which clusters already have cached labels
-    let mut cached_keys: HashMap<(usize, usize), String> = HashMap::new(); // (gi,ci) -> cache_key
+    // For every sub-cluster decide: cache hit, or (heuristic + heal queue).
+    let mut heal_queue: Vec<OwnedSubcluster> = Vec::new();
+    let mut heuristic_writes: HashMap<String, CachedLabel> = HashMap::new();
+
     for (gi, ci, file_refs) in &all_sublabels {
         let paths: Vec<&str> = file_refs.iter().map(|f| f.relative_path.as_str()).collect();
-        let key = super::super::semantic_navigate::cluster_cache_key(&paths);
-        if let Some(label) = label_cache.get(&key) {
+        let key = cluster_cache_key(&paths);
+        if let Some(cached) = label_cache.get(&key) {
             tracing::info!(
                 group_idx = gi,
                 cluster_idx = ci,
-                label = label.as_str(),
+                label = cached.label.as_str(),
+                quality = ?cached.quality,
                 "semantic_navigate: using cached label for [{}, {}]: {:?}",
                 gi,
                 ci,
-                label
+                cached.label
             );
-            llm_label_map.insert((*gi, *ci), label.clone());
+            label_map.insert((*gi, *ci), cached.label.clone());
+        } else {
+            let h = heuristic_label(file_refs);
+            label_map.insert((*gi, *ci), h.clone());
+            heuristic_writes.insert(key.clone(), CachedLabel::heuristic(h));
+            heal_queue.push(OwnedSubcluster {
+                cache_key: key,
+                parent_label: pending_groups[*gi].label.clone(),
+                files: file_refs.iter().map(|f| (*f).clone()).collect(),
+            });
         }
-        cached_keys.insert((*gi, *ci), key);
     }
 
-    // Filter out cached sublabels — only send uncached to LLM
-    let uncached_sublabels: Vec<&(usize, usize, Vec<&FileInfo>)> = all_sublabels
+    // Persist heuristics now so a crash leaves usable labels on disk.
+    if !heuristic_writes.is_empty() {
+        save_label_cache_merged(root_dir, &heuristic_writes);
+    }
+
+    // Spawn the background LLM heal — caller does NOT await this.
+    if !heal_queue.is_empty() {
+        spawn_subcluster_heal(heal_queue, ollama.clone(), root_dir.to_path_buf());
+    }
+
+    label_map
+}
+
+/// Run the LLM batch for a queue of sub-clusters and merge the upgraded
+/// labels into the on-disk cache. Same prompt/parsing/validation as the
+/// previous foreground path — moved here so the foreground returns instantly.
+async fn run_subcluster_llm_heal(
+    queue: &[OwnedSubcluster],
+    ollama: &OllamaClient,
+    root_dir: &Path,
+) {
+    use super::super::semantic_navigate::{CachedLabel, save_label_cache_merged};
+    if queue.is_empty() {
+        return;
+    }
+
+    // Build (gi, ci, file_refs) tuples on the owned data. We synthesize indices
+    // for batch logging; they don't have to match the foreground gi/ci.
+    let all_sublabels: Vec<(usize, usize, Vec<&FileInfo>)> = queue
         .iter()
-        .filter(|(gi, ci, _)| !llm_label_map.contains_key(&(*gi, *ci)))
+        .enumerate()
+        .map(|(i, snap)| (i, 0usize, snap.files.iter().collect::<Vec<&FileInfo>>()))
         .collect();
+    let parent_labels: Vec<&str> = queue.iter().map(|s| s.parent_label.as_str()).collect();
 
-    tracing::info!(
-        total_sublabels = all_sublabels.len(),
-        uncached_count = uncached_sublabels.len(),
-        "semantic_navigate: sub-cluster LLM batching — {} uncached of {} total clusters",
-        uncached_sublabels.len(),
-        all_sublabels.len()
-    );
+    let mut llm_label_map: HashMap<usize, String> = HashMap::new();
 
-    // Send ALL uncached clusters to LLM in batches to avoid timeout
-    if !uncached_sublabels.is_empty() {
-        for batch in uncached_sublabels.chunks(LLM_BATCH_SIZE) {
-            tracing::info!(
-                batch_size = batch.len(),
-                "semantic_navigate: sending batch of {} clusters to LLM",
-                batch.len()
-            );
+    for batch in all_sublabels.chunks(LLM_BATCH_SIZE) {
+        tracing::info!(
+            batch_size = batch.len(),
+            "semantic_navigate: heal — sending batch of {} clusters to LLM",
+            batch.len()
+        );
 
-            let descriptions: Vec<String> = batch
-                .iter()
-                .enumerate()
-                .map(|(desc_idx, (gi, _, file_refs))| {
-                    let parent_label = &pending_groups[*gi].label;
+        let descriptions: Vec<String> = batch
+            .iter()
+            .enumerate()
+            .map(|(desc_idx, (queue_idx, _, file_refs))| {
+                let parent_label = parent_labels[*queue_idx];
 
-                    // Group files by subdirectory for representative sampling
-                    let mut subdir_files: HashMap<String, Vec<&FileInfo>> = HashMap::new();
-                    for f in file_refs.iter() {
-                        let subdir = Path::new(&f.relative_path)
-                            .parent()
-                            .and_then(|p| {
-                                let components: Vec<_> = p.components().collect();
-                                if components.is_empty() {
-                                    None
-                                } else {
-                                    let depth = components.len().min(2);
-                                    let sub: std::path::PathBuf = components[..depth].iter().collect();
-                                    Some(sub.to_string_lossy().to_string())
-                                }
-                            })
-                            .unwrap_or_else(|| ".".to_string());
-                        subdir_files.entry(subdir).or_default().push(f);
-                    }
-
-                    // Subdirectory summary sorted by count descending
-                    let mut subdir_counts: Vec<(String, usize)> = subdir_files
-                        .iter()
-                        .map(|(dir, files)| (dir.clone(), files.len()))
-                        .collect();
-                    subdir_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
-                    let subdir_summary = subdir_counts
-                        .iter()
-                        .map(|(dir, count)| format!("{} ({})", dir, count))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-
-                    // Round-robin across subdirectories for representative sample
-                    let sample: Vec<&FileInfo> = if file_refs.len() <= MAX_FILES_PER_LABEL {
-                        file_refs.to_vec()
-                    } else {
-                        let mut sorted_dirs: Vec<(&String, &Vec<&FileInfo>)> =
-                            subdir_files.iter().collect();
-                        sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-
-                        let mut picked: Vec<&FileInfo> = Vec::with_capacity(MAX_FILES_PER_LABEL);
-                        let mut dir_indices: Vec<usize> = vec![0; sorted_dirs.len()];
-                        while picked.len() < MAX_FILES_PER_LABEL {
-                            let mut added_this_round = false;
-                            for (di, (_, files)) in sorted_dirs.iter().enumerate() {
-                                if picked.len() >= MAX_FILES_PER_LABEL {
-                                    break;
-                                }
-                                let idx = dir_indices[di];
-                                if idx < files.len() {
-                                    picked.push(files[idx]);
-                                    dir_indices[di] += 1;
-                                    added_this_round = true;
-                                }
+                // Group files by subdirectory for representative sampling
+                let mut subdir_files: HashMap<String, Vec<&FileInfo>> = HashMap::new();
+                for f in file_refs.iter() {
+                    let subdir = Path::new(&f.relative_path)
+                        .parent()
+                        .and_then(|p| {
+                            let components: Vec<_> = p.components().collect();
+                            if components.is_empty() {
+                                None
+                            } else {
+                                let depth = components.len().min(2);
+                                let sub: std::path::PathBuf =
+                                    components[..depth].iter().collect();
+                                Some(sub.to_string_lossy().to_string())
                             }
-                            if !added_this_round {
+                        })
+                        .unwrap_or_else(|| ".".to_string());
+                    subdir_files.entry(subdir).or_default().push(f);
+                }
+
+                let mut subdir_counts: Vec<(String, usize)> = subdir_files
+                    .iter()
+                    .map(|(dir, files)| (dir.clone(), files.len()))
+                    .collect();
+                subdir_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
+                let subdir_summary = subdir_counts
+                    .iter()
+                    .map(|(dir, count)| format!("{} ({})", dir, count))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let sample: Vec<&FileInfo> = if file_refs.len() <= MAX_FILES_PER_LABEL {
+                    file_refs.clone()
+                } else {
+                    let mut sorted_dirs: Vec<(&String, &Vec<&FileInfo>)> =
+                        subdir_files.iter().collect();
+                    sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
+
+                    let mut picked: Vec<&FileInfo> = Vec::with_capacity(MAX_FILES_PER_LABEL);
+                    let mut dir_indices: Vec<usize> = vec![0; sorted_dirs.len()];
+                    while picked.len() < MAX_FILES_PER_LABEL {
+                        let mut added_this_round = false;
+                        for (di, (_, files)) in sorted_dirs.iter().enumerate() {
+                            if picked.len() >= MAX_FILES_PER_LABEL {
                                 break;
                             }
+                            let idx = dir_indices[di];
+                            if idx < files.len() {
+                                picked.push(files[idx]);
+                                dir_indices[di] += 1;
+                                added_this_round = true;
+                            }
                         }
-                        picked
-                    };
-
-                    let file_list = sample
-                        .iter()
-                        .map(|f| {
-                            let desc = if f.header.is_empty() { "no description" } else { &f.header };
-                            format!("{}: {}", f.relative_path, desc)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n  ");
-                    {
-                        let letter = (b'A' + (desc_idx as u8 % 26)) as char;
-                        format!(
-                            "Group {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
-                            letter, file_refs.len(), parent_label, subdir_summary, file_list
-                        )
+                        if !added_this_round {
+                            break;
+                        }
                     }
-                })
-                .collect();
+                    picked
+                };
 
-            let prompt = format!(
-                "You are labeling clusters of source code files in a software project.\n\
-                For each cluster, think about:\n\
-                - What is the overarching THEME of these files? (not the directory name)\n\
-                - What DISTINGUISHES this cluster from its siblings?\n\
-                Give each cluster a descriptive label of 2-5 words that captures its PURPOSE.\n\n\
-                Good labels: \"Appointment Core Logic\", \"Auth Middleware\", \"Patient Data Access\", \"Webhook Event Handlers\"\n\
-                Bad labels: \"service\", \"delivery/http\", \"repository/pg\", \"files\", \"source\"\n\n\
-                Do NOT echo directory names as labels — describe what the code DOES.\n\
-                Do NOT name after a single file — name after the MAJORITY.\n\n\
-                {}\n\n\
-                Return ONLY a JSON array of {} strings, one per cluster.",
-                descriptions.join("\n\n"),
-                batch.len()
-            );
+                let file_list = sample
+                    .iter()
+                    .map(|f| {
+                        let desc = if f.header.is_empty() {
+                            "no description"
+                        } else {
+                            &f.header
+                        };
+                        format!("{}: {}", f.relative_path, desc)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n  ");
+                let letter = (b'A' + (desc_idx as u8 % 26)) as char;
+                format!(
+                    "Group {} (TOTAL: {} files, within \"{}\"):\n  Subdirectory distribution (label should reflect the largest groups): {}\n  Sample files:\n  {}",
+                    letter, file_refs.len(), parent_label, subdir_summary, file_list
+                )
+            })
+            .collect();
 
-            if let Ok(response) = ollama.chat(&prompt).await {
-                if let Some(json_str) =
-                    super::super::semantic_navigate::extract_json_array(&response)
-                    && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str)
-                {
-                    tracing::info!(
-                        label_count = labels.len(),
-                        batch_size = batch.len(),
-                        "semantic_navigate: LLM returned {} labels for {} clusters",
-                        labels.len(),
-                        batch.len()
-                    );
-                    for (j, (gi, ci, file_refs)) in batch.iter().enumerate() {
-                        if let Some(label) = labels.get(j) {
-                            let clean_label = label.trim();
-                            // Post-processing: reject garbage labels
-                            if clean_label.is_empty()
-                                || clean_label.len() > 50
-                                || clean_label.contains('.')
-                                || clean_label.contains('/')
-                            {
-                                tracing::info!(
-                                    group_idx = gi,
-                                    cluster_idx = ci,
-                                    label = clean_label,
-                                    "semantic_navigate: rejected LLM label (garbage format) for [{}, {}]: {:?}",
-                                    gi,
-                                    ci,
-                                    clean_label
-                                );
-                                continue;
-                            }
-                            // Post-processing: reject labels that name a minority feature.
-                            // If the label words match a specific subdirectory that holds <20%
-                            // of the cluster's files, the LLM was misled by a prominent filename.
-                            if !validate_label_against_cluster(clean_label, file_refs) {
-                                tracing::info!(
-                                    group_idx = gi,
-                                    cluster_idx = ci,
-                                    label = clean_label,
-                                    file_count = file_refs.len(),
-                                    "semantic_navigate: rejected LLM label (validation failed) for [{}, {}]: {:?} ({} files)",
-                                    gi,
-                                    ci,
-                                    clean_label,
-                                    file_refs.len()
-                                );
-                                continue;
-                            }
-                            tracing::info!(
-                                group_idx = gi,
-                                cluster_idx = ci,
-                                label = clean_label,
-                                file_count = file_refs.len(),
-                                "semantic_navigate: accepted LLM label for [{}, {}]: {:?} ({} files)",
-                                gi,
-                                ci,
-                                clean_label,
-                                file_refs.len()
-                            );
-                            llm_label_map.insert((*gi, *ci), clean_label.to_string());
+        let prompt = format!(
+            "You are labeling clusters of source code files in a software project.\n\
+            For each cluster, think about:\n\
+            - What is the overarching THEME of these files? (not the directory name)\n\
+            - What DISTINGUISHES this cluster from its siblings?\n\
+            Give each cluster a descriptive label of 2-5 words that captures its PURPOSE.\n\n\
+            Good labels: \"Appointment Core Logic\", \"Auth Middleware\", \"Patient Data Access\", \"Webhook Event Handlers\"\n\
+            Bad labels: \"service\", \"delivery/http\", \"repository/pg\", \"files\", \"source\"\n\n\
+            Do NOT echo directory names as labels — describe what the code DOES.\n\
+            Do NOT name after a single file — name after the MAJORITY.\n\n\
+            {}\n\n\
+            Return ONLY a JSON array of {} strings, one per cluster.",
+            descriptions.join("\n\n"),
+            batch.len()
+        );
+
+        if let Ok(response) = ollama.chat(&prompt).await {
+            if let Some(json_str) = super::super::semantic_navigate::extract_json_array(&response)
+                && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str)
+            {
+                for (j, (queue_idx, _, file_refs)) in batch.iter().enumerate() {
+                    if let Some(label) = labels.get(j) {
+                        let clean_label = label.trim();
+                        if clean_label.is_empty()
+                            || clean_label.len() > 50
+                            || clean_label.contains('.')
+                            || clean_label.contains('/')
+                        {
+                            continue;
                         }
+                        if !validate_label_against_cluster(clean_label, file_refs) {
+                            continue;
+                        }
+                        llm_label_map.insert(*queue_idx, clean_label.to_string());
                     }
                 }
-            } else {
-                tracing::info!(
-                    "semantic_navigate: LLM chat call failed for sub-cluster labeling batch"
-                );
             }
+        } else {
+            tracing::info!("semantic_navigate: heal — LLM chat call failed for sub-cluster batch");
         }
-
-        // Save newly generated LLM labels to the cache
-        let mut updated_cache = label_cache;
-        for (gi, ci, file_refs) in all_sublabels.iter() {
-            if let Some(label) = llm_label_map.get(&(*gi, *ci)) {
-                let paths: Vec<&str> = file_refs.iter().map(|f| f.relative_path.as_str()).collect();
-                let key = super::super::semantic_navigate::cluster_cache_key(&paths);
-                updated_cache.insert(key, label.clone());
-            }
-        }
-        super::super::semantic_navigate::save_label_cache(root_dir, &updated_cache);
     }
 
-    llm_label_map
+    // Merge upgraded labels into on-disk cache.
+    let mut upgrades: HashMap<String, CachedLabel> = HashMap::new();
+    for (queue_idx, snap) in queue.iter().enumerate() {
+        if let Some(label) = llm_label_map.get(&queue_idx) {
+            upgrades.insert(snap.cache_key.clone(), CachedLabel::llm(label.clone()));
+        }
+    }
+    if !upgrades.is_empty() {
+        save_label_cache_merged(root_dir, &upgrades);
+        tracing::info!(
+            upgraded = upgrades.len(),
+            queued = queue.len(),
+            "semantic_navigate: heal — upgraded {} of {} sub-cluster labels",
+            upgrades.len(),
+            queue.len()
+        );
+    }
+}
+
+/// Spawn a `tokio::spawn` task that runs the LLM heal for sub-clusters.
+/// Process-wide dedup ensures the same `cache_key` never has two heals in
+/// flight; if every key in `queue` is already being healed, this is a no-op.
+fn spawn_subcluster_heal(
+    queue: Vec<OwnedSubcluster>,
+    ollama: OllamaClient,
+    root_dir: std::path::PathBuf,
+) {
+    use super::super::semantic_navigate::{claim_in_flight_keys, release_in_flight_keys};
+
+    let keys: Vec<String> = queue.iter().map(|s| s.cache_key.clone()).collect();
+    let claimed = claim_in_flight_keys(&keys);
+    if claimed.is_empty() {
+        return;
+    }
+    let to_heal: Vec<OwnedSubcluster> = queue
+        .into_iter()
+        .filter(|s| claimed.contains(&s.cache_key))
+        .collect();
+    let claimed_keys: Vec<String> = to_heal.iter().map(|s| s.cache_key.clone()).collect();
+
+    tokio::spawn(async move {
+        run_subcluster_llm_heal(&to_heal, &ollama, &root_dir).await;
+        release_in_flight_keys(&claimed_keys);
+    });
 }
 
 /// Group files by meaningful directory structure for top-level clustering.

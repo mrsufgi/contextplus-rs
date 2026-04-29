@@ -6,11 +6,22 @@ use std::sync::LazyLock;
 
 use crate::core::embeddings::content_hash;
 
-/// Maximum files to cluster. Set to usize::MAX to disable sampling.
-/// With directory-based grouping at depth 0, spectral clustering only
-/// runs on individual groups (50-400 files each), not the full file set.
-/// The O(n³) eigen is bounded by group size, not total files.
-pub const MAX_NAVIGATE_FILES: usize = usize::MAX;
+/// Default cap on files fed to the top-level navigate clustering step.
+/// Even with Lanczos top-k eigendecomposition (O(n^2*k)), affinity-matrix
+/// construction is O(n^2) at ~8 bytes/entry — n=2000 is ~32MB, still cheap;
+/// n=3000+ pushes wall-clock past acceptable interactive latency on cold
+/// caches. Override at runtime via `CONTEXTPLUS_NAVIGATE_MAX_FILES`.
+pub const MAX_NAVIGATE_FILES_DEFAULT: usize = 2000;
+
+/// Resolve the effective navigate file cap, honoring the
+/// `CONTEXTPLUS_NAVIGATE_MAX_FILES` env override. Falls back to
+/// `MAX_NAVIGATE_FILES_DEFAULT` when the var is unset or unparsable.
+pub fn max_navigate_files() -> usize {
+    std::env::var("CONTEXTPLUS_NAVIGATE_MAX_FILES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_NAVIGATE_FILES_DEFAULT)
+}
 
 /// Maximum files in a leaf cluster before it gets sub-clustered.
 /// Lowered from 20 to 10 to force semantic splitting on medium groups

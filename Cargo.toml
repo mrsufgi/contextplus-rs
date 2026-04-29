@@ -59,6 +59,10 @@ notify-debouncer-full = "0.7"
 # Spectral clustering
 nalgebra = "0.33"
 
+# (Top-k Lanczos lives inline in src/core/clustering.rs — see lanczos_smallest_eigen.
+# The upstream `lanczos` crate seeded with a random vector and broke run-to-run
+# determinism, scrambling the navigate-labels.json cache key.)
+
 # Graph
 petgraph = "0.7"
 

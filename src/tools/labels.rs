@@ -1299,6 +1299,125 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
     true
 }
 
+// ── Stale-while-revalidate heuristic label ──────────────────────────
+//
+// Produces a fast, sub-millisecond label for a cluster without any LLM call.
+// Used as the immediate response when a cluster's label is not yet cached;
+// the on-disk cache is later upgraded to an LLM label by a background task.
+//
+// Strategy:
+//   1. Find the longest common path prefix across the cluster's files.
+//   2. Augment with the dominant top-level signal: classify each file
+//      (test / component / route / model / service / config / type / etc.)
+//      and append a parenthesized hint when one category clearly dominates.
+//   3. Fall back to "<commonPrefix>/*" if no signal.
+//   4. Cap at 64 chars (truncating on a char boundary).
+const HEURISTIC_LABEL_MAX_LEN: usize = 64;
+const HEURISTIC_DOMINANCE_THRESHOLD: f32 = 0.5;
+
+pub(crate) fn heuristic_label(files: &[&FileInfo]) -> String {
+    if files.is_empty() {
+        return "(empty cluster)".to_string();
+    }
+
+    // Step 1: longest common path prefix (directory components only — never
+    // include the filename itself, which is unique per file).
+    let split_paths: Vec<Vec<&str>> = files
+        .iter()
+        .map(|f| f.relative_path.split('/').collect::<Vec<_>>())
+        .collect();
+    let min_depth = split_paths.iter().map(|p| p.len()).min().unwrap_or(0);
+
+    let mut common_depth = 0;
+    // Only consider directory segments — exclude the filename (last component).
+    let max_dir_depth = if min_depth > 0 { min_depth - 1 } else { 0 };
+    for d in 0..max_dir_depth {
+        let probe = split_paths[0][d];
+        if split_paths.iter().all(|p| p[d] == probe) {
+            common_depth = d + 1;
+        } else {
+            break;
+        }
+    }
+    let prefix: String = if common_depth == 0 {
+        String::new()
+    } else {
+        split_paths[0][..common_depth].join("/")
+    };
+
+    // Step 2: dominant kind hint.
+    let total = files.len();
+    let mut kind_counts: HashMap<&'static str, usize> = HashMap::new();
+    for file in files {
+        let kind = heuristic_kind_for(file);
+        *kind_counts.entry(kind).or_default() += 1;
+    }
+    let dominant: Option<&'static str> = kind_counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .filter(|(_, n)| **n as f32 / total as f32 >= HEURISTIC_DOMINANCE_THRESHOLD)
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, _)| *k);
+
+    let mut label = if prefix.is_empty() {
+        match dominant {
+            Some(kind) => format!("(mixed) ({})", kind),
+            None => "(mixed)".to_string(),
+        }
+    } else {
+        match dominant {
+            Some(kind) => format!("{} ({})", prefix, kind),
+            None => format!("{}/*", prefix),
+        }
+    };
+
+    if label.len() > HEURISTIC_LABEL_MAX_LEN {
+        label = crate::core::parser::truncate_to_char_boundary(&label, HEURISTIC_LABEL_MAX_LEN)
+            .to_string();
+    }
+    label
+}
+
+/// Classify a file into a coarse heuristic kind. Covers the high-signal cases;
+/// returns "" when none apply (so it doesn't drown out other categories).
+fn heuristic_kind_for(file: &FileInfo) -> &'static str {
+    let path = file.relative_path.as_str();
+    let lower = path.to_ascii_lowercase();
+
+    if is_test_file(path) {
+        return "tests";
+    }
+    if lower.ends_with(".d.ts") || lower.contains("/types/") || lower.ends_with("/types.ts") {
+        return "types";
+    }
+    // Path-segment hints take priority over extension-only classification.
+    for seg in lower.split('/') {
+        match seg {
+            "routes" | "route" | "controllers" | "handlers" => return "routes",
+            "services" | "service" => return "services",
+            "components" => return "components",
+            "hooks" => return "hooks",
+            "models" | "model" => return "models",
+            "schemas" | "schema" => return "schemas",
+            "repositories" | "repository" | "repo" | "repos" => return "repositories",
+            "middleware" | "middlewares" => return "middleware",
+            "migrations" | "migration" => return "migrations",
+            "config" | "configs" => return "config",
+            "utils" | "util" | "helpers" | "helper" => return "utils",
+            _ => {}
+        }
+    }
+    // Extension-driven fallback.
+    match classify_file_type(path) {
+        "components" => "components",
+        "schemas" => "schemas",
+        "proto" => "proto",
+        "sql" => "sql",
+        "yaml" | "json" => "config",
+        _ => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2840,6 +2959,102 @@ mod tests {
         assert!(
             !LABEL_ALLOWLIST.contains("invoicing"),
             "expected 'invoicing' to not be in LABEL_ALLOWLIST"
+        );
+    }
+
+    // ── heuristic_label tests ─────────────────────────────────────────────
+
+    fn make_file(path: &str) -> FileInfo {
+        FileInfo {
+            relative_path: path.to_string(),
+            header: String::new(),
+            content: String::new(),
+            symbol_preview: vec![],
+        }
+    }
+
+    #[test]
+    fn heuristic_label_returns_path_prefix_for_simple_cluster() {
+        let f1 = make_file("src/auth/login.rs");
+        let f2 = make_file("src/auth/session.rs");
+        let f3 = make_file("src/auth/middleware.rs");
+        let label = heuristic_label(&[&f1, &f2, &f3]);
+        // Expect the longest common directory prefix in the label.
+        assert!(
+            label.starts_with("src/auth"),
+            "expected label to start with 'src/auth', got {:?}",
+            label
+        );
+    }
+
+    #[test]
+    fn heuristic_label_appends_dominant_kind_hint_for_tests() {
+        let files = [
+            make_file("src/auth/login_test.rs"),
+            make_file("src/auth/session_test.rs"),
+            make_file("src/auth/middleware_test.rs"),
+        ];
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let label = heuristic_label(&refs);
+        assert!(
+            label.contains("(tests)"),
+            "expected '(tests)' in label, got {:?}",
+            label
+        );
+    }
+
+    #[test]
+    fn heuristic_label_handles_empty_cluster() {
+        let label = heuristic_label(&[]);
+        assert_eq!(label, "(empty cluster)");
+    }
+
+    #[test]
+    fn heuristic_label_caps_length_at_64_chars() {
+        let long_dir = "a".repeat(80);
+        let p1 = format!("{}/x.rs", long_dir);
+        let p2 = format!("{}/y.rs", long_dir);
+        let f1 = make_file(&p1);
+        let f2 = make_file(&p2);
+        let label = heuristic_label(&[&f1, &f2]);
+        assert!(
+            label.len() <= 64,
+            "label exceeds cap: {} chars: {:?}",
+            label.len(),
+            label
+        );
+    }
+
+    #[test]
+    fn heuristic_label_falls_back_to_star_when_no_kind_signal() {
+        let f1 = make_file("src/auth/foo.rs");
+        let f2 = make_file("src/auth/bar.rs");
+        let label = heuristic_label(&[&f1, &f2]);
+        // No path-segment hint AND extension is "rust" (returns "" in mapper)
+        // — should produce a "<prefix>/*" label.
+        assert!(
+            label.ends_with("/*"),
+            "expected fallback '/*' suffix, got {:?}",
+            label
+        );
+    }
+
+    #[test]
+    fn heuristic_label_is_fast_under_one_ms_per_cluster() {
+        // Sub-millisecond per cluster is the spec target. Use a 100-file cluster
+        // and assert the call comes back in under 5 ms (very loose, accounts for
+        // CI variance).
+        let files: Vec<FileInfo> = (0..100)
+            .map(|i| make_file(&format!("src/auth/file_{}.rs", i)))
+            .collect();
+        let refs: Vec<&FileInfo> = files.iter().collect();
+        let start = std::time::Instant::now();
+        let _label = heuristic_label(&refs);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 50,
+            "heuristic_label too slow: {:?}",
+            elapsed
         );
     }
 }

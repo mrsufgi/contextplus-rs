@@ -244,6 +244,25 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// Atomic on-disk swap is preserved (write to unique temp file then rename).
 pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
+    save_cache_with_deletions(root_dir, name, data, &[])
+}
+
+/// Same as [`save_cache`] but additionally removes any keys present in
+/// `deletions` from the merged result before persisting.
+///
+/// Deletion semantics: load disk, overlay incoming on top (incoming wins for
+/// shared keys), then strip every key in `deletions`. This lets the live MCP
+/// runtime persist file deletions across save cycles — without it, a key
+/// removed from the in-memory cache would be silently re-merged from disk on
+/// every subsequent save and the cache would grow monotonically.
+///
+/// All work happens under the same fd-lock as `save_cache`.
+pub fn save_cache_with_deletions(
+    root_dir: &Path,
+    name: &str,
+    data: &CacheData,
+    deletions: &[String],
+) -> Result<()> {
     ensure_cache_dir(root_dir)?;
 
     // Acquire an exclusive advisory lock on the sentinel file before the
@@ -270,22 +289,41 @@ pub fn save_cache(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
     // A corrupt or version-mismatched on-disk file (truncated payload, bumped
     // CACHE_VERSION, partial write from a prior crash) returns Err here.
     // Propagating it would brick every subsequent save_cache call indefinitely
-    // until the cache file is manually removed. Treat any load failure as
-    // "no usable disk state" and overwrite — the new snapshot is whole and
-    // self-consistent, so resetting from it is strictly better than refusing
-    // to write forever.
-    let merged = match load_cache(root_dir, name) {
+    // until the cache file is manually removed. Rotate the broken file aside
+    // (preserving operator-recoverable data) and proceed with the incoming
+    // snapshot — refusing to write forever is strictly worse than rotating.
+    let mut merged = match load_cache(root_dir, name) {
         Ok(Some(disk)) => merge_cache_data(disk, data),
         Ok(None) => clone_cache_data(data),
         Err(e) => {
-            tracing::warn!(
-                cache = name,
-                error = %e,
-                "save_cache: on-disk cache unreadable; overwriting with incoming snapshot"
-            );
+            let rotated = rotate_corrupt_cache(root_dir, name);
+            match rotated {
+                Ok(Some(rotated_path)) => tracing::warn!(
+                    cache = name,
+                    error = %e,
+                    rotated = %rotated_path.display(),
+                    "save_cache: on-disk cache unreadable; rotated to {} and overwriting with incoming snapshot",
+                    rotated_path.display()
+                ),
+                Ok(None) => tracing::warn!(
+                    cache = name,
+                    error = %e,
+                    "save_cache: on-disk cache unreadable and not present after rotation attempt; overwriting with incoming snapshot"
+                ),
+                Err(rotate_err) => tracing::warn!(
+                    cache = name,
+                    error = %e,
+                    rotate_error = %rotate_err,
+                    "save_cache: on-disk cache unreadable and rotation failed; overwriting with incoming snapshot"
+                ),
+            }
             clone_cache_data(data)
         }
     };
+
+    if !deletions.is_empty() {
+        apply_deletions(&mut merged, deletions);
+    }
 
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&merged)
         .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
@@ -324,6 +362,65 @@ fn clone_cache_data(data: &CacheData) -> CacheData {
         hashes: data.hashes.clone(),
         vectors: data.vectors.clone(),
     }
+}
+
+/// Remove every key in `deletions` from `data` in-place, keeping the parallel
+/// arrays (keys, hashes, vectors) consistent. No-op for keys not present.
+fn apply_deletions(data: &mut CacheData, deletions: &[String]) {
+    if deletions.is_empty() || data.keys.is_empty() {
+        return;
+    }
+    let dim = data.dims as usize;
+    let to_remove: std::collections::HashSet<&str> = deletions.iter().map(|s| s.as_str()).collect();
+
+    let mut new_keys = Vec::with_capacity(data.keys.len());
+    let mut new_hashes = Vec::with_capacity(data.keys.len());
+    let mut new_vectors = if dim == 0 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(data.keys.len() * dim)
+    };
+
+    for (i, key) in data.keys.iter().enumerate() {
+        if to_remove.contains(key.as_str()) {
+            continue;
+        }
+        new_keys.push(key.clone());
+        new_hashes.push(data.hashes.get(i).cloned().unwrap_or_default());
+        if dim > 0 {
+            let off = i * dim;
+            if off + dim <= data.vectors.len() {
+                new_vectors.extend_from_slice(&data.vectors[off..off + dim]);
+            } else {
+                // Misaligned entry — drop it (parallel arrays must stay sized).
+                new_keys.pop();
+                new_hashes.pop();
+            }
+        }
+    }
+
+    data.keys = new_keys;
+    data.hashes = new_hashes;
+    data.vectors = new_vectors;
+}
+
+/// Move a corrupt cache file aside as `<path>.corrupt.<unix_ts>` so the
+/// operator can recover data from it. Returns the new path on success, or
+/// `Ok(None)` if the cache file was already absent. Errors are propagated.
+fn rotate_corrupt_cache(root_dir: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let path = cache_path(root_dir, name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut rotated = path.clone();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache");
+    rotated.set_file_name(format!("{}.corrupt.{}", file_name, ts));
+    fs::rename(&path, &rotated)?;
+    Ok(Some(rotated))
 }
 
 /// Merge two `CacheData` snapshots, with `incoming` overriding `disk` for
@@ -439,58 +536,43 @@ pub fn load_vector_store(root_dir: &Path, name: &str) -> Result<Option<VectorSto
     }
 }
 
-/// Save a VectorStore to disk.
-pub fn save_vector_store(root_dir: &Path, name: &str, store: &VectorStore) -> Result<()> {
-    let data = CacheData::from_store(store);
-    save_cache(root_dir, name, &data)
+/// Merge an in-memory `VectorStore` into the on-disk cache, preserving any
+/// keys the on-disk file has that this caller doesn't know about.
+///
+/// This is the single canonical save path. Use on any caller — live MCP
+/// runtime, warmup binaries, tests — because no caller actually owns the
+/// entire keyspace. The MCP server's in-memory snapshot only covers the
+/// subset of keys it has touched this session; an offline `warmup_*` binary
+/// or a second MCP instance may have written entries the current process
+/// never loaded. A naive overwrite would silently drop them.
+///
+/// Atomic: acquires the cache's fd-lock, loads the on-disk `CacheData`,
+/// merges incoming entries on top (incoming wins for shared keys), and writes
+/// the union back via tmp-file + rename. All under one lock — no TOCTOU
+/// window between the load and the save.
+///
+/// Cost on a ~150 MB cache: one extra read + one merge pass + one write.
+pub fn save_vector_store_merged(root_dir: &Path, name: &str, store: &VectorStore) -> Result<()> {
+    save_vector_store_merged_with_deletions(root_dir, name, store, &[])
 }
 
-/// Save `data` to disk **without** loading or merging the existing file.
+/// Same as [`save_vector_store_merged`] but additionally evicts any keys in
+/// `deletions` from the on-disk cache.
 ///
-/// Use this on the live MCP path where the in-memory `VectorStore` is the
-/// single ground-truth writer. Skips the ~146 MB read + ~200K String clones
-/// + ~146 MB write overhead of the merging `save_cache`.
-///
-/// Still uses an atomic write (tmp → rename) so the on-disk file is never
-/// left in a partial state. Does NOT acquire the fd-lock — this is a
-/// single-writer path by design; the warmup binaries use `save_cache` instead.
-pub fn save_cache_overwrite(root_dir: &Path, name: &str, data: &CacheData) -> Result<()> {
-    ensure_cache_dir(root_dir)?;
-
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(data)
-        .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
-
-    let path = cache_path(root_dir, name);
-    let tmp_path = cache_dir(root_dir).join(format!(
-        "{}.rkyv.{}.{}.tmp",
-        name,
-        std::process::id(),
-        WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-
-    let mut buf = Vec::with_capacity(HEADER_SIZE + bytes.len());
-    buf.resize(HEADER_SIZE, 0);
-    buf[0] = CACHE_VERSION;
-    buf.extend_from_slice(&bytes);
-
-    if let Err(e) = fs::write(&tmp_path, &buf) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    if let Err(e) = fs::rename(&tmp_path, &path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
-    Ok(())
-}
-
-/// Save a VectorStore to disk without loading or merging the existing file.
-///
-/// Single-writer live MCP path variant — see `save_cache_overwrite`.
-pub fn save_vector_store_overwrite(root_dir: &Path, name: &str, store: &VectorStore) -> Result<()> {
+/// Required on the live MCP runtime when source files have been deleted
+/// since the last save: the in-memory cache evicts the entry on file
+/// deletion, but a plain merged save would re-populate it from the on-disk
+/// snapshot and the cache would grow monotonically. Pass the set of keys
+/// that were `cache.remove`'d since the last save here and the on-disk
+/// state will track the deletions.
+pub fn save_vector_store_merged_with_deletions(
+    root_dir: &Path,
+    name: &str,
+    store: &VectorStore,
+    deletions: &[String],
+) -> Result<()> {
     let data = CacheData::from_store(store);
-    save_cache_overwrite(root_dir, name, &data)
+    save_cache_with_deletions(root_dir, name, &data, deletions)
 }
 
 // ---------------------------------------------------------------------------
@@ -547,9 +629,9 @@ pub fn query_cache_name(model: &str) -> String {
 /// entries are written; if the slice is longer, the MRU tail is kept (we slice
 /// from the end).
 ///
-/// Uses an atomic write (tmp → rename) identical to `save_cache_overwrite`.
-/// No merge with the existing file — the caller's in-memory LRU is the single
-/// source of truth for the query cache (only one MCP process writes it).
+/// Uses an atomic write (tmp → rename). No merge with the existing file —
+/// the caller's in-memory LRU is the single source of truth for the query
+/// cache (only one MCP process writes it).
 pub fn save_query_cache(
     root_dir: &Path,
     model: &str,
@@ -870,7 +952,7 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
 
-        save_vector_store(dir.path(), "vectors", &store).unwrap();
+        save_vector_store_merged(dir.path(), "vectors", &store).unwrap();
         let loaded = load_vector_store(dir.path(), "vectors").unwrap().unwrap();
 
         assert_eq!(loaded.count(), 2);
@@ -1205,7 +1287,7 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
 
-        save_vector_store(dir.path(), "zc", &store).unwrap();
+        save_vector_store_merged(dir.path(), "zc", &store).unwrap();
         let loaded = mmap_vector_store(dir.path(), "zc").unwrap().unwrap();
 
         assert_eq!(loaded.count(), 2);
@@ -1239,7 +1321,7 @@ mod tests {
             vec![0.9, 0.1, 0.0, 0.0, 0.9, 0.1, 0.5, 0.5, 0.0],
         );
 
-        save_vector_store(dir.path(), "cmp", &store).unwrap();
+        save_vector_store_merged(dir.path(), "cmp", &store).unwrap();
 
         let regular = load_vector_store(dir.path(), "cmp").unwrap().unwrap();
         let mmap = mmap_vector_store(dir.path(), "cmp").unwrap().unwrap();
@@ -1283,7 +1365,7 @@ mod tests {
             vec![0.9, 0.1, 0.0, 0.0, 0.9, 0.1, 0.5, 0.5, 0.0],
         );
 
-        save_vector_store(dir.path(), "nn", &store).unwrap();
+        save_vector_store_merged(dir.path(), "nn", &store).unwrap();
 
         let regular = load_vector_store(dir.path(), "nn").unwrap().unwrap();
         let mmap = mmap_vector_store(dir.path(), "nn").unwrap().unwrap();
@@ -1417,47 +1499,6 @@ mod tests {
         );
     }
 
-    // -- save_cache_overwrite tests --
-
-    #[test]
-    fn overwrite_does_not_preserve_disk_only_keys() {
-        // Proves that save_cache_overwrite is a true overwrite: keys that were
-        // on disk but absent from the incoming CacheData are NOT preserved.
-        let dir = TempDir::new().unwrap();
-
-        // Write a richer state first via the merging path.
-        let disk = CacheData {
-            dims: 2,
-            keys: vec!["disk-only".into(), "shared".into()],
-            hashes: vec!["hd".into(), "hs".into()],
-            vectors: vec![1.0, 1.1, 2.0, 2.1],
-        };
-        save_cache(dir.path(), "ow", &disk).unwrap();
-
-        // Overwrite with a snapshot that only contains "shared".
-        let incoming = CacheData {
-            dims: 2,
-            keys: vec!["shared".into()],
-            hashes: vec!["hs-new".into()],
-            vectors: vec![3.0, 3.1],
-        };
-        save_cache_overwrite(dir.path(), "ow", &incoming).unwrap();
-
-        let loaded = load_cache(dir.path(), "ow").unwrap().unwrap();
-        assert_eq!(
-            loaded.keys.len(),
-            1,
-            "overwrite must not retain disk-only keys; got {:?}",
-            loaded.keys
-        );
-        assert_eq!(loaded.keys[0], "shared");
-        assert_eq!(loaded.hashes[0], "hs-new");
-        assert!(
-            !loaded.keys.iter().any(|k| k == "disk-only"),
-            "disk-only key must be gone after overwrite"
-        );
-    }
-
     #[test]
     fn save_cache_merge_still_preserves_disk_keys() {
         // Regression guard: the merging save_cache must still preserve disk-side
@@ -1494,33 +1535,6 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_round_trip_exact() {
-        // Round-trip: load after save_cache_overwrite returns exactly the
-        // incoming CacheData (same keys, hashes, and vectors byte-for-byte).
-        let dir = TempDir::new().unwrap();
-
-        let data = CacheData {
-            dims: 3,
-            keys: vec!["a.rs".into(), "b.rs".into()],
-            hashes: vec!["ha".into(), "hb".into()],
-            vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-        };
-        save_cache_overwrite(dir.path(), "rt", &data).unwrap();
-        let loaded = load_cache(dir.path(), "rt").unwrap().unwrap();
-
-        assert_eq!(loaded.dims, data.dims);
-        assert_eq!(loaded.keys, data.keys);
-        assert_eq!(loaded.hashes, data.hashes);
-        assert_eq!(loaded.vectors.len(), data.vectors.len());
-        for (a, b) in loaded.vectors.iter().zip(data.vectors.iter()) {
-            assert!(
-                (a - b).abs() < 1e-6,
-                "vector mismatch: got {a}, expected {b}"
-            );
-        }
-    }
-
-    #[test]
     fn worktree_name_rejects_path_traversal_pointers() {
         // A malicious gitdir pointer ending in `..` or `.` would otherwise
         // collapse the worktree's cache into the main checkout's directory.
@@ -1554,7 +1568,7 @@ mod tests {
             vec![0.5, 0.7],
         );
 
-        save_vector_store(dir.path(), "cache-test", &store).unwrap();
+        save_vector_store_merged(dir.path(), "cache-test", &store).unwrap();
         let loaded = mmap_vector_store(dir.path(), "cache-test")
             .unwrap()
             .unwrap();
@@ -1771,9 +1785,9 @@ mod tests {
                 0.7, 0.8, // packages/api/index.ts
             ],
         };
-        // Bypass the hygiene sweep by writing directly via save_cache_overwrite
-        // (which is a raw write with no sweep).
-        save_cache_overwrite(dir.path(), "test-dirty", &dirty).unwrap();
+        // The hygiene sweep only fires on `load_cache`; `save_cache` writes the
+        // payload as-is into a fresh dir (empty disk → no merge).
+        save_cache(dir.path(), "test-dirty", &dirty).unwrap();
 
         // Now load through the public API — sweep must have fired.
         let loaded = load_cache(dir.path(), "test-dirty").unwrap().unwrap();
@@ -1888,5 +1902,345 @@ mod tests {
 
         assert_eq!(loaded_b.len(), 1);
         assert_eq!(loaded_b[0].0, "qb");
+    }
+
+    // -- save_vector_store_merged tests (live MCP runtime path) --
+
+    #[test]
+    fn merged_save_persists_all_keys_when_disk_is_empty() {
+        // Empty disk + a fresh in-memory snapshot: every key must end up on disk.
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::new(
+            2,
+            vec!["src/a.rs".into(), "src/b.rs".into()],
+            vec!["ha".into(), "hb".into()],
+            vec![1.0, 2.0, 3.0, 4.0],
+        );
+
+        save_vector_store_merged(dir.path(), "merged-empty", &store).unwrap();
+
+        let loaded = load_vector_store(dir.path(), "merged-empty")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.count(), 2);
+        assert!(loaded.has_key("src/a.rs"));
+        assert!(loaded.has_key("src/b.rs"));
+    }
+
+    #[test]
+    fn merged_save_preserves_disk_keys_unknown_to_caller() {
+        // Reproduces the regression: warmup writes A,B,C to disk; the live MCP
+        // then does a partial save with only B,D. After the merged save the
+        // file must contain {A,B,C,D}, with B's vector taken from the in-memory
+        // (incoming) snapshot.
+        let dir = TempDir::new().unwrap();
+
+        let warmup_disk = CacheData {
+            dims: 2,
+            keys: vec!["A".into(), "B".into(), "C".into()],
+            hashes: vec!["hA-old".into(), "hB-old".into(), "hC-old".into()],
+            vectors: vec![1.0, 1.1, 2.0, 2.1, 3.0, 3.1],
+        };
+        save_cache(dir.path(), "merged-runtime", &warmup_disk).unwrap();
+
+        // Live MCP only knows B and D — its in-memory store is missing A and C.
+        let runtime_store = VectorStore::new(
+            2,
+            vec!["B".into(), "D".into()],
+            vec!["hB-new".into(), "hD-new".into()],
+            vec![20.0, 21.0, 4.0, 4.1],
+        );
+        save_vector_store_merged(dir.path(), "merged-runtime", &runtime_store).unwrap();
+
+        let loaded = load_cache(dir.path(), "merged-runtime").unwrap().unwrap();
+        let key_set: std::collections::HashSet<_> = loaded.keys.iter().cloned().collect();
+        assert_eq!(
+            key_set,
+            ["A", "B", "C", "D"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<std::collections::HashSet<_>>(),
+            "merged save dropped disk-only keys; got {:?}",
+            loaded.keys
+        );
+
+        // B's vector must be the incoming one (20.0, 21.0), not the stale disk
+        // value (2.0, 2.1).
+        let b_idx = loaded.keys.iter().position(|k| k == "B").unwrap();
+        assert_eq!(loaded.hashes[b_idx], "hB-new");
+        assert!((loaded.vectors[b_idx * 2] - 20.0).abs() < 1e-6);
+        assert!((loaded.vectors[b_idx * 2 + 1] - 21.0).abs() < 1e-6);
+
+        // A and C must keep their original disk values.
+        let a_idx = loaded.keys.iter().position(|k| k == "A").unwrap();
+        assert_eq!(loaded.hashes[a_idx], "hA-old");
+        assert!((loaded.vectors[a_idx * 2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merged_save_concurrent_writers_union_all_keys() {
+        // N threads each call save_vector_store_merged with a unique key.
+        // The fd-lock + load-merge-save sequence must produce a final cache
+        // containing every thread's key, with no losses.
+        use std::collections::HashSet;
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+
+        const N: usize = 4;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        ensure_cache_dir(&root).unwrap();
+
+        let barrier = StdArc::new(Barrier::new(N));
+
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let root = root.clone();
+                let barrier = StdArc::clone(&barrier);
+                s.spawn(move || {
+                    let key = format!("vs_file_{}.rs", i);
+                    let store = VectorStore::new(
+                        2,
+                        vec![key],
+                        vec![format!("hash_{}", i)],
+                        vec![i as f32, i as f32 + 0.5],
+                    );
+                    barrier.wait();
+                    save_vector_store_merged(&root, "merged-race", &store).unwrap();
+                });
+            }
+        });
+
+        let loaded = load_vector_store(&root, "merged-race").unwrap().unwrap();
+        let key_set: HashSet<_> = loaded.keys().iter().cloned().collect();
+        for i in 0..N {
+            let expected = format!("vs_file_{}.rs", i);
+            assert!(
+                key_set.contains(&expected),
+                "save_vector_store_merged lost concurrent writer's key '{}'; got keys={:?}",
+                expected,
+                loaded.keys()
+            );
+        }
+        assert_eq!(loaded.count(), N);
+    }
+
+    /// Disk has {A,B,C}; in-memory has {B}; deletions=[C].
+    /// Post-state must be {A,B} — A survives (disk-only key preserved), B is
+    /// updated from incoming, C is evicted.
+    #[test]
+    fn merged_save_honors_deletion_list() {
+        let dir = TempDir::new().unwrap();
+
+        let disk = CacheData {
+            dims: 2,
+            keys: vec!["A".into(), "B".into(), "C".into()],
+            hashes: vec!["hA".into(), "hB-old".into(), "hC".into()],
+            vectors: vec![1.0, 1.1, 2.0, 2.1, 3.0, 3.1],
+        };
+        save_cache(dir.path(), "del", &disk).unwrap();
+
+        let in_mem = VectorStore::new(2, vec!["B".into()], vec!["hB-new".into()], vec![20.0, 21.0]);
+        save_vector_store_merged_with_deletions(dir.path(), "del", &in_mem, &["C".to_string()])
+            .unwrap();
+
+        let loaded = load_cache(dir.path(), "del").unwrap().unwrap();
+        let key_set: std::collections::HashSet<_> = loaded.keys.iter().cloned().collect();
+        assert_eq!(
+            key_set,
+            ["A", "B"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<std::collections::HashSet<_>>(),
+            "deletion list must remove C while preserving A and B; got {:?}",
+            loaded.keys
+        );
+
+        // B must have the incoming hash (incoming wins on shared keys).
+        let b_idx = loaded.keys.iter().position(|k| k == "B").unwrap();
+        assert_eq!(loaded.hashes[b_idx], "hB-new");
+        assert!((loaded.vectors[b_idx * 2] - 20.0).abs() < 1e-6);
+
+        // A retains disk values.
+        let a_idx = loaded.keys.iter().position(|k| k == "A").unwrap();
+        assert_eq!(loaded.hashes[a_idx], "hA");
+
+        // Vector buffer must stay aligned with the surviving key count.
+        assert_eq!(
+            loaded.vectors.len(),
+            loaded.keys.len() * loaded.dims as usize
+        );
+    }
+
+    /// Garbage on disk → save must rotate the corrupt file aside as
+    /// `<path>.corrupt.<unix_ts>` and write the incoming snapshot fresh.
+    #[test]
+    fn merged_save_rotates_corrupt_file_aside() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = TempDir::new().unwrap();
+        ensure_cache_dir(dir.path()).unwrap();
+
+        // Plant garbage at the cache path.
+        let cache_file = cache_path(dir.path(), "corrupt-test");
+        fs::write(&cache_file, b"\x00not a valid rkyv payload\x00\x01\x02\x03").unwrap();
+
+        let before_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let in_mem = VectorStore::new(
+            2,
+            vec!["new-key".into()],
+            vec!["h-new".into()],
+            vec![9.0, 9.5],
+        );
+        save_vector_store_merged(dir.path(), "corrupt-test", &in_mem).unwrap();
+
+        // The new cache file must contain the in-memory entries — clean state.
+        let loaded = load_cache(dir.path(), "corrupt-test").unwrap().unwrap();
+        assert_eq!(loaded.keys, vec!["new-key".to_string()]);
+        assert_eq!(loaded.hashes, vec!["h-new".to_string()]);
+        assert!((loaded.vectors[0] - 9.0).abs() < 1e-6);
+
+        // A rotated `<file>.corrupt.<ts>` sibling must exist.
+        let parent = cache_file.parent().unwrap();
+        let mut found_rotated = None;
+        for entry in fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("corrupt-test.rkyv.corrupt.") {
+                found_rotated = Some((entry.path(), name));
+                break;
+            }
+        }
+        let (rotated_path, rotated_name) =
+            found_rotated.expect("corrupt file must be rotated aside as <path>.corrupt.<ts>");
+
+        // The trailing component after `.corrupt.` must be a unix timestamp
+        // close to "now" (sanity check — within a generous window).
+        let ts_str = rotated_name
+            .rsplit('.')
+            .next()
+            .expect("rotated name must have a timestamp suffix");
+        let ts: u64 = ts_str
+            .parse()
+            .expect("rotated suffix must be a unix timestamp");
+        let after_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            ts >= before_ts.saturating_sub(2) && ts <= after_ts + 2,
+            "rotation timestamp {ts} out of expected window [{before_ts}, {after_ts}]"
+        );
+
+        // The rotated bytes must equal the original garbage we planted —
+        // the operator can recover from this file.
+        let rotated_bytes = fs::read(&rotated_path).unwrap();
+        assert_eq!(
+            rotated_bytes, b"\x00not a valid rkyv payload\x00\x01\x02\x03",
+            "rotated file must preserve the original (corrupt) bytes"
+        );
+    }
+
+    /// Production-grade concurrency: K=200 disk keys + N=8 threads each holding
+    /// a small subset (10 disk keys + 50 thread-unique keys). Every disk key
+    /// must survive and every thread's unique keys must survive — no key losses.
+    /// Last-writer-wins on shared keys is acceptable; we only assert the union.
+    #[test]
+    fn merged_save_large_disk_small_memory_subsets_under_concurrency() {
+        use std::collections::HashSet;
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+
+        const K: usize = 200; // disk keys
+        const N: usize = 8; // threads
+        const SHARED_PER_THREAD: usize = 10; // each thread overlaps 10 disk keys
+        const UNIQUE_PER_THREAD: usize = 50; // and adds 50 unique keys
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        ensure_cache_dir(&root).unwrap();
+
+        // Pre-seed disk with K random keys via a single merged save.
+        let disk_keys: Vec<String> = (0..K).map(|i| format!("disk_key_{:04}", i)).collect();
+        let disk_hashes: Vec<String> = (0..K).map(|i| format!("disk_hash_{:04}", i)).collect();
+        let mut disk_vectors: Vec<f32> = Vec::with_capacity(K * 2);
+        for i in 0..K {
+            disk_vectors.push(i as f32);
+            disk_vectors.push(i as f32 + 0.5);
+        }
+        let disk_store = VectorStore::new(2, disk_keys.clone(), disk_hashes.clone(), disk_vectors);
+        save_vector_store_merged(&root, "big-race", &disk_store).unwrap();
+
+        let barrier = StdArc::new(Barrier::new(N));
+
+        std::thread::scope(|s| {
+            for t in 0..N {
+                let root = root.clone();
+                let barrier = StdArc::clone(&barrier);
+                let disk_keys = disk_keys.clone();
+                s.spawn(move || {
+                    // Deterministic per-thread subset: take SHARED_PER_THREAD
+                    // disk keys at offset t*SHARED_PER_THREAD (wrapping), and
+                    // UNIQUE_PER_THREAD thread-unique keys.
+                    let mut keys: Vec<String> =
+                        Vec::with_capacity(SHARED_PER_THREAD + UNIQUE_PER_THREAD);
+                    let mut hashes: Vec<String> = Vec::with_capacity(keys.capacity());
+                    let mut vectors: Vec<f32> = Vec::with_capacity(keys.capacity() * 2);
+                    for i in 0..SHARED_PER_THREAD {
+                        let idx = (t * SHARED_PER_THREAD + i) % disk_keys.len();
+                        keys.push(disk_keys[idx].clone());
+                        hashes.push(format!("thread_{}_overwrite_{}", t, i));
+                        vectors.push(1000.0 + t as f32);
+                        vectors.push(1000.0 + t as f32 + 0.5);
+                    }
+                    for u in 0..UNIQUE_PER_THREAD {
+                        keys.push(format!("thread_{}_unique_{:04}", t, u));
+                        hashes.push(format!("thread_{}_unique_hash_{:04}", t, u));
+                        vectors.push(t as f32 * 100.0 + u as f32);
+                        vectors.push(t as f32 * 100.0 + u as f32 + 0.5);
+                    }
+                    let store = VectorStore::new(2, keys, hashes, vectors);
+                    barrier.wait();
+                    save_vector_store_merged(&root, "big-race", &store).unwrap();
+                });
+            }
+        });
+
+        let loaded = load_vector_store(&root, "big-race").unwrap().unwrap();
+        let final_keys: HashSet<String> = loaded.keys().iter().cloned().collect();
+
+        // Every disk key must survive.
+        for dk in &disk_keys {
+            assert!(
+                final_keys.contains(dk),
+                "disk key '{}' was lost under concurrent merged saves",
+                dk
+            );
+        }
+
+        // Every thread's unique keys must survive.
+        for t in 0..N {
+            for u in 0..UNIQUE_PER_THREAD {
+                let key = format!("thread_{}_unique_{:04}", t, u);
+                assert!(
+                    final_keys.contains(&key),
+                    "thread {}'s unique key '{}' was lost under concurrent merged saves",
+                    t,
+                    key
+                );
+            }
+        }
+
+        // Total count must be at least disk + thread-unique = K + N*UNIQUE_PER_THREAD.
+        assert!(
+            loaded.count() >= K + N * UNIQUE_PER_THREAD,
+            "expected at least {} keys, got {}",
+            K + N * UNIQUE_PER_THREAD,
+            loaded.count()
+        );
     }
 }

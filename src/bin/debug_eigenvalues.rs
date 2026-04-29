@@ -5,7 +5,7 @@ use contextplus_rs::core::clustering::{
     build_affinity_matrix, find_optimal_k, full_eigen, normalized_laplacian,
     spectral_cluster_with_min,
 };
-use contextplus_rs::tools::navigate_constants::{MAX_NAVIGATE_FILES, nav_cache_name};
+use contextplus_rs::tools::navigate_constants::{max_navigate_files, nav_cache_name};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -45,11 +45,11 @@ fn main() {
         .map(|i| flat[i * dims..(i + 1) * dims].to_vec())
         .collect();
 
-    // Sample to MAX_NAVIGATE_FILES to match semantic_navigate behavior
-    #[allow(clippy::absurd_extreme_comparisons)]
-    let vectors: Vec<Vec<f32>> = if all_vectors.len() > MAX_NAVIGATE_FILES {
-        let step = all_vectors.len() as f64 / MAX_NAVIGATE_FILES as f64;
-        (0..MAX_NAVIGATE_FILES)
+    // Sample to navigate cap to match semantic_navigate behavior
+    let max_files = max_navigate_files();
+    let vectors: Vec<Vec<f32>> = if all_vectors.len() > max_files {
+        let step = all_vectors.len() as f64 / max_files as f64;
+        (0..max_files)
             .map(|i| {
                 let idx = (i as f64 * step).floor() as usize;
                 all_vectors[idx.min(all_vectors.len() - 1)].clone()
