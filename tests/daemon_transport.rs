@@ -843,15 +843,24 @@ fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
 }
 
 /// Poll until a Unix socket at `path` accepts connections, up to `timeout`.
-/// This is stricter than `wait_for_path`: it proves the socket is listening,
-/// not just that a file exists at that path (which could be a stale file).
+/// This is stricter than `wait_for_path`: it proves the socket is a proper
+/// Unix domain socket (not a stale regular file) by checking the file mode
+/// bits via `stat`. We deliberately avoid actually *connecting* here because
+/// a test-connect could interfere with in-process daemon tests that run in
+/// parallel (the daemon would accept and track the unexpected connection).
 #[cfg(unix)]
 fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
-    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::os::unix::fs::FileTypeExt;
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if StdUnixStream::connect(path).is_ok() {
-            return true;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.file_type().is_socket() {
+                // File is a Unix socket — it should be connectable shortly
+                // after bind. Give it one small extra poll to let the kernel
+                // finish setting up the listen backlog, then return.
+                std::thread::sleep(Duration::from_millis(20));
+                return true;
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
