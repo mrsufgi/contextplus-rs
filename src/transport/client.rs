@@ -30,7 +30,11 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::UnixStream;
 
-use crate::transport::paths;
+use crate::transport::{daemon, paths};
+
+/// Back-off when a live daemon's accept queue is momentarily full and we
+/// receive a spurious `ECONNREFUSED`.
+const BACKOFF_ON_LIVE_DAEMON: Duration = Duration::from_millis(50);
 
 /// Maximum time to wait for a freshly-spawned daemon to bind its socket.
 pub const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,10 +61,46 @@ pub async fn connect_or_spawn(root_dir: &Path) -> Result<UnixStream> {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) =>
         {
-            // Stale socket file (daemon crashed) or never started — clean up
-            // and respawn. Removal is best-effort; a missing file is fine.
             if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                let _ = std::fs::remove_file(&socket);
+                // Before unlinking the socket, probe the daemon lock to
+                // distinguish a truly dead daemon from a live one whose accept
+                // queue is momentarily full (ECONNREFUSED under high load).
+                let lock_path = paths::daemon_lock_path(root_dir);
+                match daemon::probe_lock_held(root_dir) {
+                    Ok(true) => {
+                        // A daemon IS alive — the ECONNREFUSED was spurious
+                        // (full accept queue). Do NOT unlink the socket; just
+                        // back off and retry once.
+                        tracing::debug!(
+                            "spurious ECONNREFUSED at {} — daemon lock held, retrying after backoff",
+                            socket.display()
+                        );
+                        tokio::time::sleep(BACKOFF_ON_LIVE_DAEMON).await;
+                        return UnixStream::connect(&socket).await.with_context(|| {
+                            format!(
+                                "connect retry after spurious ECONNREFUSED at {}",
+                                socket.display()
+                            )
+                        });
+                    }
+                    Ok(false) => {
+                        // No daemon. Safe to remove the stale socket and spawn.
+                        tracing::debug!(
+                            "daemon lock is free — removing stale socket {}",
+                            socket.display()
+                        );
+                        let _ = std::fs::remove_file(&socket);
+                    }
+                    Err(e) => {
+                        // Could not probe the lock — err on the side of caution:
+                        // do not unlink. Log and fall through to spawn attempt
+                        // (spawn will fail to bind but that surfaces a clear error).
+                        tracing::warn!(
+                            "could not probe daemon lock at {}: {e} — skipping socket removal",
+                            lock_path.display()
+                        );
+                    }
+                }
             }
             tracing::debug!("no daemon at {} — spawning", socket.display());
         }

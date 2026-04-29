@@ -665,6 +665,80 @@ async fn run_if_owner_returns_false_when_already_running() {
 }
 
 // ---------------------------------------------------------------------------
+// Fix regression: socket permissions are 0o600 post-bind (PR #70 fix 2)
+// ---------------------------------------------------------------------------
+
+/// After `bind_listener` the socket file must be mode 0o600 so other users
+/// on a shared host cannot connect to this workspace's daemon.
+#[tokio::test]
+async fn socket_permissions_are_0o600_after_bind() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let listener = daemon::bind_listener(root).expect("bind_listener should succeed");
+    let socket_path = paths::daemon_socket_path(root);
+
+    let perms = std::fs::metadata(&socket_path)
+        .expect("socket file should exist")
+        .permissions();
+
+    // Only the mode bits (lower 12) matter; mask off the file-type bits.
+    let mode = perms.mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "socket file mode should be 0o600, got 0o{mode:o}"
+    );
+
+    drop(listener);
+}
+
+// ---------------------------------------------------------------------------
+// Fix regression: connect_or_spawn probes lock before unlinking (PR #70 fix 1)
+// ---------------------------------------------------------------------------
+
+/// When the daemon lock is held (daemon alive) and we receive what would be
+/// a spurious ECONNREFUSED, `connect_or_spawn` must NOT unlink the socket.
+///
+/// We simulate the scenario: hold the lock manually (representing a running
+/// daemon) and leave the socket file present but not listening. Then call
+/// `connect_or_spawn`; it will get ConnectionRefused, probe the lock, see it
+/// held, and retry — the socket file must still exist after the probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_or_spawn_does_not_unlink_socket_when_daemon_lock_held() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Ensure .mcp_data dir exists.
+    let mcp_data = root.join(paths::MCP_DATA_DIR);
+    std::fs::create_dir_all(&mcp_data).unwrap();
+
+    // Hold the daemon lock (simulating a live daemon).
+    let _lock_guard = match daemon::acquire_lock(&root).unwrap() {
+        AcquireOutcome::Acquired(g) => g,
+        AcquireOutcome::AlreadyRunning => panic!("fresh tempdir should not be locked"),
+    };
+
+    // Plant a socket file at the expected path (not actually listening).
+    // `connect_or_spawn` will get ECONNREFUSED on it, probe the lock, find it
+    // held, and must leave the file alone rather than unlinking it.
+    let socket_path = paths::daemon_socket_path(&root);
+    std::fs::write(&socket_path, b"placeholder").unwrap();
+
+    // The retry after back-off will also fail (nothing is actually listening),
+    // so we only care that the socket file was not unlinked — we tolerate the
+    // connect_or_spawn returning Err.
+    let _ = contextplus_rs::transport::client::connect_or_spawn(&root).await;
+
+    // The file must still be present — if the old racy code ran, it would have
+    // removed it.
+    assert!(
+        socket_path.exists(),
+        "connect_or_spawn must not unlink the socket when the daemon lock is held"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // socket_override affects all path helpers
 // ---------------------------------------------------------------------------
 

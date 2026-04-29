@@ -114,6 +114,9 @@ pub fn acquire_lock(root_dir: &Path) -> Result<AcquireOutcome> {
 
 /// Bind the Unix listener, removing any stale socket file from a crashed
 /// previous daemon. Caller must already hold the daemon lock.
+///
+/// After a successful bind the socket file is `chmod 600` so other users on
+/// a shared host cannot connect to this workspace's daemon.
 pub fn bind_listener(root_dir: &Path) -> Result<UnixListener> {
     let socket_path = paths::daemon_socket_path(root_dir);
     if let Some(parent) = socket_path.parent() {
@@ -128,8 +131,23 @@ pub fn bind_listener(root_dir: &Path) -> Result<UnixListener> {
             .with_context(|| format!("failed to remove stale socket: {}", socket_path.display()))?;
     }
 
-    UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind socket: {}", socket_path.display()))
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("failed to bind socket: {}", socket_path.display()))?;
+
+    // Restrict socket to owner-only so other users on the same host cannot
+    // connect to this workspace's daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&socket_path)
+            .with_context(|| format!("stat({}) failed", socket_path.display()))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&socket_path, perms)
+            .with_context(|| format!("chmod 600 {} failed", socket_path.display()))?;
+    }
+
+    Ok(listener)
 }
 
 /// Best-effort: write our PID to the daemon pid file. Failures are logged and
@@ -145,8 +163,32 @@ pub fn write_pid_file(root_dir: &Path) {
 /// Resolve daemon idle timeout from the env. `0` means disabled.
 pub fn idle_secs_from_env() -> u64 {
     match std::env::var(DAEMON_IDLE_SECS_ENV) {
-        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_DAEMON_IDLE_SECS),
-        Err(_) => DEFAULT_DAEMON_IDLE_SECS,
+        Ok(s) if !s.trim().is_empty() => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    "CONTEXTPLUS_DAEMON_IDLE_SECS={s:?} is not a valid u64; using default {DEFAULT_DAEMON_IDLE_SECS}"
+                );
+                DEFAULT_DAEMON_IDLE_SECS
+            }
+        },
+        _ => DEFAULT_DAEMON_IDLE_SECS,
+    }
+}
+
+/// Probe whether the daemon lock for `root_dir` is currently held by another
+/// process. Returns `true` if the lock is held (daemon alive), `false` if it
+/// is free (no daemon).
+///
+/// Callers should treat an `Err` as "unknown / don't unlink" to be safe.
+pub(crate) fn probe_lock_held(root_dir: &Path) -> Result<bool> {
+    match acquire_lock(root_dir)? {
+        AcquireOutcome::Acquired(_guard) => {
+            // We got the lock — no daemon is alive.
+            // _guard drops here, releasing the lock immediately.
+            Ok(false)
+        }
+        AcquireOutcome::AlreadyRunning => Ok(true),
     }
 }
 
@@ -342,6 +384,12 @@ fn spawn_signal_listener(draining: Arc<AtomicBool>) {
                     return;
                 }
             };
+            // We intentionally treat SIGHUP as a drain signal here, not the
+            // conventional "reload config". The daemon has no on-disk config to
+            // reload; SIGHUP from a terminal close (parent shell exit) means our
+            // stdio is gone anyway, so a clean drain is the right response. If
+            // config-reload is added later, split this listener so SIGHUP routes
+            // elsewhere.
             let mut sighup = match signal(SignalKind::hangup()) {
                 Ok(s) => s,
                 Err(e) => {
