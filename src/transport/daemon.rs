@@ -416,7 +416,7 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
 mod tests {
     use super::*;
 
-    /// Both env-driven cases live in a single test so they don't race against
+    /// All env-driven cases live in a single test so they don't race against
     /// each other on the shared `DAEMON_IDLE_SECS_ENV` var. cargo runs tests
     /// in parallel by default and `set_var`/`remove_var` aren't isolated.
     #[test]
@@ -424,15 +424,30 @@ mod tests {
         // SAFETY: test-only; we restore on exit. Env mutations from
         // separate tests on the same var are racy, so this combined test
         // owns the variable end-to-end.
+
+        // Case: var absent → default
         unsafe {
             std::env::remove_var(DAEMON_IDLE_SECS_ENV);
         }
         assert_eq!(idle_secs_from_env(), DEFAULT_DAEMON_IDLE_SECS);
 
+        // Case: non-numeric value → falls back to default
         unsafe {
             std::env::set_var(DAEMON_IDLE_SECS_ENV, "not-a-number");
         }
         assert_eq!(idle_secs_from_env(), DEFAULT_DAEMON_IDLE_SECS);
+
+        // Case: "0" → disabled (returns 0)
+        unsafe {
+            std::env::set_var(DAEMON_IDLE_SECS_ENV, "0");
+        }
+        assert_eq!(idle_secs_from_env(), 0);
+
+        // Case: positive integer is returned verbatim
+        unsafe {
+            std::env::set_var(DAEMON_IDLE_SECS_ENV, "300");
+        }
+        assert_eq!(idle_secs_from_env(), 300);
 
         unsafe {
             std::env::remove_var(DAEMON_IDLE_SECS_ENV);
@@ -473,5 +488,54 @@ mod tests {
         std::fs::write(&stale, b"stale junk").unwrap();
         let _listener = bind_listener(root).expect("bind should clean up stale socket");
         assert!(stale.exists(), "fresh socket should be created");
+    }
+
+    /// `write_pid_file` writes the current PID to the pid file path.
+    #[test]
+    fn write_pid_file_writes_current_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mcp_data = root.join(paths::MCP_DATA_DIR);
+        std::fs::create_dir_all(&mcp_data).unwrap();
+
+        write_pid_file(root);
+
+        let pid_path = paths::daemon_pid_path(root);
+        let content = std::fs::read_to_string(&pid_path).expect("pid file should exist");
+        let parsed: u32 = content.trim().parse().expect("should be a valid pid");
+        assert_eq!(parsed, std::process::id());
+    }
+
+    /// `bind_listener` on a fresh directory creates a usable UnixListener.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_listener_fresh_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let listener = bind_listener(root).expect("bind on fresh dir should succeed");
+        let socket_path = paths::daemon_socket_path(root);
+        assert!(
+            socket_path.exists(),
+            "socket file should exist after bind_listener"
+        );
+        drop(listener);
+    }
+
+    /// Verify `acquire_lock` returns `AlreadyRunning` when same dir is locked.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_lock_already_running_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let _guard = match acquire_lock(root).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::AlreadyRunning => panic!("first acquire should succeed"),
+        };
+
+        match acquire_lock(root).unwrap() {
+            AcquireOutcome::AlreadyRunning => {} // expected arm
+            AcquireOutcome::Acquired(_) => panic!("should have been AlreadyRunning"),
+        }
     }
 }
