@@ -416,22 +416,24 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// Both env-driven cases live in a single test so they don't race against
+    /// each other on the shared `DAEMON_IDLE_SECS_ENV` var. cargo runs tests
+    /// in parallel by default and `set_var`/`remove_var` aren't isolated.
     #[test]
-    fn idle_secs_default() {
-        // SAFETY: test-only; single-threaded test binary.
+    fn idle_secs_env_handling() {
+        // SAFETY: test-only; we restore on exit. Env mutations from
+        // separate tests on the same var are racy, so this combined test
+        // owns the variable end-to-end.
         unsafe {
             std::env::remove_var(DAEMON_IDLE_SECS_ENV);
         }
         assert_eq!(idle_secs_from_env(), DEFAULT_DAEMON_IDLE_SECS);
-    }
 
-    #[test]
-    fn idle_secs_invalid_falls_back() {
-        // SAFETY: test-only.
         unsafe {
             std::env::set_var(DAEMON_IDLE_SECS_ENV, "not-a-number");
         }
         assert_eq!(idle_secs_from_env(), DEFAULT_DAEMON_IDLE_SECS);
+
         unsafe {
             std::env::remove_var(DAEMON_IDLE_SECS_ENV);
         }
