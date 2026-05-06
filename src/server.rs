@@ -124,6 +124,42 @@ pub struct SharedState {
     /// of `dispatch_inner` via an `InflightGuard`; decremented on drop. The
     /// drain watcher exits the process once draining is true and this hits 0.
     pub inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// **Multi-ref scaffolding (U3).** Registry of `RefId → RefIndex` for
+    /// all worktrees this daemon serves. In U3 the registry is populated
+    /// with exactly one entry — `default_ref_id` — and per-ref heavy state
+    /// (cache, tracker, memory graph) still lives on `SharedState` directly.
+    /// U4 will route `register_session` calls through this registry; U6 + U7
+    /// will migrate the heavy state into `RefIndex`. See [`crate::ref_index`].
+    pub refs: crate::ref_index::RefRegistry,
+    /// `RefId` of the singleton ref served today. Tool dispatches that don't
+    /// carry an explicit `RefId` use this. U4 replaces the implicit-default
+    /// path with explicit per-session routing.
+    pub default_ref_id: crate::ref_index::RefId,
+}
+
+impl SharedState {
+    /// Look up the default ref's index. Today this is the only entry in the
+    /// registry; U4 will introduce alternate refs.
+    ///
+    /// Returns `None` only if the registry was tampered with externally —
+    /// internal code paths can `expect` it freely.
+    pub fn default_ref(&self) -> Option<Arc<crate::ref_index::RefIndex>> {
+        // Try-read is appropriate: the registry write path (attach/detach)
+        // is bounded and not held long; the only contention would be a
+        // U4-era register_session firing concurrently with a tool call.
+        self.refs
+            .try_read()
+            .ok()
+            .and_then(|r| r.get(&self.default_ref_id).cloned())
+    }
+
+    /// Look up a ref by id. Reserved for U4's session-scoped dispatch.
+    pub fn ref_index(
+        &self,
+        id: crate::ref_index::RefId,
+    ) -> Option<Arc<crate::ref_index::RefIndex>> {
+        self.refs.try_read().ok().and_then(|r| r.get(&id).cloned())
+    }
 }
 
 /// The MCP server exposing context+ tools.
@@ -183,6 +219,16 @@ impl ContextPlusServer {
         // Canonicalize once at construction so resolve_root() can skip per-request syscalls.
         let canonical_root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
 
+        // Build the multi-ref scaffolding: registry containing the singleton
+        // default ref. U4 will register additional refs via session handshake.
+        let default_ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_root);
+        let default_ref = Arc::new(crate::ref_index::RefIndex::new(
+            root_dir.clone(),
+            canonical_root.clone(),
+            None, // primary ref has no parent
+        ));
+        let refs = crate::ref_index::new_registry_with_default(default_ref_id, default_ref);
+
         let state = Arc::new(SharedState {
             config,
             canonical_root,
@@ -199,6 +245,8 @@ impl ContextPlusServer {
             idle_monitor: RwLock::new(None),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            refs,
+            default_ref_id,
         });
         Self { state }
     }
