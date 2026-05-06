@@ -2,6 +2,7 @@ pub mod clustering;
 pub mod dependent_expand;
 pub mod embedding_tracker;
 pub mod embeddings;
+pub mod git_worktree;
 pub mod hub;
 pub mod import_resolver;
 pub mod memory_graph;
