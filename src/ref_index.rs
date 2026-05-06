@@ -22,6 +22,17 @@
 //! * [`RefRegistry`] — the daemon's `HashMap<RefId, Arc<RefIndex>>`,
 //!   wrapped in a `RwLock` so attach/detach can land without coordination
 //!   with read-only tool dispatches.
+//!
+//! ## U6 additions
+//!
+//! `RefId` now has a stable hex representation (`to_hex`) used as the on-disk
+//! directory name under `.mcp_data/refs/<hex>/`. The CAS store lookup path
+//! calls [`RefIndex::fork_from`] to initialize the parent pointer on disk when
+//! a new worktree ref is first attached.
+//!
+//! **Seam for U4**: today `fork_from` is called explicitly by test code and by
+//! `SharedState::new` for the single default ref. U4's `attach_ref` will call
+//! it after resolving the fork base from `merge-base`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,9 +47,10 @@ use tokio::sync::RwLock;
 /// bridges connecting to the same worktree converge on one shared
 /// [`RefIndex`] without explicit coordination.
 ///
-/// The current derivation uses the standard library's hasher for simplicity
-/// and zero-cost. U6 may switch to BLAKE3 if cross-process stability across
-/// daemon restarts becomes load-bearing for the on-disk CAS layout.
+/// **U6**: uses BLAKE3 of the canonical path bytes for cross-restart stability.
+/// The first 8 bytes of the BLAKE3 hash are stored as a `u64` for in-process
+/// routing; the full 32-byte hash is used as the on-disk directory name
+/// (returned by [`RefId::to_hex`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RefId(pub u64);
 
@@ -49,16 +61,27 @@ impl RefId {
     /// inputs will produce non-canonical ids that may not match across calls.
     /// Use [`crate::core::git_worktree::resolve_primary_worktree`] +
     /// `canonicalize()` before constructing.
+    ///
+    /// **U6**: switched from `DefaultHasher` (process-local SipHash) to BLAKE3
+    /// so the routing key is stable across daemon restarts and can serve as the
+    /// on-disk directory name under `.mcp_data/refs/`.
     pub fn for_canonical_path(path: &Path) -> Self {
-        use std::hash::{Hash, Hasher};
-        // `DefaultHasher` is deterministic within a single process (it uses
-        // SipHash 1-3 with fixed keys when constructed via `new`). That's
-        // sufficient for routing within a daemon's lifetime. U6 will switch
-        // to BLAKE3 when the on-disk CAS layout needs cross-restart-stable
-        // keys.
-        let mut hasher = std::hash::DefaultHasher::new();
-        path.hash(&mut hasher);
-        RefId(hasher.finish())
+        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
+        let bytes = hash.as_bytes();
+        let id = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        RefId(id)
+    }
+
+    /// Return a 16-character lowercase hex string suitable for use as an
+    /// on-disk directory name under `.mcp_data/refs/`.
+    ///
+    /// Using the full `u64` as hex (8 bytes = 16 hex chars) is sufficient for
+    /// routing uniqueness in practice; collisions across simultaneously active
+    /// refs would require `2^32` worktrees.
+    pub fn to_hex(self) -> String {
+        format!("{:016x}", self.0)
     }
 }
 
@@ -67,6 +90,12 @@ impl RefId {
 /// In U3 this struct only holds identification fields. U4 will add the
 /// session refcount + parent linkage; U6 + U7 will migrate per-ref caches
 /// and memory-graph overlay state into it.
+///
+/// **U6 additions**:
+/// - `cas_ref_id_hex`: the stable on-disk ref-id hex (from BLAKE3 of canonical
+///   path) used as the directory name under `.mcp_data/refs/`.
+/// - `fork_from`: initializes the parent pointer on disk and is the seam that
+///   U4's `attach_ref` will call after resolving the merge-base.
 ///
 /// Wrap in `Arc` for cheap cloning across handler dispatches.
 pub struct RefIndex {
@@ -80,16 +109,64 @@ pub struct RefIndex {
     /// HEAD SHA at the time of registration. Used by U7's auto-merge.
     /// `None` until U4's `register_session` populates it.
     pub head_sha: Option<String>,
+    /// Stable 16-character hex key for this ref's on-disk CAS directory.
+    /// Derived from `BLAKE3(canonical_root)[:8]`. Stable across daemon
+    /// restarts as long as the canonical path is the same.
+    pub cas_ref_id_hex: String,
 }
 
 impl RefIndex {
     /// Build a new `RefIndex` from a freshly-attached session.
     pub fn new(root_dir: PathBuf, canonical_root: PathBuf, parent_ref_id: Option<RefId>) -> Self {
+        let id = RefId::for_canonical_path(&canonical_root);
         Self {
             root_dir,
             canonical_root,
             parent_ref_id,
             head_sha: None,
+            cas_ref_id_hex: id.to_hex(),
+        }
+    }
+
+    /// Initialize the CAS on-disk layout for this ref.
+    ///
+    /// For **primary refs** (no parent): creates the ref directory under
+    /// `.mcp_data/refs/<hex>/` with an empty manifest. The `parent` file is
+    /// omitted (no parent chain).
+    ///
+    /// For **forked refs**: creates the ref directory and writes the parent
+    /// pointer so chunk lookups chain through the parent's manifest.
+    ///
+    /// This is the U4 seam: today called at daemon construction for the single
+    /// default ref. U4's `attach_ref` will call it after resolving fork base
+    /// from `merge-base HEAD <upstream>`.
+    ///
+    /// `mcp_data_dir` — path to the primary worktree's `.mcp_data/` directory.
+    /// `model` — embedding model name (used for CAS shard naming).
+    pub fn fork_from(
+        &self,
+        mcp_data_dir: &Path,
+        model: &str,
+        parent: Option<&RefIndex>,
+    ) -> crate::error::Result<()> {
+        use crate::cache::cas::CasStore;
+        let cas = CasStore::new(mcp_data_dir.to_path_buf(), model);
+        match parent {
+            None => {
+                // Primary ref: just ensure the directory exists.
+                let dir = mcp_data_dir.join("refs").join(&self.cas_ref_id_hex);
+                std::fs::create_dir_all(&dir)?;
+                // Write an empty manifest if none exists yet.
+                if !dir.join("manifest.rkyv").exists() {
+                    let empty = crate::cache::cas::Manifest::new();
+                    cas.save_manifest(&self.cas_ref_id_hex, &empty)?;
+                }
+                Ok(())
+            }
+            Some(p) => {
+                cas.fork_ref(&self.cas_ref_id_hex, &p.cas_ref_id_hex)?;
+                Ok(())
+            }
         }
     }
 }
@@ -165,5 +242,83 @@ mod tests {
         // The Arc returned via the registry should be the same as the one
         // we inserted (so call sites can share, not copy).
         assert!(Arc::ptr_eq(inner.get(&id).unwrap(), &r));
+    }
+
+    // ---- U6: BLAKE3-based RefId stability ----
+
+    #[test]
+    fn ref_id_hex_is_16_chars() {
+        let p = PathBuf::from("/tmp/repo");
+        let id = RefId::for_canonical_path(&p);
+        assert_eq!(id.to_hex().len(), 16);
+    }
+
+    #[test]
+    fn ref_id_hex_is_stable_across_calls() {
+        let p = PathBuf::from("/home/user/repos/my-project");
+        let a = RefId::for_canonical_path(&p);
+        let b = RefId::for_canonical_path(&p);
+        assert_eq!(a.to_hex(), b.to_hex());
+    }
+
+    #[test]
+    fn ref_index_has_cas_ref_id_hex() {
+        let p = PathBuf::from("/tmp/myrepo");
+        let r = RefIndex::new(p.clone(), p.clone(), None);
+        let id = RefId::for_canonical_path(&p);
+        assert_eq!(r.cas_ref_id_hex, id.to_hex());
+        assert_eq!(r.cas_ref_id_hex.len(), 16);
+    }
+
+    // ---- U6: fork_from disk layout ----
+
+    #[test]
+    fn fork_from_primary_creates_manifest_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mcp_data = tmp.path().join(".mcp_data");
+        std::fs::create_dir_all(&mcp_data).unwrap();
+
+        let p = tmp.path().join("primary_repo");
+        std::fs::create_dir_all(&p).unwrap();
+        let primary = RefIndex::new(p.clone(), p, None);
+        primary
+            .fork_from(&mcp_data, "nomic-embed-text", None)
+            .unwrap();
+
+        let ref_dir = mcp_data.join("refs").join(&primary.cas_ref_id_hex);
+        assert!(ref_dir.exists(), "ref dir should be created");
+        assert!(
+            ref_dir.join("manifest.rkyv").exists(),
+            "manifest should be created"
+        );
+    }
+
+    #[test]
+    fn fork_from_child_writes_parent_pointer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mcp_data = tmp.path().join(".mcp_data");
+        std::fs::create_dir_all(&mcp_data).unwrap();
+
+        let pp = tmp.path().join("primary");
+        std::fs::create_dir_all(&pp).unwrap();
+        let primary = RefIndex::new(pp.clone(), pp, None);
+        primary.fork_from(&mcp_data, "model", None).unwrap();
+
+        let cp = tmp.path().join("child");
+        std::fs::create_dir_all(&cp).unwrap();
+        let child = RefIndex::new(
+            cp.clone(),
+            cp,
+            Some(RefId::for_canonical_path(&primary.canonical_root)),
+        );
+        child.fork_from(&mcp_data, "model", Some(&primary)).unwrap();
+
+        let parent_file = mcp_data
+            .join("refs")
+            .join(&child.cas_ref_id_hex)
+            .join("parent");
+        assert!(parent_file.exists());
+        let content = std::fs::read_to_string(&parent_file).unwrap();
+        assert_eq!(content.trim(), primary.cas_ref_id_hex);
     }
 }
