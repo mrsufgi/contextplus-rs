@@ -30,13 +30,38 @@ use std::path::{Path, PathBuf};
 
 /// Resolve the primary worktree root for `root`.
 ///
-/// **Returns `root` (canonical when possible) on any error**, after emitting
-/// a `tracing::warn!`. This function never panics and never bails — a
-/// half-broken worktree pointer should degrade to "treat this directory as
-/// its own primary" rather than crash the daemon.
+/// **Returns `root` on any error**, after emitting a `tracing::warn!`. This
+/// function never panics and never bails — a half-broken worktree pointer
+/// should degrade to "treat this directory as its own primary" rather than
+/// crash the daemon.
+///
+/// **Performance contract.** The fast paths — `<root>/.git` is a directory
+/// (standard repo) or absent (non-git folder) — avoid `canonicalize()`
+/// entirely. Only the slow path (`<root>/.git` is a file → linked worktree)
+/// canonicalizes, since the gitdir pointer's resolution requires comparing
+/// paths from different roots. This matters because `paths::daemon_dir` is
+/// called multiple times during daemon startup (lock, socket, pid) and
+/// burning a syscall on every call is observable under high test
+/// parallelism.
 pub fn resolve_primary_worktree(root: &Path) -> PathBuf {
+    let dot_git = root.join(".git");
+    match fs::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_dir() => {
+            // Fast path: standard repo. `root` IS primary.
+            return root.to_path_buf();
+        }
+        Err(_) => {
+            // Fast path: no `.git` at all. Non-git folder; `root` is fine.
+            return root.to_path_buf();
+        }
+        Ok(_) => {
+            // `.git` is a file (or symlink to file): need slow path.
+        }
+    }
+
+    // Slow path: linked worktree. Canonicalize + parse `gitdir:` pointer.
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    match resolve_primary_inner(&canonical_root) {
+    match resolve_linked_worktree_primary(&canonical_root) {
         Ok(primary) => primary,
         Err(e) => {
             tracing::warn!(
@@ -49,28 +74,10 @@ pub fn resolve_primary_worktree(root: &Path) -> PathBuf {
     }
 }
 
-fn resolve_primary_inner(root: &Path) -> Result<PathBuf, ResolveError> {
+/// Slow path: `<root>/.git` is a file. Parse the `gitdir:` pointer and walk
+/// to the primary's `.git/` via the linked-worktree gitdir's `commondir` file.
+fn resolve_linked_worktree_primary(root: &Path) -> Result<PathBuf, ResolveError> {
     let dot_git = root.join(".git");
-    let meta = match fs::symlink_metadata(&dot_git) {
-        Ok(m) => m,
-        Err(_) => {
-            // No `.git` at all — `root` is not in a git repo. Caller's choice
-            // to treat `root` as primary is reasonable; non-git roots are
-            // legal contextplus inputs (e.g. running on a plain folder).
-            return Ok(root.to_path_buf());
-        }
-    };
-
-    if meta.is_dir() {
-        // Standard repo: `root` is the primary worktree.
-        return Ok(root.to_path_buf());
-    }
-
-    if !meta.is_file() {
-        // Symlinked or otherwise unusual; fall through to the file path which
-        // canonicalizes via `read_to_string`.
-    }
-
     // `.git` is a file: parse `gitdir: <path>` pointer.
     let contents = fs::read_to_string(&dot_git).map_err(ResolveError::ReadDotGit)?;
     let worktree_gitdir =
