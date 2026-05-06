@@ -88,6 +88,24 @@ pub fn mcp_data_writable(root_dir: &Path) -> bool {
     }
 }
 
+/// Resolve whether the daemon transport should be attempted for `mode` and
+/// `root_dir`.
+///
+/// This is the pure, synchronous part of [`run_implicit_default`]'s decision:
+/// - `Stdio`  → always `false`
+/// - `Daemon` → always `true`
+/// - `Auto`   → probe `<root_dir>/.mcp_data/` writability at runtime
+///
+/// Extracted as a separate function so the branch logic is unit-testable
+/// without spawning an async runtime.
+pub fn resolve_want_daemon(mode: TransportMode, root_dir: &Path) -> bool {
+    match mode {
+        TransportMode::Stdio => false,
+        TransportMode::Daemon => true,
+        TransportMode::Auto => mcp_data_writable(root_dir),
+    }
+}
+
 /// Handle the implicit (no sub-command) invocation.
 ///
 /// Behaviour:
@@ -100,11 +118,7 @@ pub async fn run_implicit_default(
     root_dir: PathBuf,
     config: Config,
 ) -> Result<()> {
-    let want_daemon = match mode {
-        TransportMode::Stdio => false,
-        TransportMode::Daemon => true,
-        TransportMode::Auto => mcp_data_writable(&root_dir),
-    };
+    let want_daemon = resolve_want_daemon(mode, &root_dir);
 
     if want_daemon {
         match crate::transport::client::run(&root_dir).await {
@@ -360,5 +374,96 @@ mod tests {
         // Restore permissions so tempdir cleanup can remove the dir.
         std::fs::set_permissions(&mcp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn writable_probe_file_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(mcp_data_writable(tmp.path()));
+        // The write probe must be cleaned up after a successful check.
+        let probe = tmp.path().join(MCP_DATA_DIR).join(".write-probe");
+        assert!(!probe.exists(), ".write-probe must be removed after check");
+    }
+
+    #[test]
+    fn writable_idempotent_across_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Calling twice must both succeed — second call should not fail
+        // because `.mcp_data/` already exists.
+        assert!(mcp_data_writable(tmp.path()));
+        assert!(mcp_data_writable(tmp.path()));
+    }
+
+    // ── resolve_want_daemon ──────────────────────────────────────────────────
+
+    #[test]
+    fn want_daemon_stdio_always_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Stdio mode never wants the daemon, regardless of writability.
+        assert!(!resolve_want_daemon(TransportMode::Stdio, tmp.path()));
+    }
+
+    #[test]
+    fn want_daemon_daemon_always_true() {
+        // Daemon mode always wants the daemon, even for a path that may not be
+        // writable (writability check is irrelevant in this mode).
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_want_daemon(TransportMode::Daemon, tmp.path()));
+    }
+
+    #[test]
+    fn want_daemon_auto_writable_returns_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Auto mode with a writable root → wants daemon.
+        assert!(resolve_want_daemon(TransportMode::Auto, tmp.path()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn want_daemon_auto_readonly_returns_false() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mcp_dir = tmp.path().join(MCP_DATA_DIR);
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::set_permissions(&mcp_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Auto mode with a non-writable .mcp_data/ → does NOT want daemon.
+        let result = resolve_want_daemon(TransportMode::Auto, tmp.path());
+        std::fs::set_permissions(&mcp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn want_daemon_auto_creates_mcp_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new_root = tmp.path().join("new_workspace");
+        std::fs::create_dir_all(&new_root).unwrap();
+        // Auto mode must create .mcp_data/ when it doesn't exist.
+        assert!(resolve_want_daemon(TransportMode::Auto, &new_root));
+        assert!(
+            new_root.join(MCP_DATA_DIR).exists(),
+            ".mcp_data/ must be created by Auto mode writability probe"
+        );
+    }
+
+    // ── mcp_data_writable — non-existent parent ──────────────────────────────
+
+    #[test]
+    fn nonexistent_parent_dir_returns_false() {
+        // If the entire root path does not exist, create_dir_all will fail
+        // when the parent itself cannot be created (e.g. under a read-only FS).
+        // On a normal writable FS this actually succeeds (mkdir -p), so we test
+        // a path inside a known non-writable location instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let ro_parent = tmp.path().join("ro_parent");
+            std::fs::create_dir_all(&ro_parent).unwrap();
+            std::fs::set_permissions(&ro_parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Try to create .mcp_data/ inside a read-only parent — must fail.
+            let result = mcp_data_writable(&ro_parent.join("child"));
+            std::fs::set_permissions(&ro_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!result);
+        }
     }
 }
