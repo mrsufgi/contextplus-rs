@@ -68,7 +68,7 @@ impl std::error::Error for PathTranslationError {}
 ///
 /// ```
 /// use std::path::Path;
-/// use contextplus::core::path_translation::translate_input_path;
+/// use contextplus_rs::core::path_translation::translate_input_path;
 ///
 /// let root = Path::new("/home/user/repo");
 /// assert_eq!(
