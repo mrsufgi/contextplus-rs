@@ -30,37 +30,39 @@ use std::path::{Path, PathBuf};
 
 /// Resolve the primary worktree root for `root`.
 ///
+/// **Always returns a canonicalized path** (when canonicalize succeeds). This
+/// matters because `daemon_dir(primary)` and `daemon_dir(linked_worktree)`
+/// must compare equal byte-for-byte for two bridges to converge on one
+/// daemon. On macOS where `/var` is a symlink to `/private/var`, comparing
+/// non-canonical paths from one branch with canonical paths from another
+/// would silently break worktree convergence.
+///
 /// **Returns `root` on any error**, after emitting a `tracing::warn!`. This
 /// function never panics and never bails — a half-broken worktree pointer
 /// should degrade to "treat this directory as its own primary" rather than
 /// crash the daemon.
-///
-/// **Performance contract.** The fast paths — `<root>/.git` is a directory
-/// (standard repo) or absent (non-git folder) — avoid `canonicalize()`
-/// entirely. Only the slow path (`<root>/.git` is a file → linked worktree)
-/// canonicalizes, since the gitdir pointer's resolution requires comparing
-/// paths from different roots. This matters because `paths::daemon_dir` is
-/// called multiple times during daemon startup (lock, socket, pid) and
-/// burning a syscall on every call is observable under high test
-/// parallelism.
 pub fn resolve_primary_worktree(root: &Path) -> PathBuf {
-    let dot_git = root.join(".git");
+    // Canonicalize once up-front so every return path produces the same form.
+    // The cost is one stat-and-symlink-resolve syscall, observable but small;
+    // critically, both fast and slow paths must agree on path shape.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let dot_git = canonical_root.join(".git");
     match fs::symlink_metadata(&dot_git) {
         Ok(m) if m.is_dir() => {
-            // Fast path: standard repo. `root` IS primary.
-            return root.to_path_buf();
+            // Fast path: standard repo. `canonical_root` IS primary.
+            return canonical_root;
         }
         Err(_) => {
-            // Fast path: no `.git` at all. Non-git folder; `root` is fine.
-            return root.to_path_buf();
+            // Fast path: no `.git` at all. Non-git folder; canonical root is fine.
+            return canonical_root;
         }
         Ok(_) => {
             // `.git` is a file (or symlink to file): need slow path.
         }
     }
 
-    // Slow path: linked worktree. Canonicalize + parse `gitdir:` pointer.
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // Slow path: linked worktree. Parse `gitdir:` pointer.
     match resolve_linked_worktree_primary(&canonical_root) {
         Ok(primary) => primary,
         Err(e) => {

@@ -30,7 +30,7 @@
 //!
 //! # Migration from old path-keyed `.rkyv` format
 //!
-//! On daemon start, [`detect_legacy_format`] checks for old-format `.rkyv` files
+//! On daemon start, [`CasStore::detect_and_migrate_legacy`] checks for old-format `.rkyv` files
 //! in `.mcp_data/` with the `cas/` directory absent. When detected, all legacy
 //! files are deleted, a `migration_in_progress` marker is written, and embeddings
 //! rebuild fresh. The marker makes the operation idempotent on crash.
