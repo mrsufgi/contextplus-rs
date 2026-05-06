@@ -2705,7 +2705,21 @@ mod tests {
         let n = ANN_THRESHOLD + 50;
         let (docs, vectors) = make_ann_corpus(n);
         let mut index = SearchIndex::new();
-        index.index_with_vectors(docs, vectors);
+        // HNSW is approximate — at the default `ef_search = 32`, recall of
+        // the *true* nearest neighbor among 2050 docs is not guaranteed and
+        // varies across CPU architectures (observed flake on macOS aarch64
+        // where doc_0 falls outside top-5 with a query pointing nearly
+        // exactly at doc_0). Bumping `ef_search` to 256 gives this test
+        // sufficient recall while still exercising the same ANN-on/off
+        // dispatch logic the assertion is meant to prove.
+        index.index_with_vectors_and_tuning(
+            docs,
+            vectors,
+            crate::core::embeddings::HnswTuning {
+                ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
+                ef_search: 256,
+            },
+        );
 
         // The ANN store must have been built.
         assert!(
@@ -2729,10 +2743,9 @@ mod tests {
 
         let results = index.search("file", &query_vec, &opts);
         assert_eq!(results.len(), 5, "should return top_k=5 results");
-        // HNSW is an approximate algorithm — its top-1 isn't deterministic
-        // across Rust versions (MSRV 1.88 vs stable can reorder within recall).
-        // Assert doc_0 is in top_k instead; that's the invariant the ANN path
-        // actually provides at default ef_search.
+        // doc_0 should be in top_k — its embedding is the closest match to
+        // the query by cosine similarity. HNSW at `ef_search=256` reliably
+        // recalls it across MSRV (1.88) and stable, x86_64 and aarch64.
         let paths: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
         assert!(
             paths.contains(&"src/file_0.ts"),
