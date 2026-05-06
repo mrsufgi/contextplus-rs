@@ -41,9 +41,36 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::config::Config;
+use crate::core::head_watcher::{HeadEvent, start_head_watcher};
+use crate::core::memory_graph::MemoryGraph;
+use crate::core::memory_merge::run_merge_ladder;
 use crate::core::process_lifecycle;
+use crate::ref_index::{RefId, RefIndex};
 use crate::server::ContextPlusServer;
+use crate::transport::client::{RegisterSession, SessionReady, read_frame, write_frame};
 use crate::transport::paths;
+
+/// Environment variable for the ref TTL (seconds) after the last session
+/// disconnects. Default 24 h. `0` means immediate eviction.
+pub const REF_TTL_SECS_ENV: &str = "CONTEXTPLUS_REF_TTL_SECS";
+/// Default TTL: 24 hours.
+pub const DEFAULT_REF_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Read the ref TTL from the environment, falling back to the 24 h default.
+pub fn ref_ttl_from_env() -> u64 {
+    match std::env::var(REF_TTL_SECS_ENV) {
+        Ok(s) if !s.trim().is_empty() => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    "{REF_TTL_SECS_ENV}={s:?} is not a valid u64; using default {DEFAULT_REF_TTL_SECS}"
+                );
+                DEFAULT_REF_TTL_SECS
+            }
+        },
+        _ => DEFAULT_REF_TTL_SECS,
+    }
+}
 
 /// Default idle shutdown when running as a daemon — 30 minutes after the last
 /// client disconnects. Override with `CONTEXTPLUS_DAEMON_IDLE_SECS`.
@@ -351,9 +378,89 @@ pub async fn run(
     Ok(())
 }
 
-/// Serve one MCP session over an accepted Unix stream. Logs and swallows
-/// errors — a bad client must not take down the daemon.
-async fn serve_connection(server: ContextPlusServer, stream: UnixStream) {
+/// Serve one MCP session over an accepted Unix stream. Performs the
+/// `register_session` handshake, attaches the appropriate `RefIndex`, then
+/// hands the stream off to rmcp. Logs and swallows errors — a bad client must
+/// not take down the daemon.
+async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
+    let ttl_secs = ref_ttl_from_env();
+
+    // ── Step 1: register_session handshake ──────────────────────────────────
+    let reg: RegisterSession = match read_frame(&mut stream).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("register_session read failed: {e}");
+            return;
+        }
+    };
+    tracing::debug!(
+        client_root = %reg.client_root.display(),
+        head_sha = %reg.head_sha,
+        client_pid = reg.client_pid,
+        "register_session received"
+    );
+
+    // Reject immediately if draining.
+    if server.state.draining.load(Ordering::Acquire) {
+        let _ = write_frame(&mut stream, &SessionReady::RejectedDraining).await;
+        return;
+    }
+
+    // ── Step 2: resolve ref_id from client_root ──────────────────────────────
+    let canonical_root = reg
+        .client_root
+        .canonicalize()
+        .unwrap_or_else(|_| reg.client_root.clone());
+    let ref_id = RefId::for_canonical_path(&canonical_root);
+
+    // Determine parent ref: find merge-base between client HEAD and primary.
+    // For now: if the client root differs from the primary root, the primary
+    // ref is the parent (CoW-fork). U6 will wire in proper merge-base lookup.
+    let parent_ref_id = if ref_id != server.state.default_ref_id {
+        Some(server.state.default_ref_id)
+    } else {
+        None
+    };
+
+    let head_sha = reg.head_sha.clone();
+    let client_root = reg.client_root.clone();
+
+    let ref_arc = server
+        .state
+        .attach_ref(ref_id, || {
+            Arc::new(RefIndex::new_with_head(
+                client_root.clone(),
+                canonical_root.clone(),
+                parent_ref_id,
+                head_sha.clone(),
+            ))
+        })
+        .await;
+
+    tracing::debug!(
+        ref_id = ref_id.0,
+        sessions = ref_arc.session_count.load(Ordering::Acquire),
+        "ref attached"
+    );
+
+    // ── Step 3: send session_ready ───────────────────────────────────────────
+    let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
+    // TODO(U6): detect warming state once CAS/diff embedding is wired up.
+    // For now we always reply Ready.
+    let reply = SessionReady::Ready {
+        session_id,
+        ref_id: ref_id.0,
+    };
+    if let Err(e) = write_frame(&mut stream, &reply).await {
+        tracing::warn!("session_ready write failed: {e}");
+        server.state.detach_ref(ref_id, 0).await;
+        return;
+    }
+
+    // ── Step 4: serve MCP over the remainder of the stream ──────────────────
+    // Clone here so `server.state` is still accessible after `.serve()` moves
+    // the server into the transport.
+    let state = Arc::clone(&server.state);
     let (read_half, write_half) = stream.into_split();
     match server.serve((read_half, write_half)).await {
         Ok(running) => match running.waiting().await {
@@ -368,6 +475,10 @@ async fn serve_connection(server: ContextPlusServer, stream: UnixStream) {
             tracing::warn!("MCP handshake failed on Unix stream: {e}");
         }
     }
+
+    // ── Step 5: detach ref (decrement refcount, schedule eviction if 0) ─────
+    state.detach_ref(ref_id, ttl_secs).await;
+    tracing::debug!(ref_id = ref_id.0, "ref detached");
 }
 
 /// Spawn signal listeners that flip the drain flag. The drain watcher then
@@ -456,8 +567,148 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
         server.spawn_warmup_task();
     }
 
+    // HEAD watcher: track primary HEAD advances and trigger memory-graph
+    // merge for overlay refs whose HEAD has become an ancestor.
+    //
+    // ## U4 / U7 seam
+    //
+    // Today the registry holds only the primary ref (U3 scaffolding) so the
+    // merge loop is a no-op: there are no overlay graphs to fold in.  When
+    // U4 lands and multiple refs populate `server.state.refs`, this task
+    // will iterate over them and call `run_merge_ladder` for each that
+    // qualifies.
+    //
+    // The `_head_watcher_handle` binding keeps the watcher alive for the
+    // daemon's lifetime; dropping it shuts down the background thread.
+    let _head_watcher_handle = spawn_head_watcher_task(&server, root_dir.clone());
+
     run(server, listener, socket_path, pid_path, idle_secs, lock).await?;
     Ok(true)
+}
+
+/// Spawn the HEAD-watcher + merge-dispatch background task.
+///
+/// Returns the watcher handle (drop = shutdown).  If the gitdir cannot be
+/// found or the watcher fails to start, logs a warning and returns `None`
+/// so the rest of the daemon still operates.
+fn spawn_head_watcher_task(
+    server: &ContextPlusServer,
+    root_dir: PathBuf,
+) -> Option<crate::core::head_watcher::HeadWatcherHandle> {
+    // Locate the gitdir.  For a primary worktree `.git` is a directory; for
+    // a linked worktree `.git` is a file — `git_worktree::resolve_primary_worktree`
+    // already handles both, but here we need the gitdir itself, not just the
+    // primary root.  We shell out to `git rev-parse --git-dir` to cover both
+    // cases.
+    let gitdir_out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(&root_dir)
+        .output();
+
+    let gitdir = match gitdir_out {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if std::path::Path::new(&raw).is_absolute() {
+                std::path::PathBuf::from(raw)
+            } else {
+                root_dir.join(raw)
+            }
+        }
+        _ => {
+            tracing::warn!(
+                root = %root_dir.display(),
+                "head_watcher: could not resolve gitdir — HEAD-advance events disabled"
+            );
+            return None;
+        }
+    };
+
+    let (handle, mut event_rx) = match start_head_watcher(root_dir.clone(), gitdir) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("head_watcher: failed to start: {e} — merge events disabled");
+            return None;
+        }
+    };
+
+    // Capture what we need for the async task.
+    let state = Arc::clone(&server.state);
+    let root_str = root_dir.to_string_lossy().to_string();
+
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let HeadEvent::Advanced {
+                old_sha: _,
+                new_sha,
+            } = event;
+
+            // Suppress merges during drain.
+            if state.draining.load(std::sync::atomic::Ordering::Acquire) {
+                tracing::debug!(
+                    "head_watcher: daemon draining — skipping merge for HEAD {}",
+                    new_sha
+                );
+                continue;
+            }
+
+            // Iterate over all registered refs and check ancestry.
+            // U3: the registry has only one ref (primary); no overlay nodes to
+            // merge.  U4 will add secondary refs; this loop body will process
+            // them once they carry real overlay memory graphs.
+            let refs_snapshot: Vec<(crate::ref_index::RefId, Arc<crate::ref_index::RefIndex>)> = {
+                let reg = state.refs.read().await;
+                reg.iter().map(|(id, r)| (*id, Arc::clone(r))).collect()
+            };
+
+            for (ref_id, ref_index) in &refs_snapshot {
+                let ref_head = match &ref_index.head_sha {
+                    Some(h) => h.clone(),
+                    None => continue, // no HEAD recorded yet — skip
+                };
+
+                // Skip the primary ref itself.
+                if ref_index.parent_ref_id.is_none() {
+                    continue;
+                }
+
+                // Check ancestry.
+                let is_anc = crate::core::head_watcher::is_ancestor(&root_dir, &ref_head, &new_sha);
+                if is_anc != Some(true) {
+                    continue;
+                }
+
+                tracing::info!(
+                    ref_id = ?ref_id,
+                    ref_head = %ref_head,
+                    primary_head = %new_sha,
+                    "head_watcher: ref HEAD is ancestor of primary — entering merge ladder"
+                );
+
+                // U4/U7 seam: when RefIndex carries its own MemoryGraph
+                // overlay, the merge runs here.  Today there is no overlay
+                // stored on RefIndex so we run a no-op merge (empty overlay).
+                //
+                // Pattern to extend when U4 lands:
+                //   let overlay = ref_index.memory_graph_overlay();
+                //   let summary = run_merge_ladder(&overlay, &mut primary_graph, &[], draining);
+                let overlay = MemoryGraph::new(); // empty — no-op
+                let _ = state
+                    .memory_graph
+                    .get_graph(&root_str, |primary_graph| {
+                        run_merge_ladder(
+                            &overlay,
+                            primary_graph,
+                            &[],
+                            state.draining.load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    })
+                    .await;
+            }
+        }
+        tracing::debug!("head_watcher: event channel closed — merge task exiting");
+    });
+
+    Some(handle)
 }
 
 #[cfg(test)]

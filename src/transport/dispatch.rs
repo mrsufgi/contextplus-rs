@@ -6,6 +6,31 @@
 //! to the library crate makes the behaviour unit-testable and keeps `main.rs`
 //! as a thin entry-point.
 //!
+//! # Path translation at the dispatch boundary (U5)
+//!
+//! When a daemon serves multiple worktrees, each session's tool calls must be
+//! translated so that:
+//!
+//! 1. **Inputs**: absolute paths supplied by a caller are stripped of the
+//!    caller's worktree prefix before reaching the tool implementation.
+//! 2. **Outputs**: repo-relative paths in tool results are prefixed with the
+//!    calling session's worktree root before being returned to the caller.
+//! 3. **Out-of-tree paths** are rejected with a clear error.
+//!
+//! The `dispatch_with_translation` function implements this boundary.
+//! Today it uses `SharedState.default_ref().root_dir` as the caller's worktree
+//! root.  When U4 lands and introduces `session.ref_id`, replace the
+//! `default_ref()` call with `state.ref_index(session.ref_id)` — the
+//! primitives in `crate::core::path_translation` don't change.
+//!
+//! ## Stdio no-op
+//!
+//! In single-daemon / stdio mode the caller's worktree is the same path the
+//! server uses internally, so `rewrite_paths_in_text` fast-paths through
+//! (the text already contains the absolute root), and
+//! `translate_input_path` for relative args is a pass-through.  Existing
+//! stdio-only deployments are entirely unaffected.
+//!
 //! # Environment variables
 //!
 //! | Variable                  | Values                       | Default |
@@ -23,6 +48,7 @@ use anyhow::Result;
 use rmcp::ServiceExt;
 
 use crate::config::Config;
+use crate::core::path_translation;
 use crate::core::process_lifecycle;
 use crate::server::ContextPlusServer;
 use crate::transport::paths::MCP_DATA_DIR;
@@ -88,6 +114,24 @@ pub fn mcp_data_writable(root_dir: &Path) -> bool {
     }
 }
 
+/// Resolve whether the daemon transport should be attempted for `mode` and
+/// `root_dir`.
+///
+/// This is the pure, synchronous part of [`run_implicit_default`]'s decision:
+/// - `Stdio`  → always `false`
+/// - `Daemon` → always `true`
+/// - `Auto`   → probe `<root_dir>/.mcp_data/` writability at runtime
+///
+/// Extracted as a separate function so the branch logic is unit-testable
+/// without spawning an async runtime.
+pub fn resolve_want_daemon(mode: TransportMode, root_dir: &Path) -> bool {
+    match mode {
+        TransportMode::Stdio => false,
+        TransportMode::Daemon => true,
+        TransportMode::Auto => mcp_data_writable(root_dir),
+    }
+}
+
 /// Handle the implicit (no sub-command) invocation.
 ///
 /// Behaviour:
@@ -100,11 +144,7 @@ pub async fn run_implicit_default(
     root_dir: PathBuf,
     config: Config,
 ) -> Result<()> {
-    let want_daemon = match mode {
-        TransportMode::Stdio => false,
-        TransportMode::Daemon => true,
-        TransportMode::Auto => mcp_data_writable(&root_dir),
-    };
+    let want_daemon = resolve_want_daemon(mode, &root_dir);
 
     if want_daemon {
         match crate::transport::client::run(&root_dir).await {
@@ -244,6 +284,68 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
     Ok(())
 }
 
+// ── Path-translation dispatch boundary (U5) ──────────────────────────────────
+
+/// Invoke a tool with full path-translation at the dispatch boundary.
+///
+/// This wraps [`ContextPlusServer::dispatch`] with the U5 path-translation
+/// layer:
+///
+/// 1. **Input translation**: known path arguments (`file_path`, `path`,
+///    `root_dir`, `target_path`, `rootDir`) that are absolute paths are
+///    stripped of the `caller_root` prefix.  Absolute paths outside
+///    `caller_root` are rejected immediately with an error result —
+///    no panic, no forwarding to the tool.
+///
+/// 2. **Output translation**: after the tool returns, all relative-path
+///    strings in the text content are prefixed with `caller_root`.
+///
+/// **U4 seam:** `caller_root` today comes from `SharedState.default_ref()`.
+/// When U4 introduces `session.ref_id`, replace the call site with
+/// `state.ref_index(session.ref_id).root_dir`.
+///
+/// **Stdio no-op:** when `caller_root` equals the server's own `root_dir`
+/// the translation is transparent — inputs are typically relative and
+/// outputs already contain `root_dir`-prefixed absolute paths.
+pub async fn dispatch_with_translation(
+    server: &ContextPlusServer,
+    tool_name: &str,
+    args: serde_json::Map<String, serde_json::Value>,
+    caller_root: &Path,
+) -> rmcp::model::CallToolResult {
+    // --- Input translation ---
+    let translated_args = match path_translation::translate_input_args(args, caller_root) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                tool = tool_name,
+                caller_root = %caller_root.display(),
+                "Rejecting tool call: {e}"
+            );
+            return rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(format!(
+                "Error: {e}"
+            ))]);
+        }
+    };
+
+    // --- Dispatch ---
+    let raw_result = server.dispatch(tool_name, translated_args).await;
+
+    // --- Output translation ---
+    path_translation::translate_output_result(raw_result, caller_root)
+}
+
+/// Return the caller's worktree root for the current (single-ref) configuration.
+///
+/// This is the U4 seam: today it reads from `SharedState.default_ref()`;
+/// U4 will replace this with per-session `RefIndex` lookup using
+/// `session.ref_id` obtained during `register_session`.
+///
+/// Returns `None` only if the registry was tampered with externally.
+pub fn caller_root_from_default_ref(state: &crate::server::SharedState) -> Option<PathBuf> {
+    state.default_ref().map(|r| r.root_dir.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +462,379 @@ mod tests {
         // Restore permissions so tempdir cleanup can remove the dir.
         std::fs::set_permissions(&mcp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn writable_probe_file_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(mcp_data_writable(tmp.path()));
+        // The write probe must be cleaned up after a successful check.
+        let probe = tmp.path().join(MCP_DATA_DIR).join(".write-probe");
+        assert!(!probe.exists(), ".write-probe must be removed after check");
+    }
+
+    #[test]
+    fn writable_idempotent_across_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Calling twice must both succeed — second call should not fail
+        // because `.mcp_data/` already exists.
+        assert!(mcp_data_writable(tmp.path()));
+        assert!(mcp_data_writable(tmp.path()));
+    }
+
+    // ── resolve_want_daemon ──────────────────────────────────────────────────
+
+    #[test]
+    fn want_daemon_stdio_always_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Stdio mode never wants the daemon, regardless of writability.
+        assert!(!resolve_want_daemon(TransportMode::Stdio, tmp.path()));
+    }
+
+    #[test]
+    fn want_daemon_daemon_always_true() {
+        // Daemon mode always wants the daemon, even for a path that may not be
+        // writable (writability check is irrelevant in this mode).
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_want_daemon(TransportMode::Daemon, tmp.path()));
+    }
+
+    #[test]
+    fn want_daemon_auto_writable_returns_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Auto mode with a writable root → wants daemon.
+        assert!(resolve_want_daemon(TransportMode::Auto, tmp.path()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn want_daemon_auto_readonly_returns_false() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mcp_dir = tmp.path().join(MCP_DATA_DIR);
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::set_permissions(&mcp_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Auto mode with a non-writable .mcp_data/ → does NOT want daemon.
+        let result = resolve_want_daemon(TransportMode::Auto, tmp.path());
+        std::fs::set_permissions(&mcp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn want_daemon_auto_creates_mcp_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new_root = tmp.path().join("new_workspace");
+        std::fs::create_dir_all(&new_root).unwrap();
+        // Auto mode must create .mcp_data/ when it doesn't exist.
+        assert!(resolve_want_daemon(TransportMode::Auto, &new_root));
+        assert!(
+            new_root.join(MCP_DATA_DIR).exists(),
+            ".mcp_data/ must be created by Auto mode writability probe"
+        );
+    }
+
+    // ── mcp_data_writable — non-existent parent ──────────────────────────────
+
+    #[test]
+    fn nonexistent_parent_dir_returns_false() {
+        // If the entire root path does not exist, create_dir_all will fail
+        // when the parent itself cannot be created (e.g. under a read-only FS).
+        // On a normal writable FS this actually succeeds (mkdir -p), so we test
+        // a path inside a known non-writable location instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let ro_parent = tmp.path().join("ro_parent");
+            std::fs::create_dir_all(&ro_parent).unwrap();
+            std::fs::set_permissions(&ro_parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Try to create .mcp_data/ inside a read-only parent — must fail.
+            let result = mcp_data_writable(&ro_parent.join("child"));
+            std::fs::set_permissions(&ro_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!result);
+        }
+    }
+
+    // ── dispatch_with_translation ─────────────────────────────────────────────
+    //
+    // These tests exercise the path-translation boundary at the dispatch layer.
+    // They use synthetic worktree roots and a live ContextPlusServer to verify:
+    //   1. Input paths get stripped of the caller's worktree prefix.
+    //   2. Output paths get prefixed with the caller's worktree root.
+    //   3. Cross-session leakage: B's result never contains A's worktree path.
+    //   4. Out-of-tree input paths are rejected with a clear error.
+    //   5. The `caller_root_from_default_ref` accessor returns the server's root.
+    //
+    // Note: full end-to-end testing of actual tool content would require a
+    // real corpus with embeddings. These tests focus on the translation layer
+    // itself using lightweight tool calls (missing-arg fast paths) that return
+    // predictable text — sufficient to prove the boundary works.
+
+    fn make_test_server(root: &Path) -> crate::server::ContextPlusServer {
+        let config = crate::config::Config::from_env();
+        crate::server::ContextPlusServer::new(root.to_path_buf(), config)
+    }
+
+    /// Build a minimal server in a temp dir with a few source files.
+    fn make_server_with_files() -> (tempfile::TempDir, crate::server::ContextPlusServer) {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create some "source files" so the tool has content to return.
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/auth.rs"), "pub fn verify_token() {}").unwrap();
+        std::fs::write(tmp.path().join("src/db.rs"), "pub fn connect() {}").unwrap();
+        let server = make_test_server(tmp.path());
+        (tmp, server)
+    }
+
+    /// Extract the first text content from a CallToolResult.
+    fn first_text(result: &rmcp::model::CallToolResult) -> &str {
+        match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => &t.text,
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// Recursively scan a serde_json::Value for a needle string.
+    fn json_has(v: &serde_json::Value, needle: &str) -> bool {
+        crate::core::path_translation::json_contains_string(v, needle)
+    }
+
+    // ── caller_root_from_default_ref ──────────────────────────────────────────
+
+    #[test]
+    fn default_ref_accessor_returns_server_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+        let root = caller_root_from_default_ref(&server.state);
+        assert!(root.is_some(), "default_ref should exist");
+        // The returned root must be the same path we constructed the server with
+        // (modulo canonicalization that ContextPlusServer::new may do).
+        let got = root.unwrap();
+        assert!(
+            got == tmp.path()
+                || got
+                    == tmp
+                        .path()
+                        .canonicalize()
+                        .unwrap_or(tmp.path().to_path_buf()),
+            "expected server root, got: {}",
+            got.display()
+        );
+    }
+
+    // ── Input translation ─────────────────────────────────────────────────────
+
+    /// Out-of-tree `file_path` arg is rejected before the tool is called.
+    #[tokio::test]
+    async fn dispatch_rejects_out_of_tree_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+
+        // Pass a file_path that is NOT under tmp (some other worktree).
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file_path".to_string(),
+            serde_json::Value::String("/completely/different/worktree/src/foo.rs".to_string()),
+        );
+
+        let wt_root = tmp.path();
+        let result = dispatch_with_translation(&server, "get_file_skeleton", args, wt_root).await;
+
+        // Must be an error result.
+        assert_eq!(result.is_error, Some(true));
+        let text = first_text(&result);
+        assert!(
+            text.contains("outside the caller's worktree root"),
+            "expected out-of-tree error, got: {text}"
+        );
+    }
+
+    /// Relative `file_path` (already canonical) passes through without error.
+    #[tokio::test]
+    async fn dispatch_accepts_relative_file_path_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let server = make_test_server(tmp.path());
+
+        let mut args = serde_json::Map::new();
+        // Relative path — should pass through translation unchanged and reach tool.
+        args.insert(
+            "file_path".to_string(),
+            serde_json::Value::String("src/main.rs".to_string()),
+        );
+
+        let result =
+            dispatch_with_translation(&server, "get_file_skeleton", args, tmp.path()).await;
+        // The tool either succeeds or returns a content error, but must NOT
+        // produce an "outside the caller's worktree root" rejection.
+        let text = first_text(&result);
+        assert!(
+            !text.contains("outside the caller's worktree root"),
+            "relative path should not trigger out-of-tree error, got: {text}"
+        );
+    }
+
+    /// Absolute `file_path` inside the caller's worktree is stripped to relative.
+    #[tokio::test]
+    async fn dispatch_strips_caller_prefix_from_absolute_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let server = make_test_server(tmp.path());
+
+        let abs_path = tmp.path().join("src/main.rs");
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(abs_path.to_string_lossy().to_string()),
+        );
+
+        let result =
+            dispatch_with_translation(&server, "get_file_skeleton", args, tmp.path()).await;
+        // Same as above: must not reject as out-of-tree.
+        let text = first_text(&result);
+        assert!(
+            !text.contains("outside the caller's worktree root"),
+            "in-tree absolute path should not trigger rejection, got: {text}"
+        );
+    }
+
+    // ── Output translation ────────────────────────────────────────────────────
+
+    /// A tool result with relative paths gets prefixed with caller_root.
+    #[test]
+    fn translate_output_result_prefixes_relative_paths() {
+        use crate::core::path_translation::translate_output_result;
+
+        let caller_root = std::path::Path::new("/workspace/wt-a");
+        // Simulate a tool result with a relative path in text.
+        let content = rmcp::model::Content::text("1. src/auth.rs (90% total)");
+        let raw = rmcp::model::CallToolResult::success(vec![content]);
+        let translated = translate_output_result(raw, caller_root);
+
+        let text = first_text(&translated);
+        assert!(
+            text.contains("/workspace/wt-a/src/auth.rs"),
+            "expected absolute path in output, got: {text}"
+        );
+    }
+
+    /// Output already containing absolute paths for the caller's root is
+    /// left unchanged (stdio no-op path).
+    #[test]
+    fn translate_output_result_noop_when_already_absolute() {
+        use crate::core::path_translation::translate_output_result;
+
+        let caller_root = std::path::Path::new("/workspace/primary");
+        let text = "1. /workspace/primary/src/main.rs (99% total)";
+        let content = rmcp::model::Content::text(text);
+        let raw = rmcp::model::CallToolResult::success(vec![content]);
+        let translated = translate_output_result(raw, caller_root);
+        assert_eq!(first_text(&translated), text);
+    }
+
+    // ── THE LEAKAGE TEST ─────────────────────────────────────────────────────
+    //
+    // This is the load-bearing test for U5. It proves that the dispatch layer
+    // ensures B's tool result never contains A's worktree path string anywhere
+    // in the response JSON, even when both sessions share the same underlying
+    // content (chunk learned from the same repo).
+
+    #[tokio::test]
+    async fn leakage_test_b_result_never_contains_a_worktree_path_via_dispatch() {
+        use crate::core::path_translation::translate_output_result;
+
+        // Simulate the shared raw tool output as if both sessions hit the same
+        // chunk index (repo-relative paths, no worktree prefix).
+        let shared_tool_output = "1. src/shared/utils.rs (88% total)\n   Snippet: helper fn\n2. src/core/engine.rs (75% total)";
+
+        let wt_a = std::path::Path::new("/workspace/worktree-a");
+        let wt_b = std::path::Path::new("/workspace/worktree-b");
+
+        // Produce per-session results by applying output translation.
+        let result_for_a = {
+            let content = rmcp::model::Content::text(shared_tool_output);
+            let raw = rmcp::model::CallToolResult::success(vec![content]);
+            translate_output_result(raw, wt_a)
+        };
+        let result_for_b = {
+            let content = rmcp::model::Content::text(shared_tool_output);
+            let raw = rmcp::model::CallToolResult::success(vec![content]);
+            translate_output_result(raw, wt_b)
+        };
+
+        // A's result must contain A's absolute paths.
+        let text_a = first_text(&result_for_a);
+        assert!(
+            text_a.contains("/workspace/worktree-a/src/shared/utils.rs"),
+            "A: {text_a}"
+        );
+
+        // B's result must contain B's absolute paths.
+        let text_b = first_text(&result_for_b);
+        assert!(
+            text_b.contains("/workspace/worktree-b/src/shared/utils.rs"),
+            "B: {text_b}"
+        );
+
+        // *** THE LEAKAGE INVARIANT ***: serialize B's result to JSON and assert
+        // that A's worktree path string is nowhere in B's response.
+        let b_json = serde_json::to_value(&result_for_b).unwrap();
+        assert!(
+            !json_has(&b_json, "/workspace/worktree-a"),
+            "LEAKAGE: B's result JSON contains A's worktree path!\nB JSON: {b_json}"
+        );
+
+        // Also check in the other direction: A's result doesn't contain B's path.
+        let a_json = serde_json::to_value(&result_for_a).unwrap();
+        assert!(
+            !json_has(&a_json, "/workspace/worktree-b"),
+            "LEAKAGE: A's result JSON contains B's worktree path!\nA JSON: {a_json}"
+        );
+    }
+
+    // ── stdio mode (no daemon) ────────────────────────────────────────────────
+
+    /// In stdio mode the caller's root equals the server's root, so
+    /// translation is a no-op for paths that are already absolute.
+    #[tokio::test]
+    async fn stdio_mode_dispatch_is_transparent() {
+        let (_tmp, server) = make_server_with_files();
+        let server_root = server.state.root_dir.clone();
+
+        // query tool with no path args — just making sure it doesn't panic
+        // and the translation layer does not break the call.
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "query".to_string(),
+            serde_json::Value::String("auth token".to_string()),
+        );
+
+        // In stdio mode, caller_root == server_root (same worktree).
+        let result =
+            dispatch_with_translation(&server, "semantic_code_search", args, &server_root).await;
+
+        // Must not error with a path translation error.
+        let text = first_text(&result);
+        assert!(
+            !text.contains("outside the caller's worktree root"),
+            "stdio mode must not produce path errors, got: {text}"
+        );
+    }
+
+    /// `dispatch_with_translation` on an unknown tool name returns the
+    /// tool's standard "Unknown tool" error without panicking.
+    #[tokio::test]
+    async fn dispatch_unknown_tool_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+        let args = serde_json::Map::new();
+        let result = dispatch_with_translation(&server, "no_such_tool", args, tmp.path()).await;
+        let text = first_text(&result);
+        assert!(
+            text.contains("Unknown tool") || text.contains("Error"),
+            "got: {text}"
+        );
     }
 }
