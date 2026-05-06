@@ -1,11 +1,10 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use contextplus_rs::config::Config;
-use contextplus_rs::core::process_lifecycle;
-use contextplus_rs::server::ContextPlusServer;
-use rmcp::ServiceExt;
+use contextplus_rs::transport::dispatch::{
+    resolve_transport_mode, run_implicit_default, run_mcp_server,
+};
 
 #[derive(Parser)]
 #[command(
@@ -45,22 +44,21 @@ impl AgentTarget {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the MCP server over stdio (default behavior)
+    /// Start the MCP server over stdio (legacy, still supported).
     Serve,
+    /// Run as a per-workspace daemon listening on a Unix socket.
+    Daemon,
+    /// Run as a thin stdio<->socket proxy, spawning a daemon if absent.
+    Client,
     /// Generate MCP config file for a coding agent
     Init {
-        /// Target agent (claude, cursor, vscode, windsurf, opencode)
         #[arg(value_enum, default_value = "claude")]
         target: AgentTarget,
     },
     /// Print file skeleton for a file
-    Skeleton {
-        /// Path to the file
-        file: String,
-    },
+    Skeleton { file: String },
     /// Print context tree for a directory
     Tree {
-        /// Max tokens for output
         #[arg(long)]
         max_tokens: Option<usize>,
     },
@@ -73,9 +71,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum HooksAction {
-    /// Install (or refresh) managed git hooks in this repository
     Install,
-    /// Remove the managed git hook block (preserves any user-authored content)
     Uninstall,
 }
 
@@ -98,8 +94,22 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env();
 
     match cli.command {
-        None | Some(Commands::Serve) => {
+        None => {
+            let mode = resolve_transport_mode();
+            run_implicit_default(mode, root_dir, config).await?;
+        }
+        Some(Commands::Serve) => {
             run_mcp_server(root_dir, config).await?;
+        }
+        Some(Commands::Daemon) => {
+            let owner =
+                contextplus_rs::transport::daemon::run_if_owner(root_dir.clone(), config).await?;
+            if !owner {
+                tracing::info!("another daemon already owns this workspace -- exiting");
+            }
+        }
+        Some(Commands::Client) => {
+            contextplus_rs::transport::client::run(&root_dir).await?;
         }
         Some(Commands::Init { target }) => {
             let binary_path = std::env::current_exe()
@@ -206,7 +216,6 @@ async fn main() -> anyhow::Result<()> {
 
             let walker_entries = contextplus_rs::core::walker::walk_with_config(&root_dir, &config);
 
-            // Convert walker entries to context_tree entries
             let entries: Vec<context_tree::FileEntry> = walker_entries
                 .iter()
                 .map(|e| context_tree::FileEntry {
@@ -277,175 +286,6 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     }
-
-    Ok(())
-}
-
-async fn run_mcp_server(root_dir: PathBuf, config: Config) -> anyhow::Result<()> {
-    tracing::info!(
-        "Starting contextplus MCP server on {} (model: {})",
-        root_dir.display(),
-        config.ollama_embed_model
-    );
-
-    let server = ContextPlusServer::new(root_dir.clone(), config.clone());
-
-    // Pre-load memory graph from disk
-    let root_str = root_dir.to_string_lossy().to_string();
-    if let Err(e) = server
-        .state
-        .memory_graph
-        .get_graph(&root_str, |_graph| {})
-        .await
-    {
-        tracing::warn!("Failed to pre-load memory graph from disk: {e}");
-    }
-
-    // Spawn background debounce task for memory graph persistence
-    let _debounce_handle = server.state.memory_graph.spawn_debounce_task();
-
-    // Embedding tracker modes: Eager (start now), Lazy (start on first semantic call), Off
-    use contextplus_rs::config::TrackerMode;
-    tracing::info!(mode = %config.embed_tracker_mode, "Embedding tracker mode");
-    if config.embed_tracker_mode == TrackerMode::Eager {
-        server.ensure_tracker_started();
-    }
-
-    // Warm the SearchIndex cache in the background so the first real query is served
-    // from a hot cache instead of the 30 s cold path.
-    if config.warmup_on_start {
-        tracing::info!("Spawning SearchIndex warmup task (CONTEXTPLUS_WARMUP_ON_START=true)");
-        server.spawn_warmup_task();
-    }
-
-    // --- Process lifecycle monitors ---
-
-    // Idle shutdown: fires after config.idle_timeout_ms of no tool calls.
-    let idle_timeout_ms = config.idle_timeout_ms;
-    let idle_monitor = process_lifecycle::create_idle_monitor(idle_timeout_ms, move || {
-        tracing::info!(
-            "Idle timeout ({}ms) reached — initiating shutdown",
-            idle_timeout_ms
-        );
-        std::process::exit(0);
-    });
-    if config.idle_timeout_ms > 0 {
-        tracing::info!(
-            "Idle shutdown monitor started ({}ms)",
-            config.idle_timeout_ms
-        );
-    }
-
-    // Store idle monitor on shared state so tool handlers can touch it.
-    let idle_monitor = Arc::new(idle_monitor);
-    {
-        let mut guard = server.state.idle_monitor.write().await;
-        *guard = Some(idle_monitor.clone());
-    }
-
-    // Parent PID monitor: detect orphaned process. On detection we transition
-    // to graceful drain mode (reject new calls, let in-flight ones finish)
-    // rather than exiting immediately — see the drain watcher below.
-    #[cfg(unix)]
-    let _parent_monitor = {
-        let parent_pid = std::os::unix::process::parent_id();
-        let draining = Arc::clone(&server.state.draining);
-        let inflight = Arc::clone(&server.state.inflight);
-
-        // Start the drain watcher upfront — it polls the draining flag and
-        // either waits for inflight==0 or hits the grace-deadline ceiling.
-        let drain_grace_secs = process_lifecycle::get_drain_grace_secs(
-            std::env::var("CONTEXTPLUS_DRAIN_GRACE_SECS")
-                .ok()
-                .as_deref(),
-        );
-        let _drain_watcher = process_lifecycle::start_drain_watcher(
-            Arc::clone(&draining),
-            inflight,
-            std::time::Duration::from_secs(drain_grace_secs),
-            move |reason| {
-                tracing::info!(
-                    ?reason,
-                    "drain watcher fired — exiting cleanly after parent death",
-                );
-                std::process::exit(0);
-            },
-        );
-
-        let handle =
-            process_lifecycle::start_parent_monitor(parent_pid, config.parent_poll_ms, move || {
-                tracing::info!(
-                    "parent process (pid={}) exited — entering drain mode (grace={}s)",
-                    parent_pid,
-                    drain_grace_secs,
-                );
-                draining.store(true, std::sync::atomic::Ordering::Release);
-            });
-        tracing::info!(
-            "parent PID monitor started (pid={}, poll={}ms, drain_grace={}s)",
-            parent_pid,
-            config.parent_poll_ms,
-            drain_grace_secs,
-        );
-        handle
-    };
-
-    let memory_graph = Arc::clone(&server.state.memory_graph);
-
-    // Keep a handle to shared state so we can cancel embeddings on shutdown.
-    let state_for_shutdown = server.state.clone();
-
-    let transport = rmcp::transport::io::stdio();
-    let ct = server.serve(transport).await?;
-
-    // --- Signal handling ---
-    // Handle SIGTERM, SIGHUP, SIGINT for graceful shutdown.
-    // On shutdown, cancel in-flight embeddings and persist memory graph before exiting.
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    #[cfg(unix)]
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-
-    tokio::select! {
-        result = ct.waiting() => {
-            result?;
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("SIGINT received — cancelling embeddings and shutting down");
-            state_for_shutdown.ollama.cancel_all_embeddings();
-        }
-        _ = async {
-            #[cfg(unix)]
-            { sigterm.recv().await }
-            #[cfg(not(unix))]
-            { std::future::pending::<Option<()>>().await }
-        } => {
-            tracing::info!("SIGTERM received — shutting down");
-            state_for_shutdown.ollama.cancel_all_embeddings();
-        }
-        _ = async {
-            #[cfg(unix)]
-            { sighup.recv().await }
-            #[cfg(not(unix))]
-            { std::future::pending::<Option<()>>().await }
-        } => {
-            tracing::info!("SIGHUP received — shutting down");
-            state_for_shutdown.ollama.cancel_all_embeddings();
-        }
-    }
-
-    // Flush outstanding query embeddings to disk before exit.
-    state_for_shutdown.ollama.flush_query_cache();
-
-    // Always flush memory graph on exit
-    if let Err(e) = memory_graph.flush().await {
-        tracing::warn!("Failed to persist memory graph on shutdown: {e}");
-    }
-
-    // Graceful cleanup
-    idle_monitor.stop();
-    #[cfg(unix)]
-    _parent_monitor.stop();
 
     Ok(())
 }
