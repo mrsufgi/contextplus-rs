@@ -22,12 +22,54 @@ pub struct WalkOptions<'a> {
     pub ignore_dirs: &'a HashSet<String>,
 }
 
+/// File names that are always excluded by their literal name.
+///
+/// These are big, generated, or noise-only files that pollute semantic search
+/// results without contributing meaning. They live alongside legitimate source
+/// in the same directory, so they cannot be excluded by directory-name rules.
+///
+/// **Lockfiles policy.** `package-lock.json`, `pnpm-lock.yaml`, and `*.lockb`
+/// are excluded — they are giant generated trees. `yarn.lock`, `Cargo.lock`,
+/// `poetry.lock`, and `go.sum` are intentionally NOT excluded because their
+/// contents (resolved dep graphs) are sometimes useful when an agent is
+/// debugging dependency resolution.
+const ALWAYS_IGNORE_FILENAMES: &[&str] =
+    &["package-lock.json", "pnpm-lock.yaml", "npm-shrinkwrap.json"];
+
+/// File-name suffixes (case-sensitive) excluded from walks.
+///
+/// Suffix matching is intentionally simple: no glob crate, no regex, no escapes.
+/// Each suffix is matched literally against the file name's tail.
+const ALWAYS_IGNORE_SUFFIXES: &[&str] = &[
+    // Source maps + minified bundles
+    ".map",
+    ".min.js",
+    ".min.css",
+    ".min.mjs",
+    ".bundle.js",
+    ".bundle.mjs",
+    // Bun's binary lockfile
+    ".lockb",
+    // Generated protobuf bindings (TS connect-es / connect-go / pbjs)
+    "_pb.ts",
+    "_pb.js",
+    "_pb.d.ts",
+    ".pb.go",
+    ".pb.cc",
+    ".pb.h",
+    ".connect.ts",
+    ".connect.js",
+    // Snapshot test files outside __snapshots__/
+    ".snap",
+];
+
 /// Segment-based path ignore check.
-/// Checks if any path segment matches the ignore set.
-/// Also skips any segment starting with `.` (hidden files/dirs), matching
-/// the TS walker's `entry.name.startsWith(".")` check.
-/// This is the correct approach (matching our TS fork fix) — prevents
-/// false positives from prefix matching like "generated" matching "gen".
+/// Checks if any path segment matches the ignore set or starts with `.`
+/// (hidden files/dirs), and rejects file names matching the global
+/// always-ignore list (lockfiles, sourcemaps, generated proto bindings, etc.).
+///
+/// Segment matching is exact, not prefix-based — `gen` segment is blocked but
+/// `generic/` is not.
 pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
     if path.is_empty() {
         return false;
@@ -38,6 +80,17 @@ pub fn should_track(path: &str, ignore_dirs: &HashSet<String>) -> bool {
         }
         if ignore_dirs.contains(segment) {
             return false;
+        }
+    }
+    // File-name level filtering: only the trailing segment matters.
+    if let Some(name) = path.rsplit('/').next() {
+        if ALWAYS_IGNORE_FILENAMES.contains(&name) {
+            return false;
+        }
+        for suffix in ALWAYS_IGNORE_SUFFIXES {
+            if name.ends_with(suffix) {
+                return false;
+            }
         }
     }
     true
@@ -490,6 +543,86 @@ mod tests {
                 config.ignore_dirs.contains(*entry),
                 "Rust ignore_dirs is missing '{}' which is in TS ALWAYS_IGNORE",
                 entry
+            );
+        }
+    }
+
+    #[test]
+    fn should_track_blocks_lockfiles() {
+        let ignore = make_ignore_set(&[]);
+        assert!(!should_track("package-lock.json", &ignore));
+        assert!(!should_track("pnpm-lock.yaml", &ignore));
+        assert!(!should_track("npm-shrinkwrap.json", &ignore));
+        assert!(!should_track("apps/x/package-lock.json", &ignore));
+        // these should still be indexed
+        assert!(should_track("yarn.lock", &ignore));
+        assert!(should_track("Cargo.lock", &ignore));
+        assert!(should_track("go.sum", &ignore));
+        assert!(should_track("poetry.lock", &ignore));
+    }
+
+    #[test]
+    fn should_track_blocks_sourcemaps_and_bundles() {
+        let ignore = make_ignore_set(&[]);
+        assert!(!should_track("dist/app.js.map", &ignore));
+        assert!(!should_track("packages/x/build/main.css.map", &ignore));
+        assert!(!should_track("public/app.min.js", &ignore));
+        assert!(!should_track("public/app.min.css", &ignore));
+        assert!(!should_track("public/app.min.mjs", &ignore));
+        assert!(!should_track("dist/main.bundle.js", &ignore));
+        assert!(!should_track("dist/main.bundle.mjs", &ignore));
+        assert!(!should_track("bun.lockb", &ignore));
+        // similarly-named real source must pass
+        assert!(should_track("src/sourceMapHelper.ts", &ignore));
+        assert!(should_track("src/minifier.js", &ignore));
+        assert!(should_track("src/Bundle.ts", &ignore));
+    }
+
+    #[test]
+    fn should_track_blocks_generated_proto_bindings() {
+        let ignore = make_ignore_set(&[]);
+        assert!(!should_track("packages/contracts/profiles_pb.ts", &ignore));
+        assert!(!should_track(
+            "packages/contracts/profiles_pb.d.ts",
+            &ignore
+        ));
+        assert!(!should_track("packages/contracts/profiles_pb.js", &ignore));
+        assert!(!should_track("internal/v1/service.pb.go", &ignore));
+        assert!(!should_track("internal/v1/service.pb.cc", &ignore));
+        assert!(!should_track("internal/v1/service.pb.h", &ignore));
+        assert!(!should_track("packages/contracts/foo.connect.ts", &ignore));
+        assert!(!should_track("packages/contracts/foo.connect.js", &ignore));
+        // hand-written protobuf-related code must pass
+        assert!(should_track("src/proto_helpers.ts", &ignore));
+        assert!(should_track("src/connect_setup.ts", &ignore));
+    }
+
+    #[test]
+    fn should_track_blocks_jest_snapshot_files() {
+        let ignore = make_ignore_set(&[]);
+        assert!(!should_track("src/x.test.ts.snap", &ignore));
+        // hand-written *.snap.ts (uncommon but legal) is unaffected:
+        // we suffix-match on `.snap`, not `snap` segment
+        assert!(should_track("src/snapshot.ts", &ignore));
+    }
+
+    #[test]
+    fn should_track_blocks_new_dir_defaults() {
+        let config = crate::config::Config::from_env();
+        // New non-dot dirs added in U1 must be in the ignore set
+        for dir in [
+            "vendor",
+            "_build",
+            "obj",
+            "__snapshots__",
+            "htmlcov",
+            "venv",
+        ] {
+            let test_path = format!("{}/some_file.ts", dir);
+            assert!(
+                !should_track(&test_path, &config.ignore_dirs),
+                "expected `{}` to be ignored",
+                dir
             );
         }
     }

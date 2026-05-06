@@ -98,7 +98,22 @@ const MAX_EMBED_BATCH_SIZE: usize = 512;
 const DEFAULT_MAX_EMBED_FILE_SIZE: usize = 50 * 1024;
 const MIN_MAX_EMBED_FILE_SIZE: usize = 1024;
 
+/// Base directory names always excluded from walks.
+///
+/// **Note on dot-prefixed dirs.** `should_track` in `core::walker` rejects any
+/// path whose segment starts with `.` (hidden-file convention), so dot-prefixed
+/// dirs (`.yarn`, `.moon`, `.turbo`, `.idea`, `.vscode`, `.venv`,
+/// `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.tox`, `.svelte-kit`,
+/// `.astro`, `.vercel`, `.netlify`, etc.) are already excluded with no entry
+/// needed here. The dot-prefixed entries below are kept for parity with the TS
+/// reference fork only — removing them would not change behavior.
+///
+/// Non-dot entries below cover common build/vendor/output dirs that a strict
+/// `git_ignore`-respecting walker would still descend into when missing from
+/// the user's `.gitignore` (common in fresh checkouts and in monorepos with
+/// mixed-language tooling).
 const BASE_IGNORE_DIRS: &[&str] = &[
+    // Always-ignore (TS reference fork parity)
     "node_modules",
     ".git",
     "dist",
@@ -116,6 +131,16 @@ const BASE_IGNORE_DIRS: &[&str] = &[
     ".cache",
     ".turbo",
     ".parcel-cache",
+    // Vendored dependency directories (rarely user-authored source)
+    "vendor", // Go convention, sometimes Ruby/PHP
+    // Build outputs from non-Node toolchains
+    "_build", // Erlang / Elixir / OCaml / Sphinx
+    "obj",    // .NET intermediate output
+    // Test/coverage artifacts
+    "__snapshots__", // Jest snapshot files (often MB of generated text)
+    "htmlcov",       // Python coverage HTML output
+    // Python virtualenvs without leading dot
+    "venv",
 ];
 
 /// Parse a `usize` env var, emitting a `tracing::warn` and returning `default` on invalid input.
