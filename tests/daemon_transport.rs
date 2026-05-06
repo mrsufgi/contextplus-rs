@@ -853,14 +853,14 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
     use std::os::unix::fs::FileTypeExt;
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.file_type().is_socket() {
-                // File is a Unix socket — it should be connectable shortly
-                // after bind. Give it one small extra poll to let the kernel
-                // finish setting up the listen backlog, then return.
-                std::thread::sleep(Duration::from_millis(20));
-                return true;
-            }
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.file_type().is_socket()
+        {
+            // File is a Unix socket — it should be connectable shortly
+            // after bind. Give it one small extra poll to let the kernel
+            // finish setting up the listen backlog, then return.
+            std::thread::sleep(Duration::from_millis(20));
+            return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
