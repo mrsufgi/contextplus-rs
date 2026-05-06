@@ -42,8 +42,32 @@ use tokio::sync::Notify;
 
 use crate::config::Config;
 use crate::core::process_lifecycle;
+use crate::ref_index::{RefId, RefIndex};
 use crate::server::ContextPlusServer;
+use crate::transport::client::{RegisterSession, SessionReady, read_frame, write_frame};
 use crate::transport::paths;
+
+/// Environment variable for the ref TTL (seconds) after the last session
+/// disconnects. Default 24 h. `0` means immediate eviction.
+pub const REF_TTL_SECS_ENV: &str = "CONTEXTPLUS_REF_TTL_SECS";
+/// Default TTL: 24 hours.
+pub const DEFAULT_REF_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Read the ref TTL from the environment, falling back to the 24 h default.
+pub fn ref_ttl_from_env() -> u64 {
+    match std::env::var(REF_TTL_SECS_ENV) {
+        Ok(s) if !s.trim().is_empty() => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    "{REF_TTL_SECS_ENV}={s:?} is not a valid u64; using default {DEFAULT_REF_TTL_SECS}"
+                );
+                DEFAULT_REF_TTL_SECS
+            }
+        },
+        _ => DEFAULT_REF_TTL_SECS,
+    }
+}
 
 /// Default idle shutdown when running as a daemon — 30 minutes after the last
 /// client disconnects. Override with `CONTEXTPLUS_DAEMON_IDLE_SECS`.
@@ -351,9 +375,89 @@ pub async fn run(
     Ok(())
 }
 
-/// Serve one MCP session over an accepted Unix stream. Logs and swallows
-/// errors — a bad client must not take down the daemon.
-async fn serve_connection(server: ContextPlusServer, stream: UnixStream) {
+/// Serve one MCP session over an accepted Unix stream. Performs the
+/// `register_session` handshake, attaches the appropriate `RefIndex`, then
+/// hands the stream off to rmcp. Logs and swallows errors — a bad client must
+/// not take down the daemon.
+async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
+    let ttl_secs = ref_ttl_from_env();
+
+    // ── Step 1: register_session handshake ──────────────────────────────────
+    let reg: RegisterSession = match read_frame(&mut stream).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("register_session read failed: {e}");
+            return;
+        }
+    };
+    tracing::debug!(
+        client_root = %reg.client_root.display(),
+        head_sha = %reg.head_sha,
+        client_pid = reg.client_pid,
+        "register_session received"
+    );
+
+    // Reject immediately if draining.
+    if server.state.draining.load(Ordering::Acquire) {
+        let _ = write_frame(&mut stream, &SessionReady::RejectedDraining).await;
+        return;
+    }
+
+    // ── Step 2: resolve ref_id from client_root ──────────────────────────────
+    let canonical_root = reg
+        .client_root
+        .canonicalize()
+        .unwrap_or_else(|_| reg.client_root.clone());
+    let ref_id = RefId::for_canonical_path(&canonical_root);
+
+    // Determine parent ref: find merge-base between client HEAD and primary.
+    // For now: if the client root differs from the primary root, the primary
+    // ref is the parent (CoW-fork). U6 will wire in proper merge-base lookup.
+    let parent_ref_id = if ref_id != server.state.default_ref_id {
+        Some(server.state.default_ref_id)
+    } else {
+        None
+    };
+
+    let head_sha = reg.head_sha.clone();
+    let client_root = reg.client_root.clone();
+
+    let ref_arc = server
+        .state
+        .attach_ref(ref_id, || {
+            Arc::new(RefIndex::new_with_head(
+                client_root.clone(),
+                canonical_root.clone(),
+                parent_ref_id,
+                head_sha.clone(),
+            ))
+        })
+        .await;
+
+    tracing::debug!(
+        ref_id = ref_id.0,
+        sessions = ref_arc.session_count.load(Ordering::Acquire),
+        "ref attached"
+    );
+
+    // ── Step 3: send session_ready ───────────────────────────────────────────
+    let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
+    // TODO(U6): detect warming state once CAS/diff embedding is wired up.
+    // For now we always reply Ready.
+    let reply = SessionReady::Ready {
+        session_id,
+        ref_id: ref_id.0,
+    };
+    if let Err(e) = write_frame(&mut stream, &reply).await {
+        tracing::warn!("session_ready write failed: {e}");
+        server.state.detach_ref(ref_id, 0).await;
+        return;
+    }
+
+    // ── Step 4: serve MCP over the remainder of the stream ──────────────────
+    // Clone here so `server.state` is still accessible after `.serve()` moves
+    // the server into the transport.
+    let state = Arc::clone(&server.state);
     let (read_half, write_half) = stream.into_split();
     match server.serve((read_half, write_half)).await {
         Ok(running) => match running.waiting().await {
@@ -368,6 +472,10 @@ async fn serve_connection(server: ContextPlusServer, stream: UnixStream) {
             tracing::warn!("MCP handshake failed on Unix stream: {e}");
         }
     }
+
+    // ── Step 5: detach ref (decrement refcount, schedule eviction if 0) ─────
+    state.detach_ref(ref_id, ttl_secs).await;
+    tracing::debug!(ref_id = ref_id.0, "ref detached");
 }
 
 /// Spawn signal listeners that flip the drain flag. The drain watcher then

@@ -160,6 +160,86 @@ impl SharedState {
     ) -> Option<Arc<crate::ref_index::RefIndex>> {
         self.refs.try_read().ok().and_then(|r| r.get(&id).cloned())
     }
+
+    /// Attach a session to an existing ref, or insert a new `RefIndex` and
+    /// attach. Returns the `RefId` that the caller should use for subsequent
+    /// tool dispatches.
+    ///
+    /// Concurrent calls from two bridges connecting to the same canonical root
+    /// are safe: the write lock ensures only one `RefIndex` is inserted, and
+    /// both callers will share the same `Arc<RefIndex>` after the lock is
+    /// released.
+    pub async fn attach_ref(
+        &self,
+        ref_id: crate::ref_index::RefId,
+        make_ref: impl FnOnce() -> Arc<crate::ref_index::RefIndex>,
+    ) -> Arc<crate::ref_index::RefIndex> {
+        let mut guard = self.refs.write().await;
+        let entry = guard.entry(ref_id).or_insert_with(make_ref);
+        entry
+            .session_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Arc::clone(entry)
+    }
+
+    /// Detach a session from a ref. Decrements the session refcount. When the
+    /// count reaches zero the ref enters the TTL eviction queue (spawned as a
+    /// background task). The primary ref (matching `default_ref_id`) is never
+    /// evicted from the registry regardless of refcount.
+    ///
+    /// `ttl_secs` — how long after last-session-disconnect before the in-memory
+    /// `RefIndex` is removed. `0` means immediate removal. The on-disk overlay
+    /// (U6) is not touched here; only the in-memory registry entry is dropped.
+    pub async fn detach_ref(self: &Arc<Self>, ref_id: crate::ref_index::RefId, ttl_secs: u64) {
+        let count = {
+            let guard = self.refs.read().await;
+            guard
+                .get(&ref_id)
+                .map(|r| {
+                    r.session_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                })
+                .unwrap_or(0)
+        };
+        // count is the *pre-decrement* value; after this call it is count - 1.
+        // Only schedule eviction when transitioning to 0.
+        if count != 1 {
+            return;
+        }
+        // Primary ref is never evicted — the daemon owns it for its lifetime.
+        if ref_id == self.default_ref_id {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if ttl_secs > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(ttl_secs)).await;
+            }
+            // Re-check the refcount after the TTL — a new session may have
+            // re-attached in the interim.
+            let guard = state.refs.read().await;
+            if let Some(r) = guard.get(&ref_id) {
+                if r.session_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "TTL eviction cancelled — new session attached"
+                    );
+                    return;
+                }
+            } else {
+                return; // already removed
+            }
+            drop(guard);
+            let mut guard = state.refs.write().await;
+            // Double-check under write lock.
+            if let Some(r) = guard.get(&ref_id)
+                && r.session_count.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
+                guard.remove(&ref_id);
+                tracing::info!(ref_id = ref_id.0, "ref evicted after TTL expiry");
+            }
+        });
+    }
 }
 
 /// The MCP server exposing context+ tools.

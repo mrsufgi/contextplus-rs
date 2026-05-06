@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::RwLock;
 
@@ -87,9 +88,9 @@ impl RefId {
 
 /// Per-ref identity metadata held by the daemon's registry.
 ///
-/// In U3 this struct only holds identification fields. U4 will add the
-/// session refcount + parent linkage; U6 + U7 will migrate per-ref caches
-/// and memory-graph overlay state into it.
+/// U4 adds a session `refcount` (number of active bridges bound to this ref)
+/// and a `head_sha` populated at registration. U6 + U7 will migrate per-ref
+/// caches and memory-graph overlay state into it.
 ///
 /// **U6 additions**:
 /// - `cas_ref_id_hex`: the stable on-disk ref-id hex (from BLAKE3 of canonical
@@ -113,6 +114,10 @@ pub struct RefIndex {
     /// Derived from `BLAKE3(canonical_root)[:8]`. Stable across daemon
     /// restarts as long as the canonical path is the same.
     pub cas_ref_id_hex: String,
+    /// Number of sessions currently attached to this ref. Incremented by
+    /// `SharedState::attach_ref`, decremented by `detach_ref`. When it
+    /// reaches zero the ref enters the TTL eviction queue.
+    pub session_count: Arc<AtomicUsize>,
 }
 
 impl RefIndex {
@@ -125,6 +130,26 @@ impl RefIndex {
             parent_ref_id,
             head_sha: None,
             cas_ref_id_hex: id.to_hex(),
+            session_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Build a new `RefIndex` with an explicit head SHA. Used by U4's
+    /// `register_session` handshake when the bridge announces its `head_sha`.
+    pub fn new_with_head(
+        root_dir: PathBuf,
+        canonical_root: PathBuf,
+        parent_ref_id: Option<RefId>,
+        head_sha: String,
+    ) -> Self {
+        let id = RefId::for_canonical_path(&canonical_root);
+        Self {
+            root_dir,
+            canonical_root,
+            parent_ref_id,
+            head_sha: Some(head_sha),
+            cas_ref_id_hex: id.to_hex(),
+            session_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
