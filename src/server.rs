@@ -159,8 +159,8 @@ pub struct SharedState {
     /// Capacity is set from `config.ollama_max_concurrent` at server construction
     /// and never changes for the lifetime of the daemon.
     ///
-    /// U17 wires the actual Ollama embed paths through this semaphore.
-    /// U18 triggers warmup on ref attach using it.
+    /// U17 wires the actual Ollama embed paths through this semaphore via
+    /// `OllamaClient::with_semaphore`. U18 triggers warmup on ref attach.
     pub ollama_semaphore: Arc<Semaphore>,
 }
 
@@ -359,7 +359,13 @@ pub fn cache_name(base: &str, model: &str) -> String {
 
 impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
-        let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()));
+        // Global Ollama embed semaphore (U16+U17). Capacity is sourced from
+        // `config.ollama_max_concurrent`, which Config::from_env clamps into
+        // [1, 64]. We wire the same semaphore into the OllamaClient so that
+        // every outbound embed (warmup, tracker, on-demand) shares one budget.
+        let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
+        let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
+            .with_semaphore(Arc::clone(&ollama_semaphore));
         let memory_graph = Arc::new(GraphStore::new());
 
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
@@ -408,10 +414,6 @@ impl ContextPlusServer {
         let project_cache = Arc::clone(&default_ref.project_cache);
 
         let refs = crate::ref_index::new_registry_with_default(default_ref_id, default_ref);
-
-        // Build the global Ollama semaphore before constructing SharedState so
-        // the capacity is captured from the config without borrowing issues.
-        let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent));
 
         let state = Arc::new(SharedState {
             config,

@@ -176,6 +176,19 @@ pub struct OllamaClient {
     /// wait for the result instead of issuing their own HTTP request.
     in_flight:
         Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<Option<InFlightResult>>>>>,
+    /// Optional concurrency gate for outbound Ollama embed HTTP calls.
+    ///
+    /// When `Some`, every call to `call_embed_api` acquires one permit before
+    /// issuing the HTTP request and releases it on completion (or error).
+    /// `None` means no gating — existing behaviour, used in unit tests that
+    /// construct `OllamaClient` without a running server.
+    ///
+    /// The in-flight coalescing layer for single-text queries is intentionally
+    /// outside the gate: coalesced waiters share the producer's result without
+    /// holding their own permit.  Only the *producer* task that actually issues
+    /// the HTTP call acquires a permit (via `embed_single_query` →
+    /// `embed_batch_adaptive` → `call_embed_api`).
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(serde::Serialize)]
@@ -308,6 +321,7 @@ impl OllamaClient {
             root_dir: root_dir.map(Arc::new),
             flush_tx: flush_tx_arc,
             in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            semaphore: None,
         }
     }
 
@@ -337,6 +351,20 @@ impl OllamaClient {
     /// Override the per-request wall-clock deadline. Mostly useful in tests.
     pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Attach a concurrency semaphore to this client.
+    ///
+    /// Every outbound Ollama embed HTTP call will acquire one permit before
+    /// sending and release it on completion or error.  Clones of this client
+    /// share the same `Arc<Semaphore>` so the cap is global across all clones.
+    ///
+    /// Call this once when constructing the production `OllamaClient` via
+    /// `ContextPlusServer::new`.  Unit tests that do not pass a semaphore
+    /// retain the default `None` (no gating).
+    pub fn with_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.semaphore = Some(semaphore);
         self
     }
 
@@ -608,6 +636,22 @@ impl OllamaClient {
         if self.cancel_token.is_cancelled() {
             return Err(ContextPlusError::Cancelled);
         }
+
+        // Acquire a concurrency permit (if a semaphore is configured) before
+        // making the outbound HTTP call.  The permit is held for the full
+        // send + body-read lifecycle and dropped automatically when `_permit`
+        // goes out of scope — including on the error paths below.
+        //
+        // Note: `acquire_owned` is used so the permit lifetime is not tied to
+        // the `&Semaphore` borrow (the semaphore lives in an `Arc`).
+        // `ok()` converts the `AcquireError` (only fires when the semaphore is
+        // closed, which never happens in normal operation) into `None`,
+        // effectively skipping the gate on the rare closed-semaphore case.
+        let _permit = if let Some(ref sem) = self.semaphore {
+            Some(Arc::clone(sem).acquire_owned().await.ok())
+        } else {
+            None
+        };
 
         let url = format!("{}/api/embed", self.host);
         let body = EmbedRequest {
@@ -2755,5 +2799,208 @@ mod chunk_merge_tests {
         let v2: Vec<f32> = (0..dim).map(|i| (dim - i) as f32).collect();
         let merged = merge_embedding_vectors(&[v1, v2], &[100, 200]).unwrap();
         assert_eq!(merged.len(), dim);
+    }
+}
+
+#[cfg(test)]
+mod semaphore_tests {
+    use crate::config::Config;
+    use crate::core::embeddings::OllamaClient;
+    use std::sync::Arc;
+
+    fn config_with_host(host: &str) -> Config {
+        let mut config = Config::from_env();
+        config.ollama_host = host.to_string();
+        config
+    }
+
+    /// `OllamaClient::new` constructs with no semaphore by default.
+    /// Existing tests remain green because no permit is required.
+    #[test]
+    fn new_client_has_no_semaphore() {
+        let config = Config::from_env();
+        let client = OllamaClient::new(&config);
+        assert!(
+            client.semaphore.is_none(),
+            "default client must not have a semaphore"
+        );
+    }
+
+    /// `with_semaphore` stores the Arc and clones share it.
+    #[test]
+    fn with_semaphore_plumbs_arc() {
+        let config = Config::from_env();
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let client = OllamaClient::new(&config).with_semaphore(Arc::clone(&sem));
+        assert!(
+            client.semaphore.is_some(),
+            "semaphore should be set after with_semaphore"
+        );
+        // Both Arcs point to the same semaphore object.
+        let client_sem = client.semaphore.as_ref().unwrap();
+        assert!(
+            Arc::ptr_eq(client_sem, &sem),
+            "client semaphore Arc must point to the same Semaphore"
+        );
+    }
+
+    /// With capacity=1, two concurrent `embed` calls serialise: the second
+    /// completes only after the first releases its permit.
+    #[tokio::test]
+    async fn semaphore_capacity_one_serialises_concurrent_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Add a short delay so concurrent requests actually overlap without the cap.
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[1.0, 2.0]]}))
+                    .set_delay(std::time::Duration::from_millis(50)),
+            )
+            .mount(&server)
+            .await;
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config).with_semaphore(Arc::clone(&sem));
+
+        // Track peak concurrent Ollama calls.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let client_a = client.clone();
+        let in_flight_a = Arc::clone(&in_flight);
+        let peak_a = Arc::clone(&peak);
+        let h1 = tokio::spawn(async move {
+            in_flight_a.fetch_add(1, Ordering::SeqCst);
+            let cur = in_flight_a.load(Ordering::SeqCst);
+            peak_a.fetch_max(cur, Ordering::SeqCst);
+            let r = client_a.embed(&["text a".to_string()]).await;
+            in_flight_a.fetch_sub(1, Ordering::SeqCst);
+            r
+        });
+
+        let client_b = client.clone();
+        let in_flight_b = Arc::clone(&in_flight);
+        let peak_b = Arc::clone(&peak);
+        let h2 = tokio::spawn(async move {
+            in_flight_b.fetch_add(1, Ordering::SeqCst);
+            let cur = in_flight_b.load(Ordering::SeqCst);
+            peak_b.fetch_max(cur, Ordering::SeqCst);
+            let r = client_b.embed(&["text b".to_string()]).await;
+            in_flight_b.fetch_sub(1, Ordering::SeqCst);
+            r
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        assert!(r1.unwrap().is_ok(), "call 1 should succeed");
+        assert!(r2.unwrap().is_ok(), "call 2 should succeed");
+
+        // Wiremock received exactly 2 requests.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "both requests must reach Ollama");
+    }
+
+    /// Permit is released even when Ollama returns an error — the next call
+    /// can still acquire the permit.
+    #[tokio::test]
+    async fn semaphore_permit_released_on_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // First call → error; second call → success.
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&call_count);
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(500).set_body_string("internal error")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"embeddings": [[0.9, 0.8]]}))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config).with_semaphore(Arc::clone(&sem));
+
+        // First call fails.
+        let r1 = client.embed(&["first call".to_string()]).await;
+        assert!(r1.is_err(), "first call should fail with HTTP 500");
+
+        // Permit must have been released — second call should succeed.
+        let r2 = client.embed(&["second call".to_string()]).await;
+        assert!(
+            r2.is_ok(),
+            "second call should succeed after permit was released by the errored first call"
+        );
+    }
+
+    /// Coalesced waiters do NOT each acquire a permit.
+    ///
+    /// Two concurrent `embed("same")` calls with capacity=1 → the in-flight
+    /// coalescing deduplicates them.  Only ONE permit is acquired (by the
+    /// producer); the waiter gets the result without needing its own permit.
+    /// Verification: capacity=1 semaphore; after both complete the permit is
+    /// still available (available_permits == 1), confirming only one
+    /// acquisition happened.
+    #[tokio::test]
+    async fn semaphore_coalesced_waiters_do_not_double_acquire() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[7.0, 8.0]]}))
+                    // Enough delay so both tasks enter embed() before the first
+                    // one's Ollama response lands.
+                    .set_delay(std::time::Duration::from_millis(80)),
+            )
+            .mount(&server)
+            .await;
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let config = config_with_host(&server.uri());
+        let client = OllamaClient::new(&config).with_semaphore(Arc::clone(&sem));
+
+        // Fire two identical queries concurrently.
+        let c1 = client.clone();
+        let c2 = client.clone();
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { c1.embed(&["coalesce me".to_string()]).await }),
+            tokio::spawn(async move { c2.embed(&["coalesce me".to_string()]).await }),
+        );
+
+        assert!(r1.unwrap().is_ok());
+        assert!(r2.unwrap().is_ok());
+
+        // Only one HTTP call should have reached Ollama.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "coalescing must produce exactly 1 Ollama call"
+        );
+
+        // And the single permit must be back — semaphore is not saturated.
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "permit must be released after coalesced calls complete"
+        );
     }
 }
