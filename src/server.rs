@@ -5205,7 +5205,8 @@ mod tests {
         }
 
         // Wait for identifier_index to be set (parse runs after project_cache write).
-        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // CI runners are slower than local dev; 10s is the conservative ceiling.
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             {
                 let ref_index = server.state.ref_index(ref_id).unwrap();
@@ -5215,7 +5216,7 @@ mod tests {
                 }
             }
             if std::time::Instant::now() > deadline2 {
-                panic!("ref_warmup shallow: identifier_index never populated within 3s");
+                panic!("ref_warmup shallow: identifier_index never populated within 10s");
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }

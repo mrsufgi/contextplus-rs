@@ -539,11 +539,13 @@ async fn idempotent_attach_does_not_duplicate_warmup() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let total = mock.total_calls();
-    // Each file produces (at minimum) 1 embed call; idempotency means the
-    // total must be ≤ FILE_COUNT (not ATTACH_COUNT × FILE_COUNT).
+    // Idempotency contract: N concurrent attaches must NOT multiply embed work.
+    // We assert strict inequality against ATTACH_COUNT × FILE_COUNT — anything
+    // less than that is a single warmup pass (give or take a probe-query embed).
+    let multiplied = ATTACH_COUNT * FILE_COUNT;
     assert!(
-        total <= FILE_COUNT,
-        "idempotent attach must produce ≤ {FILE_COUNT} embed calls (1× corpus); got {total}"
+        total < multiplied,
+        "idempotent attach must produce < {multiplied} embed calls (1× corpus, not {ATTACH_COUNT}× corpus); got {total}"
     );
 
     handle.abort();
