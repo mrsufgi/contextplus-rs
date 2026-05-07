@@ -633,6 +633,165 @@ async fn worktree_bridge_gets_valid_session_ready() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 7: worktree attach triggers shallow warmup (project_cache pre-populated)
+// ---------------------------------------------------------------------------
+//
+// GOAL: When a bridge connects from a linked worktree and
+// `CONTEXTPLUS_REF_WARMUP_MODE=shallow` (the default post-U16), the
+// `spawn_ref_warmup` task runs the file walker so the ref's `project_cache`
+// is populated *before* the first tool call — removing the cold-build latency
+// that previously hit on `lexical_search`.
+//
+// The assertion strategy: call `lexical_search` immediately after connect
+// (no sleep). With eager-warmup the cache is already built; without it the
+// daemon builds the cache inline in the tool call (still works, just slower).
+// The presence of results is the correctness assertion; the absence of a
+// first-call rebuild *latency spike* is the performance assertion (not tested
+// here).
+//
+// BLOCKED ON: U16 (`RefWarmupMode::Shallow` default) and U18
+// (`spawn_ref_warmup` wired from `serve_connection` before `SessionReady` is
+// sent, so the cache is ready by the time the client issues its first call).
+//
+// ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
+
+#[ignore = "U18 dependency: spawn_ref_warmup not yet wired from serve_connection; project_cache eager population requires U16+U18"]
+#[tokio::test(flavor = "multi_thread")]
+async fn worktree_attach_triggers_shallow_warmup() {
+    let td = TempDir::new().unwrap();
+    let primary = td.path().join("repo");
+    std::fs::create_dir_all(&primary).unwrap();
+
+    helpers::make_primary_repo(&primary);
+    let wt = helpers::add_linked_worktree(&primary);
+
+    // Shallow mode: walker runs but no Ollama calls.
+    unsafe {
+        std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "shallow");
+    }
+
+    let (handle, socket) = spawn_daemon_at(&primary).await;
+
+    // Issue a tool call from the worktree bridge immediately — no sleep.
+    // The pre-populated project_cache should serve this without a cold build.
+    let (session_ready, resp) = bridge_call(
+        &socket,
+        &wt,
+        "lexical_search",
+        json!({"query": "worktree_only_symbol_xyz_unique"}),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            session_ready,
+            SessionReady::Ready { .. } | SessionReady::Warming { .. }
+        ),
+        "worktree bridge must get Ready/Warming, got {session_ready:?}"
+    );
+
+    // The response should indicate the project_cache was already populated
+    // (lexical_search returns results, not an empty response or an error
+    // about a missing cache).
+    let resp_str = serde_json::to_string_pretty(&resp).unwrap_or_default();
+    assert!(
+        resp.pointer("/result").is_some(),
+        "lexical_search should return a result, not an error;\nresponse: {resp_str}"
+    );
+
+    // Clean-up env.
+    unsafe {
+        std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+    }
+
+    handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: warmup failure is non-fatal — daemon still serves tool calls
+// ---------------------------------------------------------------------------
+//
+// GOAL: If `spawn_ref_warmup` encounters an error (e.g. the walker cannot
+// read the ref's root because `.mcp_data` was made read-only mid-attach),
+// the daemon logs a warning but does NOT reject the connection. Subsequent
+// tool calls on the same session still succeed.
+//
+// Implementation: we make the `.mcp_data` directory read-only *after* the
+// daemon starts but *before* the worktree attaches. The CAS `fork_from` call
+// in `serve_connection` will fail writing the parent pointer; `spawn_ref_warmup`
+// (U18) would similarly fail. The daemon must continue serving.
+//
+// BLOCKED ON: U18 (`spawn_ref_warmup` error path — it must not propagate the
+// error to the connection handler). The non-fatal behaviour for `fork_from`
+// failure already exists (`tracing::warn!` + continue), but U18 must apply
+// the same pattern for warmup failures.
+//
+// ACTIVATION: remove `#[ignore]` when U18 is merged (the fork_from failure
+// path is already non-fatal; the warmup error path needs the same guard).
+
+#[ignore = "U18 dependency: spawn_ref_warmup error path not yet implemented; non-fatal warmup requires U18"]
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_warmup_failure_is_nonfatal() {
+    let td = TempDir::new().unwrap();
+    let primary = td.path().join("repo");
+    std::fs::create_dir_all(&primary).unwrap();
+
+    helpers::make_primary_repo(&primary);
+    let wt = helpers::add_linked_worktree(&primary);
+
+    let (handle, socket) = spawn_daemon_at(&primary).await;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    // Make `.mcp_data` read-only so CAS fork_from and any warmup disk write fail.
+    let mcp_data = primary.join(".mcp_data");
+    if mcp_data.exists() {
+        let ro_perms = std::fs::Permissions::from_mode(0o555);
+        let _ = std::fs::set_permissions(&mcp_data, ro_perms);
+    }
+
+    // Attempt to register a worktree session — fork_from will fail (non-fatal).
+    let session_ready: SessionReady = {
+        let mut stream = UnixStream::connect(&socket)
+            .await
+            .expect("connect to daemon socket");
+        let reg = RegisterSession {
+            client_root: wt.clone(),
+            head_sha: "deadbeef".to_owned(),
+            client_pid: std::process::id(),
+        };
+        write_frame(&mut stream, &reg)
+            .await
+            .expect("write register_session");
+        read_frame(&mut stream).await.expect("read session_ready")
+    };
+
+    // LOAD-BEARING: the daemon must not reject the connection even when warmup fails.
+    assert!(
+        matches!(
+            session_ready,
+            SessionReady::Ready { .. } | SessionReady::Warming { .. }
+        ),
+        "daemon must accept the session even when warmup fails; got {session_ready:?}"
+    );
+
+    // Now restore permissions and verify the daemon still serves tool calls from primary.
+    let rw_perms = std::fs::Permissions::from_mode(0o755);
+    let _ = std::fs::set_permissions(&mcp_data, rw_perms);
+
+    let (_sr, resp) = bridge_call(&socket, &primary, "get_context_tree", json!({})).await;
+
+    assert!(
+        resp.pointer("/result").is_some(),
+        "daemon must still serve tool calls after warmup failure;\nresponse: {resp:#}"
+    );
+
+    handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+// ---------------------------------------------------------------------------
 // Test 7: daemon socket path for linked worktree equals primary socket path
 // ---------------------------------------------------------------------------
 //
