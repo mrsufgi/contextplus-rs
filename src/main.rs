@@ -77,13 +77,31 @@ enum HooksAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("contextplus_rs=info".parse()?),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // When CONTEXTPLUS_DAEMON_LOG=<path> is set, append tracing output there
+    // instead of stderr. The bridge that spawns the daemon redirects stderr to
+    // /dev/null, which has historically made "Transport closed" panics
+    // unobservable. Pointing this at a file recovers full backtraces.
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("contextplus_rs=info".parse()?);
+    match std::env::var("CONTEXTPLUS_DAEMON_LOG").ok() {
+        Some(path) if !path.trim().is_empty() => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
 
     let cli = Cli::parse();
     let root_dir = cli
