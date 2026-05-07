@@ -103,6 +103,40 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Install a panic hook that routes panic payloads through `tracing::error!`
+    // so they land in CONTEXTPLUS_DAEMON_LOG. The default hook writes to
+    // stderr, which is /dev/null for daemon processes spawned by the bridge.
+    // Without this hook, every "Transport closed" panic vanishes silently.
+    //
+    // Forces RUST_BACKTRACE=1 for the panic-payload formatting so the captured
+    // line includes a backtrace pointer; users can still override with the
+    // env var explicitly.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: setting an env var before any threads spawn is safe; we are
+        // pre-`#[tokio::main]` task creation here.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic payload>");
+        tracing::error!(
+            location = %location,
+            backtrace = %backtrace,
+            "PANIC: {payload}"
+        );
+        prev_hook(info);
+    }));
+
     let cli = Cli::parse();
     let root_dir = cli
         .root_dir
