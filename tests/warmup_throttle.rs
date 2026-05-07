@@ -780,12 +780,12 @@ async fn full_attach_inherits_baseline_then_embeds_diff_only() {
     let td = TempDir::new().unwrap();
 
     // Primary: 3 source files.
-    let primary = make_repo_with_files(td.path(), "primary-full", 3);
+    let primary = make_repo_with_files(td.path(), "p", 3);
 
     // Worktree: same 3 files + 1 new + 1 modified.
     // Files must mirror the primary's directory structure (primary puts files in
     // src/) so the relative paths match and CAS lookup_chunk finds hits.
-    let wt = td.path().join("wt-full");
+    let wt = td.path().join("w");
     let wt_src = wt.join("src");
     std::fs::create_dir_all(&wt_src).expect("create wt/src dir");
     // Mirror the primary's 3 files verbatim under src/ (identical content → CAS hits).
@@ -890,7 +890,7 @@ async fn full_attach_inherits_baseline_then_embeds_diff_only() {
 async fn shallow_attach_to_unrelated_root_falls_through_to_lazy() {
     let td = TempDir::new().unwrap();
     // Fresh repo with no prior embed history.
-    let repo = make_repo_with_files(td.path(), "orphan-repo", 4);
+    let repo = make_repo_with_files(td.path(), "o", 4);
 
     // Build Config directly to avoid env-var cross-contamination in parallel tests.
     let mock = MockOllamaServer::start(0).await;
