@@ -157,6 +157,7 @@ impl MockOllamaServer {
     }
 
     /// Peak number of simultaneous in-flight batch calls observed.
+    #[allow(dead_code)]
     pub fn peak_concurrent(&self) -> usize {
         self.peak_concurrent.load(Ordering::Acquire)
     }

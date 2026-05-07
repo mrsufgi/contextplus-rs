@@ -42,6 +42,9 @@
 
 #![cfg(unix)]
 
+// Bring in the shared mock harness (used by U21 test).
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -179,6 +182,42 @@ async fn spawn_daemon_at(primary: &Path) -> (tokio::task::JoinHandle<()>, PathBu
     ));
 
     // Wait for the socket to appear.
+    for _ in 0..50 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(socket_path.exists(), "daemon never bound its socket");
+
+    (handle, socket_path)
+}
+
+/// Like `spawn_daemon_at` but uses a caller-supplied `Config`.
+/// Used by U21 tests that need to inject a mock Ollama URI.
+async fn spawn_daemon_with_config_at(
+    primary: &Path,
+    config: Config,
+) -> (tokio::task::JoinHandle<()>, PathBuf) {
+    let lock = match daemon::acquire_lock(primary).expect("acquire_lock") {
+        AcquireOutcome::Acquired(l) => l,
+        AcquireOutcome::AlreadyRunning => panic!("fresh dir should not be contended"),
+    };
+    let listener = daemon::bind_listener(primary).expect("bind_listener");
+    daemon::write_pid_file(primary);
+
+    let socket_path = paths::daemon_socket_path(primary);
+    let pid_path = paths::daemon_pid_path(primary);
+    let server = ContextPlusServer::new(primary.to_path_buf(), config);
+
+    let handle = tokio::spawn(run_daemon_task(
+        server,
+        listener,
+        socket_path.clone(),
+        pid_path,
+        lock,
+    ));
+
     for _ in 0..50 {
         if socket_path.exists() {
             break;
@@ -837,4 +876,150 @@ async fn daemon_socket_path_for_worktree_equals_primary() {
         wt_socket.file_name(),
         "socket filename must be the same"
     );
+}
+
+// ---------------------------------------------------------------------------
+// U21 Test: worktree is searchable immediately after shallow attach
+// ---------------------------------------------------------------------------
+//
+// GOAL: Prove the end-to-end HNSW inheritance path from primary to worktree
+// through the daemon transport (not via direct in-process calls).
+//
+// SCENARIO
+//   1. Primary repo is registered under `mode=full` so all files get embedded
+//      via mock Ollama and CAS blobs are persisted.
+//   2. A linked git worktree is created from primary.
+//   3. A second daemon (shallow mode) is started; primary is re-attached so
+//      in-memory state is rebuilt against the existing CAS.
+//   4. The worktree is attached via `register_session` — shallow warmup fires
+//      and calls `import_baseline_for_ref`, inheriting the primary's HNSW index.
+//   5. Immediately after `SessionReady`, a `lexical_search` for a symbol that
+//      only exists in the primary (on the shared branch) returns hits.
+//
+// This proves the HNSW index is built from inherited vectors before the first
+// query — the worktree is searchable immediately after shallow attach.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worktree_searchable_immediately_after_shallow_attach() {
+    use common::mock_ollama::MockOllamaServer;
+
+    let td = TempDir::new().unwrap();
+    let primary = td.path().join("repo");
+    std::fs::create_dir_all(&primary).unwrap();
+
+    // Primary repo: has `primary_only_symbol` in lib.rs.
+    helpers::make_primary_repo(&primary);
+    // Add linked git worktree (shares primary's git history including lib.rs).
+    let wt = helpers::add_linked_worktree(&primary);
+
+    // Phase 1: prime the primary CAS in full mode using a mock Ollama.
+    // Build Config directly (not via env vars) to avoid process-wide contamination
+    // when tests run concurrently.
+    let mock = MockOllamaServer::start(0).await;
+    let mut config_full = Config::from_env();
+    config_full.ollama_host = mock.uri().to_string();
+    config_full.embed_tracker_mode = contextplus_rs::config::TrackerMode::Off;
+    config_full.warmup_on_start = false;
+    config_full.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Full;
+    config_full.ollama_max_concurrent = 4;
+    let (handle_full, socket_full) = spawn_daemon_with_config_at(&primary, config_full).await;
+
+    // Register primary — triggers full warmup, CAS gets lib.rs blob.
+    let mut stream = UnixStream::connect(&socket_full).await.unwrap();
+    let reg = RegisterSession {
+        client_root: primary.clone(),
+        head_sha: "deadbeef".to_owned(),
+        client_pid: std::process::id(),
+    };
+    write_frame(&mut stream, &reg).await.unwrap();
+    let _: SessionReady = read_frame(&mut stream).await.unwrap();
+    drop(stream);
+
+    // Wait for full warmup to finish.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        mock.total_calls() > 0,
+        "primary full warmup must produce at least 1 embed call"
+    );
+
+    // Phase 2: restart in shallow mode. CAS blobs persist on disk.
+    handle_full.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle_full).await;
+
+    mock.reset_counters();
+    let mut config_shallow = Config::from_env();
+    config_shallow.ollama_host = mock.uri().to_string();
+    config_shallow.embed_tracker_mode = contextplus_rs::config::TrackerMode::Off;
+    config_shallow.warmup_on_start = false;
+    config_shallow.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Shallow;
+    config_shallow.ollama_max_concurrent = 4;
+    let (handle_shallow, socket_shallow) =
+        spawn_daemon_with_config_at(&primary, config_shallow).await;
+
+    // Re-attach primary to rebuild in-memory state with shallow warmup.
+    let mut stream_p = UnixStream::connect(&socket_shallow).await.unwrap();
+    let reg_p = RegisterSession {
+        client_root: primary.clone(),
+        head_sha: "deadbeef".to_owned(),
+        client_pid: std::process::id(),
+    };
+    write_frame(&mut stream_p, &reg_p).await.unwrap();
+    let _: SessionReady = read_frame(&mut stream_p).await.unwrap();
+    drop(stream_p);
+    // Allow primary shallow warmup (walk + CAS import for primary; it has no parent).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 3: attach worktree via register_session.
+    // Shallow warmup fires → import_baseline_for_ref reads primary's CAS → HNSW built.
+    let _wt_ready = {
+        let mut stream_wt = UnixStream::connect(&socket_shallow).await.unwrap();
+        let reg_wt = RegisterSession {
+            client_root: wt.clone(),
+            head_sha: "deadbeef".to_owned(),
+            client_pid: std::process::id(),
+        };
+        write_frame(&mut stream_wt, &reg_wt).await.unwrap();
+        let ready: SessionReady = read_frame(&mut stream_wt).await.unwrap();
+        drop(stream_wt);
+        ready
+    };
+
+    // Allow shallow warmup task to complete — walk + CAS baseline import.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Phase 4: immediately issue a lexical_search from the worktree bridge.
+    // The worktree's inherited project_cache (from CAS baseline import) should
+    // allow lexical search to return results without a cold-build delay.
+    let (_sr, resp) = bridge_call(
+        &socket_shallow,
+        &wt,
+        "lexical_search",
+        json!({"query": "primary_only_symbol"}),
+    )
+    .await;
+
+    // LOAD-BEARING: the inherited corpus must allow immediate search results.
+    let text = extract_text(&resp);
+    assert!(
+        resp.pointer("/result").is_some(),
+        "lexical_search on worktree must succeed immediately after shallow attach \
+         (inherited corpus); response: {text}"
+    );
+    // The result must mention the symbol or its source file — confirming the
+    // HNSW index (and project_cache) was built from the primary's data.
+    assert!(
+        text.contains("primary_only_symbol") || text.contains("lib.rs"),
+        "worktree must find primary_only_symbol in its inherited corpus; response: {text}"
+    );
+
+    // Zero Ollama calls for the worktree warmup (shallow + CAS hits only).
+    // The lexical_search itself needs no embed call.
+    let wt_calls = mock.total_calls();
+    assert_eq!(
+        wt_calls, 0,
+        "worktree shallow warmup must not call Ollama (all inherited from CAS); got {wt_calls}"
+    );
+
+    handle_shallow.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle_shallow).await;
 }
