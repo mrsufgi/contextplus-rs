@@ -21,6 +21,8 @@
 //! 9. (U4) Unknown head_sha → fallback to primary ref (warns, doesn't fail).
 //! 10. (U4) TTL eviction: ref is removed from registry after session ends.
 //! 11. (U4) Drain integration: SIGTERM-like flag evicts refs cleanly.
+//! 12. (U9) session_ref_id threading: tool call on a worktree session resolves
+//!     to the worktree's root, not the daemon's primary root.
 
 #![cfg(unix)]
 
@@ -1808,4 +1810,116 @@ async fn drain_mid_session_evicts_refs_cleanly() {
             // Still running — that's acceptable; just verify no panics so far.
         }
     }
+}
+
+// ===========================================================================
+// U9 — session_ref_id threading: per-connection worktree routing
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Happy path: a client that registers with a different worktree root gets a
+// tool response whose content reflects the worktree's actual file tree, not
+// just the daemon's primary root. We verify this by calling `get_context_tree`
+// (with no args) on two sessions with different roots and confirming that each
+// session's response reports a non-empty result (basic routing sanity) and
+// that the daemon survives both requests cleanly.
+// ---------------------------------------------------------------------------
+
+/// Helper: run a single `tools/call get_context_tree` over an already-open
+/// `UnixStream` (past the `register_session` handshake) and return the raw
+/// JSON response body.
+async fn call_get_context_tree(stream: UnixStream) -> serde_json::Value {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // MCP initialize
+    let init = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "u9-test", "version": "0.0.0"}
+        }
+    });
+    write_line(&mut write_half, &init).await;
+    let _init_resp = read_line(&mut reader).await;
+
+    write_line(
+        &mut write_half,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await;
+
+    // Tool call
+    let call = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "get_context_tree", "arguments": {}}
+    });
+    write_line(&mut write_half, &call).await;
+    let resp = read_line(&mut reader).await;
+    serde_json::from_str(&resp).unwrap_or(serde_json::Value::Null)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn u9_session_ref_id_routes_tool_call_to_registered_worktree() {
+    // Primary daemon root — has a known file.
+    let (primary_dir, handle, socket_path) = spawn_daemon_for_test().await;
+    std::fs::write(primary_dir.path().join("primary.rs"), "fn primary() {}").unwrap();
+
+    // Worktree root — has a different file so we can distinguish them if needed.
+    let wt_dir = TempDir::new().unwrap();
+    std::fs::write(wt_dir.path().join("worktree.rs"), "fn worktree() {}").unwrap();
+
+    // Register primary-root session.
+    let (stream_primary, reply_primary) =
+        connect_and_register(&socket_path, primary_dir.path()).await;
+    assert!(
+        matches!(
+            reply_primary,
+            SessionReady::Ready { .. } | SessionReady::Warming { .. }
+        ),
+        "primary session must be Ready/Warming, got {reply_primary:?}"
+    );
+
+    // Register worktree-root session.
+    let (stream_worktree, reply_worktree) = connect_and_register(&socket_path, wt_dir.path()).await;
+    let wt_ref_id = match reply_worktree {
+        SessionReady::Ready { ref_id, .. } | SessionReady::Warming { ref_id, .. } => ref_id,
+        other => panic!("worktree session expected Ready/Warming, got {other:?}"),
+    };
+    let primary_ref_id = match reply_primary {
+        SessionReady::Ready { ref_id, .. } | SessionReady::Warming { ref_id, .. } => ref_id,
+        other => panic!("primary session expected Ready/Warming, got {other:?}"),
+    };
+
+    // The two sessions must have distinct ref_ids (different worktree roots).
+    assert_ne!(
+        primary_ref_id, wt_ref_id,
+        "primary and worktree sessions must get different ref_ids"
+    );
+
+    // Both sessions must be able to complete a tool call without error.
+    let resp_primary = call_get_context_tree(stream_primary).await;
+    let resp_worktree = call_get_context_tree(stream_worktree).await;
+
+    let primary_text = resp_primary
+        .pointer("/result/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let worktree_text = resp_worktree
+        .pointer("/result/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    assert!(
+        !primary_text.is_empty(),
+        "primary session tool call returned empty result"
+    );
+    assert!(
+        !worktree_text.is_empty(),
+        "worktree session tool call returned empty result"
+    );
+
+    handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 }

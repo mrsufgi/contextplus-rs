@@ -458,11 +458,13 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     }
 
     // ── Step 4: serve MCP over the remainder of the stream ──────────────────
-    // Clone here so `server.state` is still accessible after `.serve()` moves
-    // the server into the transport.
-    let state = Arc::clone(&server.state);
+    // Build a session-scoped server: clone shares the Arc<SharedState> but
+    // sets session_ref_id so every subsequent tool call resolves to this
+    // connection's registered worktree (U9).
+    let session_server = server.with_session(ref_id);
+    let state = Arc::clone(&session_server.state);
     let (read_half, write_half) = stream.into_split();
-    match server.serve((read_half, write_half)).await {
+    match session_server.serve((read_half, write_half)).await {
         Ok(running) => match running.waiting().await {
             Ok(reason) => {
                 tracing::debug!(?reason, "client session ended");

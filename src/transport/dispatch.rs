@@ -351,13 +351,47 @@ pub async fn dispatch_with_translation(
 
 /// Return the caller's worktree root for the current (single-ref) configuration.
 ///
-/// This is the U4 seam: today it reads from `SharedState.default_ref()`;
-/// U4 will replace this with per-session `RefIndex` lookup using
-/// `session.ref_id` obtained during `register_session`.
+/// Preserved for internal use and tests that exercise the default-ref path
+/// directly. New call sites should prefer [`caller_root_for_session`].
 ///
 /// Returns `None` only if the registry was tampered with externally.
 pub fn caller_root_from_default_ref(state: &crate::server::SharedState) -> Option<PathBuf> {
     state.default_ref().map(|r| r.root_dir.clone())
+}
+
+/// Resolve the caller's worktree root for a given session.
+///
+/// This is the U9 dispatch point:
+///
+/// * `session_ref_id = Some(id)` — look up `id` in the registry and return
+///   that ref's `root_dir`. If `id` is not found (registry tampered between
+///   handshake and tool call) a warning is emitted and the function falls back
+///   to the default ref.
+/// * `session_ref_id = None` — stdio mode or no handshake; returns the
+///   default ref's `root_dir`, preserving pre-U9 behaviour exactly.
+///
+/// Returns `None` only when both the session ref and the default ref are
+/// absent from the registry — an internal invariant violation.
+pub fn caller_root_for_session(
+    state: &crate::server::SharedState,
+    session_ref_id: Option<crate::ref_index::RefId>,
+) -> Option<PathBuf> {
+    match session_ref_id {
+        Some(id) => {
+            if let Some(r) = state.ref_index(id) {
+                return Some(r.root_dir.clone());
+            }
+            // Registry no longer contains the ref this session was assigned to.
+            // This should never happen in normal operation; emit a warning and
+            // fall back so the request is not silently dropped.
+            tracing::warn!(
+                ref_id = id.0,
+                "session ref_id not found in registry; falling back to default_ref"
+            );
+            caller_root_from_default_ref(state)
+        }
+        None => caller_root_from_default_ref(state),
+    }
 }
 
 #[cfg(test)]
@@ -875,5 +909,100 @@ mod tests {
             text.contains("Unknown tool") || text.contains("Error"),
             "got: {text}"
         );
+    }
+
+    // ── caller_root_for_session (U9) ──────────────────────────────────────────
+
+    /// `None` session_ref_id falls back to default_ref — preserves pre-U9
+    /// behaviour for stdio mode and non-handshaked clients.
+    #[test]
+    fn caller_root_for_session_none_returns_default_ref_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+        let resolved = caller_root_for_session(&server.state, None);
+        assert_eq!(
+            resolved,
+            Some(tmp.path().to_path_buf()),
+            "None session must resolve to default_ref root"
+        );
+    }
+
+    /// `Some(default_ref_id)` resolves to the same root as `None`.
+    #[test]
+    fn caller_root_for_session_default_ref_id_returns_server_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+        let ref_id = server.state.default_ref_id;
+        let resolved = caller_root_for_session(&server.state, Some(ref_id));
+        assert_eq!(
+            resolved,
+            Some(tmp.path().to_path_buf()),
+            "default ref_id must resolve to server root"
+        );
+    }
+
+    /// `Some(unknown_id)` (not in registry) falls back to default_ref and
+    /// does not panic.
+    #[test]
+    fn caller_root_for_session_unknown_id_falls_back_to_default() {
+        use crate::ref_index::RefId;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+        // Construct an id that is definitely not in the registry.
+        let bogus_id = RefId(0xffffffffffffffff);
+        // Confirm it's really not there.
+        assert!(server.state.ref_index(bogus_id).is_none());
+        // Must fall back gracefully.
+        let resolved = caller_root_for_session(&server.state, Some(bogus_id));
+        assert_eq!(
+            resolved,
+            Some(tmp.path().to_path_buf()),
+            "unknown ref_id must fall back to default_ref root, not None"
+        );
+    }
+
+    /// A session registered for a second worktree root resolves to that
+    /// worktree's directory, not the server root.
+    #[tokio::test]
+    async fn caller_root_for_session_registered_worktree_returns_worktree_root() {
+        use crate::ref_index::{RefId, RefIndex};
+        use std::sync::Arc;
+
+        let primary_tmp = tempfile::tempdir().unwrap();
+        let worktree_tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(primary_tmp.path());
+
+        // Simulate what daemon::serve_connection does: attach a second ref for
+        // a different worktree root.
+        let wt_root = worktree_tmp.path().to_path_buf();
+        let canonical_wt = wt_root.canonicalize().unwrap_or_else(|_| wt_root.clone());
+        let wt_ref_id = RefId::for_canonical_path(&canonical_wt);
+
+        // Confirm the new ref_id differs from the default.
+        assert_ne!(wt_ref_id, server.state.default_ref_id);
+
+        // attach_ref inserts and bumps session_count.
+        let _ref_arc = server
+            .state
+            .attach_ref(wt_ref_id, || {
+                Arc::new(RefIndex::new(
+                    wt_root.clone(),
+                    canonical_wt.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        // Now caller_root_for_session should resolve to the worktree root.
+        let resolved = caller_root_for_session(&server.state, Some(wt_ref_id));
+        assert_eq!(
+            resolved,
+            Some(wt_root.clone()),
+            "session ref_id must resolve to the registered worktree root"
+        );
+
+        // Clean up: detach to avoid Arc leaks in short-lived tests.
+        server.state.detach_ref(wt_ref_id, 0).await;
     }
 }

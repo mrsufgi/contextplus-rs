@@ -243,9 +243,37 @@ impl SharedState {
 }
 
 /// The MCP server exposing context+ tools.
+///
+/// Each instance is associated with exactly one MCP transport. In daemon mode
+/// the per-connection `serve_connection` function creates a session-scoped
+/// copy via [`ContextPlusServer::with_session`] so that every tool call
+/// dispatched on that connection resolves to the registered worktree's
+/// [`crate::ref_index::RefIndex`] rather than the singleton default ref.
+///
+/// In stdio mode (`session_ref_id = None`) the server behaves identically to
+/// the pre-U9 code path: all tool calls route through
+/// `SharedState::default_ref`.
 #[derive(Clone)]
 pub struct ContextPlusServer {
     pub state: Arc<SharedState>,
+    /// Set per-connection by `daemon::serve_connection` after
+    /// `register_session` completes. `None` means "stdio mode or no
+    /// handshake" — all tool calls fall back to `default_ref`.
+    pub session_ref_id: Option<crate::ref_index::RefId>,
+}
+
+impl ContextPlusServer {
+    /// Return a clone of this server with `session_ref_id` set to `ref_id`.
+    ///
+    /// The `Arc<SharedState>` is shared — only the routing key changes.
+    /// Callers should prefer this over mutating `session_ref_id` directly so
+    /// the original server (held by the daemon accept loop) remains unchanged.
+    pub fn with_session(&self, ref_id: crate::ref_index::RefId) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            session_ref_id: Some(ref_id),
+        }
+    }
 }
 
 /// Sanitize a model name for use in cache filenames.
@@ -328,7 +356,10 @@ impl ContextPlusServer {
             refs,
             default_ref_id,
         });
-        Self { state }
+        Self {
+            state,
+            session_ref_id: None,
+        }
     }
 
     /// Build a refresh callback for the embedding tracker.
@@ -1974,20 +2005,22 @@ impl ServerHandler for ContextPlusServer {
 
         // Route through U5's path-translation boundary.
         //
-        // Today (single-ref): `caller_root` resolves via
-        // [`crate::transport::dispatch::caller_root_from_default_ref`]; the
-        // dispatch layer passes `foreign_roots = &[]` so output rewriting is
-        // identity. The only translation that takes effect is input-side
-        // rejection of out-of-tree path arguments — the safety net that
-        // should always run regardless of ref topology.
+        // U9: `caller_root` is now resolved per-session:
+        //   • If `session_ref_id` is Some(id), look up that ref's `root_dir`
+        //     in the registry. This is set by `daemon::serve_connection` after
+        //     `register_session` completes, so worktree-scoped connections get
+        //     their own caller root automatically.
+        //   • If `session_ref_id` is None (stdio mode / no handshake), fall
+        //     back to `default_ref` — identical to pre-U9 behaviour.
+        //   • If the id is Some but not found in the registry (registry
+        //     tampered), warn and fall back to `default_ref`.
         //
-        // U4 seam: per-session `RefIndex` lookup via `session.ref_id` once
-        // the rmcp `RequestContext` carries a session id from
-        // `register_session`. At that point `dispatch_with_translation` will
-        // receive the list of OTHER attached refs as `foreign_roots`,
-        // activating cross-ref leakage protection for cached entries
-        // authored under a different ref.
-        match crate::transport::dispatch::caller_root_from_default_ref(&self.state) {
+        // The dispatch layer passes `foreign_roots = &[]` so output rewriting
+        // is still identity in single-ref mode. Cross-ref leakage protection
+        // (listing other refs' roots as `foreign_roots`) is reserved for U10+.
+        let caller_root_opt =
+            crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id);
+        match caller_root_opt {
             Some(caller_root) => Ok(crate::transport::dispatch::dispatch_with_translation(
                 self,
                 &name,
@@ -1999,7 +2032,7 @@ impl ServerHandler for ContextPlusServer {
                 // Registry tampered with externally — fall back to direct
                 // dispatch so we don't lose the request entirely.
                 tracing::warn!(
-                    "default_ref missing from registry; bypassing path translation for tool {name}"
+                    "caller_root unavailable; bypassing path translation for tool {name}"
                 );
                 Ok(self.dispatch(&name, args).await)
             }
@@ -4060,5 +4093,61 @@ mod tests {
             .await;
         let text = extract_text(&result);
         assert!(text.contains("shutting down"), "got: {text}");
+    }
+
+    // ── U9: with_session / session_ref_id ────────────────────────────────────
+
+    /// `new()` produces a server with no session ref — stdio / no-handshake
+    /// mode falls through to `default_ref` routing.
+    #[test]
+    fn new_server_has_no_session_ref_id() {
+        let server = test_server();
+        assert!(
+            server.session_ref_id.is_none(),
+            "freshly constructed server must have session_ref_id = None"
+        );
+    }
+
+    /// `with_session` returns a clone that carries the given `RefId` while
+    /// leaving the original unchanged.
+    #[test]
+    fn with_session_sets_ref_id_without_mutating_original() {
+        use crate::ref_index::RefId;
+
+        let server = test_server();
+        let fake_id = RefId(0xdeadbeef_cafebabe);
+        let session_server = server.with_session(fake_id);
+
+        // Original is untouched.
+        assert!(
+            server.session_ref_id.is_none(),
+            "original server must remain None after with_session"
+        );
+        // Clone carries the new id.
+        assert_eq!(
+            session_server.session_ref_id,
+            Some(fake_id),
+            "session copy must carry the provided RefId"
+        );
+        // Both share the same Arc<SharedState>.
+        assert!(
+            Arc::ptr_eq(&server.state, &session_server.state),
+            "with_session must not clone SharedState — same Arc"
+        );
+    }
+
+    /// `with_session` is idempotent: calling it again overwrites the ref_id.
+    #[test]
+    fn with_session_can_be_called_twice_overwriting_ref_id() {
+        use crate::ref_index::RefId;
+
+        let server = test_server();
+        let id_a = RefId(1);
+        let id_b = RefId(2);
+        let s_a = server.with_session(id_a);
+        let s_b = s_a.with_session(id_b);
+
+        assert_eq!(s_a.session_ref_id, Some(id_a));
+        assert_eq!(s_b.session_ref_id, Some(id_b));
     }
 }
