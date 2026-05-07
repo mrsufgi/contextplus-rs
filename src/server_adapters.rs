@@ -189,11 +189,43 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 "semantic_code_search embedding cache hit/miss"
             );
 
-            // Embed only uncached files
+            // Embed only uncached files — TIME-BOXED.
+            //
+            // The historical bug here: when uncached_indices is large (cache
+            // recently invalidated by tracker, or fresh attach with no warmup),
+            // synchronously embedding 3000+ files at ~7s/batch on CPU Ollama
+            // takes 12-18 minutes. Codex's `tool_timeout_sec` (15 min default)
+            // fires, the bridge closes the stream, and the user sees
+            // "Transport closed" while the daemon is happily still working.
+            //
+            // Fix: cap embed work per call at `EMBED_BUDGET_MS`. After the
+            // budget, stop fetching new embeddings and return partial results
+            // — files without a vector yet are simply absent from this query's
+            // ranking. The embedding tracker keeps filling the cache in the
+            // background; the next query benefits.
+            //
+            // The user-visible degradation is minor: a fresh call against a
+            // cold corpus returns slightly less complete results, not
+            // "Transport closed". `EMBED_BUDGET_MS` is intentionally
+            // conservative (60s) so it stays well under any reasonable client
+            // timeout.
+            const EMBED_BUDGET_MS: u128 = 60_000;
             if !uncached_texts.is_empty() {
+                let embed_start = std::time::Instant::now();
                 let batch_size = config.embed_batch_size.max(1);
                 let mut new_vectors = Vec::with_capacity(uncached_texts.len());
+                let mut budget_exceeded = false;
                 for chunk in uncached_texts.chunks(batch_size) {
+                    if embed_start.elapsed().as_millis() >= EMBED_BUDGET_MS {
+                        // Fill remaining slots with empty vectors so indexing
+                        // alignment with `uncached_indices` stays correct;
+                        // empty vectors are skipped at insert time below.
+                        for _ in chunk {
+                            new_vectors.push(Vec::new());
+                        }
+                        budget_exceeded = true;
+                        continue;
+                    }
                     match ollama.embed(chunk).await {
                         Ok(embeddings) => new_vectors.extend(embeddings),
                         Err(e) => {
@@ -203,6 +235,16 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                             }
                         }
                     }
+                }
+                if budget_exceeded {
+                    let still_uncached = new_vectors.iter().filter(|v| v.is_empty()).count();
+                    tracing::warn!(
+                        budget_ms = EMBED_BUDGET_MS as u64,
+                        elapsed_ms = embed_start.elapsed().as_millis() as u64,
+                        embedded = uncached_texts.len() - still_uncached,
+                        skipped = still_uncached,
+                        "semantic_code_search embed budget exceeded — returning partial results; tracker will fill remaining in background"
+                    );
                 }
 
                 // Store new vectors in cache and build the snapshot to persist.
