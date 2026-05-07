@@ -66,14 +66,18 @@ async fn spawn_daemon_for_test() -> (TempDir, tokio::task::JoinHandle<()>, std::
         lock,
     ));
 
-    // Wait for the socket file to appear.
-    for _ in 0..50 {
+    // Wait for the socket file to appear. macOS CI under parallel test load
+    // can exceed 1 s; 10 s keeps headroom without slowing happy-path runs.
+    for _ in 0..500 {
         if socket_path.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(socket_path.exists(), "daemon never bound its socket");
+    assert!(
+        socket_path.exists(),
+        "daemon never bound its socket within 10s"
+    );
     (dir, handle, socket_path)
 }
 
