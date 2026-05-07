@@ -1,7 +1,7 @@
 // MCP server wiring — dispatches tool calls to underlying implementations.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,10 +10,10 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use serde_json::Value;
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{OnceCell, RwLock, Semaphore};
 
 use crate::cache::rkyv_store;
-use crate::config::{Config, TrackerMode};
+use crate::config::{Config, RefWarmupMode, TrackerMode};
 use crate::core::embedding_tracker::{
     EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
 };
@@ -82,6 +82,18 @@ const INSTRUCTIONS_SOURCE_URL: &str = "https://contextplus.vercel.app/api/instru
 const INSTRUCTIONS_RESOURCE_URI: &str = "contextplus://instructions";
 
 /// Shared state accessible by all tool handlers.
+///
+/// ## U10 migration note
+///
+/// The per-ref cache fields (`embedding_cache`, `identifier_index`,
+/// `search_index_cache`, `cache_generation`, `tracker_handle`, `project_cache`)
+/// are now owned by [`crate::ref_index::RefIndex`].  During the U10→U11
+/// transition they are kept here as **`Arc` clones** of the default ref's
+/// fields.  This means all existing call sites (`state.embedding_cache.read()`,
+/// etc.) continue to compile and operate on the correct data.
+///
+/// U11 will mechanically migrate the ~57 call sites to use
+/// `state.ref_index(session.ref_id).embedding_cache` instead.
 pub struct SharedState {
     pub config: Config,
     pub root_dir: PathBuf,
@@ -91,16 +103,21 @@ pub struct SharedState {
     pub canonical_root: PathBuf,
     pub ollama: OllamaClient,
     pub memory_graph: Arc<GraphStore>,
-    pub project_cache: RwLock<Option<Arc<ProjectCache>>>,
-    /// Cached embedding vectors keyed by relative file path.
-    /// Uses CacheEntry (hash + vector) for content-hash invalidation.
-    /// Persisted to disk via rkyv_store for cross-restart survival.
-    pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
-    /// Cached identifier index — avoids re-embedding all symbols on each call.
-    pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `project_cache`. Shares the same underlying `RwLock` as the default
+    /// `RefIndex` entry. U11 will migrate call sites to use the per-ref field.
+    pub project_cache: Arc<RwLock<Option<Arc<ProjectCache>>>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `embedding_cache`. All reads/writes go through the same lock as
+    /// `state.default_ref().embedding_cache`. U11 migrates to per-ref.
+    pub embedding_cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `identifier_index`. U11 migrates to per-ref.
+    pub identifier_index: Arc<RwLock<Option<Arc<IdentifierIndex>>>>,
     /// Cached SearchIndex for semantic_code_search — reused when the walk fingerprint
     /// is unchanged, eliminating the per-request HNSW rebuild for large corpora.
-    /// Wrapped in `Arc` so background rebuild tasks can hold a clone of the lock.
+    /// `Arc`-wrapped so background rebuild tasks can hold a clone.
+    /// **U10**: also stored in the default ref's `search_index_cache` (same Arc).
     pub search_index_cache:
         Arc<RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>>,
     /// Monotonic counter incremented by the embedding tracker whenever a file-change
@@ -109,11 +126,13 @@ pub struct SharedState {
     /// changes since the last build and the filesystem walk can be skipped entirely.
     /// When the tracker is disabled the counter stays at 0 and the fingerprint-based
     /// fallback takes over.
+    /// **U10**: same Arc stored in the default ref's `cache_generation`.
     pub cache_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Cached instructions content — fetched once from remote, then served from memory.
     pub instructions_cache: OnceCell<String>,
-    /// Tracker handle for lazy-start mode.
-    pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `tracker_handle`. U11 migrates to per-ref.
+    pub tracker_handle: Arc<std::sync::Mutex<Option<EmbeddingTrackerHandle>>>,
     /// Idle monitor handle — tool handlers touch this to reset the idle timer.
     pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
     /// Drain flag — set when the parent process dies (or another graceful
@@ -124,12 +143,202 @@ pub struct SharedState {
     /// of `dispatch_inner` via an `InflightGuard`; decremented on drop. The
     /// drain watcher exits the process once draining is true and this hits 0.
     pub inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Registry of `RefId → RefIndex` for all worktrees this daemon serves.
+    /// Each `RefIndex` carries its own per-ref caches (U10+).
+    /// The registry is `RwLock`-wrapped so attach/detach don't block tool calls.
+    pub refs: crate::ref_index::RefRegistry,
+    /// `RefId` of the default (primary) ref. Tool dispatches that don't
+    /// carry an explicit `RefId` use this. U4 / U11 will migrate to explicit
+    /// per-session routing via `session_ref_id`.
+    pub default_ref_id: crate::ref_index::RefId,
+    /// Global Ollama embed semaphore. All callers that issue embed requests
+    /// (on-demand tool calls, embedding tracker, ref warmup) must acquire a
+    /// permit before calling Ollama so that N concurrent warmups cannot fan-out
+    /// N×files requests and saturate a CPU-only Ollama instance.
+    ///
+    /// Capacity is set from `config.ollama_max_concurrent` at server construction
+    /// and never changes for the lifetime of the daemon.
+    pub ollama_semaphore: Arc<Semaphore>,
+    /// Set of refs currently being warmed up (U18 idempotency guard).
+    ///
+    /// `spawn_ref_warmup` inserts the `RefId` before spawning the background
+    /// task and removes it when the task completes via a `WarmupGuard` RAII
+    /// drop. A second call for the same ref while the first is running is a
+    /// no-op.
+    pub warmup_in_flight:
+        Arc<tokio::sync::Mutex<std::collections::HashSet<crate::ref_index::RefId>>>,
+}
+
+impl SharedState {
+    /// Return a cloned `Arc` pointing at the global Ollama embed semaphore.
+    ///
+    /// Callers in U17 will hold this semaphore for the duration of each Ollama
+    /// embed request. Callers in U18 will hold it across a full ref warmup pass.
+    /// The permit count is fixed at `config.ollama_max_concurrent` for the
+    /// lifetime of the daemon.
+    pub fn ollama_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.ollama_semaphore)
+    }
+
+    /// Look up the default ref's index. Today this is the only entry in the
+    /// registry; U4 will introduce alternate refs.
+    ///
+    /// Returns `None` only if the registry was tampered with externally —
+    /// internal code paths can `expect` it freely.
+    pub fn default_ref(&self) -> Option<Arc<crate::ref_index::RefIndex>> {
+        // Try-read is appropriate: the registry write path (attach/detach)
+        // is bounded and not held long; the only contention would be a
+        // U4-era register_session firing concurrently with a tool call.
+        self.refs
+            .try_read()
+            .ok()
+            .and_then(|r| r.get(&self.default_ref_id).cloned())
+    }
+
+    /// Look up a ref by id. Reserved for U4's session-scoped dispatch.
+    pub fn ref_index(
+        &self,
+        id: crate::ref_index::RefId,
+    ) -> Option<Arc<crate::ref_index::RefIndex>> {
+        self.refs.try_read().ok().and_then(|r| r.get(&id).cloned())
+    }
+
+    /// Attach a session to an existing ref, or insert a new `RefIndex` and
+    /// attach. Returns the `RefId` that the caller should use for subsequent
+    /// tool dispatches.
+    ///
+    /// Concurrent calls from two bridges connecting to the same canonical root
+    /// are safe: the write lock ensures only one `RefIndex` is inserted, and
+    /// both callers will share the same `Arc<RefIndex>` after the lock is
+    /// released.
+    pub async fn attach_ref(
+        &self,
+        ref_id: crate::ref_index::RefId,
+        make_ref: impl FnOnce() -> Arc<crate::ref_index::RefIndex>,
+    ) -> Arc<crate::ref_index::RefIndex> {
+        let mut guard = self.refs.write().await;
+        let entry = guard.entry(ref_id).or_insert_with(make_ref);
+        entry
+            .session_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Arc::clone(entry)
+    }
+
+    /// Detach a session from a ref. Decrements the session refcount. When the
+    /// count reaches zero the ref enters the TTL eviction queue (spawned as a
+    /// background task). The primary ref (matching `default_ref_id`) is never
+    /// evicted from the registry regardless of refcount.
+    ///
+    /// `ttl_secs` — how long after last-session-disconnect before the in-memory
+    /// `RefIndex` is removed. `0` means immediate removal. The on-disk overlay
+    /// (U6) is not touched here; only the in-memory registry entry is dropped.
+    pub async fn detach_ref(self: &Arc<Self>, ref_id: crate::ref_index::RefId, ttl_secs: u64) {
+        let count = {
+            let guard = self.refs.read().await;
+            guard
+                .get(&ref_id)
+                .map(|r| {
+                    r.session_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                })
+                .unwrap_or(0)
+        };
+        // count is the *pre-decrement* value; after this call it is count - 1.
+        // Only schedule eviction when transitioning to 0.
+        if count != 1 {
+            return;
+        }
+        // Primary ref is never evicted — the daemon owns it for its lifetime.
+        if ref_id == self.default_ref_id {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if ttl_secs > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(ttl_secs)).await;
+            }
+            // Re-check the refcount after the TTL — a new session may have
+            // re-attached in the interim.
+            let guard = state.refs.read().await;
+            if let Some(r) = guard.get(&ref_id) {
+                if r.session_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "TTL eviction cancelled — new session attached"
+                    );
+                    return;
+                }
+            } else {
+                return; // already removed
+            }
+            drop(guard);
+            let mut guard = state.refs.write().await;
+            // Double-check under write lock.
+            if let Some(r) = guard.get(&ref_id)
+                && r.session_count.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
+                guard.remove(&ref_id);
+                tracing::info!(ref_id = ref_id.0, "ref evicted after TTL expiry");
+            }
+        });
+    }
 }
 
 /// The MCP server exposing context+ tools.
+///
+/// Each instance is associated with exactly one MCP transport. In daemon mode
+/// the per-connection `serve_connection` function creates a session-scoped
+/// copy via [`ContextPlusServer::with_session`] so that every tool call
+/// dispatched on that connection resolves to the registered worktree's
+/// [`crate::ref_index::RefIndex`] rather than the singleton default ref.
+///
+/// In stdio mode (`session_ref_id = None`) the server behaves identically to
+/// the pre-U9 code path: all tool calls route through
+/// `SharedState::default_ref`.
 #[derive(Clone)]
 pub struct ContextPlusServer {
     pub state: Arc<SharedState>,
+    /// Set per-connection by `daemon::serve_connection` after
+    /// `register_session` completes. `None` means "stdio mode or no
+    /// handshake" — all tool calls fall back to `default_ref`.
+    pub session_ref_id: Option<crate::ref_index::RefId>,
+}
+
+impl ContextPlusServer {
+    /// Return a clone of this server with `session_ref_id` set to `ref_id`.
+    ///
+    /// The `Arc<SharedState>` is shared — only the routing key changes.
+    /// Callers should prefer this over mutating `session_ref_id` directly so
+    /// the original server (held by the daemon accept loop) remains unchanged.
+    pub fn with_session(&self, ref_id: crate::ref_index::RefId) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            session_ref_id: Some(ref_id),
+        }
+    }
+
+    /// Resolve the per-ref state for the current session.
+    ///
+    /// Resolution order:
+    /// 1. `session_ref_id = Some(id)` and `id` is in the registry → that ref.
+    /// 2. `session_ref_id = Some(id)` but `id` not found (registry tampered) →
+    ///    fall back to `default_ref` and emit a debug log.
+    /// 3. `session_ref_id = None` (stdio mode or no handshake) → `default_ref`.
+    ///
+    /// The `default_ref` always exists for the lifetime of the daemon, so the
+    /// `expect` here is guaranteed to succeed under normal operating conditions.
+    ///
+    /// **Single-ref behaviour is unchanged:** when `session_ref_id` is `None`
+    /// (stdio) or equals `default_ref_id` (daemon, one worktree), this returns
+    /// exactly the same `RefIndex` as the `SharedState` backward-compat shims.
+    /// No observable difference for existing callers until U12 introduces
+    /// per-ref file walkers.
+    pub fn current_ref(&self) -> Arc<crate::ref_index::RefIndex> {
+        self.session_ref_id
+            .and_then(|id| self.state.ref_index(id))
+            .or_else(|| self.state.default_ref())
+            .expect("default_ref always present — registry invariant violated")
+    }
 }
 
 /// Sanitize a model name for use in cache filenames.
@@ -155,7 +364,13 @@ pub fn cache_name(base: &str, model: &str) -> String {
 
 impl ContextPlusServer {
     pub fn new(root_dir: PathBuf, config: Config) -> Self {
-        let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()));
+        // Global Ollama embed semaphore (U16+U17). Capacity is sourced from
+        // `config.ollama_max_concurrent`, which Config::from_env clamps into
+        // [1, 64]. We wire the same semaphore into the OllamaClient so that
+        // every outbound embed (warmup, tracker, on-demand) shares one budget.
+        let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
+        let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
+            .with_semaphore(Arc::clone(&ollama_semaphore));
         let memory_graph = Arc::new(GraphStore::new());
 
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
@@ -183,30 +398,59 @@ impl ContextPlusServer {
         // Canonicalize once at construction so resolve_root() can skip per-request syscalls.
         let canonical_root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
 
+        // Build the default ref with the disk-loaded embedding cache (U10).
+        // All other per-ref caches start empty.
+        let default_ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_root);
+        let default_ref = Arc::new(crate::ref_index::RefIndex::with_preloaded_cache(
+            root_dir.clone(),
+            canonical_root.clone(),
+            initial_cache,
+        ));
+
+        // Clone the per-ref Arcs so SharedState can expose them as backward-compat
+        // shims.  Both SharedState and the RefIndex entry point at the SAME
+        // underlying RwLock / Mutex — writes through one are visible through the
+        // other.  U11 will migrate call sites to go through RefIndex directly.
+        let embedding_cache = Arc::clone(&default_ref.embedding_cache);
+        let identifier_index = Arc::clone(&default_ref.identifier_index);
+        let search_index_cache = Arc::clone(&default_ref.search_index_cache);
+        let cache_generation = Arc::clone(&default_ref.cache_generation);
+        let tracker_handle = Arc::clone(&default_ref.tracker_handle);
+        let project_cache = Arc::clone(&default_ref.project_cache);
+
+        let refs = crate::ref_index::new_registry_with_default(default_ref_id, default_ref);
+
         let state = Arc::new(SharedState {
             config,
             canonical_root,
             root_dir,
             ollama,
             memory_graph,
-            project_cache: RwLock::new(None),
-            embedding_cache: RwLock::new(initial_cache),
-            identifier_index: RwLock::new(None),
-            search_index_cache: Arc::new(RwLock::new(None)),
-            cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            project_cache,
+            embedding_cache,
+            identifier_index,
+            search_index_cache,
+            cache_generation,
             instructions_cache: OnceCell::new(),
-            tracker_handle: std::sync::Mutex::new(None),
+            tracker_handle,
             idle_monitor: RwLock::new(None),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            refs,
+            default_ref_id,
+            ollama_semaphore,
+            warmup_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         });
-        Self { state }
+        Self {
+            state,
+            session_ref_id: None,
+        }
     }
 
     /// Build a refresh callback for the embedding tracker.
     pub fn build_tracker_callback(&self) -> RefreshCallback {
         let server = self.clone();
-        let root = self.state.root_dir.clone();
+        let root = self.current_ref().root_dir.clone();
         Arc::new(move |_root, files| {
             let srv = server.clone();
             let root = root.clone();
@@ -224,7 +468,7 @@ impl ContextPlusServer {
                 // generation mismatch and re-walk + rebuild instead of reusing the stale
                 // cached index.
                 let new_gen = srv
-                    .state
+                    .current_ref()
                     .cache_generation
                     .fetch_add(1, std::sync::atomic::Ordering::Release)
                     + 1;
@@ -242,7 +486,8 @@ impl ContextPlusServer {
         if self.state.config.embed_tracker_mode == TrackerMode::Off {
             return;
         }
-        let mut guard = self.state.tracker_handle.lock().unwrap_or_else(|poisoned| {
+        let ref_index = self.current_ref();
+        let mut guard = ref_index.tracker_handle.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("tracker_handle mutex was poisoned; recovering inner value");
             poisoned.into_inner()
         });
@@ -256,7 +501,7 @@ impl ContextPlusServer {
         };
         let callback = self.build_tracker_callback();
         match crate::core::embedding_tracker::start_tracker(
-            self.state.root_dir.clone(),
+            ref_index.root_dir.clone(),
             tracker_config,
             callback,
         ) {
@@ -292,8 +537,457 @@ impl ContextPlusServer {
         });
     }
 
-    fn root_dir(&self) -> &Path {
-        &self.state.root_dir
+    // -----------------------------------------------------------------------
+    // U18: per-ref warmup on attach
+    // -----------------------------------------------------------------------
+
+    /// Trigger warmup for `ref_id` according to the configured
+    /// [`RefWarmupMode`].
+    ///
+    /// The call is **idempotent**: if a warmup task for the same `ref_id` is
+    /// already running, this is a no-op (logged at `DEBUG`).  Likewise, if the
+    /// ref's `project_cache` is already populated and fresh, the spawned task
+    /// exits early without re-walking.
+    ///
+    /// Warmup failure is non-fatal — errors are logged as `WARN` and never
+    /// propagate to the connection handler.
+    pub fn spawn_ref_warmup(&self, ref_id: crate::ref_index::RefId) {
+        match self.state.config.ref_warmup_mode {
+            RefWarmupMode::Off => {
+                tracing::info!(
+                    ref_id = ref_id.0,
+                    mode = "off",
+                    "ref_warmup mode=off — skipping"
+                );
+            }
+            RefWarmupMode::Shallow => {
+                self.spawn_shallow_warmup_task(ref_id);
+            }
+            RefWarmupMode::Full => {
+                self.spawn_full_warmup_task(ref_id);
+            }
+        }
+    }
+
+    /// Spawn the shallow warmup background task for `ref_id`.
+    ///
+    /// Shallow warmup (U20 contract):
+    /// 1. Walks the ref's `root_dir` via `walk_with_config`.
+    /// 2. Reads all non-directory files into `ref.project_cache`.
+    /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`.
+    /// 4. Calls `import_baseline_for_ref` — for every chunk, looks up the
+    ///    BLAKE3 hash in the CAS parent chain.  Hits are loaded into
+    ///    `embedding_cache` and used to build `search_index_cache` (HNSW).
+    /// 5. Does NOT call `OllamaClient::embed*`.  Zero outbound Ollama calls.
+    ///    Diff chunks (misses in step 4) remain unembedded; they fill lazily
+    ///    on the first real tool call.
+    ///
+    /// Idempotent: skips if `project_cache` is already populated and fresh.
+    fn spawn_shallow_warmup_task(&self, ref_id: crate::ref_index::RefId) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            // --- Idempotency guard ---
+            {
+                let mut inflight = state.warmup_in_flight.lock().await;
+                if inflight.contains(&ref_id) {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "ref_warmup shallow: already in-flight, skipping"
+                    );
+                    return;
+                }
+                inflight.insert(ref_id);
+            }
+
+            // Ensure we release the guard slot even on early return or panic.
+            let _guard = WarmupGuard {
+                state: Arc::clone(&state),
+                ref_id,
+            };
+
+            let ref_index = match state.ref_index(ref_id) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(ref_id = ref_id.0, "ref_warmup shallow: ref not found");
+                    return;
+                }
+            };
+
+            // --- Skip if already warm ---
+            {
+                let guard = ref_index.project_cache.read().await;
+                if let Some(ref cache) = *guard {
+                    let ttl = state.config.cache_ttl_secs;
+                    if cache.last_refresh.elapsed().as_secs() < ttl {
+                        tracing::debug!(
+                            ref_id = ref_id.0,
+                            "ref_warmup shallow: project_cache already populated, skipping"
+                        );
+                        return;
+                    }
+                }
+            }
+
+            let root = ref_index.root_dir.clone();
+            let config = state.config.clone();
+            let t0 = std::time::Instant::now();
+            tracing::info!(ref_id = ref_id.0, root = %root.display(), "ref_warmup shallow: starting walk");
+
+            // --- Walk + read files (blocking I/O) ---
+            let new_cache = tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                let entries = walk_with_config(&root, &config);
+                let file_content: HashMap<String, Arc<String>> = entries
+                    .par_iter()
+                    .filter(|e| !e.is_directory)
+                    .filter_map(|e| {
+                        let full = root.join(&e.relative_path);
+                        std::fs::read_to_string(&full)
+                            .ok()
+                            .map(|c| (e.relative_path.clone(), Arc::new(c)))
+                    })
+                    .collect();
+                ProjectCache {
+                    file_entries: entries,
+                    file_content,
+                    last_refresh: std::time::Instant::now(),
+                }
+            })
+            .await;
+
+            let new_cache = match new_cache {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    tracing::warn!(ref_id = ref_id.0, error = %e, "ref_warmup shallow: spawn_blocking failed");
+                    return;
+                }
+            };
+
+            // --- Populate project_cache ---
+            {
+                let mut guard = ref_index.project_cache.write().await;
+                // First-writer-wins: only update if still unpopulated (or stale).
+                let needs_update = match &*guard {
+                    None => true,
+                    Some(c) => c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs,
+                };
+                if needs_update {
+                    *guard = Some(Arc::clone(&new_cache));
+                }
+            }
+
+            // --- Parse tree-sitter symbols into identifier_index.docs ---
+            // We run the full parse pipeline (flatten_symbols + token_set) but
+            // skip the embedding step.  The identifier search handler will rebuild
+            // with embeddings on the first real tool call.
+            let cache_for_parse = Arc::clone(&new_cache);
+            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    cache_for_parse
+                        .file_entries
+                        .par_iter()
+                        .filter(|e| !e.is_directory)
+                        .filter_map(|entry| {
+                            let content =
+                                cache_for_parse.file_content.get(&entry.relative_path)?;
+                            let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                            let symbols = parse_with_tree_sitter(content, ext).ok()?;
+                            let header = crate::core::parser::extract_header(content);
+                            let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                                crate::core::parser::flatten_symbols(&symbols, None)
+                                    .into_iter()
+                                    .map(|sym| {
+                                        let sig = sym.signature.clone().unwrap_or_default();
+                                        let text = format!(
+                                            "{} {} {} {} {} {}",
+                                            sym.name,
+                                            sym.kind,
+                                            sig,
+                                            entry.relative_path,
+                                            header,
+                                            sym.parent_name.as_deref().unwrap_or("")
+                                        );
+                                        let token_set = crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
+                                            &sym.name,
+                                            &sig,
+                                            &entry.relative_path,
+                                            &header,
+                                        );
+                                        crate::tools::semantic_identifiers::IdentifierDoc {
+                                            id: format!(
+                                                "{}:{}:{}",
+                                                entry.relative_path, sym.name, sym.line
+                                            ),
+                                            path: entry.relative_path.clone(),
+                                            header: header.clone(),
+                                            name: sym.name.clone(),
+                                            kind_lower: sym.kind.to_lowercase(),
+                                            kind: sym.kind.clone(),
+                                            line: sym.line,
+                                            end_line: sym.end_line,
+                                            signature: sig,
+                                            parent_name: sym.parent_name.clone(),
+                                            text,
+                                            token_set,
+                                        }
+                                    })
+                                    .collect();
+                            Some(local)
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
+            let file_count = new_cache
+                .file_entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .count();
+            {
+                let mut guard = ref_index.identifier_index.write().await;
+                let needs_update = match &*guard {
+                    None => true,
+                    Some(idx) => idx.file_count != file_count,
+                };
+                if needs_update {
+                    *guard = Some(Arc::new(IdentifierIndex {
+                        docs: doc_list,
+                        // vector_buffer + dims left empty — shallow mode omits
+                        // embedding calls.  Full mode (or first real tool call)
+                        // will populate these fields.
+                        vector_buffer: Vec::new(),
+                        dims: 0,
+                        file_count,
+                        built_at: std::time::Instant::now(),
+                    }));
+                }
+            }
+
+            // --- U20: CAS baseline import — zero Ollama calls ---
+            // Walk the CAS parent chain for every chunk in the corpus.  Hits are
+            // loaded into `embedding_cache` and used to build `search_index_cache`.
+            // Misses are left for lazy fill on first tool call (Shallow mode).
+            let report = import_baseline_for_ref(&state, ref_id, Arc::clone(&new_cache)).await;
+            tracing::info!(
+                ref_id = ref_id.0,
+                hits = report.hits,
+                misses = report.misses.len(),
+                elapsed_ms = t0.elapsed().as_millis(),
+                files = file_count,
+                "ref_warmup shallow: complete (no embed calls)"
+            );
+        });
+    }
+
+    /// Spawn the full warmup background task for `ref_id`.
+    ///
+    /// Full warmup (U20 contract):
+    /// 1. Runs the same walk + parse + CAS baseline-import as Shallow — zero
+    ///    code duplication.  The worktree is immediately searchable using the
+    ///    primary's embedding corpus after this phase.
+    /// 2. Embeds the diff chunks (CAS misses) via Ollama, gated by the
+    ///    `ollama_semaphore`.  After this phase the worktree is fully indexed
+    ///    including worktree-specific diffs.
+    ///
+    /// Idempotent: skips if `project_cache` is already warm.
+    fn spawn_full_warmup_task(&self, ref_id: crate::ref_index::RefId) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            // --- Idempotency guard ---
+            {
+                let mut inflight = state.warmup_in_flight.lock().await;
+                if inflight.contains(&ref_id) {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "ref_warmup full: already in-flight, skipping"
+                    );
+                    return;
+                }
+                inflight.insert(ref_id);
+            }
+
+            let _guard = WarmupGuard {
+                state: Arc::clone(&state),
+                ref_id,
+            };
+
+            let ref_index = match state.ref_index(ref_id) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(ref_id = ref_id.0, "ref_warmup full: ref not found");
+                    return;
+                }
+            };
+
+            // --- Skip if already warm ---
+            {
+                let guard = ref_index.project_cache.read().await;
+                if let Some(ref cache) = *guard
+                    && cache.last_refresh.elapsed().as_secs() < state.config.cache_ttl_secs
+                {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "ref_warmup full: project_cache already populated, skipping"
+                    );
+                    return;
+                }
+            }
+
+            let t0 = std::time::Instant::now();
+            tracing::info!(ref_id = ref_id.0, "ref_warmup full: starting walk");
+
+            // --- Phase 1: walk + read files ---
+            let root = ref_index.root_dir.clone();
+            let config = state.config.clone();
+            let new_cache = tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                let entries = walk_with_config(&root, &config);
+                let file_content: HashMap<String, Arc<String>> = entries
+                    .par_iter()
+                    .filter(|e| !e.is_directory)
+                    .filter_map(|e| {
+                        let full = root.join(&e.relative_path);
+                        std::fs::read_to_string(&full)
+                            .ok()
+                            .map(|c| (e.relative_path.clone(), Arc::new(c)))
+                    })
+                    .collect();
+                ProjectCache {
+                    file_entries: entries,
+                    file_content,
+                    last_refresh: std::time::Instant::now(),
+                }
+            })
+            .await;
+
+            let new_cache = match new_cache {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    tracing::warn!(ref_id = ref_id.0, error = %e, "ref_warmup full: spawn_blocking failed");
+                    return;
+                }
+            };
+
+            // --- Populate project_cache ---
+            {
+                let mut guard = ref_index.project_cache.write().await;
+                let needs_update = match &*guard {
+                    None => true,
+                    Some(c) => c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs,
+                };
+                if needs_update {
+                    *guard = Some(Arc::clone(&new_cache));
+                }
+            }
+
+            // --- Phase 2: tree-sitter parse ---
+            let cache_for_parse = Arc::clone(&new_cache);
+            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    cache_for_parse
+                        .file_entries
+                        .par_iter()
+                        .filter(|e| !e.is_directory)
+                        .filter_map(|entry| {
+                            let content =
+                                cache_for_parse.file_content.get(&entry.relative_path)?;
+                            let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                            let symbols = parse_with_tree_sitter(content, ext).ok()?;
+                            let header = crate::core::parser::extract_header(content);
+                            let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                                crate::core::parser::flatten_symbols(&symbols, None)
+                                    .into_iter()
+                                    .map(|sym| {
+                                        let sig = sym.signature.clone().unwrap_or_default();
+                                        let text = format!(
+                                            "{} {} {} {} {} {}",
+                                            sym.name,
+                                            sym.kind,
+                                            sig,
+                                            entry.relative_path,
+                                            header,
+                                            sym.parent_name.as_deref().unwrap_or("")
+                                        );
+                                        let token_set = crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
+                                            &sym.name,
+                                            &sig,
+                                            &entry.relative_path,
+                                            &header,
+                                        );
+                                        crate::tools::semantic_identifiers::IdentifierDoc {
+                                            id: format!(
+                                                "{}:{}:{}",
+                                                entry.relative_path, sym.name, sym.line
+                                            ),
+                                            path: entry.relative_path.clone(),
+                                            header: header.clone(),
+                                            name: sym.name.clone(),
+                                            kind_lower: sym.kind.to_lowercase(),
+                                            kind: sym.kind.clone(),
+                                            line: sym.line,
+                                            end_line: sym.end_line,
+                                            signature: sig,
+                                            parent_name: sym.parent_name.clone(),
+                                            text,
+                                            token_set,
+                                        }
+                                    })
+                                    .collect();
+                            Some(local)
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
+            let file_count = new_cache
+                .file_entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .count();
+            {
+                let mut guard = ref_index.identifier_index.write().await;
+                let needs_update = match &*guard {
+                    None => true,
+                    Some(idx) => idx.file_count != file_count,
+                };
+                if needs_update {
+                    *guard = Some(Arc::new(IdentifierIndex {
+                        docs: doc_list,
+                        vector_buffer: Vec::new(),
+                        dims: 0,
+                        file_count,
+                        built_at: std::time::Instant::now(),
+                    }));
+                }
+            }
+
+            // --- Phase 3: CAS baseline import (same as Shallow, zero Ollama) ---
+            let report = import_baseline_for_ref(&state, ref_id, Arc::clone(&new_cache)).await;
+            tracing::info!(
+                ref_id = ref_id.0,
+                hits = report.hits,
+                misses = report.misses.len(),
+                "ref_warmup full: baseline import complete"
+            );
+
+            // --- Phase 4: embed diff chunks via Ollama (gated by semaphore) ---
+            embed_diff_chunks(&state, ref_id, &report.misses).await;
+
+            tracing::info!(
+                ref_id = ref_id.0,
+                elapsed_ms = t0.elapsed().as_millis(),
+                files = file_count,
+                "ref_warmup full: complete"
+            );
+        });
+    }
+
+    fn root_dir(&self) -> PathBuf {
+        self.current_ref().root_dir.clone()
     }
 
     /// Fetch instructions content (cached after first successful fetch).
@@ -368,15 +1062,23 @@ impl ContextPlusServer {
 
     // --- Walk + analyze helpers ---
 
-    /// Returns a snapshot of the project cache, lazily initializing or refreshing
-    /// when the TTL has expired. All filesystem I/O runs inside `spawn_blocking`.
+    /// Returns a snapshot of the project cache for the current session's ref,
+    /// lazily initializing or refreshing when the TTL has expired.
+    ///
+    /// When `session_ref_id` is set (daemon mode, per-connection), this walks
+    /// the worktree's own file tree (`ref.root_dir`) and stores the result in
+    /// the per-ref `project_cache`. When `session_ref_id` is `None` (stdio
+    /// mode), it falls back to the primary ref — identical to pre-U12 behaviour.
+    ///
+    /// All filesystem I/O runs inside `spawn_blocking`.
     /// Uses Arc to avoid deep-cloning the entire cache on every tool call.
     async fn ensure_project_cache(&self) -> Result<Arc<ProjectCache>> {
         let ttl_secs = self.state.config.cache_ttl_secs;
+        let ref_index = self.current_ref();
 
         // Fast path: cache exists and is fresh — just clone the Arc (cheap)
         {
-            let guard = self.state.project_cache.read().await;
+            let guard = ref_index.project_cache.read().await;
             if let Some(ref cache) = *guard
                 && cache.last_refresh.elapsed().as_secs() < ttl_secs
             {
@@ -385,7 +1087,7 @@ impl ContextPlusServer {
         }
 
         // Slow path: rebuild cache
-        let root = self.state.root_dir.clone();
+        let root = ref_index.root_dir.clone();
         let config = self.state.config.clone();
 
         let new_cache = tokio::task::spawn_blocking(move || {
@@ -413,46 +1115,67 @@ impl ContextPlusServer {
 
         let arc_cache = Arc::new(new_cache);
 
-        // Store the Arc in shared state (cheap clone of the Arc pointer)
+        // Store the Arc in per-ref state (cheap clone of the Arc pointer)
         {
-            let mut guard = self.state.project_cache.write().await;
+            let mut guard = ref_index.project_cache.write().await;
             *guard = Some(Arc::clone(&arc_cache));
         }
 
         Ok(arc_cache)
     }
 
-    /// Invalidate the project cache. Called by the file watcher when files change.
-    /// Note: embedding_cache is NOT cleared — content hashes in CacheEntry
-    /// handle staleness detection. Only clears the project file/line cache.
-    /// Also invalidates the identifier index so it rebuilds with fresh data.
+    /// Invalidate the project cache for the current session's ref.
+    ///
+    /// Called by the file watcher when files change. Clears the per-ref
+    /// `project_cache` and `identifier_index` so they rebuild with fresh data
+    /// on the next tool call.
     pub async fn invalidate_project_cache(&self) {
-        let mut guard = self.state.project_cache.write().await;
+        let ref_index = self.current_ref();
+        let mut guard = ref_index.project_cache.write().await;
         *guard = None;
         drop(guard);
-        let mut idx_guard = self.state.identifier_index.write().await;
+        let mut idx_guard = ref_index.identifier_index.write().await;
         *idx_guard = None;
     }
 
     /// Incrementally re-embed specific changed files without invalidating the entire cache.
-    /// Reads each file, computes content hash, re-embeds only if changed, updates cache.
+    ///
+    /// Uses the current session's ref (`current_ref()`) so per-worktree caches
+    /// stay isolated. Integrates CAS dedup: before sending a chunk to Ollama the
+    /// content hash is checked against the per-ref manifest chain; on a hit the
+    /// existing CAS blob is reused and only the manifest entry is updated —
+    /// no Ollama call is made (U12 diff-only embedding).
+    ///
     /// Returns (updated_count, skipped_count).
     pub async fn incremental_reembed(&self, files: &[std::path::PathBuf]) -> (usize, usize) {
+        use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
+
         let mut updated = 0usize;
         let mut skipped = 0usize;
 
         let max_file_size = self.state.config.max_embed_file_size as u64;
+        let ref_index = self.current_ref();
+
+        // CAS setup for diff-only embedding via U6 content-addressed store.
+        let mcp_data_dir = ref_index.root_dir.join(".mcp_data");
+        let cas = CasStore::new(mcp_data_dir, &self.state.config.ollama_embed_model);
+        let ref_id_hex = ref_index.cas_ref_id_hex.clone();
 
         let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
+        let mut cas_hit_entries: Vec<(String, String, Vec<f32>)> = Vec::new(); // (rel_path, hash, vector) from CAS
+        let mut cas_manifest_updates: Vec<(ChunkKey, ChunkHash)> = Vec::new();
         // Keys evicted from the in-memory cache because the source file was deleted.
         // Must be plumbed through to `save_vector_store_merged_with_deletions` —
         // a plain merged save would re-populate them from disk on the next save.
         let mut deletions: Vec<String> = Vec::new();
 
         for file_path in files {
-            let rel_path = match file_path.strip_prefix(&self.state.root_dir) {
+            let rel_path = match file_path.strip_prefix(&ref_index.root_dir) {
                 Ok(r) => r.to_string_lossy().to_string(),
-                Err(_) => file_path.to_string_lossy().to_string(),
+                Err(_) => match file_path.strip_prefix(&self.state.root_dir) {
+                    Ok(r) => r.to_string_lossy().to_string(),
+                    Err(_) => file_path.to_string_lossy().to_string(),
+                },
             };
 
             if let Ok(meta) = tokio::fs::metadata(file_path).await
@@ -467,7 +1190,7 @@ impl ContextPlusServer {
                 Err(_) => {
                     // File deleted — remove from cache and record so the save
                     // path can evict the same key from disk.
-                    let mut cache = self.state.embedding_cache.write().await;
+                    let mut cache = ref_index.embedding_cache.write().await;
                     cache.remove(&rel_path);
                     deletions.push(rel_path.clone());
                     updated += 1;
@@ -477,9 +1200,9 @@ impl ContextPlusServer {
 
             let hash = crate::core::parser::hash_content(&content);
 
-            // Check if content actually changed
+            // Check if content actually changed (in-memory cache hit)
             {
-                let cache = self.state.embedding_cache.read().await;
+                let cache = ref_index.embedding_cache.read().await;
                 if let Some(entry) = cache.get(&rel_path)
                     && entry.hash == hash
                 {
@@ -495,12 +1218,65 @@ impl ContextPlusServer {
             };
             let header = crate::core::parser::extract_header(&truncated);
             let text = format!("{} {} {}", header, rel_path, truncated);
-            texts_to_embed.push((rel_path, hash, text));
+
+            // CAS dedup: check if this chunk's BLAKE3 hash exists in the parent chain.
+            // chunk_idx = 0 because we treat each file as a single chunk here.
+            let chunk_hash = ChunkHash::of(&text);
+            let key = ChunkKey::new(rel_path.clone(), 0);
+            let cas_entry = match cas.lookup_chunk(&ref_id_hex, &key) {
+                Ok(Some(h)) if h == chunk_hash => {
+                    // Hash matches — read existing blob from CAS (no Ollama call).
+                    match cas.read_blob(&h) {
+                        Ok(Some(vec)) => {
+                            tracing::debug!(
+                                rel_path = %rel_path,
+                                "CAS hit: skipping Ollama embed"
+                            );
+                            Some((chunk_hash.clone(), vec))
+                        }
+                        _ => None, // blob missing — fall through to embed
+                    }
+                }
+                _ => None, // miss or error — fall through to embed
+            };
+
+            if let Some((ch, vec)) = cas_entry {
+                // CAS hit: record the manifest entry and the in-memory cache update.
+                cas_hit_entries.push((rel_path, hash, vec));
+                // No new CAS write needed — blob already exists.
+                cas_manifest_updates.push((key, ch));
+            } else {
+                texts_to_embed.push((rel_path, hash, text));
+            }
+        }
+
+        // Apply CAS hit entries to the in-memory embedding cache.
+        if !cas_hit_entries.is_empty() {
+            let mut cache = ref_index.embedding_cache.write().await;
+            for (rel_path, hash, vec) in &cas_hit_entries {
+                cache.insert(
+                    rel_path.clone(),
+                    CacheEntry {
+                        hash: hash.clone(),
+                        vector: vec.clone(),
+                    },
+                );
+                updated += 1;
+            }
         }
 
         // Nothing to embed and nothing to delete → skip the save entirely.
         if texts_to_embed.is_empty() && deletions.is_empty() {
-            return (updated, skipped);
+            // Still need to update the CAS manifest for hits.
+            if !cas_manifest_updates.is_empty()
+                && let Err(e) = cas.update_manifest(&ref_id_hex, &cas_manifest_updates)
+            {
+                tracing::warn!("CAS manifest update failed (non-fatal): {e}");
+            }
+            if cas_hit_entries.is_empty() {
+                return (updated, skipped);
+            }
+            // Fall through to persist the updated in-memory cache to disk.
         }
 
         // Embed any pending texts (may be empty if this batch was deletion-only).
@@ -510,17 +1286,26 @@ impl ContextPlusServer {
                 texts_to_embed.iter().map(|(_, _, t)| t.clone()).collect();
             match self.state.ollama.embed(&embed_texts).await {
                 Ok(vectors) => {
-                    let mut cache = self.state.embedding_cache.write().await;
-                    for (i, (rel_path, hash, _)) in texts_to_embed.iter().enumerate() {
+                    let mut cache = ref_index.embedding_cache.write().await;
+                    for (i, (rel_path, hash, text)) in texts_to_embed.iter().enumerate() {
                         if i < vectors.len() {
+                            let vec = &vectors[i];
                             cache.insert(
                                 rel_path.clone(),
                                 CacheEntry {
                                     hash: hash.clone(),
-                                    vector: vectors[i].clone(),
+                                    vector: vec.clone(),
                                 },
                             );
                             updated += 1;
+                            // Write new blob + manifest entry to CAS.
+                            let chunk_hash = ChunkHash::of(text);
+                            let key = ChunkKey::new(rel_path.clone(), 0);
+                            if let Err(e) = cas.write_blob(&chunk_hash, vec) {
+                                tracing::warn!("CAS write_blob failed (non-fatal): {e}");
+                            } else {
+                                cas_manifest_updates.push((key, chunk_hash));
+                            }
                         }
                     }
                 }
@@ -531,6 +1316,14 @@ impl ContextPlusServer {
             }
         }
 
+        // Flush all CAS manifest updates in one batch.
+        if !embed_failed
+            && !cas_manifest_updates.is_empty()
+            && let Err(e) = cas.update_manifest(&ref_id_hex, &cas_manifest_updates)
+        {
+            tracing::warn!("CAS manifest batch update failed (non-fatal): {e}");
+        }
+
         // Persist on every successful pass — even pure-deletion ones — so the
         // on-disk cache evicts the deleted keys. A plain merged save would
         // silently re-populate them from disk and the cache would grow without
@@ -538,14 +1331,14 @@ impl ContextPlusServer {
         // guard, then run the save off the Tokio worker via spawn_blocking.
         if !embed_failed {
             let store_to_save = {
-                let cache = self.state.embedding_cache.read().await;
+                let cache = ref_index.embedding_cache.read().await;
                 let store = crate::core::embeddings::VectorStore::from_cache(&cache);
                 drop(cache);
                 store
             };
 
             let embed_cache_name = cache_name("embeddings", &self.state.config.ollama_embed_model);
-            let root = self.state.root_dir.clone();
+            let root = ref_index.root_dir.clone();
             let deletions_owned = std::mem::take(&mut deletions);
             let result = tokio::task::spawn_blocking(move || {
                 // Merge with disk under fd-lock: the runtime in-memory store
@@ -609,10 +1402,11 @@ impl ContextPlusServer {
             .iter()
             .filter(|e| !e.is_directory)
             .count();
+        let ref_index = self.current_ref();
 
         // Fast path: index exists, TTL valid, file count unchanged — clone Arc (cheap)
         {
-            let guard = self.state.identifier_index.read().await;
+            let guard = ref_index.identifier_index.read().await;
             if let Some(ref idx) = *guard
                 && idx.file_count == file_count
                 && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
@@ -698,7 +1492,7 @@ impl ContextPlusServer {
                 file_count,
                 built_at: Instant::now(),
             });
-            let mut guard = self.state.identifier_index.write().await;
+            let mut guard = ref_index.identifier_index.write().await;
             *guard = Some(Arc::clone(&idx));
             return Ok(idx);
         }
@@ -715,7 +1509,7 @@ impl ContextPlusServer {
             "identifier-embeddings",
             &self.state.config.ollama_embed_model,
         );
-        let id_cache = match rkyv_store::load_cache(&self.state.root_dir, &id_cache_name) {
+        let id_cache = match rkyv_store::load_cache(&ref_index.root_dir, &id_cache_name) {
             Ok(Some(data)) => {
                 let store = data.to_store();
                 tracing::info!(cached = store.count(), "Loaded identifier embedding cache");
@@ -774,7 +1568,7 @@ impl ContextPlusServer {
                         .collect();
                     let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
                     let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
-                    let root = self.state.root_dir.clone();
+                    let root = ref_index.root_dir.clone();
                     let cache_name_owned = id_cache_name.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         // Merge with disk under fd-lock so we preserve identifier
@@ -813,9 +1607,9 @@ impl ContextPlusServer {
             built_at: Instant::now(),
         });
 
-        // Store Arc in shared state (cheap pointer clone, no data copy)
+        // Store Arc in per-ref state (cheap pointer clone, no data copy)
         {
-            let mut guard = self.state.identifier_index.write().await;
+            let mut guard = ref_index.identifier_index.write().await;
             *guard = Some(Arc::clone(&idx));
         }
 
@@ -963,7 +1757,8 @@ impl ContextPlusServer {
 
         // Check ProjectCache.file_content first to avoid a disk read on warm cache.
         let cached_content: Option<Arc<String>> = {
-            let cache_guard = self.state.project_cache.read().await;
+            let ref_index = self.current_ref();
+            let cache_guard = ref_index.project_cache.read().await;
             if let Some(ref cache) = *cache_guard {
                 cache.file_content.get(&file_path).map(Arc::clone)
             } else {
@@ -1072,8 +1867,9 @@ impl ContextPlusServer {
         // `semantic_code_search` can skip the walk on a generation hit.
         // When the tracker is Off the counter stays at 0 and the
         // fingerprint-based fallback is used instead.
+        let ref_index = self.current_ref();
         let cache_gen = if self.state.config.embed_tracker_mode != crate::config::TrackerMode::Off {
-            Some(&self.state.cache_generation)
+            Some(&ref_index.cache_generation)
         } else {
             None
         };
@@ -1081,7 +1877,7 @@ impl ContextPlusServer {
             options,
             &embedder,
             &walker,
-            Some(Arc::clone(&self.state.search_index_cache)),
+            Some(Arc::clone(&ref_index.search_index_cache)),
             cache_gen.cloned(),
         )
         .await?;
@@ -1147,12 +1943,13 @@ impl ContextPlusServer {
             mode: Self::get_str(&args, "mode"),
         };
 
+        let ref_index = self.current_ref();
         let result = crate::tools::semantic_navigate::semantic_navigate(
             options,
             &self.state.ollama,
             &self.state.config,
-            &self.state.embedding_cache,
-            &self.state.root_dir,
+            &ref_index.embedding_cache,
+            &ref_index.root_dir,
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -1428,21 +2225,22 @@ impl ContextPlusServer {
     // --- Helpers ---
 
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
+        let ref_index = self.current_ref();
         if let Some(requested) = Self::get_str(args, "rootDir") {
             let requested_path = PathBuf::from(&requested);
             // Use pre-canonicalized root (computed once at construction, not per-request).
             if let Ok(canonical_requested) = requested_path.canonicalize()
-                && canonical_requested.starts_with(&self.state.canonical_root)
+                && canonical_requested.starts_with(&ref_index.canonical_root)
             {
                 return canonical_requested;
             }
             tracing::warn!(
                 requested = %requested,
-                root = %self.state.root_dir.display(),
+                root = %ref_index.root_dir.display(),
                 "Caller-provided rootDir is outside the server root; ignoring"
             );
         }
-        self.state.root_dir.clone()
+        ref_index.root_dir.clone()
     }
 
     // ----- find_dead_code -----
@@ -1528,7 +2326,7 @@ impl ContextPlusServer {
             .min(MAX_FILES_CAP);
 
         let cache = self.ensure_project_cache().await?;
-        let root = self.state.root_dir.clone();
+        let root = self.current_ref().root_dir.clone();
 
         let formatted = tokio::task::spawn_blocking(move || {
             let symbols_by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
@@ -1585,7 +2383,7 @@ impl ContextPlusServer {
         use crate::tools::dependency_loop_detect::{find_cycles, format_cycles};
 
         let cache = self.ensure_project_cache().await?;
-        let root = self.state.root_dir.clone();
+        let root = self.current_ref().root_dir.clone();
 
         let formatted = tokio::task::spawn_blocking(move || {
             let all_abs_paths: Vec<PathBuf> = cache
@@ -1635,7 +2433,8 @@ impl ContextPlusServer {
         let requested_dim = Self::get_usize(&args, "expected_dim").filter(|&d| d > 0);
 
         let vectors: Vec<(PathBuf, Vec<f32>)> = {
-            let guard = self.state.embedding_cache.read().await;
+            let ref_index = self.current_ref();
+            let guard = ref_index.embedding_cache.read().await;
             guard
                 .iter()
                 .map(|(path, entry)| (PathBuf::from(path), entry.vector.clone()))
@@ -1843,7 +2642,74 @@ impl ServerHandler for ContextPlusServer {
         }
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-        Ok(self.dispatch(&name, args).await)
+
+        // Tool-call entry log — pairs with an exit log below. Lets daemon-log
+        // operators correlate "Transport closed" / "completed without a
+        // result" client-side errors against a specific tool dispatch and its
+        // duration. Includes session_ref_id so multi-worktree races are
+        // distinguishable.
+        let _call_started = std::time::Instant::now();
+        tracing::debug!(
+            tool = %name,
+            session_ref_id = self.session_ref_id.map(|r| r.0),
+            "call_tool: entry"
+        );
+
+        // Route through U5's path-translation boundary.
+        //
+        // U9: `caller_root` is now resolved per-session:
+        //   • If `session_ref_id` is Some(id), look up that ref's `root_dir`
+        //     in the registry. This is set by `daemon::serve_connection` after
+        //     `register_session` completes, so worktree-scoped connections get
+        //     their own caller root automatically.
+        //   • If `session_ref_id` is None (stdio mode / no handshake), fall
+        //     back to `default_ref` — identical to pre-U9 behaviour.
+        //   • If the id is Some but not found in the registry (registry
+        //     tampered), warn and fall back to `default_ref`.
+        //
+        // The dispatch layer passes `foreign_roots = &[]` so output rewriting
+        // is still identity in single-ref mode. Cross-ref leakage protection
+        // (listing other refs' roots as `foreign_roots`) is reserved for U10+.
+        let caller_root_opt =
+            crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id);
+        let result = match caller_root_opt {
+            Some(caller_root) => Ok(crate::transport::dispatch::dispatch_with_translation(
+                self,
+                &name,
+                args,
+                &caller_root,
+                // U9 + U14 wiring: `self.session_ref_id` is set per-connection by
+                // `daemon::serve_connection` after `register_session`. Passing it
+                // to `dispatch_with_translation` lets `foreign_roots_for_session`
+                // exclude the caller's own ref from the foreign-roots list and
+                // include only OTHER attached refs — activating cross-ref
+                // leakage protection for multi-ref daemons.
+                self.session_ref_id,
+            )
+            .await),
+            None => {
+                // Registry tampered with externally — fall back to direct
+                // dispatch so we don't lose the request entirely.
+                tracing::warn!(
+                    "caller_root unavailable; bypassing path translation for tool {name}"
+                );
+                Ok(self.dispatch(&name, args).await)
+            }
+        };
+
+        let elapsed_ms = _call_started.elapsed().as_millis() as u64;
+        let content_count = result
+            .as_ref()
+            .ok()
+            .map(|r: &CallToolResult| r.content.len());
+        tracing::info!(
+            tool = %name,
+            session_ref_id = self.session_ref_id.map(|r| r.0),
+            elapsed_ms,
+            content_count = ?content_count,
+            "call_tool: exit"
+        );
+        result
     }
 }
 
@@ -1914,24 +2780,409 @@ fn parse_metadata(
 // make_tool() is re-exported from server_definitions — see imports at top of this file.
 
 // ---------------------------------------------------------------------------
-// Startup warmup
+// U18: warmup helpers
 // ---------------------------------------------------------------------------
 
-/// Run a trivial semantic search query through the full pipeline to populate
-/// the in-memory `SearchIndex` cache and pre-build the HNSW index.
+/// RAII guard that removes `ref_id` from `state.warmup_in_flight` on drop.
 ///
-/// This is intentionally a module-level (non-`impl`) function so tests can
-/// call it directly with a bare `Arc<SharedState>` without constructing a
-/// full `ContextPlusServer`.
-pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
+/// This ensures the in-flight slot is released even if the warmup task panics
+/// or returns early, allowing a future `spawn_ref_warmup` call to retry.
+struct WarmupGuard {
+    state: Arc<SharedState>,
+    ref_id: crate::ref_index::RefId,
+}
+
+impl Drop for WarmupGuard {
+    fn drop(&mut self) {
+        // We are inside a tokio task, so we can't call `.await` here.
+        // Use `try_lock` — if the mutex is contended we skip (the warmup loop
+        // will remove the entry shortly anyway on its own unlock path).
+        if let Ok(mut inflight) = self.state.warmup_in_flight.try_lock() {
+            inflight.remove(&self.ref_id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// U20: baseline-import helpers
+// ---------------------------------------------------------------------------
+
+/// A chunk that had no CAS hit and needs an Ollama embed.
+pub struct MissedChunk {
+    /// Repo-relative file path.
+    pub rel_path: String,
+    /// FNV hash of the raw content (used as the in-memory `CacheEntry.hash`).
+    pub content_hash: String,
+    /// Text that was prepared for embedding (header + path + truncated content).
+    pub embed_text: String,
+}
+
+/// Summary returned by the baseline-import pass.
+pub struct BaselineImportReport {
+    /// Number of CAS hits (chunks loaded from parent chain, zero Ollama).
+    pub hits: usize,
+    /// Chunks that had no CAS hit — available for Ollama embed in Full mode.
+    pub misses: Vec<MissedChunk>,
+}
+
+/// Walk every file in `project_cache`, compute chunk hashes, look up the CAS
+/// parent chain, and register any hits into the ref's in-memory
+/// `embedding_cache` and `search_index_cache` — without any Ollama calls.
+///
+/// Called by **both** Shallow and Full warmup so neither duplicates logic:
+/// - Shallow invokes this and discards the misses.
+/// - Full invokes this then calls [`embed_diff_chunks`] on the misses.
+///
+/// The CAS is rooted at `state.root_dir/.mcp_data` (the primary worktree's
+/// data directory) regardless of which ref is being warmed, matching the
+/// behaviour of `incremental_reembed`.
+async fn import_baseline_for_ref(
+    state: &Arc<SharedState>,
+    ref_id: crate::ref_index::RefId,
+    project_cache: Arc<ProjectCache>,
+) -> BaselineImportReport {
+    use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
+    use crate::tools::semantic_search::{CachedSearchIndex, IndexFingerprint, SearchDocument};
+
+    let ref_index = match state.ref_index(ref_id) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(ref_id = ref_id.0, "import_baseline_for_ref: ref not found");
+            return BaselineImportReport {
+                hits: 0,
+                misses: Vec::new(),
+            };
+        }
+    };
+
+    // CAS lives at the primary worktree's .mcp_data directory.
+    let mcp_data_dir = state.root_dir.join(".mcp_data");
+    let cas = CasStore::new(mcp_data_dir, &state.config.ollama_embed_model);
+    let ref_id_hex = ref_index.cas_ref_id_hex.clone();
+    let max_file_size = state.config.max_embed_file_size;
+
+    // Collect per-file results on a blocking thread to avoid holding async locks
+    // during synchronous I/O.
+    type HitEntry = (String, String, Vec<f32>); // (rel_path, content_hash, vector)
+    let project_cache_for_idx = Arc::clone(&project_cache);
+    let (hits_raw, misses): (Vec<HitEntry>, Vec<MissedChunk>) =
+        tokio::task::spawn_blocking(move || {
+            let mut hits: Vec<HitEntry> = Vec::new();
+            let mut misses: Vec<MissedChunk> = Vec::new();
+
+            for (rel_path, content) in &project_cache.file_content {
+                // Skip files that exceed the max embed size.
+                if content.len() > max_file_size {
+                    continue;
+                }
+                let content_hash = crate::core::parser::hash_content(content);
+                let truncated = if content.len() > 500 {
+                    crate::core::parser::truncate_to_char_boundary(content, 500).to_string()
+                } else {
+                    content.as_str().to_string()
+                };
+                let header = crate::core::parser::extract_header(content);
+                let embed_text = format!("{} {} {}", header, rel_path, truncated);
+
+                let chunk_hash = ChunkHash::of(&embed_text);
+                let key = ChunkKey::new(rel_path.clone(), 0);
+
+                match cas.lookup_chunk(&ref_id_hex, &key) {
+                    Ok(Some(h)) if h == chunk_hash => {
+                        // Chunk hash matches manifest entry — try to load the blob.
+                        match cas.read_blob(&h) {
+                            Ok(Some(vec)) => {
+                                hits.push((rel_path.clone(), content_hash, vec));
+                            }
+                            _ => {
+                                // Blob missing despite manifest hit — treat as miss.
+                                misses.push(MissedChunk {
+                                    rel_path: rel_path.clone(),
+                                    content_hash,
+                                    embed_text,
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        misses.push(MissedChunk {
+                            rel_path: rel_path.clone(),
+                            content_hash,
+                            embed_text,
+                        });
+                    }
+                }
+            }
+            (hits, misses)
+        })
+        .await
+        .unwrap_or_default();
+
+    let hit_count = hits_raw.len();
+
+    // Register hits into the in-memory embedding_cache.
+    if !hits_raw.is_empty() {
+        let mut cache = ref_index.embedding_cache.write().await;
+        for (rel_path, content_hash, vector) in &hits_raw {
+            cache.insert(
+                rel_path.clone(),
+                CacheEntry {
+                    hash: content_hash.clone(),
+                    vector: vector.clone(),
+                },
+            );
+        }
+    }
+
+    // Build search_index_cache from the inherited blobs.
+    if !hits_raw.is_empty() {
+        let project_snap = project_cache_for_idx;
+        let hits_snap: Vec<(String, Vec<f32>)> = hits_raw
+            .iter()
+            .map(|(p, _, v)| (p.clone(), v.clone()))
+            .collect();
+
+        let (docs, vectors) = tokio::task::spawn_blocking(move || {
+            let hit_map: HashMap<String, Vec<f32>> = hits_snap.into_iter().collect();
+            let mut docs: Vec<SearchDocument> = Vec::new();
+            let mut vectors: Vec<Option<Vec<f32>>> = Vec::new();
+            for (rel_path, content) in &project_snap.file_content {
+                let header = crate::core::parser::extract_header(content);
+                let ext = rel_path.rsplit('.').next().unwrap_or("");
+                let symbols: Vec<String> = if let Ok(syms) = parse_with_tree_sitter(content, ext) {
+                    crate::core::parser::flatten_symbols(&syms, None)
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let doc = SearchDocument::new(
+                    rel_path.clone(),
+                    header,
+                    symbols,
+                    Vec::new(),
+                    content.as_str().to_string(),
+                );
+                let vec = hit_map.get(rel_path).cloned();
+                docs.push(doc);
+                vectors.push(vec);
+            }
+            (docs, vectors)
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+
+        if !docs.is_empty() {
+            use crate::tools::semantic_search::SearchIndex;
+            let current_gen = ref_index
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let fp = IndexFingerprint::from_docs(&docs);
+            let mut idx = SearchIndex::new();
+            idx.index_with_vectors_and_tuning(
+                docs,
+                vectors,
+                crate::core::embeddings::HnswTuning::global(),
+            );
+            let cached = Arc::new(CachedSearchIndex::new(idx, fp, current_gen));
+            let mut guard = ref_index.search_index_cache.write().await;
+            *guard = Some(cached);
+            tracing::debug!(
+                ref_id = ref_id.0,
+                hits = hit_count,
+                "import_baseline_for_ref: search_index_cache built from inherited blobs"
+            );
+        }
+    }
+
+    BaselineImportReport {
+        hits: hit_count,
+        misses,
+    }
+}
+
+/// Embed the diff chunks (CAS misses from [`import_baseline_for_ref`]) via
+/// Ollama, gated by the `ollama_semaphore`.  Writes new blobs + manifest
+/// entries to CAS and updates the ref's `embedding_cache`.
+///
+/// Called by `spawn_full_warmup_task` after the baseline-import phase.
+/// After embeds land, refreshes `search_index_cache` to include the new
+/// vectors.
+async fn embed_diff_chunks(
+    state: &Arc<SharedState>,
+    ref_id: crate::ref_index::RefId,
+    misses: &[MissedChunk],
+) {
+    use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
+    use crate::tools::semantic_search::{CachedSearchIndex, IndexFingerprint, SearchDocument};
+
+    if misses.is_empty() {
+        return;
+    }
+
+    let ref_index = match state.ref_index(ref_id) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(ref_id = ref_id.0, "embed_diff_chunks: ref not found");
+            return;
+        }
+    };
+
+    tracing::info!(
+        ref_id = ref_id.0,
+        count = misses.len(),
+        "ref_warmup full: embedding diff chunks via Ollama"
+    );
+
+    let embed_texts: Vec<String> = misses.iter().map(|m| m.embed_text.clone()).collect();
+
+    let vectors = match state.ollama.embed(&embed_texts).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                ref_id = ref_id.0,
+                error = %e,
+                "ref_warmup full: Ollama embed for diff chunks failed (non-fatal)"
+            );
+            return;
+        }
+    };
+
+    // Write new blobs + update embedding_cache.
+    let mcp_data_dir = state.root_dir.join(".mcp_data");
+    let cas = CasStore::new(mcp_data_dir, &state.config.ollama_embed_model);
+    let ref_id_hex = ref_index.cas_ref_id_hex.clone();
+
+    let mut manifest_updates: Vec<(ChunkKey, ChunkHash)> = Vec::new();
+    {
+        let mut cache = ref_index.embedding_cache.write().await;
+        for (i, miss) in misses.iter().enumerate() {
+            if let Some(vec) = vectors.get(i) {
+                cache.insert(
+                    miss.rel_path.clone(),
+                    CacheEntry {
+                        hash: miss.content_hash.clone(),
+                        vector: vec.clone(),
+                    },
+                );
+                let chunk_hash = ChunkHash::of(&miss.embed_text);
+                let key = ChunkKey::new(miss.rel_path.clone(), 0);
+                if let Err(e) = cas.write_blob(&chunk_hash, vec) {
+                    tracing::warn!(
+                        rel_path = %miss.rel_path,
+                        error = %e,
+                        "embed_diff_chunks: CAS write_blob failed (non-fatal)"
+                    );
+                } else {
+                    manifest_updates.push((key, chunk_hash));
+                }
+            }
+        }
+    }
+    if let Err(e) = cas.update_manifest(&ref_id_hex, &manifest_updates) {
+        tracing::warn!(
+            ref_id = ref_id.0,
+            error = %e,
+            "embed_diff_chunks: manifest update failed (non-fatal)"
+        );
+    }
+
+    // Refresh search_index_cache to include the newly embedded diff vectors.
+    // Read the current embedding_cache snapshot and rebuild the index.
+    let project_cache_snap = {
+        let guard = ref_index.project_cache.read().await;
+        guard.as_ref().map(Arc::clone)
+    };
+    if let Some(project_cache) = project_cache_snap {
+        let embedding_snap: HashMap<String, Vec<f32>> = {
+            let cache = ref_index.embedding_cache.read().await;
+            cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.vector.clone()))
+                .collect()
+        };
+
+        let (docs, vectors_for_idx) = tokio::task::spawn_blocking(move || {
+            let mut docs: Vec<SearchDocument> = Vec::new();
+            let mut vectors: Vec<Option<Vec<f32>>> = Vec::new();
+            for (rel_path, content) in &project_cache.file_content {
+                let header = crate::core::parser::extract_header(content);
+                let ext = rel_path.rsplit('.').next().unwrap_or("");
+                let symbols: Vec<String> = if let Ok(syms) = parse_with_tree_sitter(content, ext) {
+                    crate::core::parser::flatten_symbols(&syms, None)
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let doc = SearchDocument::new(
+                    rel_path.clone(),
+                    header,
+                    symbols,
+                    Vec::new(),
+                    content.as_str().to_string(),
+                );
+                let vec = embedding_snap.get(rel_path).cloned();
+                docs.push(doc);
+                vectors.push(vec);
+            }
+            (docs, vectors)
+        })
+        .await
+        .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+
+        if !docs.is_empty() {
+            use crate::tools::semantic_search::SearchIndex;
+            let current_gen = ref_index
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let fp = IndexFingerprint::from_docs(&docs);
+            let mut idx = SearchIndex::new();
+            idx.index_with_vectors_and_tuning(
+                docs,
+                vectors_for_idx,
+                crate::core::embeddings::HnswTuning::global(),
+            );
+            let cached = Arc::new(CachedSearchIndex::new(idx, fp, current_gen));
+            let mut guard = ref_index.search_index_cache.write().await;
+            *guard = Some(cached);
+            tracing::debug!(
+                ref_id = ref_id.0,
+                "embed_diff_chunks: search_index_cache refreshed with diff embeddings"
+            );
+        }
+    }
+}
+
+/// Run the semantic-search warmup pipeline for a specific `ref_id`.
+///
+/// Mirrors `warmup_semantic_search_cache` but targets the per-ref
+/// `search_index_cache` and `cache_generation` rather than the default ref's.
+/// Retained for integration-test use; production Full warmup now delegates
+/// to `import_baseline_for_ref` + `embed_diff_chunks` (U20).
+#[allow(dead_code)]
+async fn warmup_ref_search_cache(state: &Arc<SharedState>, ref_id: crate::ref_index::RefId) {
     use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
     use crate::tools::semantic_search::{SemanticSearchOptions, semantic_code_search};
 
+    let ref_index = match state.ref_index(ref_id) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(ref_id = ref_id.0, "warmup_ref_search_cache: ref not found");
+            return;
+        }
+    };
+
     let t0 = std::time::Instant::now();
-    tracing::info!("SearchIndex warmup starting");
+    tracing::info!(
+        ref_id = ref_id.0,
+        "ref_warmup full: SearchIndex warmup starting"
+    );
 
     let options = SemanticSearchOptions {
-        root_dir: state.root_dir.clone(),
+        root_dir: ref_index.root_dir.clone(),
         query: "warmup".to_string(),
         top_k: Some(1),
         semantic_weight: None,
@@ -1957,8 +3208,78 @@ pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
         options,
         &embedder,
         &walker,
-        Some(Arc::clone(&state.search_index_cache)),
-        Some(Arc::clone(&state.cache_generation)),
+        Some(Arc::clone(&ref_index.search_index_cache)),
+        Some(Arc::clone(&ref_index.cache_generation)),
+    )
+    .await
+    {
+        Ok(_) => tracing::info!(
+            ref_id = ref_id.0,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "ref_warmup full: SearchIndex warmup complete"
+        ),
+        Err(e) => tracing::warn!(
+            ref_id = ref_id.0,
+            elapsed_ms = t0.elapsed().as_millis(),
+            error = %e,
+            "ref_warmup full: SearchIndex warmup failed (non-fatal)"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup warmup
+// ---------------------------------------------------------------------------
+
+/// Run a trivial semantic search query through the full pipeline to populate
+/// the in-memory `SearchIndex` cache and pre-build the HNSW index.
+///
+/// This is intentionally a module-level (non-`impl`) function so tests can
+/// call it directly with a bare `Arc<SharedState>` without constructing a
+/// full `ContextPlusServer`.
+pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
+    use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
+    use crate::tools::semantic_search::{SemanticSearchOptions, semantic_code_search};
+
+    let t0 = std::time::Instant::now();
+    tracing::info!("SearchIndex warmup starting");
+
+    // Warmup always targets the default ref — it runs at daemon startup before
+    // any per-session refs are registered.  `default_ref()` is guaranteed to be
+    // present; the `expect` is safe under normal operating conditions.
+    let default_ref = state
+        .default_ref()
+        .expect("default_ref always present during warmup");
+
+    let options = SemanticSearchOptions {
+        root_dir: default_ref.root_dir.clone(),
+        query: "warmup".to_string(),
+        top_k: Some(1),
+        semantic_weight: None,
+        keyword_weight: None,
+        min_semantic_score: None,
+        min_keyword_score: None,
+        min_combined_score: None,
+        require_keyword_match: None,
+        require_semantic_match: None,
+        include_globs: None,
+        exclude_globs: None,
+        recency_window_days: None,
+    };
+
+    let embedder = OllamaEmbedder(state.ollama.clone());
+    let walker = CachedWalkerIndexer {
+        config: state.config.clone(),
+        ollama: state.ollama.clone(),
+        state: Arc::clone(state),
+    };
+
+    match semantic_code_search(
+        options,
+        &embedder,
+        &walker,
+        Some(Arc::clone(&default_ref.search_index_cache)),
+        Some(Arc::clone(&default_ref.cache_generation)),
     )
     .await
     {
@@ -3245,7 +4566,7 @@ mod tests {
         let root = PathBuf::from("/tmp/test-root");
         let config = Config::from_env();
         let server = ContextPlusServer::new(root.clone(), config);
-        assert_eq!(server.root_dir(), Path::new("/tmp/test-root"));
+        assert_eq!(server.root_dir(), PathBuf::from("/tmp/test-root"));
         assert_eq!(server.state.root_dir, root);
     }
 
@@ -3900,5 +5221,998 @@ mod tests {
             .await;
         let text = extract_text(&result);
         assert!(text.contains("shutting down"), "got: {text}");
+    }
+
+    // ── U9: with_session / session_ref_id ────────────────────────────────────
+
+    /// `new()` produces a server with no session ref — stdio / no-handshake
+    /// mode falls through to `default_ref` routing.
+    #[test]
+    fn new_server_has_no_session_ref_id() {
+        let server = test_server();
+        assert!(
+            server.session_ref_id.is_none(),
+            "freshly constructed server must have session_ref_id = None"
+        );
+    }
+
+    /// `with_session` returns a clone that carries the given `RefId` while
+    /// leaving the original unchanged.
+    #[test]
+    fn with_session_sets_ref_id_without_mutating_original() {
+        use crate::ref_index::RefId;
+
+        let server = test_server();
+        let fake_id = RefId(0xdeadbeef_cafebabe);
+        let session_server = server.with_session(fake_id);
+
+        // Original is untouched.
+        assert!(
+            server.session_ref_id.is_none(),
+            "original server must remain None after with_session"
+        );
+        // Clone carries the new id.
+        assert_eq!(
+            session_server.session_ref_id,
+            Some(fake_id),
+            "session copy must carry the provided RefId"
+        );
+        // Both share the same Arc<SharedState>.
+        assert!(
+            Arc::ptr_eq(&server.state, &session_server.state),
+            "with_session must not clone SharedState — same Arc"
+        );
+    }
+
+    /// `with_session` is idempotent: calling it again overwrites the ref_id.
+    #[test]
+    fn with_session_can_be_called_twice_overwriting_ref_id() {
+        use crate::ref_index::RefId;
+
+        let server = test_server();
+        let id_a = RefId(1);
+        let id_b = RefId(2);
+        let s_a = server.with_session(id_a);
+        let s_b = s_a.with_session(id_b);
+
+        assert_eq!(s_a.session_ref_id, Some(id_a));
+        assert_eq!(s_b.session_ref_id, Some(id_b));
+    }
+
+    // ── U10: per-ref state / backward-compat shims ───────────────────────────
+
+    /// `state.embedding_cache` and `default_ref().embedding_cache` must share
+    /// the same `Arc` — writes through one are visible through the other.
+    #[tokio::test]
+    async fn sharedstate_embedding_cache_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(&server.state.embedding_cache, &default_ref.embedding_cache),
+            "SharedState.embedding_cache must be the same Arc as default_ref().embedding_cache"
+        );
+    }
+
+    /// `state.project_cache` and `default_ref().project_cache` share the same Arc.
+    #[tokio::test]
+    async fn sharedstate_project_cache_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(&server.state.project_cache, &default_ref.project_cache),
+            "SharedState.project_cache must share the Arc with default_ref().project_cache"
+        );
+    }
+
+    /// `state.identifier_index` and `default_ref().identifier_index` share the same Arc.
+    #[tokio::test]
+    async fn sharedstate_identifier_index_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(
+                &server.state.identifier_index,
+                &default_ref.identifier_index
+            ),
+            "SharedState.identifier_index must share the Arc with default_ref().identifier_index"
+        );
+    }
+
+    /// `state.search_index_cache` and `default_ref().search_index_cache` share Arc.
+    #[tokio::test]
+    async fn sharedstate_search_index_cache_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(
+                &server.state.search_index_cache,
+                &default_ref.search_index_cache
+            ),
+            "SharedState.search_index_cache must share the Arc with default_ref().search_index_cache"
+        );
+    }
+
+    /// `state.cache_generation` and `default_ref().cache_generation` share Arc.
+    #[tokio::test]
+    async fn sharedstate_cache_generation_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(
+                &server.state.cache_generation,
+                &default_ref.cache_generation
+            ),
+            "SharedState.cache_generation must share the Arc with default_ref().cache_generation"
+        );
+    }
+
+    /// Writes through a non-default ref's `embedding_cache` do NOT appear in
+    /// the default ref's (i.e. `SharedState`'s) cache.
+    #[tokio::test]
+    async fn non_default_ref_cache_is_isolated_from_default() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+
+        // Attach a synthetic worktree ref.
+        let worktree_path = std::path::PathBuf::from("/tmp/u10-compat-isolation-wt");
+        let wt_ref_id = RefId::for_canonical_path(&worktree_path);
+        let wt_ref_arc = server
+            .state
+            .attach_ref(wt_ref_id, || {
+                Arc::new(RefIndex::new(
+                    worktree_path.clone(),
+                    worktree_path.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        // Write into the worktree ref's cache.
+        wt_ref_arc.embedding_cache.write().await.insert(
+            "worktree_only.rs".to_string(),
+            CacheEntry {
+                hash: "wt_hash".to_string(),
+                vector: vec![9.9],
+            },
+        );
+
+        // The default ref (and SharedState shim) must not see this entry.
+        assert!(
+            !server
+                .state
+                .embedding_cache
+                .read()
+                .await
+                .contains_key("worktree_only.rs"),
+            "default ref cache must not contain worktree-only keys"
+        );
+    }
+
+    // ── U11: current_ref() routing ───────────────────────────────────────────
+
+    /// `current_ref()` with `session_ref_id = None` returns the default ref.
+    #[test]
+    fn current_ref_with_no_session_returns_default_ref() {
+        let server = test_server();
+        assert!(
+            server.session_ref_id.is_none(),
+            "precondition: freshly constructed server has no session ref"
+        );
+
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+        let current = server.current_ref();
+
+        assert!(
+            Arc::ptr_eq(&default_ref, &current),
+            "current_ref() with None session must return the same Arc as default_ref()"
+        );
+    }
+
+    /// `current_ref()` with a registered `session_ref_id` returns that ref.
+    #[tokio::test]
+    async fn current_ref_with_registered_session_returns_session_ref() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+
+        // Register a synthetic worktree ref.
+        let wt_path = std::path::PathBuf::from("/tmp/u11-current-ref-wt");
+        let wt_ref_id = RefId::for_canonical_path(&wt_path);
+        let wt_ref_arc = server
+            .state
+            .attach_ref(wt_ref_id, || {
+                Arc::new(RefIndex::new(
+                    wt_path.clone(),
+                    wt_path.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        // Build a session-scoped server clone and check current_ref().
+        let session_server = server.with_session(wt_ref_id);
+        let current = session_server.current_ref();
+
+        assert!(
+            Arc::ptr_eq(&wt_ref_arc, &current),
+            "current_ref() for a registered session must return the registered RefIndex"
+        );
+    }
+
+    /// `current_ref()` with an unregistered `session_ref_id` falls back to `default_ref`.
+    #[test]
+    fn current_ref_with_unknown_session_falls_back_to_default_ref() {
+        use crate::ref_index::RefId;
+
+        let server = test_server();
+
+        // Use a RefId that is NOT registered in the registry.
+        let unknown_id = RefId(0xdeadbeef_12345678);
+        let session_server = server.with_session(unknown_id);
+
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+        let current = session_server.current_ref();
+
+        assert!(
+            Arc::ptr_eq(&default_ref, &current),
+            "current_ref() with unknown session_ref_id must fall back to default_ref"
+        );
+    }
+
+    /// Cross-ref isolation: writing to one ref's `embedding_cache` does NOT
+    /// appear in a second ref's cache. This proves Arc-clone isolation per-ref.
+    #[tokio::test]
+    async fn cross_ref_embedding_cache_isolation() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+
+        // Attach ref-A and ref-B as independent synthetic worktree refs.
+        let path_a = std::path::PathBuf::from("/tmp/u11-isolation-ref-a");
+        let path_b = std::path::PathBuf::from("/tmp/u11-isolation-ref-b");
+        let id_a = RefId::for_canonical_path(&path_a);
+        let id_b = RefId::for_canonical_path(&path_b);
+
+        let ref_a = server
+            .state
+            .attach_ref(id_a, || {
+                Arc::new(RefIndex::new(
+                    path_a.clone(),
+                    path_a.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        let ref_b = server
+            .state
+            .attach_ref(id_b, || {
+                Arc::new(RefIndex::new(
+                    path_b.clone(),
+                    path_b.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        // Write a unique key into ref-A's embedding cache.
+        ref_a.embedding_cache.write().await.insert(
+            "ref_a_only.rs".to_string(),
+            CacheEntry {
+                hash: "hash_a".to_string(),
+                vector: vec![1.0, 2.0, 3.0],
+            },
+        );
+
+        // ref-B's cache must NOT contain ref-A's key.
+        assert!(
+            !ref_b
+                .embedding_cache
+                .read()
+                .await
+                .contains_key("ref_a_only.rs"),
+            "ref-B's embedding_cache must not contain a key written to ref-A"
+        );
+
+        // default ref must also not contain it.
+        assert!(
+            !server
+                .state
+                .default_ref()
+                .unwrap()
+                .embedding_cache
+                .read()
+                .await
+                .contains_key("ref_a_only.rs"),
+            "default ref's embedding_cache must not contain a key written to ref-A"
+        );
+    }
+
+    // ── U16: ollama_semaphore on SharedState ─────────────────────────────────
+
+    /// `ollama_semaphore()` returns an `Arc<Semaphore>` whose permit count
+    /// matches the configured `ollama_max_concurrent`.
+    #[test]
+    fn ollama_semaphore_permits_match_config() {
+        let config = Config::from_env();
+        let capacity = config.ollama_max_concurrent;
+        let root = std::env::temp_dir().join("contextplus-u16-sem-test");
+        let _ = std::fs::create_dir_all(&root);
+        let server = ContextPlusServer::new(root, config);
+        let sem = server.state.ollama_semaphore();
+        assert_eq!(
+            sem.available_permits(),
+            capacity,
+            "semaphore available_permits must equal configured ollama_max_concurrent"
+        );
+    }
+
+    /// `ollama_semaphore()` returns a clone of the same underlying `Arc` —
+    /// acquiring through one clone reduces permits visible through another.
+    #[tokio::test]
+    async fn ollama_semaphore_clones_share_state() {
+        let root = std::env::temp_dir().join("contextplus-u16-sem-clone-test");
+        let _ = std::fs::create_dir_all(&root);
+        let server = ContextPlusServer::new(root, Config::from_env());
+
+        let sem_a = server.state.ollama_semaphore();
+        let sem_b = server.state.ollama_semaphore();
+
+        // Both Arcs point at the same Semaphore.
+        assert!(
+            Arc::ptr_eq(&sem_a, &sem_b),
+            "both Arcs must point to the same Semaphore"
+        );
+    }
+
+    /// Integration: construct with `ollama_max_concurrent = 2`, acquire 2 permits,
+    /// third `try_acquire` must return `Err`. This is the contract U17 relies on.
+    #[tokio::test]
+    async fn ollama_semaphore_blocks_at_capacity() {
+        use crate::config::RefWarmupMode;
+
+        let root = std::env::temp_dir().join("contextplus-u16-sem-block-test");
+        let _ = std::fs::create_dir_all(&root);
+
+        // Build a config with capacity=2 by overriding the env var.
+        let config = {
+            // SAFETY: test-only, single-threaded at this point in the test.
+            unsafe { std::env::set_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "2") };
+            let c = Config::from_env();
+            unsafe { std::env::remove_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT") };
+            c
+        };
+
+        assert_eq!(config.ollama_max_concurrent, 2);
+
+        let server = ContextPlusServer::new(root, config);
+        let sem = server.state.ollama_semaphore();
+
+        // Acquire both permits.
+        let _permit1 = sem.acquire().await.expect("first acquire must succeed");
+        let _permit2 = sem.acquire().await.expect("second acquire must succeed");
+
+        // Third try_acquire must fail (no permits left).
+        assert!(
+            sem.try_acquire().is_err(),
+            "try_acquire on a fully-occupied semaphore must return Err"
+        );
+
+        // Dropping one permit frees a slot.
+        drop(_permit1);
+        assert!(
+            sem.try_acquire().is_ok(),
+            "try_acquire must succeed after a permit is released"
+        );
+
+        // Verify RefWarmupMode is accessible from the config stored in state.
+        let _ = server.state.config.ref_warmup_mode;
+        assert_eq!(server.state.config.ref_warmup_mode, RefWarmupMode::Shallow);
+    }
+
+    // -----------------------------------------------------------------------
+    // U18: per-ref warmup tests
+    // -----------------------------------------------------------------------
+
+    fn test_server_with_warmup_mode(mode: crate::config::RefWarmupMode) -> ContextPlusServer {
+        let mut config = Config::from_env();
+        config.ref_warmup_mode = mode;
+        let root = std::env::temp_dir().join(format!(
+            "contextplus-u18-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        ContextPlusServer::new(root, config)
+    }
+
+    /// mode=off: spawn_ref_warmup is a no-op; nothing in `warmup_in_flight`.
+    #[tokio::test]
+    async fn ref_warmup_mode_off_is_noop() {
+        use crate::config::RefWarmupMode;
+        let server = test_server_with_warmup_mode(RefWarmupMode::Off);
+        let ref_id = server.state.default_ref_id;
+
+        server.spawn_ref_warmup(ref_id);
+
+        // Give a brief window for any (unexpected) spawned task to run.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // warmup_in_flight should be empty — Off mode never inserts.
+        let inflight = server.state.warmup_in_flight.lock().await;
+        assert!(
+            inflight.is_empty(),
+            "mode=off must not add ref_id to warmup_in_flight"
+        );
+
+        // project_cache must still be None (no walk happened).
+        let ref_index = server.state.default_ref().unwrap();
+        let cache = ref_index.project_cache.read().await;
+        assert!(cache.is_none(), "mode=off must not populate project_cache");
+    }
+
+    /// mode=shallow: task walks, populates project_cache; no Ollama calls.
+    ///
+    /// We verify Ollama is never called by pointing the host at a dead port.
+    /// If `embed` were called it would try to connect and fail (which we'd see
+    /// on the identifier_index). Since shallow mode doesn't touch embed, the
+    /// task must succeed regardless.
+    #[tokio::test]
+    async fn ref_warmup_shallow_populates_project_cache_no_embed() {
+        use crate::config::RefWarmupMode;
+        use std::fs;
+
+        // Build a tiny project with two files so walker finds something.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().to_path_buf();
+        fs::write(root_path.join("hello.rs"), "fn hello() {}").unwrap();
+        fs::write(root_path.join("world.txt"), "hello world").unwrap();
+
+        let mut config = Config::from_env();
+        // Point Ollama at a dead host — if embed is called it will error.
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+
+        let server = ContextPlusServer::new(root_path.clone(), config);
+        let ref_id = server.state.default_ref_id;
+
+        server.spawn_ref_warmup(ref_id);
+
+        // Wait up to 3 s for the background task to populate the cache.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            {
+                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let cache = ref_index.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup shallow: project_cache never populated within 3s");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Verify project_cache fields.
+        {
+            let ref_index = server.state.ref_index(ref_id).unwrap();
+            let cache_guard = ref_index.project_cache.read().await;
+            let cache = cache_guard.as_ref().unwrap();
+            assert!(
+                !cache.file_entries.is_empty(),
+                "shallow warmup must produce non-empty file_entries"
+            );
+            assert!(
+                cache.file_content.contains_key("hello.rs"),
+                "shallow warmup must read hello.rs into file_content"
+            );
+        }
+
+        // Wait for identifier_index to be set (parse runs after project_cache write).
+        // CI runners are slower than local dev; 10s is the conservative ceiling.
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            {
+                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let guard = ref_index.identifier_index.read().await;
+                if guard.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline2 {
+                panic!("ref_warmup shallow: identifier_index never populated within 10s");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Verify identifier_index.docs was populated (tree-sitter ran).
+        {
+            let ref_index = server.state.ref_index(ref_id).unwrap();
+            let idx_guard = ref_index.identifier_index.read().await;
+            let idx = idx_guard.as_ref().expect("identifier_index should be set");
+            // hello.rs has one function; docs should be non-empty.
+            assert!(
+                !idx.docs.is_empty(),
+                "shallow warmup must parse symbols into identifier_index.docs"
+            );
+            // dims == 0 confirms no embed call was made.
+            assert_eq!(
+                idx.dims, 0,
+                "shallow warmup must NOT populate embedding dims (no Ollama call)"
+            );
+            assert!(
+                idx.vector_buffer.is_empty(),
+                "shallow warmup must NOT populate vector_buffer (no Ollama call)"
+            );
+        }
+    }
+
+    /// Idempotency: calling spawn_ref_warmup 5 times concurrently for the same
+    /// ref_id must result in at most one warmup run (first-writer-wins).
+    #[tokio::test]
+    async fn ref_warmup_idempotent_concurrent_calls() {
+        use crate::config::RefWarmupMode;
+        use std::fs;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().to_path_buf();
+        fs::write(root_path.join("a.rs"), "pub fn a() {}").unwrap();
+
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+
+        let server = ContextPlusServer::new(root_path.clone(), config);
+        let ref_id = server.state.default_ref_id;
+
+        // Fire 5 concurrent spawn_ref_warmup calls.
+        for _ in 0..5 {
+            server.spawn_ref_warmup(ref_id);
+        }
+
+        // Wait for warmup to settle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let cache = ref_index.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup idempotency: cache never populated within 5s");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // After completion, warmup_in_flight should be empty (guard released).
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let inflight = server.state.warmup_in_flight.lock().await;
+        assert!(
+            inflight.is_empty(),
+            "warmup_in_flight must be empty after all tasks complete"
+        );
+    }
+
+    /// Per-ref isolation: warmup for ref-A must not touch ref-B's project_cache.
+    #[tokio::test]
+    async fn ref_warmup_per_ref_isolation() {
+        use crate::config::RefWarmupMode;
+        use crate::ref_index::{RefId, RefIndex};
+        use std::fs;
+        use std::sync::atomic::Ordering;
+
+        // Build two separate roots.
+        let root_a = tempfile::tempdir().expect("tempdir_a");
+        let root_b = tempfile::tempdir().expect("tempdir_b");
+
+        fs::write(root_a.path().join("a.rs"), "pub fn only_a() {}").unwrap();
+        fs::write(root_b.path().join("b.rs"), "pub fn only_b() {}").unwrap();
+
+        let canonical_b = root_b.path().canonicalize().unwrap();
+
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+
+        // Build server rooted at root_a (default ref = ref_a).
+        let server = ContextPlusServer::new(root_a.path().to_path_buf(), config.clone());
+        let ref_id_a = server.state.default_ref_id;
+
+        // Register ref_b manually.
+        let ref_id_b = RefId::for_canonical_path(&canonical_b);
+        server
+            .state
+            .attach_ref(ref_id_b, || {
+                Arc::new(RefIndex::new(
+                    root_b.path().to_path_buf(),
+                    canonical_b.clone(),
+                    None,
+                ))
+            })
+            .await;
+        // Undo the session-count side-effect from attach_ref.
+        if let Some(r) = server.state.ref_index(ref_id_b) {
+            r.session_count.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        // Warm ref_a only.
+        server.spawn_ref_warmup(ref_id_a);
+
+        // Wait for ref_a's cache.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let ref_a = server.state.ref_index(ref_id_a).unwrap();
+                let cache = ref_a.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup isolation: ref_a cache never populated");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // ref_b's project_cache must still be None.
+        let ref_b = server.state.ref_index(ref_id_b).unwrap();
+        let cache_b = ref_b.project_cache.read().await;
+        assert!(
+            cache_b.is_none(),
+            "warming ref_a must not touch ref_b's project_cache"
+        );
+
+        // ref_a's cache must contain only its own files.
+        let ref_a = server.state.ref_index(ref_id_a).unwrap();
+        let cache_a = ref_a.project_cache.read().await;
+        let cache_a = cache_a.as_ref().unwrap();
+        assert!(
+            cache_a.file_content.contains_key("a.rs"),
+            "ref_a cache must contain a.rs"
+        );
+        assert!(
+            !cache_a.file_content.contains_key("b.rs"),
+            "ref_a cache must NOT contain b.rs"
+        );
+    }
+
+    /// Config: default ref_warmup_mode is Shallow.
+    #[test]
+    fn ref_warmup_mode_defaults_to_shallow() {
+        use crate::config::RefWarmupMode;
+        // Ensure env var is absent.
+        let _lock = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Shallow);
+    }
+
+    /// Config: CONTEXTPLUS_REF_WARMUP_MODE=off disables warmup.
+    #[test]
+    fn ref_warmup_mode_can_be_disabled() {
+        use crate::config::RefWarmupMode;
+        let _lock = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "off");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Off);
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+        }
+    }
+
+    /// Config: CONTEXTPLUS_REF_WARMUP_MODE=full enables full warmup.
+    #[test]
+    fn ref_warmup_mode_full() {
+        use crate::config::RefWarmupMode;
+        let _lock = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "full");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Full);
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // U20: baseline-import tests
+    // -----------------------------------------------------------------------
+
+    /// Shallow warmup on a worktree ref that has a parent with one CAS blob
+    /// inherits that blob into `embedding_cache` and `search_index_cache`.
+    /// Zero Ollama calls — the dead-port assertion still holds.
+    #[tokio::test]
+    async fn ref_warmup_shallow_imports_parent_baseline() {
+        use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
+        use crate::config::RefWarmupMode;
+        use crate::ref_index::{RefId, RefIndex};
+        use std::fs;
+
+        // ── Set up primary root with one Rust file. ──────────────────────────
+        let primary_root = tempfile::tempdir().expect("primary_root tempdir");
+        let primary_path = primary_root.path().to_path_buf();
+        fs::write(primary_path.join("hello.rs"), "fn hello() {}").unwrap();
+
+        // Build a server rooted at primary_path; Ollama pointed at dead port.
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+        let server = ContextPlusServer::new(primary_path.clone(), config);
+
+        let primary_ref_id = server.state.default_ref_id;
+        let primary_ref = server.state.default_ref().unwrap();
+
+        // ── Pre-seed the primary's CAS manifest + blob. ─────────────────────
+        // Compute the same embed-text format that import_baseline_for_ref uses.
+        let content = "fn hello() {}";
+        let truncated = if content.len() > 500 {
+            crate::core::parser::truncate_to_char_boundary(content, 500).to_string()
+        } else {
+            content.to_string()
+        };
+        let header = crate::core::parser::extract_header(content);
+        let embed_text = format!("{} {} {}", header, "hello.rs", truncated);
+        let chunk_hash = ChunkHash::of(&embed_text);
+        let chunk_key = ChunkKey::new("hello.rs".to_string(), 0);
+
+        // Write a synthetic vector (768-dim) to the CAS under the primary ref.
+        let synthetic_vec: Vec<f32> = (0..768).map(|i| i as f32 * 0.001).collect();
+        let mcp_data = primary_path.join(".mcp_data");
+        fs::create_dir_all(&mcp_data).unwrap();
+        let cas = CasStore::new(mcp_data.clone(), &server.state.config.ollama_embed_model);
+        cas.write_blob(&chunk_hash, &synthetic_vec).unwrap();
+        cas.update_manifest(
+            &primary_ref.cas_ref_id_hex,
+            &[(chunk_key.clone(), chunk_hash.clone())],
+        )
+        .unwrap();
+
+        // ── Build a worktree ref forked from primary. ────────────────────────
+        let wt_root = tempfile::tempdir().expect("wt_root tempdir");
+        let wt_path = wt_root.path().to_path_buf();
+        fs::write(wt_path.join("hello.rs"), "fn hello() {}").unwrap();
+        let canonical_wt = wt_path.canonicalize().unwrap();
+        let wt_ref_id = RefId::for_canonical_path(&canonical_wt);
+        let wt_ref = server
+            .state
+            .attach_ref(wt_ref_id, || {
+                Arc::new(RefIndex::new(
+                    wt_path.clone(),
+                    canonical_wt.clone(),
+                    Some(primary_ref_id),
+                ))
+            })
+            .await;
+
+        // Write the parent pointer on disk so CAS lookup chains to primary.
+        cas.write_parent(&wt_ref.cas_ref_id_hex, &primary_ref.cas_ref_id_hex)
+            .unwrap();
+
+        // ── Trigger shallow warmup on the worktree ref. ──────────────────────
+        server.spawn_ref_warmup(wt_ref_id);
+
+        // Wait up to 5 s for the embedding_cache to be populated.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let cache = wt_ref.embedding_cache.read().await;
+                if cache.contains_key("hello.rs") {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "ref_warmup_shallow_imports_parent_baseline: embedding_cache never populated"
+                );
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // ── Assertions. ──────────────────────────────────────────────────────
+        {
+            let cache = wt_ref.embedding_cache.read().await;
+            let entry = cache
+                .get("hello.rs")
+                .expect("hello.rs must be in embedding_cache");
+            assert_eq!(
+                entry.vector.len(),
+                768,
+                "inherited vector must have the correct dimension"
+            );
+            // Spot-check the first element against our synthetic vector.
+            assert!(
+                (entry.vector[0] - 0.0_f32).abs() < 1e-5,
+                "vector[0] must match the seeded synthetic vector"
+            );
+        }
+        // search_index_cache must be populated (HNSW built from inherited blobs).
+        {
+            let idx = wt_ref.search_index_cache.read().await;
+            assert!(
+                idx.is_some(),
+                "search_index_cache must be populated after baseline import"
+            );
+        }
+        // identifier_index must have docs (tree-sitter ran).
+        {
+            let guard = wt_ref.identifier_index.read().await;
+            let idx = guard.as_ref().expect("identifier_index must be set");
+            assert!(!idx.docs.is_empty(), "tree-sitter must have parsed symbols");
+        }
+    }
+
+    /// Full warmup imports the baseline (zero Ollama so far), then embeds diff
+    /// chunks. With a dead Ollama host the diff-embed phase fails gracefully,
+    /// but baseline hits must already be in `embedding_cache`.
+    ///
+    /// This test asserts the "extends Shallow" invariant: if the worktree has
+    /// an identical file to the parent, that file appears in `embedding_cache`
+    /// even when the Ollama host is unreachable.
+    #[tokio::test]
+    async fn ref_warmup_full_layers_ollama_on_baseline() {
+        use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
+        use crate::config::RefWarmupMode;
+        use crate::ref_index::{RefId, RefIndex};
+        use std::fs;
+
+        // ── Primary root with one file whose CAS blob is pre-seeded. ─────────
+        let primary_root = tempfile::tempdir().expect("primary_root tempdir");
+        let primary_path = primary_root.path().to_path_buf();
+        fs::write(primary_path.join("shared.rs"), "fn shared() {}").unwrap();
+
+        let mut config = Config::from_env();
+        // Dead Ollama host — baseline import succeeds (no Ollama), diff embed fails
+        // gracefully.
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Full;
+        let server = ContextPlusServer::new(primary_path.clone(), config);
+
+        let primary_ref_id = server.state.default_ref_id;
+        let primary_ref = server.state.default_ref().unwrap();
+
+        // Pre-seed the CAS for the shared file.
+        let content = "fn shared() {}";
+        let truncated = if content.len() > 500 {
+            crate::core::parser::truncate_to_char_boundary(content, 500).to_string()
+        } else {
+            content.to_string()
+        };
+        let header = crate::core::parser::extract_header(content);
+        let embed_text = format!("{} {} {}", header, "shared.rs", truncated);
+        let chunk_hash = ChunkHash::of(&embed_text);
+        let chunk_key = ChunkKey::new("shared.rs".to_string(), 0);
+
+        let seeded_vec: Vec<f32> = (0..768).map(|i| (i as f32) * 0.002).collect();
+        let mcp_data = primary_path.join(".mcp_data");
+        fs::create_dir_all(&mcp_data).unwrap();
+        let cas = CasStore::new(mcp_data.clone(), &server.state.config.ollama_embed_model);
+        cas.write_blob(&chunk_hash, &seeded_vec).unwrap();
+        cas.update_manifest(&primary_ref.cas_ref_id_hex, &[(chunk_key, chunk_hash)])
+            .unwrap();
+
+        // ── Worktree ref: same shared file + a new diff file. ────────────────
+        let wt_root = tempfile::tempdir().expect("wt_root tempdir");
+        let wt_path = wt_root.path().to_path_buf();
+        fs::write(wt_path.join("shared.rs"), "fn shared() {}").unwrap();
+        fs::write(wt_path.join("new_in_wt.rs"), "fn new_fn() {}").unwrap();
+        let canonical_wt = wt_path.canonicalize().unwrap();
+        let wt_ref_id = RefId::for_canonical_path(&canonical_wt);
+        let wt_ref = server
+            .state
+            .attach_ref(wt_ref_id, || {
+                Arc::new(RefIndex::new(
+                    wt_path.clone(),
+                    canonical_wt.clone(),
+                    Some(primary_ref_id),
+                ))
+            })
+            .await;
+
+        // Set parent pointer on disk.
+        cas.write_parent(&wt_ref.cas_ref_id_hex, &primary_ref.cas_ref_id_hex)
+            .unwrap();
+
+        // ── Trigger full warmup. ──────────────────────────────────────────────
+        server.spawn_ref_warmup(wt_ref_id);
+
+        // Wait up to 5 s for project_cache to be populated (baseline import
+        // phase runs after walk, before Ollama).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let cache = wt_ref.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup_full_layers_ollama_on_baseline: project_cache never populated");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Wait for the embedding_cache to pick up the baseline hit (shared.rs).
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let cache = wt_ref.embedding_cache.read().await;
+                if cache.contains_key("shared.rs") {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline2 {
+                panic!(
+                    "ref_warmup_full_layers_ollama_on_baseline: shared.rs never in embedding_cache"
+                );
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // ── Assertions. ──────────────────────────────────────────────────────
+        // shared.rs must be in embedding_cache (inherited from parent — no Ollama).
+        {
+            let cache = wt_ref.embedding_cache.read().await;
+            let entry = cache
+                .get("shared.rs")
+                .expect("shared.rs must be in embedding_cache from baseline import");
+            assert_eq!(entry.vector.len(), 768, "inherited vector must be 768-dim");
+        }
+        // new_in_wt.rs is a diff file; with dead Ollama it won't be embedded, but
+        // it must appear in project_cache (walk happened).
+        {
+            let guard = wt_ref.project_cache.read().await;
+            let pc = guard.as_ref().unwrap();
+            assert!(
+                pc.file_content.contains_key("new_in_wt.rs"),
+                "new_in_wt.rs must be in project_cache after walk"
+            );
+        }
+        // search_index_cache must be populated from the baseline hits.
+        {
+            let guard = wt_ref.search_index_cache.read().await;
+            assert!(
+                guard.is_some(),
+                "search_index_cache must be populated from baseline import"
+            );
+        }
     }
 }

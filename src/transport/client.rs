@@ -27,10 +27,96 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncWriteExt, copy};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::UnixStream;
 
 use crate::transport::{daemon, paths};
+
+// ── Bridge↔Daemon framing ────────────────────────────────────────────────────
+//
+// Before forwarding raw MCP stdio the bridge sends a single length-prefixed
+// JSON frame:
+//   [u32 big-endian length][JSON bytes]
+//
+// The daemon replies with the same framing (session_ready or rejected_draining).
+// After that exchange the stream reverts to plain stdio passthrough.
+
+/// Message the bridge sends immediately after connecting.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RegisterSession {
+    /// `--root-dir` as resolved by the bridge process.
+    pub client_root: std::path::PathBuf,
+    /// Output of `git rev-parse HEAD` in `client_root`. Empty string when
+    /// the worktree has no commits yet.
+    pub head_sha: String,
+    /// PID of the bridge process (advisory; used for logging).
+    pub client_pid: u32,
+}
+
+/// Response the daemon sends back.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status")]
+pub enum SessionReady {
+    /// Daemon accepted the session and assigned a ref.
+    Ready { session_id: String, ref_id: u64 },
+    /// Daemon is draining; bridge should exit 0 cleanly.
+    RejectedDraining,
+    /// Ref is being warmed (initial embedding); calls will succeed but may
+    /// observe stale index until warming finishes.
+    Warming {
+        session_id: String,
+        ref_id: u64,
+        eta_ms: u64,
+    },
+}
+
+/// Write a length-prefixed JSON frame onto `w`.
+pub async fn write_frame<W, T>(w: &mut W, msg: &T) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(msg)?;
+    let len = payload.len() as u32;
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(&payload).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read a length-prefixed JSON frame from `r`.
+pub async fn read_frame<R, T>(r: &mut R) -> Result<T>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)
+        .await
+        .context("read frame length")?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)
+        .await
+        .context("read frame payload")?;
+    let msg: T = serde_json::from_slice(&payload).context("deserialize frame")?;
+    Ok(msg)
+}
+
+/// Resolve `git rev-parse HEAD` for a given directory. Returns an empty string
+/// if the directory is not a git repo or has no commits yet.
+pub fn resolve_head_sha(root_dir: &Path) -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root_dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
 
 /// Back-off when a live daemon's accept queue is momentarily full and we
 /// receive a spurious `ECONNREFUSED`.
@@ -43,8 +129,54 @@ pub const SPAWN_POLL: Duration = Duration::from_millis(50);
 
 /// Connect to the per-workspace daemon, spawning one if absent, then bridge
 /// stdin↔socket↔stdout until either side closes.
+///
+/// Performs the `register_session` handshake before entering the stdio
+/// passthrough loop. If the daemon responds with `RejectedDraining` the
+/// function returns `Ok(())` immediately (bridge exits 0, clean shutdown).
 pub async fn run(root_dir: &Path) -> Result<()> {
     let stream = connect_or_spawn(root_dir).await?;
+    run_with_handshake(root_dir, stream).await
+}
+
+/// Perform the register_session handshake and then bridge stdio. Exposed for
+/// tests so they can inject a pre-connected stream.
+pub async fn run_with_handshake(root_dir: &Path, mut stream: UnixStream) -> Result<()> {
+    let head_sha = resolve_head_sha(root_dir);
+    let reg = RegisterSession {
+        client_root: root_dir.to_path_buf(),
+        head_sha,
+        client_pid: std::process::id(),
+    };
+    write_frame(&mut stream, &reg)
+        .await
+        .context("send register_session")?;
+
+    let reply: SessionReady = read_frame(&mut stream)
+        .await
+        .context("read session_ready")?;
+
+    match reply {
+        SessionReady::RejectedDraining => {
+            tracing::info!("daemon is draining — bridge exiting cleanly");
+            return Ok(());
+        }
+        SessionReady::Ready { session_id, ref_id } => {
+            tracing::debug!(%session_id, ref_id, "session registered with daemon");
+        }
+        SessionReady::Warming {
+            session_id,
+            ref_id,
+            eta_ms,
+        } => {
+            tracing::debug!(
+                %session_id,
+                ref_id,
+                eta_ms,
+                "daemon accepted session — ref is warming"
+            );
+        }
+    }
+
     bridge(stream).await
 }
 

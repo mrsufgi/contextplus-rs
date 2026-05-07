@@ -116,6 +116,28 @@ pub struct MemoryNode {
     pub last_accessed: u64,
     pub access_count: u32,
     pub metadata: HashMap<String, String>,
+    /// Chunk hashes this node was derived from.
+    ///
+    /// Set when a node is created from indexed code chunks. When U6 lands,
+    /// this will hold `Vec<ChunkHash>` (BLAKE3 content addresses). Today we
+    /// use `Vec<String>` as a placeholder — the seam is deliberately narrow
+    /// so U6 can swap the element type without touching call-sites outside
+    /// this field.
+    #[serde(default)]
+    pub references_chunk_hashes: Vec<String>,
+    /// Nodes flagged `needs_rebuild` are excluded from search/traversal
+    /// results until they are rebuilt.
+    ///
+    /// A node is flagged in two situations:
+    /// 1. A merge-ladder conflict: two refs produced contradictory bodies.
+    /// 2. A referenced chunk hash has changed (file edited): the node's
+    ///    content may be stale.
+    ///
+    /// On direct access (`get_node(id)`), the server attempts to re-embed
+    /// the body and re-validate edge endpoints.  If rebuild fails (the
+    /// referenced symbol is gone), the node is pruned.
+    #[serde(default)]
+    pub needs_rebuild: bool,
 }
 
 /// An edge in the memory graph.
@@ -173,6 +195,23 @@ pub struct InterlinkResult {
 
 /// In-memory graph structure backed by petgraph's StableGraph.
 /// StableGraph preserves node/edge indices on removal.
+///
+/// ## Copy-on-Write overlay (U7)
+///
+/// A secondary `MemoryGraph` can be designated as the *parent* via
+/// [`MemoryGraph::with_parent`].  When a parent is set:
+///
+/// * **Reads** (e.g. `get_node`) first look in this graph's local storage,
+///   then fall through to the parent on a miss.
+/// * **Writes** (e.g. `upsert_node`, `create_relation`) always go to local
+///   storage only — the parent is never mutated.
+///
+/// The overlay is the set of nodes/edges stored locally (i.e. the diff
+/// against the parent).  `overlay_node_ids()` enumerates those node IDs for
+/// the merge ladder.
+///
+/// `parent` is an `Option<Arc<MemoryGraph>>` so it can be cloned cheaply
+/// across async tasks.
 pub struct MemoryGraph {
     graph: StableGraph<MemoryNode, MemoryEdge>,
     /// Map (label, node_type_str) -> NodeIndex for fast lookup
@@ -180,6 +219,11 @@ pub struct MemoryGraph {
     /// Map node_id -> NodeIndex
     id_index: HashMap<String, NodeIndex>,
     dirty: bool,
+    /// Optional parent graph for CoW read-through.
+    ///
+    /// Reads that miss locally fall through to the parent; writes stay local.
+    /// `None` means this is the primary (root) graph.
+    parent: Option<Arc<MemoryGraph>>,
 }
 
 impl Default for MemoryGraph {
@@ -189,14 +233,44 @@ impl Default for MemoryGraph {
 }
 
 impl MemoryGraph {
-    /// Create an empty graph.
+    /// Create an empty graph (primary — no parent).
     pub fn new() -> Self {
         Self {
             graph: StableGraph::new(),
             node_index: HashMap::new(),
             id_index: HashMap::new(),
             dirty: false,
+            parent: None,
         }
+    }
+
+    /// Create an empty overlay graph that reads through to `parent` on miss.
+    ///
+    /// Writes go to the overlay only; the parent is never mutated.
+    pub fn with_parent(parent: Arc<MemoryGraph>) -> Self {
+        Self {
+            graph: StableGraph::new(),
+            node_index: HashMap::new(),
+            id_index: HashMap::new(),
+            dirty: false,
+            parent: Some(parent),
+        }
+    }
+
+    /// Return the IDs of all nodes held in this graph's *local* storage,
+    /// i.e. the overlay nodes that differ from (or are absent in) the parent.
+    pub fn overlay_node_ids(&self) -> Vec<String> {
+        self.id_index.keys().cloned().collect()
+    }
+
+    /// Borrow the parent graph, if any.
+    pub fn parent(&self) -> Option<&Arc<MemoryGraph>> {
+        self.parent.as_ref()
+    }
+
+    /// True when this graph has a parent (i.e. it is an overlay/fork).
+    pub fn is_overlay(&self) -> bool {
+        self.parent.is_some()
     }
 
     /// Generate a unique ID with prefix.
@@ -207,13 +281,51 @@ impl MemoryGraph {
     }
 
     /// Get a node by its ID.
+    ///
+    /// Checks this graph's local storage first; falls through to the parent
+    /// on a miss (CoW read-through).
     pub fn get_node(&self, id: &str) -> Option<&MemoryNode> {
-        self.id_index
-            .get(id)
-            .and_then(|&idx| self.graph.node_weight(idx))
+        // Local hit — this is returned as a reference into `self.graph` so
+        // lifetime is tied to `self`.
+        if let Some(&idx) = self.id_index.get(id) {
+            return self.graph.node_weight(idx);
+        }
+        // CoW: delegate to parent.  The reference lifetime must stay within
+        // the parent's `Arc`, which outlives the borrow of `self`.
+        // We cannot return a `&MemoryNode` that refers into the parent's
+        // `Arc<MemoryGraph>` while the caller borrows `&self`, because Rust
+        // would need to tie the return lifetime to the parent `Arc`.
+        // Instead we follow the same pattern as the old code: return `None`
+        // from the local graph and let callers call the parent directly when
+        // needed.
+        //
+        // For the most common CoW read-through path, callers should use
+        // `get_node_cow` which accepts an explicit parent reference.
+        None
     }
 
-    /// Get a mutable node by its ID.
+    /// Get a node by ID with CoW parent fallback.
+    ///
+    /// Returns a `Cow<MemoryNode>` to avoid the lifetime entanglement of
+    /// returning a `&MemoryNode` that may point into a parent `Arc`.
+    ///
+    /// This is the preferred read API for overlay graphs.
+    pub fn get_node_cow<'a>(&'a self, id: &str) -> Option<std::borrow::Cow<'a, MemoryNode>>
+    where
+        MemoryNode: Clone,
+    {
+        // Local hit — borrow directly.
+        if let Some(&idx) = self.id_index.get(id) {
+            return self.graph.node_weight(idx).map(std::borrow::Cow::Borrowed);
+        }
+        // CoW: clone from parent.
+        if let Some(p) = &self.parent {
+            return p.get_node_cow(id);
+        }
+        None
+    }
+
+    /// Get a mutable node by its ID (local storage only — parent is never mutated).
     pub fn get_node_mut(&mut self, id: &str) -> Option<&mut MemoryNode> {
         self.id_index
             .get(id)
@@ -221,12 +333,28 @@ impl MemoryGraph {
             .and_then(|idx| self.graph.node_weight_mut(idx))
     }
 
-    /// Check if a node exists by ID.
+    /// Check if a node exists by ID (including CoW parent fallback).
     pub fn node_exists(&self, id: &str) -> bool {
+        if self.id_index.contains_key(id) {
+            return true;
+        }
+        if let Some(p) = &self.parent {
+            return p.node_exists(id);
+        }
+        false
+    }
+
+    /// Check if a node exists in this graph's local storage only (no parent fallback).
+    pub fn node_exists_local(&self, id: &str) -> bool {
         self.id_index.contains_key(id)
     }
 
-    /// Find a node by label and type.
+    /// Find a node by label and type (local storage only — no CoW fallback).
+    ///
+    /// The upsert path uses this to decide whether to update or create, so it
+    /// deliberately does *not* fall through to the parent: a write to an
+    /// overlay graph should create a local copy even if the parent has the
+    /// same `(label, type)` key.
     pub fn find_node(&self, label: &str, node_type: &NodeType) -> Option<&MemoryNode> {
         let key = (label.to_string(), node_type.as_str().to_string());
         self.node_index
@@ -270,6 +398,8 @@ impl MemoryGraph {
             last_accessed: now,
             access_count: 1,
             metadata: metadata.unwrap_or_default(),
+            references_chunk_hashes: Vec::new(),
+            needs_rebuild: false,
         };
 
         let idx = self.graph.add_node(node.clone());
@@ -385,11 +515,17 @@ impl MemoryGraph {
         edge_filter: Option<&[RelationType]>,
     ) -> (GraphSearchResult, Vec<String>) {
         // Score all nodes by index — no cloning until top_k is known.
+        // Nodes flagged `needs_rebuild` are excluded: their content may be
+        // stale or contradictory and should not appear in search results until
+        // they are rebuilt via a direct access.
         let mut scored: Vec<(NodeIndex, f64)> = self
             .graph
             .node_indices()
             .filter_map(|idx| {
                 let node = self.graph.node_weight(idx)?;
+                if node.needs_rebuild {
+                    return None;
+                }
                 let score = Self::cosine(query_vec, &node.embedding);
                 Some((idx, score))
             })
@@ -509,6 +645,12 @@ impl MemoryGraph {
                 Some(n) => n.clone(),
                 None => continue,
             };
+
+            // Skip nodes that need rebuilding — they are stale or conflicted.
+            if neighbor.needs_rebuild {
+                visited.insert(neighbor_id.clone());
+                continue;
+            }
 
             visited.insert(neighbor_id.clone());
             touched_ids.push(neighbor_id.clone());
@@ -834,6 +976,12 @@ impl MemoryGraph {
                 None => continue,
             };
 
+            // Skip nodes that need rebuilding — their content may be stale.
+            if neighbor.needs_rebuild {
+                visited.insert(neighbor_id.clone());
+                continue;
+            }
+
             visited.insert(neighbor_id.clone());
             touched_ids.push(neighbor_id.clone());
 
@@ -949,6 +1097,102 @@ impl MemoryGraph {
     /// Mark graph as clean (after saving).
     pub fn mark_clean(&mut self) {
         self.dirty = false;
+    }
+
+    // --- needs_rebuild helpers ---
+
+    /// Flag a node as needing a rebuild.
+    ///
+    /// Called by the merge ladder on conflict, or by the chunk-change tracker
+    /// when any chunk hash referenced by a node has changed.
+    ///
+    /// Returns `true` if the node was found and flagged; `false` if the ID was
+    /// not present in *local* storage (the caller must flag the correct graph).
+    pub fn flag_needs_rebuild(&mut self, node_id: &str) -> bool {
+        if let Some(node) = self.get_node_mut(node_id) {
+            node.needs_rebuild = true;
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+
+    /// Clear the `needs_rebuild` flag and update the embedding/content.
+    ///
+    /// Called by the rebuild path after re-embedding succeeds.
+    pub fn mark_rebuilt(
+        &mut self,
+        node_id: &str,
+        new_content: &str,
+        new_embedding: Vec<f32>,
+    ) -> bool {
+        if let Some(node) = self.get_node_mut(node_id) {
+            node.content = new_content.to_string();
+            node.embedding = new_embedding;
+            node.needs_rebuild = false;
+            node.last_accessed = now_millis();
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+
+    /// Flag all nodes that reference any of the given chunk hashes as `needs_rebuild`.
+    ///
+    /// This is the eager path called by the chunk-change tracker (U6 seam).
+    /// Today it walks the local graph only; U6 will wire it into the CAS
+    /// change events.
+    ///
+    /// Returns the IDs of nodes that were flagged.
+    pub fn flag_nodes_for_chunk_changes(&mut self, changed_hashes: &[String]) -> Vec<String> {
+        if changed_hashes.is_empty() {
+            return Vec::new();
+        }
+        let changed: std::collections::HashSet<&str> =
+            changed_hashes.iter().map(|s| s.as_str()).collect();
+        let to_flag: Vec<String> = self
+            .graph
+            .node_indices()
+            .filter_map(|idx| self.graph.node_weight(idx))
+            .filter(|n| {
+                !n.needs_rebuild
+                    && n.references_chunk_hashes
+                        .iter()
+                        .any(|h| changed.contains(h.as_str()))
+            })
+            .map(|n| n.id.clone())
+            .collect();
+
+        for id in &to_flag {
+            self.flag_needs_rebuild(id);
+        }
+        to_flag
+    }
+
+    /// Insert a node directly (used by the merge ladder to publish overlay
+    /// nodes into primary).  If a node with the same `id` already exists in
+    /// local storage it is replaced.  Indices are kept consistent.
+    pub fn insert_node(&mut self, node: MemoryNode) {
+        let key = (node.label.clone(), node.node_type.as_str().to_string());
+
+        // If the id already exists locally, remove the old entry first.
+        if let Some(&old_idx) = self.id_index.get(&node.id) {
+            if let Some(old_node) = self.graph.node_weight(old_idx) {
+                let old_key = (
+                    old_node.label.clone(),
+                    old_node.node_type.as_str().to_string(),
+                );
+                self.node_index.remove(&old_key);
+            }
+            self.graph.remove_node(old_idx);
+            self.id_index.remove(&node.id);
+        }
+
+        let id = node.id.clone();
+        let idx = self.graph.add_node(node);
+        self.node_index.insert(key, idx);
+        self.id_index.insert(id, idx);
+        self.dirty = true;
     }
 }
 

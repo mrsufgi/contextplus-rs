@@ -821,7 +821,7 @@ impl Drop for RebuildGuard {
 }
 
 impl CachedSearchIndex {
-    fn new(index: SearchIndex, fingerprint: IndexFingerprint, generation: u64) -> Self {
+    pub(crate) fn new(index: SearchIndex, fingerprint: IndexFingerprint, generation: u64) -> Self {
         Self {
             index,
             fingerprint,

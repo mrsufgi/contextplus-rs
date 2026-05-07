@@ -537,6 +537,8 @@ mod tests {
                 last_accessed: 0,
                 access_count,
                 metadata: HashMap::new(),
+                references_chunk_hashes: Vec::new(),
+                needs_rebuild: false,
             },
             depth,
             path_relations: path,
@@ -757,6 +759,8 @@ mod tests {
                 last_accessed: 0,
                 access_count: 3,
                 metadata: HashMap::new(),
+                references_chunk_hashes: Vec::new(),
+                needs_rebuild: false,
             },
             depth: 0,
             path_relations: vec![],
@@ -782,6 +786,8 @@ mod tests {
                 last_accessed: 0,
                 access_count: 1,
                 metadata: HashMap::new(),
+                references_chunk_hashes: Vec::new(),
+                needs_rebuild: false,
             },
             depth: 1,
             path_relations: vec![
@@ -809,6 +815,8 @@ mod tests {
                 last_accessed: 0,
                 access_count: 1,
                 metadata: HashMap::new(),
+                references_chunk_hashes: Vec::new(),
+                needs_rebuild: false,
             },
             depth: 0,
             path_relations: vec![],
@@ -1523,6 +1531,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1582,6 +1592,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1652,6 +1664,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1728,6 +1742,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1794,6 +1810,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1885,6 +1903,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -1962,6 +1982,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2030,6 +2052,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2103,6 +2127,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2175,6 +2201,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 
@@ -2243,6 +2271,8 @@ mod tests {
             warmup_on_start: true,
             hnsw_ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            ref_warmup_mode: crate::config::RefWarmupMode::Shallow,
+            ollama_max_concurrent: 4,
         };
         let ollama = OllamaClient::new(&config);
 

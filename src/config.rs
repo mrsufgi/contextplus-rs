@@ -10,6 +10,55 @@ pub enum TrackerMode {
     Eager,
 }
 
+/// Controls how aggressively a newly-attached worktree ref warms its caches.
+///
+/// - `Off` — no warmup on attach; caches populate lazily on first tool call.
+/// - `Shallow` — warm the embedding index for tracked files but skip the
+///   full HNSW rebuild (fast, low Ollama load). This is the default.
+/// - `Full` — rebuild the HNSW search index immediately after embedding warmup
+///   (higher quality first-query latency, higher Ollama load).
+///
+/// Controlled by `CONTEXTPLUS_REF_WARMUP_MODE` (case-insensitive).
+/// Unknown values warn and fall back to `Shallow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefWarmupMode {
+    Off,
+    #[default]
+    Shallow,
+    Full,
+}
+
+impl fmt::Display for RefWarmupMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefWarmupMode::Off => write!(f, "off"),
+            RefWarmupMode::Shallow => write!(f, "shallow"),
+            RefWarmupMode::Full => write!(f, "full"),
+        }
+    }
+}
+
+/// Parse a string into a [`RefWarmupMode`].
+///
+/// Mirrors the pattern of [`parse_tracker_mode`]: accepts `Option<&str>`,
+/// trims whitespace, and lowercases before matching.
+pub fn parse_ref_warmup_mode(value: Option<&str>) -> RefWarmupMode {
+    match value.map(|v| v.trim().to_lowercase()) {
+        Some(ref s) if s == "off" => RefWarmupMode::Off,
+        Some(ref s) if s == "full" => RefWarmupMode::Full,
+        Some(ref s) if s == "shallow" => RefWarmupMode::Shallow,
+        None => RefWarmupMode::Shallow,
+        Some(ref unknown) => {
+            tracing::warn!(
+                value = unknown.as_str(),
+                default = "shallow",
+                "unknown CONTEXTPLUS_REF_WARMUP_MODE value; falling back to shallow"
+            );
+            RefWarmupMode::Shallow
+        }
+    }
+}
+
 impl fmt::Display for TrackerMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -63,9 +112,20 @@ pub struct Config {
     /// HNSW `ef_search` — recall/latency trade-off at query time.
     /// Controlled by `CONTEXTPLUS_HNSW_EF_SEARCH` (default: 100).
     pub hnsw_ef_search: usize,
+    /// How aggressively to warm caches when a new worktree ref attaches.
+    /// Controlled by `CONTEXTPLUS_REF_WARMUP_MODE` (default: `shallow`).
+    pub ref_warmup_mode: RefWarmupMode,
+    /// Capacity of the global Ollama embed semaphore. All Ollama embed calls
+    /// (on-demand, tracker, and warmup) share this permit pool so N parallel
+    /// warmups cannot saturate a CPU-only Ollama instance.
+    /// Controlled by `CONTEXTPLUS_OLLAMA_MAX_CONCURRENT` (default: 4, clamped to [1, 64]).
+    pub ollama_max_concurrent: usize,
 }
 
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
+const DEFAULT_OLLAMA_MAX_CONCURRENT: usize = 4;
+const MIN_OLLAMA_MAX_CONCURRENT: usize = 1;
+const MAX_OLLAMA_MAX_CONCURRENT: usize = 64;
 
 /// Default `efConstruction` passed to `instant_distance::Builder`.
 /// Matches `instant_distance::Builder::default()` (100). Higher values
@@ -98,7 +158,22 @@ const MAX_EMBED_BATCH_SIZE: usize = 512;
 const DEFAULT_MAX_EMBED_FILE_SIZE: usize = 50 * 1024;
 const MIN_MAX_EMBED_FILE_SIZE: usize = 1024;
 
+/// Base directory names always excluded from walks.
+///
+/// **Note on dot-prefixed dirs.** `should_track` in `core::walker` rejects any
+/// path whose segment starts with `.` (hidden-file convention), so dot-prefixed
+/// dirs (`.yarn`, `.moon`, `.turbo`, `.idea`, `.vscode`, `.venv`,
+/// `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.tox`, `.svelte-kit`,
+/// `.astro`, `.vercel`, `.netlify`, etc.) are already excluded with no entry
+/// needed here. The dot-prefixed entries below are kept for parity with the TS
+/// reference fork only — removing them would not change behavior.
+///
+/// Non-dot entries below cover common build/vendor/output dirs that a strict
+/// `git_ignore`-respecting walker would still descend into when missing from
+/// the user's `.gitignore` (common in fresh checkouts and in monorepos with
+/// mixed-language tooling).
 const BASE_IGNORE_DIRS: &[&str] = &[
+    // Always-ignore (TS reference fork parity)
     "node_modules",
     ".git",
     "dist",
@@ -116,6 +191,16 @@ const BASE_IGNORE_DIRS: &[&str] = &[
     ".cache",
     ".turbo",
     ".parcel-cache",
+    // Vendored dependency directories (rarely user-authored source)
+    "vendor", // Go convention, sometimes Ruby/PHP
+    // Build outputs from non-Node toolchains
+    "_build", // Erlang / Elixir / OCaml / Sphinx
+    "obj",    // .NET intermediate output
+    // Test/coverage artifacts
+    "__snapshots__", // Jest snapshot files (often MB of generated text)
+    "htmlcov",       // Python coverage HTML output
+    // Python virtualenvs without leading dot
+    "venv",
 ];
 
 /// Parse a `usize` env var, emitting a `tracing::warn` and returning `default` on invalid input.
@@ -234,6 +319,14 @@ impl Config {
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
                 DEFAULT_HNSW_EF_SEARCH,
             ),
+            ref_warmup_mode: parse_ref_warmup_mode(
+                env::var("CONTEXTPLUS_REF_WARMUP_MODE").ok().as_deref(),
+            ),
+            ollama_max_concurrent: parse_usize_env_warn(
+                "CONTEXTPLUS_OLLAMA_MAX_CONCURRENT",
+                DEFAULT_OLLAMA_MAX_CONCURRENT,
+            )
+            .clamp(MIN_OLLAMA_MAX_CONCURRENT, MAX_OLLAMA_MAX_CONCURRENT),
         }
     }
 }
@@ -301,6 +394,8 @@ mod tests {
                 "CONTEXTPLUS_EMBED_CHUNK_CHARS",
                 "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
+                "CONTEXTPLUS_REF_WARMUP_MODE",
+                "CONTEXTPLUS_OLLAMA_MAX_CONCURRENT",
             ],
             || {
                 let cfg = Config::from_env();
@@ -321,6 +416,9 @@ mod tests {
                 assert_eq!(cfg.embed_chunk_chars, 2000);
                 assert_eq!(cfg.hnsw_ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
                 assert_eq!(cfg.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
+                // U16: new defaults
+                assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Shallow);
+                assert_eq!(cfg.ollama_max_concurrent, 4);
             },
         );
     }
@@ -678,5 +776,116 @@ mod tests {
                 assert_eq!(c.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
             },
         );
+    }
+
+    // ── U16: RefWarmupMode + ollama_max_concurrent ────────────────────────────
+
+    #[test]
+    fn parse_ref_warmup_mode_round_trips() {
+        assert_eq!(parse_ref_warmup_mode(None), RefWarmupMode::Shallow);
+        assert_eq!(parse_ref_warmup_mode(Some("off")), RefWarmupMode::Off);
+        assert_eq!(parse_ref_warmup_mode(Some("OFF")), RefWarmupMode::Off);
+        assert_eq!(parse_ref_warmup_mode(Some("  Off  ")), RefWarmupMode::Off);
+        assert_eq!(
+            parse_ref_warmup_mode(Some("shallow")),
+            RefWarmupMode::Shallow
+        );
+        assert_eq!(
+            parse_ref_warmup_mode(Some("SHALLOW")),
+            RefWarmupMode::Shallow
+        );
+        assert_eq!(parse_ref_warmup_mode(Some("full")), RefWarmupMode::Full);
+        assert_eq!(parse_ref_warmup_mode(Some("FULL")), RefWarmupMode::Full);
+        assert_eq!(parse_ref_warmup_mode(Some("  Full  ")), RefWarmupMode::Full);
+        // Unknown → Shallow (default)
+        assert_eq!(
+            parse_ref_warmup_mode(Some("unknown")),
+            RefWarmupMode::Shallow
+        );
+        assert_eq!(parse_ref_warmup_mode(Some("")), RefWarmupMode::Shallow);
+    }
+
+    #[test]
+    fn ref_warmup_mode_display() {
+        assert_eq!(RefWarmupMode::Off.to_string(), "off");
+        assert_eq!(RefWarmupMode::Shallow.to_string(), "shallow");
+        assert_eq!(RefWarmupMode::Full.to_string(), "full");
+    }
+
+    #[test]
+    fn ref_warmup_mode_default_is_shallow() {
+        assert_eq!(RefWarmupMode::default(), RefWarmupMode::Shallow);
+    }
+
+    #[test]
+    fn ref_warmup_mode_from_env_full() {
+        with_env(&[("CONTEXTPLUS_REF_WARMUP_MODE", "full")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ref_warmup_mode, RefWarmupMode::Full);
+        });
+    }
+
+    #[test]
+    fn ref_warmup_mode_from_env_off() {
+        with_env(&[("CONTEXTPLUS_REF_WARMUP_MODE", "off")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ref_warmup_mode, RefWarmupMode::Off);
+        });
+    }
+
+    #[test]
+    fn ref_warmup_mode_from_env_unknown_defaults_to_shallow() {
+        with_env(&[("CONTEXTPLUS_REF_WARMUP_MODE", "aggressive")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ref_warmup_mode, RefWarmupMode::Shallow);
+        });
+    }
+
+    #[test]
+    fn ollama_max_concurrent_default() {
+        with_cleared_env(&["CONTEXTPLUS_OLLAMA_MAX_CONCURRENT"], || {
+            let c = Config::from_env();
+            assert_eq!(c.ollama_max_concurrent, 4);
+        });
+    }
+
+    #[test]
+    fn ollama_max_concurrent_custom() {
+        with_env(&[("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "12")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ollama_max_concurrent, 12);
+        });
+    }
+
+    #[test]
+    fn ollama_max_concurrent_clamps_zero_to_one() {
+        with_env(&[("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "0")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ollama_max_concurrent, MIN_OLLAMA_MAX_CONCURRENT);
+        });
+    }
+
+    #[test]
+    fn ollama_max_concurrent_clamps_high_to_max() {
+        with_env(&[("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "999")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ollama_max_concurrent, MAX_OLLAMA_MAX_CONCURRENT);
+        });
+    }
+
+    #[test]
+    fn ollama_max_concurrent_boundary_one() {
+        with_env(&[("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "1")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ollama_max_concurrent, 1);
+        });
+    }
+
+    #[test]
+    fn ollama_max_concurrent_boundary_max() {
+        with_env(&[("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "64")], || {
+            let c = Config::from_env();
+            assert_eq!(c.ollama_max_concurrent, 64);
+        });
     }
 }

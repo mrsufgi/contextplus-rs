@@ -3,6 +3,7 @@ pub mod config;
 pub mod core;
 pub mod error;
 pub mod git;
+pub mod ref_index;
 pub mod server;
 pub mod server_adapters;
 pub mod server_definitions;
