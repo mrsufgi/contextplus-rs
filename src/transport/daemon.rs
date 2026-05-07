@@ -475,6 +475,12 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         }
     }
 
+    // ── Step 2c: per-ref warmup (U18) ────────────────────────────────────────
+    // Fire-and-forget: errors inside `spawn_ref_warmup` are logged and never
+    // propagate here.  Idempotent — safe to call for every connection including
+    // reconnects from the same worktree root.
+    server.spawn_ref_warmup(ref_id);
+
     // ── Step 3: send session_ready ───────────────────────────────────────────
     let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
     // For now we always reply Ready.

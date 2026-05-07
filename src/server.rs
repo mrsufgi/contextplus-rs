@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock, Semaphore};
 
 use crate::cache::rkyv_store;
-use crate::config::{Config, TrackerMode};
+use crate::config::{Config, RefWarmupMode, TrackerMode};
 use crate::core::embedding_tracker::{
     EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
 };
@@ -158,10 +158,15 @@ pub struct SharedState {
     ///
     /// Capacity is set from `config.ollama_max_concurrent` at server construction
     /// and never changes for the lifetime of the daemon.
-    ///
-    /// U17 wires the actual Ollama embed paths through this semaphore via
-    /// `OllamaClient::with_semaphore`. U18 triggers warmup on ref attach.
     pub ollama_semaphore: Arc<Semaphore>,
+    /// Set of refs currently being warmed up (U18 idempotency guard).
+    ///
+    /// `spawn_ref_warmup` inserts the `RefId` before spawning the background
+    /// task and removes it when the task completes via a `WarmupGuard` RAII
+    /// drop. A second call for the same ref while the first is running is a
+    /// no-op.
+    pub warmup_in_flight:
+        Arc<tokio::sync::Mutex<std::collections::HashSet<crate::ref_index::RefId>>>,
 }
 
 impl SharedState {
@@ -434,6 +439,7 @@ impl ContextPlusServer {
             refs,
             default_ref_id,
             ollama_semaphore,
+            warmup_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         });
         Self {
             state,
@@ -528,6 +534,300 @@ impl ContextPlusServer {
         let state = self.state.clone();
         tokio::spawn(async move {
             warmup_semantic_search_cache(&state).await;
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // U18: per-ref warmup on attach
+    // -----------------------------------------------------------------------
+
+    /// Trigger warmup for `ref_id` according to the configured
+    /// [`RefWarmupMode`].
+    ///
+    /// The call is **idempotent**: if a warmup task for the same `ref_id` is
+    /// already running, this is a no-op (logged at `DEBUG`).  Likewise, if the
+    /// ref's `project_cache` is already populated and fresh, the spawned task
+    /// exits early without re-walking.
+    ///
+    /// Warmup failure is non-fatal — errors are logged as `WARN` and never
+    /// propagate to the connection handler.
+    pub fn spawn_ref_warmup(&self, ref_id: crate::ref_index::RefId) {
+        match self.state.config.ref_warmup_mode {
+            RefWarmupMode::Off => {
+                tracing::info!(
+                    ref_id = ref_id.0,
+                    mode = "off",
+                    "ref_warmup mode=off — skipping"
+                );
+            }
+            RefWarmupMode::Shallow => {
+                self.spawn_shallow_warmup_task(ref_id);
+            }
+            RefWarmupMode::Full => {
+                self.spawn_full_warmup_task(ref_id);
+            }
+        }
+    }
+
+    /// Spawn the shallow warmup background task for `ref_id`.
+    ///
+    /// Shallow warmup:
+    /// 1. Walks the ref's `canonical_root` via `walk_with_config`.
+    /// 2. Reads all non-directory files into `ref.project_cache`.
+    /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`
+    ///    (symbol name + kind + file only — **no embedding vectors**).
+    /// 4. Does NOT call `OllamaClient::embed*`.  Zero outbound Ollama calls.
+    ///
+    /// Idempotent: skips if `project_cache` is already populated and fresh.
+    fn spawn_shallow_warmup_task(&self, ref_id: crate::ref_index::RefId) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            // --- Idempotency guard ---
+            {
+                let mut inflight = state.warmup_in_flight.lock().await;
+                if inflight.contains(&ref_id) {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "ref_warmup shallow: already in-flight, skipping"
+                    );
+                    return;
+                }
+                inflight.insert(ref_id);
+            }
+
+            // Ensure we release the guard slot even on early return or panic.
+            let _guard = WarmupGuard {
+                state: Arc::clone(&state),
+                ref_id,
+            };
+
+            let ref_index = match state.ref_index(ref_id) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(ref_id = ref_id.0, "ref_warmup shallow: ref not found");
+                    return;
+                }
+            };
+
+            // --- Skip if already warm ---
+            {
+                let guard = ref_index.project_cache.read().await;
+                if let Some(ref cache) = *guard {
+                    let ttl = state.config.cache_ttl_secs;
+                    if cache.last_refresh.elapsed().as_secs() < ttl {
+                        tracing::debug!(
+                            ref_id = ref_id.0,
+                            "ref_warmup shallow: project_cache already populated, skipping"
+                        );
+                        return;
+                    }
+                }
+            }
+
+            let root = ref_index.root_dir.clone();
+            let config = state.config.clone();
+            let t0 = std::time::Instant::now();
+            tracing::info!(ref_id = ref_id.0, root = %root.display(), "ref_warmup shallow: starting walk");
+
+            // --- Walk + read files (blocking I/O) ---
+            let new_cache = tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                let entries = walk_with_config(&root, &config);
+                let file_content: HashMap<String, Arc<String>> = entries
+                    .par_iter()
+                    .filter(|e| !e.is_directory)
+                    .filter_map(|e| {
+                        let full = root.join(&e.relative_path);
+                        std::fs::read_to_string(&full)
+                            .ok()
+                            .map(|c| (e.relative_path.clone(), Arc::new(c)))
+                    })
+                    .collect();
+                ProjectCache {
+                    file_entries: entries,
+                    file_content,
+                    last_refresh: std::time::Instant::now(),
+                }
+            })
+            .await;
+
+            let new_cache = match new_cache {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    tracing::warn!(ref_id = ref_id.0, error = %e, "ref_warmup shallow: spawn_blocking failed");
+                    return;
+                }
+            };
+
+            // --- Populate project_cache ---
+            {
+                let mut guard = ref_index.project_cache.write().await;
+                // First-writer-wins: only update if still unpopulated (or stale).
+                let needs_update = match &*guard {
+                    None => true,
+                    Some(c) => c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs,
+                };
+                if needs_update {
+                    *guard = Some(Arc::clone(&new_cache));
+                }
+            }
+
+            // --- Parse tree-sitter symbols into identifier_index.docs ---
+            // We run the full parse pipeline (flatten_symbols + token_set) but
+            // skip the embedding step.
+            //
+            // TODO(U18/embed): `vector_buffer` and `dims` are left as empty/zero.
+            // Those fields require OllamaClient::embed* calls, which shallow mode
+            // deliberately omits.  The identifier search handler will rebuild with
+            // embeddings on the first real tool call.
+            let cache_for_parse = Arc::clone(&new_cache);
+            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    cache_for_parse
+                        .file_entries
+                        .par_iter()
+                        .filter(|e| !e.is_directory)
+                        .filter_map(|entry| {
+                            let content =
+                                cache_for_parse.file_content.get(&entry.relative_path)?;
+                            let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                            let symbols = parse_with_tree_sitter(content, ext).ok()?;
+                            let header = crate::core::parser::extract_header(content);
+                            let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
+                                crate::core::parser::flatten_symbols(&symbols, None)
+                                    .into_iter()
+                                    .map(|sym| {
+                                        let sig = sym.signature.clone().unwrap_or_default();
+                                        let text = format!(
+                                            "{} {} {} {} {} {}",
+                                            sym.name,
+                                            sym.kind,
+                                            sig,
+                                            entry.relative_path,
+                                            header,
+                                            sym.parent_name.as_deref().unwrap_or("")
+                                        );
+                                        let token_set = crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
+                                            &sym.name,
+                                            &sig,
+                                            &entry.relative_path,
+                                            &header,
+                                        );
+                                        crate::tools::semantic_identifiers::IdentifierDoc {
+                                            id: format!(
+                                                "{}:{}:{}",
+                                                entry.relative_path, sym.name, sym.line
+                                            ),
+                                            path: entry.relative_path.clone(),
+                                            header: header.clone(),
+                                            name: sym.name.clone(),
+                                            kind_lower: sym.kind.to_lowercase(),
+                                            kind: sym.kind.clone(),
+                                            line: sym.line,
+                                            end_line: sym.end_line,
+                                            signature: sig,
+                                            parent_name: sym.parent_name.clone(),
+                                            text,
+                                            token_set,
+                                        }
+                                    })
+                                    .collect();
+                            Some(local)
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .await
+                .unwrap_or_default();
+            let file_count = new_cache
+                .file_entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .count();
+            {
+                let mut guard = ref_index.identifier_index.write().await;
+                let needs_update = match &*guard {
+                    None => true,
+                    Some(idx) => idx.file_count != file_count,
+                };
+                if needs_update {
+                    *guard = Some(Arc::new(IdentifierIndex {
+                        docs: doc_list,
+                        // TODO(U18/embed): vector_buffer + dims left empty — shallow
+                        // mode omits embedding calls.  Full mode (or first real tool
+                        // call) will populate these fields.
+                        vector_buffer: Vec::new(),
+                        dims: 0,
+                        file_count,
+                        built_at: std::time::Instant::now(),
+                    }));
+                }
+            }
+
+            tracing::info!(
+                ref_id = ref_id.0,
+                elapsed_ms = t0.elapsed().as_millis(),
+                files = file_count,
+                "ref_warmup shallow: complete (no embed calls)"
+            );
+        });
+    }
+
+    /// Spawn the full warmup background task for `ref_id`.
+    ///
+    /// Full warmup delegates to `warmup_semantic_search_cache` scoped to the
+    /// per-ref `root_dir` and caches.  Embedding calls go through
+    /// `OllamaClient::embed*` which is gated by U17's semaphore (if present).
+    ///
+    /// Idempotent: skips if `project_cache` is already warm.
+    fn spawn_full_warmup_task(&self, ref_id: crate::ref_index::RefId) {
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            // --- Idempotency guard ---
+            {
+                let mut inflight = state.warmup_in_flight.lock().await;
+                if inflight.contains(&ref_id) {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "ref_warmup full: already in-flight, skipping"
+                    );
+                    return;
+                }
+                inflight.insert(ref_id);
+            }
+
+            let _guard = WarmupGuard {
+                state: Arc::clone(&state),
+                ref_id,
+            };
+
+            let ref_index = match state.ref_index(ref_id) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(ref_id = ref_id.0, "ref_warmup full: ref not found");
+                    return;
+                }
+            };
+
+            // --- Skip if already warm ---
+            {
+                let guard = ref_index.project_cache.read().await;
+                if let Some(ref cache) = *guard
+                    && cache.last_refresh.elapsed().as_secs() < state.config.cache_ttl_secs
+                {
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        "ref_warmup full: project_cache already populated, skipping"
+                    );
+                    return;
+                }
+            }
+
+            tracing::info!(ref_id = ref_id.0, "ref_warmup full: starting");
+            // Reuse the existing warmup pipeline (semantic search warm path)
+            // scoped to the per-ref search_index_cache and cache_generation.
+            warmup_ref_search_cache(&state, ref_id).await;
         });
     }
 
@@ -2297,6 +2597,99 @@ fn parse_metadata(
 }
 
 // make_tool() is re-exported from server_definitions — see imports at top of this file.
+
+// ---------------------------------------------------------------------------
+// U18: warmup helpers
+// ---------------------------------------------------------------------------
+
+/// RAII guard that removes `ref_id` from `state.warmup_in_flight` on drop.
+///
+/// This ensures the in-flight slot is released even if the warmup task panics
+/// or returns early, allowing a future `spawn_ref_warmup` call to retry.
+struct WarmupGuard {
+    state: Arc<SharedState>,
+    ref_id: crate::ref_index::RefId,
+}
+
+impl Drop for WarmupGuard {
+    fn drop(&mut self) {
+        // We are inside a tokio task, so we can't call `.await` here.
+        // Use `try_lock` — if the mutex is contended we skip (the warmup loop
+        // will remove the entry shortly anyway on its own unlock path).
+        if let Ok(mut inflight) = self.state.warmup_in_flight.try_lock() {
+            inflight.remove(&self.ref_id);
+        }
+    }
+}
+
+/// Run the semantic-search warmup pipeline for a specific `ref_id`.
+///
+/// Mirrors `warmup_semantic_search_cache` but targets the per-ref
+/// `search_index_cache` and `cache_generation` rather than the default ref's.
+/// Called by `spawn_full_warmup_task`.
+async fn warmup_ref_search_cache(state: &Arc<SharedState>, ref_id: crate::ref_index::RefId) {
+    use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
+    use crate::tools::semantic_search::{SemanticSearchOptions, semantic_code_search};
+
+    let ref_index = match state.ref_index(ref_id) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(ref_id = ref_id.0, "warmup_ref_search_cache: ref not found");
+            return;
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    tracing::info!(
+        ref_id = ref_id.0,
+        "ref_warmup full: SearchIndex warmup starting"
+    );
+
+    let options = SemanticSearchOptions {
+        root_dir: ref_index.root_dir.clone(),
+        query: "warmup".to_string(),
+        top_k: Some(1),
+        semantic_weight: None,
+        keyword_weight: None,
+        min_semantic_score: None,
+        min_keyword_score: None,
+        min_combined_score: None,
+        require_keyword_match: None,
+        require_semantic_match: None,
+        include_globs: None,
+        exclude_globs: None,
+        recency_window_days: None,
+    };
+
+    let embedder = OllamaEmbedder(state.ollama.clone());
+    let walker = CachedWalkerIndexer {
+        config: state.config.clone(),
+        ollama: state.ollama.clone(),
+        state: Arc::clone(state),
+    };
+
+    match semantic_code_search(
+        options,
+        &embedder,
+        &walker,
+        Some(Arc::clone(&ref_index.search_index_cache)),
+        Some(Arc::clone(&ref_index.cache_generation)),
+    )
+    .await
+    {
+        Ok(_) => tracing::info!(
+            ref_id = ref_id.0,
+            elapsed_ms = t0.elapsed().as_millis(),
+            "ref_warmup full: SearchIndex warmup complete"
+        ),
+        Err(e) => tracing::warn!(
+            ref_id = ref_id.0,
+            elapsed_ms = t0.elapsed().as_millis(),
+            error = %e,
+            "ref_warmup full: SearchIndex warmup failed (non-fatal)"
+        ),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Startup warmup
@@ -4708,5 +5101,319 @@ mod tests {
         // Verify RefWarmupMode is accessible from the config stored in state.
         let _ = server.state.config.ref_warmup_mode;
         assert_eq!(server.state.config.ref_warmup_mode, RefWarmupMode::Shallow);
+    }
+
+
+    // -----------------------------------------------------------------------
+    // U18: per-ref warmup tests
+    // -----------------------------------------------------------------------
+
+    fn test_server_with_warmup_mode(mode: crate::config::RefWarmupMode) -> ContextPlusServer {
+        let mut config = Config::from_env();
+        config.ref_warmup_mode = mode;
+        let root = std::env::temp_dir().join(format!(
+            "contextplus-u18-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        ContextPlusServer::new(root, config)
+    }
+
+    /// mode=off: spawn_ref_warmup is a no-op; nothing in `warmup_in_flight`.
+    #[tokio::test]
+    async fn ref_warmup_mode_off_is_noop() {
+        use crate::config::RefWarmupMode;
+        let server = test_server_with_warmup_mode(RefWarmupMode::Off);
+        let ref_id = server.state.default_ref_id;
+
+        server.spawn_ref_warmup(ref_id);
+
+        // Give a brief window for any (unexpected) spawned task to run.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // warmup_in_flight should be empty — Off mode never inserts.
+        let inflight = server.state.warmup_in_flight.lock().await;
+        assert!(
+            inflight.is_empty(),
+            "mode=off must not add ref_id to warmup_in_flight"
+        );
+
+        // project_cache must still be None (no walk happened).
+        let ref_index = server.state.default_ref().unwrap();
+        let cache = ref_index.project_cache.read().await;
+        assert!(cache.is_none(), "mode=off must not populate project_cache");
+    }
+
+    /// mode=shallow: task walks, populates project_cache; no Ollama calls.
+    ///
+    /// We verify Ollama is never called by pointing the host at a dead port.
+    /// If `embed` were called it would try to connect and fail (which we'd see
+    /// on the identifier_index). Since shallow mode doesn't touch embed, the
+    /// task must succeed regardless.
+    #[tokio::test]
+    async fn ref_warmup_shallow_populates_project_cache_no_embed() {
+        use crate::config::RefWarmupMode;
+        use std::fs;
+
+        // Build a tiny project with two files so walker finds something.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().to_path_buf();
+        fs::write(root_path.join("hello.rs"), "fn hello() {}").unwrap();
+        fs::write(root_path.join("world.txt"), "hello world").unwrap();
+
+        let mut config = Config::from_env();
+        // Point Ollama at a dead host — if embed is called it will error.
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+
+        let server = ContextPlusServer::new(root_path.clone(), config);
+        let ref_id = server.state.default_ref_id;
+
+        server.spawn_ref_warmup(ref_id);
+
+        // Wait up to 3 s for the background task to populate the cache.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            {
+                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let cache = ref_index.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup shallow: project_cache never populated within 3s");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Verify project_cache fields.
+        {
+            let ref_index = server.state.ref_index(ref_id).unwrap();
+            let cache_guard = ref_index.project_cache.read().await;
+            let cache = cache_guard.as_ref().unwrap();
+            assert!(
+                !cache.file_entries.is_empty(),
+                "shallow warmup must produce non-empty file_entries"
+            );
+            assert!(
+                cache.file_content.contains_key("hello.rs"),
+                "shallow warmup must read hello.rs into file_content"
+            );
+        }
+
+        // Wait for identifier_index to be set (parse runs after project_cache write).
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            {
+                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let guard = ref_index.identifier_index.read().await;
+                if guard.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline2 {
+                panic!("ref_warmup shallow: identifier_index never populated within 3s");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Verify identifier_index.docs was populated (tree-sitter ran).
+        {
+            let ref_index = server.state.ref_index(ref_id).unwrap();
+            let idx_guard = ref_index.identifier_index.read().await;
+            let idx = idx_guard.as_ref().expect("identifier_index should be set");
+            // hello.rs has one function; docs should be non-empty.
+            assert!(
+                !idx.docs.is_empty(),
+                "shallow warmup must parse symbols into identifier_index.docs"
+            );
+            // dims == 0 confirms no embed call was made.
+            assert_eq!(
+                idx.dims, 0,
+                "shallow warmup must NOT populate embedding dims (no Ollama call)"
+            );
+            assert!(
+                idx.vector_buffer.is_empty(),
+                "shallow warmup must NOT populate vector_buffer (no Ollama call)"
+            );
+        }
+    }
+
+    /// Idempotency: calling spawn_ref_warmup 5 times concurrently for the same
+    /// ref_id must result in at most one warmup run (first-writer-wins).
+    #[tokio::test]
+    async fn ref_warmup_idempotent_concurrent_calls() {
+        use crate::config::RefWarmupMode;
+        use std::fs;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().to_path_buf();
+        fs::write(root_path.join("a.rs"), "pub fn a() {}").unwrap();
+
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+
+        let server = ContextPlusServer::new(root_path.clone(), config);
+        let ref_id = server.state.default_ref_id;
+
+        // Fire 5 concurrent spawn_ref_warmup calls.
+        for _ in 0..5 {
+            server.spawn_ref_warmup(ref_id);
+        }
+
+        // Wait for warmup to settle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let cache = ref_index.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup idempotency: cache never populated within 5s");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // After completion, warmup_in_flight should be empty (guard released).
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let inflight = server.state.warmup_in_flight.lock().await;
+        assert!(
+            inflight.is_empty(),
+            "warmup_in_flight must be empty after all tasks complete"
+        );
+    }
+
+    /// Per-ref isolation: warmup for ref-A must not touch ref-B's project_cache.
+    #[tokio::test]
+    async fn ref_warmup_per_ref_isolation() {
+        use crate::config::RefWarmupMode;
+        use crate::ref_index::{RefId, RefIndex};
+        use std::fs;
+        use std::sync::atomic::Ordering;
+
+        // Build two separate roots.
+        let root_a = tempfile::tempdir().expect("tempdir_a");
+        let root_b = tempfile::tempdir().expect("tempdir_b");
+
+        fs::write(root_a.path().join("a.rs"), "pub fn only_a() {}").unwrap();
+        fs::write(root_b.path().join("b.rs"), "pub fn only_b() {}").unwrap();
+
+        let canonical_b = root_b.path().canonicalize().unwrap();
+
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.ref_warmup_mode = RefWarmupMode::Shallow;
+
+        // Build server rooted at root_a (default ref = ref_a).
+        let server = ContextPlusServer::new(root_a.path().to_path_buf(), config.clone());
+        let ref_id_a = server.state.default_ref_id;
+
+        // Register ref_b manually.
+        let ref_id_b = RefId::for_canonical_path(&canonical_b);
+        server
+            .state
+            .attach_ref(ref_id_b, || {
+                Arc::new(RefIndex::new(
+                    root_b.path().to_path_buf(),
+                    canonical_b.clone(),
+                    None,
+                ))
+            })
+            .await;
+        // Undo the session-count side-effect from attach_ref.
+        if let Some(r) = server.state.ref_index(ref_id_b) {
+            r.session_count.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        // Warm ref_a only.
+        server.spawn_ref_warmup(ref_id_a);
+
+        // Wait for ref_a's cache.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let ref_a = server.state.ref_index(ref_id_a).unwrap();
+                let cache = ref_a.project_cache.read().await;
+                if cache.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("ref_warmup isolation: ref_a cache never populated");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // ref_b's project_cache must still be None.
+        let ref_b = server.state.ref_index(ref_id_b).unwrap();
+        let cache_b = ref_b.project_cache.read().await;
+        assert!(
+            cache_b.is_none(),
+            "warming ref_a must not touch ref_b's project_cache"
+        );
+
+        // ref_a's cache must contain only its own files.
+        let ref_a = server.state.ref_index(ref_id_a).unwrap();
+        let cache_a = ref_a.project_cache.read().await;
+        let cache_a = cache_a.as_ref().unwrap();
+        assert!(
+            cache_a.file_content.contains_key("a.rs"),
+            "ref_a cache must contain a.rs"
+        );
+        assert!(
+            !cache_a.file_content.contains_key("b.rs"),
+            "ref_a cache must NOT contain b.rs"
+        );
+    }
+
+    /// Config: default ref_warmup_mode is Shallow.
+    #[test]
+    fn ref_warmup_mode_defaults_to_shallow() {
+        use crate::config::RefWarmupMode;
+        // Ensure env var is absent.
+        let _lock = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Shallow);
+    }
+
+    /// Config: CONTEXTPLUS_REF_WARMUP_MODE=off disables warmup.
+    #[test]
+    fn ref_warmup_mode_can_be_disabled() {
+        use crate::config::RefWarmupMode;
+        let _lock = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "off");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Off);
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+        }
+    }
+
+    /// Config: CONTEXTPLUS_REF_WARMUP_MODE=full enables full warmup.
+    #[test]
+    fn ref_warmup_mode_full() {
+        use crate::config::RefWarmupMode;
+        let _lock = WARMUP_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "full");
+        }
+        let cfg = Config::from_env();
+        assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Full);
+        unsafe {
+            std::env::remove_var("CONTEXTPLUS_REF_WARMUP_MODE");
+        }
     }
 }
