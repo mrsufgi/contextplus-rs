@@ -10,7 +10,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use serde_json::Value;
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{OnceCell, RwLock, Semaphore};
 
 use crate::cache::rkyv_store;
 use crate::config::{Config, TrackerMode};
@@ -151,9 +151,30 @@ pub struct SharedState {
     /// carry an explicit `RefId` use this. U4 / U11 will migrate to explicit
     /// per-session routing via `session_ref_id`.
     pub default_ref_id: crate::ref_index::RefId,
+    /// Global Ollama embed semaphore. All callers that issue embed requests
+    /// (on-demand tool calls, embedding tracker, ref warmup) must acquire a
+    /// permit before calling Ollama so that N concurrent warmups cannot fan-out
+    /// N×files requests and saturate a CPU-only Ollama instance.
+    ///
+    /// Capacity is set from `config.ollama_max_concurrent` at server construction
+    /// and never changes for the lifetime of the daemon.
+    ///
+    /// U17 wires the actual Ollama embed paths through this semaphore.
+    /// U18 triggers warmup on ref attach using it.
+    pub ollama_semaphore: Arc<Semaphore>,
 }
 
 impl SharedState {
+    /// Return a cloned `Arc` pointing at the global Ollama embed semaphore.
+    ///
+    /// Callers in U17 will hold this semaphore for the duration of each Ollama
+    /// embed request. Callers in U18 will hold it across a full ref warmup pass.
+    /// The permit count is fixed at `config.ollama_max_concurrent` for the
+    /// lifetime of the daemon.
+    pub fn ollama_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.ollama_semaphore)
+    }
+
     /// Look up the default ref's index. Today this is the only entry in the
     /// registry; U4 will introduce alternate refs.
     ///
@@ -388,6 +409,10 @@ impl ContextPlusServer {
 
         let refs = crate::ref_index::new_registry_with_default(default_ref_id, default_ref);
 
+        // Build the global Ollama semaphore before constructing SharedState so
+        // the capacity is captured from the config without borrowing issues.
+        let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent));
+
         let state = Arc::new(SharedState {
             config,
             canonical_root,
@@ -406,6 +431,7 @@ impl ContextPlusServer {
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             refs,
             default_ref_id,
+            ollama_semaphore,
         });
         Self {
             state,
@@ -4598,5 +4624,87 @@ mod tests {
                 .contains_key("ref_a_only.rs"),
             "default ref's embedding_cache must not contain a key written to ref-A"
         );
+    }
+
+    // ── U16: ollama_semaphore on SharedState ─────────────────────────────────
+
+    /// `ollama_semaphore()` returns an `Arc<Semaphore>` whose permit count
+    /// matches the configured `ollama_max_concurrent`.
+    #[test]
+    fn ollama_semaphore_permits_match_config() {
+        let config = Config::from_env();
+        let capacity = config.ollama_max_concurrent;
+        let root = std::env::temp_dir().join("contextplus-u16-sem-test");
+        let _ = std::fs::create_dir_all(&root);
+        let server = ContextPlusServer::new(root, config);
+        let sem = server.state.ollama_semaphore();
+        assert_eq!(
+            sem.available_permits(),
+            capacity,
+            "semaphore available_permits must equal configured ollama_max_concurrent"
+        );
+    }
+
+    /// `ollama_semaphore()` returns a clone of the same underlying `Arc` —
+    /// acquiring through one clone reduces permits visible through another.
+    #[tokio::test]
+    async fn ollama_semaphore_clones_share_state() {
+        let root = std::env::temp_dir().join("contextplus-u16-sem-clone-test");
+        let _ = std::fs::create_dir_all(&root);
+        let server = ContextPlusServer::new(root, Config::from_env());
+
+        let sem_a = server.state.ollama_semaphore();
+        let sem_b = server.state.ollama_semaphore();
+
+        // Both Arcs point at the same Semaphore.
+        assert!(
+            Arc::ptr_eq(&sem_a, &sem_b),
+            "both Arcs must point to the same Semaphore"
+        );
+    }
+
+    /// Integration: construct with `ollama_max_concurrent = 2`, acquire 2 permits,
+    /// third `try_acquire` must return `Err`. This is the contract U17 relies on.
+    #[tokio::test]
+    async fn ollama_semaphore_blocks_at_capacity() {
+        use crate::config::RefWarmupMode;
+
+        let root = std::env::temp_dir().join("contextplus-u16-sem-block-test");
+        let _ = std::fs::create_dir_all(&root);
+
+        // Build a config with capacity=2 by overriding the env var.
+        let config = {
+            // SAFETY: test-only, single-threaded at this point in the test.
+            unsafe { std::env::set_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "2") };
+            let c = Config::from_env();
+            unsafe { std::env::remove_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT") };
+            c
+        };
+
+        assert_eq!(config.ollama_max_concurrent, 2);
+
+        let server = ContextPlusServer::new(root, config);
+        let sem = server.state.ollama_semaphore();
+
+        // Acquire both permits.
+        let _permit1 = sem.acquire().await.expect("first acquire must succeed");
+        let _permit2 = sem.acquire().await.expect("second acquire must succeed");
+
+        // Third try_acquire must fail (no permits left).
+        assert!(
+            sem.try_acquire().is_err(),
+            "try_acquire on a fully-occupied semaphore must return Err"
+        );
+
+        // Dropping one permit frees a slot.
+        drop(_permit1);
+        assert!(
+            sem.try_acquire().is_ok(),
+            "try_acquire must succeed after a permit is released"
+        );
+
+        // Verify RefWarmupMode is accessible from the config stored in state.
+        let _ = server.state.config.ref_warmup_mode;
+        assert_eq!(server.state.config.ref_warmup_mode, RefWarmupMode::Shallow);
     }
 }
