@@ -461,9 +461,22 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         "ref attached"
     );
 
+    // ── Step 2b: initialize CAS on-disk layout for this ref ─────────────────
+    // For the primary ref this is a no-op (idempotent empty-manifest creation).
+    // For non-primary (worktree) refs this creates the ref directory and writes
+    // the parent pointer so chunk lookups can chain through the primary's
+    // manifest (U12 diff-only embedding).
+    {
+        let mcp_data = server.state.root_dir.join(paths::MCP_DATA_DIR);
+        let model = server.state.config.ollama_embed_model.clone();
+        let parent_ref_opt = parent_ref_id.and_then(|pid| server.state.ref_index(pid));
+        if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
+            tracing::warn!(ref_id = ref_id.0, "CAS fork_from failed (non-fatal): {e}");
+        }
+    }
+
     // ── Step 3: send session_ready ───────────────────────────────────────────
     let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
-    // TODO(U6): detect warming state once CAS/diff embedding is wired up.
     // For now we always reply Ready.
     let reply = SessionReady::Ready {
         session_id,

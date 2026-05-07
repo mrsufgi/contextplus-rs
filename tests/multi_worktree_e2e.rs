@@ -448,7 +448,6 @@ async fn single_daemon_serves_both_worktrees() {
 //
 // ACTIVATION: remove `#[ignore]` when U10 is merged.
 
-#[ignore = "U10 dependency: per-ref embed pipeline not yet wired; worktree file tree is not indexed separately"]
 #[tokio::test(flavor = "multi_thread")]
 async fn worktree_finds_worktree_only_symbol() {
     let td = TempDir::new().unwrap();

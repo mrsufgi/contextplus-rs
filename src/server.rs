@@ -579,8 +579,15 @@ impl ContextPlusServer {
 
     // --- Walk + analyze helpers ---
 
-    /// Returns a snapshot of the project cache, lazily initializing or refreshing
-    /// when the TTL has expired. All filesystem I/O runs inside `spawn_blocking`.
+    /// Returns a snapshot of the project cache for the current session's ref,
+    /// lazily initializing or refreshing when the TTL has expired.
+    ///
+    /// When `session_ref_id` is set (daemon mode, per-connection), this walks
+    /// the worktree's own file tree (`ref.root_dir`) and stores the result in
+    /// the per-ref `project_cache`. When `session_ref_id` is `None` (stdio
+    /// mode), it falls back to the primary ref — identical to pre-U12 behaviour.
+    ///
+    /// All filesystem I/O runs inside `spawn_blocking`.
     /// Uses Arc to avoid deep-cloning the entire cache on every tool call.
     async fn ensure_project_cache(&self) -> Result<Arc<ProjectCache>> {
         let ttl_secs = self.state.config.cache_ttl_secs;
@@ -634,10 +641,11 @@ impl ContextPlusServer {
         Ok(arc_cache)
     }
 
-    /// Invalidate the project cache. Called by the file watcher when files change.
-    /// Note: embedding_cache is NOT cleared — content hashes in CacheEntry
-    /// handle staleness detection. Only clears the project file/line cache.
-    /// Also invalidates the identifier index so it rebuilds with fresh data.
+    /// Invalidate the project cache for the current session's ref.
+    ///
+    /// Called by the file watcher when files change. Clears the per-ref
+    /// `project_cache` and `identifier_index` so they rebuild with fresh data
+    /// on the next tool call.
     pub async fn invalidate_project_cache(&self) {
         let ref_index = self.current_ref();
         let mut guard = ref_index.project_cache.write().await;
@@ -648,16 +656,31 @@ impl ContextPlusServer {
     }
 
     /// Incrementally re-embed specific changed files without invalidating the entire cache.
-    /// Reads each file, computes content hash, re-embeds only if changed, updates cache.
+    ///
+    /// Uses the current session's ref (`current_ref()`) so per-worktree caches
+    /// stay isolated. Integrates CAS dedup: before sending a chunk to Ollama the
+    /// content hash is checked against the per-ref manifest chain; on a hit the
+    /// existing CAS blob is reused and only the manifest entry is updated —
+    /// no Ollama call is made (U12 diff-only embedding).
+    ///
     /// Returns (updated_count, skipped_count).
     pub async fn incremental_reembed(&self, files: &[std::path::PathBuf]) -> (usize, usize) {
+        use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
+
         let mut updated = 0usize;
         let mut skipped = 0usize;
 
         let max_file_size = self.state.config.max_embed_file_size as u64;
         let ref_index = self.current_ref();
 
+        // CAS setup for diff-only embedding via U6 content-addressed store.
+        let mcp_data_dir = ref_index.root_dir.join(".mcp_data");
+        let cas = CasStore::new(mcp_data_dir, &self.state.config.ollama_embed_model);
+        let ref_id_hex = ref_index.cas_ref_id_hex.clone();
+
         let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
+        let mut cas_hit_entries: Vec<(String, String, Vec<f32>)> = Vec::new(); // (rel_path, hash, vector) from CAS
+        let mut cas_manifest_updates: Vec<(ChunkKey, ChunkHash)> = Vec::new();
         // Keys evicted from the in-memory cache because the source file was deleted.
         // Must be plumbed through to `save_vector_store_merged_with_deletions` —
         // a plain merged save would re-populate them from disk on the next save.
@@ -666,7 +689,10 @@ impl ContextPlusServer {
         for file_path in files {
             let rel_path = match file_path.strip_prefix(&ref_index.root_dir) {
                 Ok(r) => r.to_string_lossy().to_string(),
-                Err(_) => file_path.to_string_lossy().to_string(),
+                Err(_) => match file_path.strip_prefix(&self.state.root_dir) {
+                    Ok(r) => r.to_string_lossy().to_string(),
+                    Err(_) => file_path.to_string_lossy().to_string(),
+                },
             };
 
             if let Ok(meta) = tokio::fs::metadata(file_path).await
@@ -691,7 +717,7 @@ impl ContextPlusServer {
 
             let hash = crate::core::parser::hash_content(&content);
 
-            // Check if content actually changed
+            // Check if content actually changed (in-memory cache hit)
             {
                 let cache = ref_index.embedding_cache.read().await;
                 if let Some(entry) = cache.get(&rel_path)
@@ -709,12 +735,65 @@ impl ContextPlusServer {
             };
             let header = crate::core::parser::extract_header(&truncated);
             let text = format!("{} {} {}", header, rel_path, truncated);
-            texts_to_embed.push((rel_path, hash, text));
+
+            // CAS dedup: check if this chunk's BLAKE3 hash exists in the parent chain.
+            // chunk_idx = 0 because we treat each file as a single chunk here.
+            let chunk_hash = ChunkHash::of(&text);
+            let key = ChunkKey::new(rel_path.clone(), 0);
+            let cas_entry = match cas.lookup_chunk(&ref_id_hex, &key) {
+                Ok(Some(h)) if h == chunk_hash => {
+                    // Hash matches — read existing blob from CAS (no Ollama call).
+                    match cas.read_blob(&h) {
+                        Ok(Some(vec)) => {
+                            tracing::debug!(
+                                rel_path = %rel_path,
+                                "CAS hit: skipping Ollama embed"
+                            );
+                            Some((chunk_hash.clone(), vec))
+                        }
+                        _ => None, // blob missing — fall through to embed
+                    }
+                }
+                _ => None, // miss or error — fall through to embed
+            };
+
+            if let Some((ch, vec)) = cas_entry {
+                // CAS hit: record the manifest entry and the in-memory cache update.
+                cas_hit_entries.push((rel_path, hash, vec));
+                // No new CAS write needed — blob already exists.
+                cas_manifest_updates.push((key, ch));
+            } else {
+                texts_to_embed.push((rel_path, hash, text));
+            }
+        }
+
+        // Apply CAS hit entries to the in-memory embedding cache.
+        if !cas_hit_entries.is_empty() {
+            let mut cache = ref_index.embedding_cache.write().await;
+            for (rel_path, hash, vec) in &cas_hit_entries {
+                cache.insert(
+                    rel_path.clone(),
+                    CacheEntry {
+                        hash: hash.clone(),
+                        vector: vec.clone(),
+                    },
+                );
+                updated += 1;
+            }
         }
 
         // Nothing to embed and nothing to delete → skip the save entirely.
         if texts_to_embed.is_empty() && deletions.is_empty() {
-            return (updated, skipped);
+            // Still need to update the CAS manifest for hits.
+            if !cas_manifest_updates.is_empty()
+                && let Err(e) = cas.update_manifest(&ref_id_hex, &cas_manifest_updates)
+            {
+                tracing::warn!("CAS manifest update failed (non-fatal): {e}");
+            }
+            if cas_hit_entries.is_empty() {
+                return (updated, skipped);
+            }
+            // Fall through to persist the updated in-memory cache to disk.
         }
 
         // Embed any pending texts (may be empty if this batch was deletion-only).
@@ -725,16 +804,25 @@ impl ContextPlusServer {
             match self.state.ollama.embed(&embed_texts).await {
                 Ok(vectors) => {
                     let mut cache = ref_index.embedding_cache.write().await;
-                    for (i, (rel_path, hash, _)) in texts_to_embed.iter().enumerate() {
+                    for (i, (rel_path, hash, text)) in texts_to_embed.iter().enumerate() {
                         if i < vectors.len() {
+                            let vec = &vectors[i];
                             cache.insert(
                                 rel_path.clone(),
                                 CacheEntry {
                                     hash: hash.clone(),
-                                    vector: vectors[i].clone(),
+                                    vector: vec.clone(),
                                 },
                             );
                             updated += 1;
+                            // Write new blob + manifest entry to CAS.
+                            let chunk_hash = ChunkHash::of(text);
+                            let key = ChunkKey::new(rel_path.clone(), 0);
+                            if let Err(e) = cas.write_blob(&chunk_hash, vec) {
+                                tracing::warn!("CAS write_blob failed (non-fatal): {e}");
+                            } else {
+                                cas_manifest_updates.push((key, chunk_hash));
+                            }
                         }
                     }
                 }
@@ -743,6 +831,14 @@ impl ContextPlusServer {
                     embed_failed = true;
                 }
             }
+        }
+
+        // Flush all CAS manifest updates in one batch.
+        if !embed_failed
+            && !cas_manifest_updates.is_empty()
+            && let Err(e) = cas.update_manifest(&ref_id_hex, &cas_manifest_updates)
+        {
+            tracing::warn!("CAS manifest batch update failed (non-fatal): {e}");
         }
 
         // Persist on every successful pass — even pure-deletion ones — so the
