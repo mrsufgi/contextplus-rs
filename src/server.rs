@@ -5103,7 +5103,6 @@ mod tests {
         assert_eq!(server.state.config.ref_warmup_mode, RefWarmupMode::Shallow);
     }
 
-
     // -----------------------------------------------------------------------
     // U18: per-ref warmup tests
     // -----------------------------------------------------------------------

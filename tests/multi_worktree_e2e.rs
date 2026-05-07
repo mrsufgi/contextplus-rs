@@ -655,7 +655,6 @@ async fn worktree_bridge_gets_valid_session_ready() {
 //
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
-#[ignore = "U18 dependency: spawn_ref_warmup not yet wired from serve_connection; project_cache eager population requires U16+U18"]
 #[tokio::test(flavor = "multi_thread")]
 async fn worktree_attach_triggers_shallow_warmup() {
     let td = TempDir::new().unwrap();
@@ -730,7 +729,6 @@ async fn worktree_attach_triggers_shallow_warmup() {
 // ACTIVATION: remove `#[ignore]` when U18 is merged (the fork_from failure
 // path is already non-fatal; the warmup error path needs the same guard).
 
-#[ignore = "U18 dependency: spawn_ref_warmup error path not yet implemented; non-fatal warmup requires U18"]
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_warmup_failure_is_nonfatal() {
     let td = TempDir::new().unwrap();

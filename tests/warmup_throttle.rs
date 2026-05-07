@@ -269,7 +269,6 @@ fn config_with_mock(mock_uri: &str) -> Config {
 //
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
-#[ignore = "U18 dependency: spawn_ref_warmup not yet wired from serve_connection (requires U16+U18)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn shallow_warmup_makes_no_ollama_calls() {
     let td = TempDir::new().unwrap();
@@ -326,7 +325,6 @@ async fn shallow_warmup_makes_no_ollama_calls() {
 //
 // ACTIVATION: remove `#[ignore]` when U16 + U17 + U18 are merged.
 
-#[ignore = "U18 dependency: spawn_ref_warmup not yet wired; U17 dependency: semaphore-gated OllamaClient not yet implemented"]
 #[tokio::test(flavor = "multi_thread")]
 async fn full_warmup_respects_concurrency_cap() {
     let td = TempDir::new().unwrap();
@@ -375,7 +373,6 @@ async fn full_warmup_respects_concurrency_cap() {
 //
 // ACTIVATION: remove `#[ignore]` when U16 + U17 + U18 are merged.
 
-#[ignore = "U18 dependency: spawn_ref_warmup not yet wired; U17 dependency: semaphore is global to the daemon, not per-ref"]
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_attaches_share_one_ollama_budget() {
     let td = TempDir::new().unwrap();
@@ -455,7 +452,6 @@ async fn concurrent_attaches_share_one_ollama_budget() {
 //
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
-#[ignore = "U18 dependency: spawn_ref_warmup not yet wired; U16 dependency: RefWarmupMode::Off not yet implemented"]
 #[tokio::test(flavor = "multi_thread")]
 async fn off_mode_skips_warmup_entirely() {
     let td = TempDir::new().unwrap();
@@ -509,7 +505,6 @@ async fn off_mode_skips_warmup_entirely() {
 //
 // ACTIVATION: remove `#[ignore]` when U18 is merged.
 
-#[ignore = "U18 dependency: warmup-started flag in RefIndex not yet implemented; idempotency gate requires U18"]
 #[tokio::test(flavor = "multi_thread")]
 async fn idempotent_attach_does_not_duplicate_warmup() {
     const FILE_COUNT: usize = 5;
