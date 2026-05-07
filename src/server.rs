@@ -2643,6 +2643,18 @@ impl ServerHandler for ContextPlusServer {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
 
+        // Tool-call entry log — pairs with an exit log below. Lets daemon-log
+        // operators correlate "Transport closed" / "completed without a
+        // result" client-side errors against a specific tool dispatch and its
+        // duration. Includes session_ref_id so multi-worktree races are
+        // distinguishable.
+        let _call_started = std::time::Instant::now();
+        tracing::debug!(
+            tool = %name,
+            session_ref_id = self.session_ref_id.map(|r| r.0),
+            "call_tool: entry"
+        );
+
         // Route through U5's path-translation boundary.
         //
         // U9: `caller_root` is now resolved per-session:
@@ -2660,7 +2672,7 @@ impl ServerHandler for ContextPlusServer {
         // (listing other refs' roots as `foreign_roots`) is reserved for U10+.
         let caller_root_opt =
             crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id);
-        match caller_root_opt {
+        let result = match caller_root_opt {
             Some(caller_root) => Ok(crate::transport::dispatch::dispatch_with_translation(
                 self,
                 &name,
@@ -2683,7 +2695,21 @@ impl ServerHandler for ContextPlusServer {
                 );
                 Ok(self.dispatch(&name, args).await)
             }
-        }
+        };
+
+        let elapsed_ms = _call_started.elapsed().as_millis() as u64;
+        let content_count = result
+            .as_ref()
+            .ok()
+            .map(|r: &CallToolResult| r.content.len());
+        tracing::info!(
+            tool = %name,
+            session_ref_id = self.session_ref_id.map(|r| r.0),
+            elapsed_ms,
+            content_count = ?content_count,
+            "call_tool: exit"
+        );
+        result
     }
 }
 
