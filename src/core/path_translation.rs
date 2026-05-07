@@ -117,122 +117,73 @@ pub fn translate_output_path(rel: &str, caller_root: &Path) -> String {
     }
 }
 
-/// Rewrite every occurrence of a repo-relative path inside a free-form
-/// text string, replacing it with an absolute path rooted at `caller_root`.
+/// Rewrite occurrences of *foreign* worktree absolute prefixes inside a
+/// free-form text string, replacing them with `caller_root`.
 ///
-/// "Occurrence" means the exact relative-path string appears in the text
-/// surrounded by either:
-/// - a non-path character (`\n`, ` `, `(`, `)`, `"`, `'`, `,`, `[`, `]`,
-///   `{`, `}`), or
-/// - the start / end of the string.
+/// The protection target: when daemon serves multiple refs and a tool result
+/// is built from a CACHE entry that was authored under another ref's
+/// worktree path, the response text might contain that other worktree's
+/// absolute prefix. Returning that to a different session would leak
+/// implementation detail (and on Linux, possibly file paths the caller has
+/// no access to). This function rewrites those foreign prefixes to the
+/// caller's own root.
 ///
-/// This is deliberately conservative: we only rewrite paths that look like
-/// file-system paths (`foo/bar`, `src/main.rs`, etc.) — sequences that
-/// contain `/` and no absolute-path marker. Paths that are already absolute
-/// are left untouched (they were produced from the server's own `root_dir`
-/// which matches the caller's worktree in the current single-ref path; and
-/// in the multi-ref future they will already have been rewritten before
-/// this point).
+/// **Single-ref no-op.** Pass an empty `foreign_roots` slice to skip text
+/// rewriting entirely. Today's daemon serves one ref; there are no foreign
+/// prefixes to translate. When real multi-ref dispatch lands the daemon
+/// passes the list of OTHER attached refs' canonical worktree paths.
 ///
-/// ## Stdio no-op
+/// **Why not regex-rewrite repo-relative paths?** The previous design
+/// scanned for any token matching `[a-zA-Z0-9_./-]+` containing `/` and
+/// prefixed it with `caller_root`. That mangles:
 ///
-/// When `caller_root` is the same path that the tool used internally
-/// (single-daemon, single-worktree), prepending the root to relative paths
-/// and then the caller reading them from under the same root produces the
-/// correct absolute path. The translation is effectively a no-op _for the
-/// caller_ because the absolute path is identical to what the tool would
-/// have produced if it had emitted absolute paths directly.
-pub fn rewrite_paths_in_text(text: &str, caller_root: &Path) -> String {
-    // Fast path: if there is nothing that looks like a path separator there
-    // is nothing to rewrite.
+/// 1. Tool labels that happen to look like paths (e.g. `semantic_navigate`
+///    cluster headers like `prior-auth-ai/app` or `[/workspace/billing]`
+///    auto-generated descriptive tokens).
+/// 2. Scope-relative paths from tools called with a sub-scope `rootDir` —
+///    the binary returns paths relative to the scope, not to the workspace
+///    root, so prefixing with `caller_root` produces the wrong absolute
+///    path (e.g. `/workspace/billing/...` instead of
+///    `/workspace/packages/domains/billing/...`).
+///
+/// Both classes of bug were observed in the live MCP. The fix: only rewrite
+/// strings that start with a known foreign-worktree absolute prefix, which
+/// are the only strings whose contents are unambiguously foreign-worktree
+/// paths. Everything else is left untouched.
+///
+/// ## Edge case: caller_root in foreign_roots
+///
+/// `foreign_roots` should NEVER contain `caller_root` itself; the caller is
+/// responsible for filtering. If it does, this function safely no-ops on
+/// those entries (it would be replacing `caller_root` with `caller_root`).
+pub fn rewrite_paths_in_text(text: &str, caller_root: &Path, foreign_roots: &[&Path]) -> String {
+    // Fast path: empty list means single-ref or no cross-ref leakage risk.
+    if foreign_roots.is_empty() {
+        return text.to_string();
+    }
+    // Fast path: nothing that looks like a path separator.
     if !text.contains('/') {
         return text.to_string();
     }
 
     let caller_root_str = caller_root.to_string_lossy();
-
-    // If the text already contains the caller's absolute root we don't need
-    // to rewrite — all occurrences are already correct absolute paths.
-    // (This is the common case for stdio mode where root_dir == caller_root.)
-    if text.contains(caller_root_str.as_ref()) {
-        return text.to_string();
-    }
-
-    // Walk through the text and replace relative path-like tokens.
-    // A "path-like token" starts at a word boundary and matches the regex
-    // pattern [a-zA-Z0-9_.\-][a-zA-Z0-9_./-]*/[a-zA-Z0-9_./\-]+ .
-    // We implement this with a simple hand-rolled scanner to avoid a regex dep.
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut result = String::with_capacity(text.len() + 32);
-    let mut i = 0;
-
-    while i < len {
-        // Check if we're at the start of a relative path.
-        // A relative path candidate must:
-        //   1. Start at position 0 or after a delimiter character.
-        //   2. Not start with `/` (that would be absolute).
-        //   3. Not start with `~` (home-dir shorthand, not handled).
-        //   4. Contain at least one `/`.
-        let at_boundary = i == 0 || is_path_delimiter(bytes[i - 1]);
-        if at_boundary
-            && bytes[i] != b'/'
-            && bytes[i] != b'~'
-            && let Some(end) = find_path_end(bytes, i)
-        {
-            let candidate = &text[i..end];
-            // Only rewrite if it contains `/` (it's a path, not a bare word).
-            // Also skip if it looks like a URL scheme ("https://", etc.)
-            if candidate.contains('/') && !candidate.contains("://") {
-                let abs = format!("{}/{}", caller_root_str, candidate);
-                result.push_str(&abs);
-                i = end;
-                continue;
-            }
+    let mut output = text.to_string();
+    for foreign in foreign_roots {
+        let foreign_str = foreign.to_string_lossy();
+        if foreign_str == caller_root_str {
+            // Caller passed its own root in the foreign list — defensively skip.
+            continue;
         }
-        // Copy current byte verbatim.
-        result.push(bytes[i] as char);
-        i += 1;
+        if !output.contains(foreign_str.as_ref()) {
+            continue;
+        }
+        // Replace every occurrence. Substring replace is safe here because
+        // a canonical absolute prefix is unique enough to not collide with
+        // legitimate text — paths that *don't* belong to a worktree won't
+        // start with a worktree's canonical absolute path.
+        output = output.replace(foreign_str.as_ref(), &caller_root_str);
     }
-
-    result
-}
-
-/// Returns `true` if `c` is a character that can appear immediately before
-/// a path in free-form tool output (whitespace or common punctuation).
-fn is_path_delimiter(c: u8) -> bool {
-    matches!(
-        c,
-        b'\n'
-            | b'\r'
-            | b'\t'
-            | b' '
-            | b'('
-            | b')'
-            | b'"'
-            | b'\''
-            | b','
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-    )
-}
-
-/// Scan forward from `start` to find the end of a path-like token.
-///
-/// A path character is: alphanumeric, `_`, `.`, `-`, `/`.
-/// We stop at the first character that is not a path character.
-fn find_path_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = start;
-    while i < bytes.len() && is_path_char(bytes[i]) {
-        i += 1;
-    }
-    if i > start { Some(i) } else { None }
-}
-
-fn is_path_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-' | b'/')
+    output
 }
 
 /// Check whether a JSON value (recursively) contains a given string anywhere
@@ -280,17 +231,21 @@ pub fn translate_input_args(
 
 /// Apply output-path translation to the text content of a [`rmcp::model::CallToolResult`].
 ///
-/// All `TextContent` items in the result have their text run through
-/// [`rewrite_paths_in_text`] so that repo-relative paths become absolute
-/// paths anchored at `caller_root`.
+/// `foreign_roots` is the list of OTHER attached refs' canonical worktree
+/// paths whose absolute prefix may appear in cached tool output and would
+/// leak across the session boundary if returned verbatim. In single-ref
+/// mode pass `&[]` — the function becomes identity, preserving every
+/// tool's native output formatting.
 ///
-/// In stdio mode (no daemon, single worktree) this is a near-no-op: the
-/// text already contains `caller_root`-anchored paths because the server's
-/// own `root_dir` matches `caller_root`, so the fast-path in
-/// [`rewrite_paths_in_text`] returns the text unchanged.
+/// **Why output translation is identity in single-ref mode.** Today the
+/// daemon serves one ref. All paths in tool output were authored against
+/// that single ref's `root_dir`, which equals `caller_root`. There is no
+/// foreign prefix to rewrite; relative paths stay relative; absolute
+/// paths with the only-known root are already correct.
 pub fn translate_output_result(
     result: rmcp::model::CallToolResult,
     caller_root: &Path,
+    foreign_roots: &[&Path],
 ) -> rmcp::model::CallToolResult {
     use rmcp::model::{Annotated, RawContent};
 
@@ -300,7 +255,8 @@ pub fn translate_output_result(
         .map(|annotated| {
             let new_raw = match annotated.raw {
                 RawContent::Text(text_content) => {
-                    let rewritten = rewrite_paths_in_text(&text_content.text, caller_root);
+                    let rewritten =
+                        rewrite_paths_in_text(&text_content.text, caller_root, foreign_roots);
                     RawContent::Text(rmcp::model::RawTextContent {
                         text: rewritten,
                         meta: text_content.meta,
@@ -394,60 +350,99 @@ mod tests {
     // ── rewrite_paths_in_text ─────────────────────────────────────────────────
 
     #[test]
-    fn rewrites_relative_path_in_plain_text() {
+    fn empty_foreign_roots_is_identity() {
         let root = Path::new("/workspace/wt-a");
-        let text = "1. src/auth.rs (90% total)";
-        let result = rewrite_paths_in_text(text, root);
-        assert!(
-            result.contains("/workspace/wt-a/src/auth.rs"),
-            "got: {result}"
-        );
+        let text = "1. src/auth.rs (90% total)\n[plugins + observability + config]";
+        let result = rewrite_paths_in_text(text, root, &[]);
+        assert_eq!(result, text, "single-ref / empty foreign_roots → identity");
     }
 
     #[test]
-    fn does_not_rewrite_when_caller_root_already_present() {
-        let root = Path::new("/workspace/wt-a");
-        let text = "Found /workspace/wt-a/src/auth.rs";
-        // Fast path: root already present → no change.
-        let result = rewrite_paths_in_text(text, root);
-        assert_eq!(result, text);
-    }
-
-    #[test]
-    fn does_not_rewrite_bare_words_without_slash() {
-        let root = Path::new("/workspace/wt-a");
-        let text = "query result: foo bar baz";
-        let result = rewrite_paths_in_text(text, root);
-        // No path separators → fast-path return, text unchanged.
-        assert_eq!(result, text);
-    }
-
-    #[test]
-    fn does_not_rewrite_url_scheme() {
-        let root = Path::new("/workspace/wt-a");
-        let text = "see https://example.com/foo/bar for details";
-        let result = rewrite_paths_in_text(text, root);
-        // URLs must not be rewritten.
-        assert!(
-            result.contains("https://example.com/foo/bar"),
-            "got: {result}"
-        );
-        assert!(!result.contains("/workspace/wt-a/https:"), "got: {result}");
-    }
-
-    #[test]
-    fn rewrites_multiple_paths_in_text() {
-        let root = Path::new("/workspace/wt-b");
-        let text = "1. src/auth.rs\n2. src/db/client.rs";
-        let result = rewrite_paths_in_text(text, root);
+    fn rewrites_when_foreign_root_present() {
+        let caller = Path::new("/workspace/wt-b");
+        let foreign = Path::new("/workspace/wt-a");
+        let text = "1. /workspace/wt-a/src/auth.rs (90% total)";
+        let result = rewrite_paths_in_text(text, caller, &[foreign]);
         assert!(
             result.contains("/workspace/wt-b/src/auth.rs"),
             "got: {result}"
         );
         assert!(
-            result.contains("/workspace/wt-b/src/db/client.rs"),
-            "got: {result}"
+            !result.contains("/workspace/wt-a"),
+            "foreign prefix must be gone: {result}"
         );
+    }
+
+    #[test]
+    fn does_not_rewrite_when_foreign_not_present() {
+        let caller = Path::new("/workspace/wt-b");
+        let foreign = Path::new("/workspace/wt-a");
+        let text = "1. src/auth.rs (95% total)\n2. /workspace/wt-c/src/x.rs";
+        let result = rewrite_paths_in_text(text, caller, &[foreign]);
+        assert_eq!(
+            result, text,
+            "no foreign prefix in text → no rewrite, even if other absolutes exist"
+        );
+    }
+
+    #[test]
+    fn defensive_skips_caller_root_in_foreign_list() {
+        let caller = Path::new("/workspace/wt-b");
+        let text = "1. /workspace/wt-b/src/auth.rs";
+        // Caller passed its own root in foreign list — must no-op safely.
+        let result = rewrite_paths_in_text(text, caller, &[caller]);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn does_not_rewrite_url_scheme_when_foreign_unrelated() {
+        let caller = Path::new("/workspace/wt-a");
+        let foreign = Path::new("/workspace/wt-b");
+        let text = "see https://example.com/foo/bar for details";
+        let result = rewrite_paths_in_text(text, caller, &[foreign]);
+        // No foreign prefix in URL → no rewrite.
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn rewrites_multiple_occurrences_of_one_foreign() {
+        let caller = Path::new("/workspace/wt-b");
+        let foreign = Path::new("/workspace/wt-a");
+        let text = "1. /workspace/wt-a/src/auth.rs\n2. /workspace/wt-a/src/db/client.rs";
+        let result = rewrite_paths_in_text(text, caller, &[foreign]);
+        assert!(result.contains("/workspace/wt-b/src/auth.rs"), "{result}");
+        assert!(
+            result.contains("/workspace/wt-b/src/db/client.rs"),
+            "{result}"
+        );
+        assert!(!result.contains("wt-a"), "{result}");
+    }
+
+    #[test]
+    fn rewrites_each_of_multiple_foreigns() {
+        let caller = Path::new("/workspace/wt-c");
+        let foreigns: &[&Path] = &[Path::new("/workspace/wt-a"), Path::new("/workspace/wt-b")];
+        let text = "1. /workspace/wt-a/x.rs\n2. /workspace/wt-b/y.rs\n3. local/z.rs";
+        let result = rewrite_paths_in_text(text, caller, foreigns);
+        assert!(result.contains("/workspace/wt-c/x.rs"), "{result}");
+        assert!(result.contains("/workspace/wt-c/y.rs"), "{result}");
+        assert!(
+            result.contains("local/z.rs"),
+            "relative untouched: {result}"
+        );
+    }
+
+    #[test]
+    fn does_not_mangle_navigate_cluster_labels() {
+        // Cluster labels (descriptive tokens shaped like paths) and
+        // scope-relative file paths must NOT be mangled in single-ref mode.
+        let caller = Path::new("/workspace");
+        let navigate_text = "Semantic Navigator: 25 files\n  \
+                             [plugins + observability + config] (10 files)\n    \
+                             config/config.test.ts\n    \
+                             plugins/health.ts";
+        let result = rewrite_paths_in_text(navigate_text, caller, &[]);
+        assert_eq!(result, navigate_text);
     }
 
     // ── json_contains_string ──────────────────────────────────────────────────
@@ -521,63 +516,31 @@ mod tests {
 
     // ── leakage invariant tests (multi-worktree scenarios) ────────────────────
 
-    /// Happy path: session for worktree A gets output paths rooted at A's dir.
-    #[test]
-    fn output_paths_are_rooted_at_caller_worktree() {
-        let worktree_a = Path::new("/workspace/wt-a");
-        // Simulate tool output with a repo-relative path.
-        let tool_output = "1. src/auth.rs (95% total)\n   Snippet: fn verify_token";
-        let rewritten = rewrite_paths_in_text(tool_output, worktree_a);
-        assert!(
-            rewritten.contains("/workspace/wt-a/src/auth.rs"),
-            "expected absolute path rooted at wt-a, got: {rewritten}"
-        );
-    }
-
-    /// Happy path: session for worktree B gets the same content prefixed with B's root.
-    #[test]
-    fn different_sessions_get_different_absolute_roots() {
-        let tool_output = "1. src/auth.rs (95% total)";
-        let rewritten_a = rewrite_paths_in_text(tool_output, Path::new("/workspace/wt-a"));
-        let rewritten_b = rewrite_paths_in_text(tool_output, Path::new("/workspace/wt-b"));
-        assert!(rewritten_a.contains("/workspace/wt-a/"), "A: {rewritten_a}");
-        assert!(rewritten_b.contains("/workspace/wt-b/"), "B: {rewritten_b}");
-        assert!(
-            !rewritten_b.contains("/workspace/wt-a/"),
-            "B must not contain A's root: {rewritten_b}"
-        );
-    }
-
-    /// THE LEAKAGE TEST: verify that B's result JSON never contains A's worktree path string.
+    /// THE LEAKAGE TEST: when ref A's absolute prefix appears in cached
+    /// output served to ref B's session, B's response must have it
+    /// rewritten to B's caller_root.
     #[test]
     fn leakage_test_b_result_never_contains_a_worktree_path() {
         let wt_a = Path::new("/workspace/worktree-a");
         let wt_b = Path::new("/workspace/worktree-b");
 
-        // Simulate a shared chunk found by both sessions — the raw tool output
-        // uses repo-relative paths (as tool implementations produce).
-        let shared_chunk_output = "1. src/shared/utils.rs (88% total)\n   Snippet: helper fn";
+        // Simulate a cached chunk authored under A's worktree (absolute path
+        // contains A's prefix, as cached SearchIndex entries do).
+        let cached_output = "1. /workspace/worktree-a/src/shared/utils.rs (88% total)";
 
-        // Session A's result: rewrite for A's worktree.
-        let result_for_a = rewrite_paths_in_text(shared_chunk_output, wt_a);
-        // Session B's result: rewrite for B's worktree.
-        let result_for_b = rewrite_paths_in_text(shared_chunk_output, wt_b);
+        // B's session: dispatch passes A as a foreign root because A is
+        // currently attached.
+        let result_for_b = rewrite_paths_in_text(cached_output, wt_b, &[wt_a]);
 
-        // A's result must contain A's absolute path.
-        assert!(result_for_a.contains("/workspace/worktree-a/src/shared/utils.rs"));
-
-        // B's result must contain B's absolute path.
+        // B's result must contain B's absolute path, not A's.
         assert!(result_for_b.contains("/workspace/worktree-b/src/shared/utils.rs"));
 
-        // *** The leakage invariant ***: B's serialized JSON must not contain
-        // any string from A's worktree path namespace.
         let b_json = serde_json::json!({
             "content": [{"type": "text", "text": result_for_b}]
         });
         assert!(
             !json_contains_string(&b_json, "/workspace/worktree-a"),
-            "LEAKAGE: B's result contains A's worktree path!\n\
-             B result JSON: {b_json}"
+            "LEAKAGE: B's result contains A's worktree path!\n{b_json}"
         );
     }
 
@@ -588,46 +551,17 @@ mod tests {
         let err =
             translate_input_path("/workspace/wt-b/secrets/credentials.json", root).unwrap_err();
         let msg = err.to_string();
-        // Must mention the rejected path.
         assert!(msg.contains("wt-b"), "msg: {msg}");
-        // Must mention the worktree root.
         assert!(msg.contains("wt-a"), "msg: {msg}");
-        // Must not panic.
     }
 
-    /// Edge case: output path learned from parent ref is rewritten to caller's
-    /// worktree prefix (simulated by calling the rewrite function).
+    /// In single-ref / stdio mode caller_root matches server root_dir;
+    /// `foreign_roots` is empty and the function is identity.
     #[test]
-    fn output_path_from_parent_ref_rewritten_to_caller_root() {
-        // The "parent ref" is the primary worktree at wt-primary.
-        // A caller is a secondary worktree at wt-secondary.
-        // The tool output contains a repo-relative path (canonical form).
-        let primary_relative_output = "1. src/core/engine.rs (92% total)";
-        let caller_root = Path::new("/workspace/wt-secondary");
-        let rewritten = rewrite_paths_in_text(primary_relative_output, caller_root);
-        assert!(
-            rewritten.contains("/workspace/wt-secondary/src/core/engine.rs"),
-            "got: {rewritten}"
-        );
-        // Must NOT contain the primary worktree path.
-        assert!(
-            !rewritten.contains("/workspace/wt-primary"),
-            "leaked primary path: {rewritten}"
-        );
-    }
-
-    /// Edge case: stdio mode — when caller_root matches the server's own root_dir,
-    /// the translation is a no-op (text already contains the absolute paths).
-    #[test]
-    fn stdio_mode_translation_is_noop_when_root_present() {
+    fn single_ref_translation_is_identity_for_absolute_paths() {
         let root = Path::new("/workspace/primary");
-        // In stdio mode the tool output already contains absolute paths
-        // rooted at root — the fast-path in rewrite_paths_in_text returns unchanged.
         let text = "1. /workspace/primary/src/main.rs (99% total)";
-        let result = rewrite_paths_in_text(text, root);
-        assert_eq!(
-            result, text,
-            "stdio mode must not alter already-absolute paths"
-        );
+        let result = rewrite_paths_in_text(text, root, &[]);
+        assert_eq!(result, text);
     }
 }

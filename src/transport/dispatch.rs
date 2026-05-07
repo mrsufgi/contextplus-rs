@@ -23,13 +23,14 @@
 //! `default_ref()` call with `state.ref_index(session.ref_id)` — the
 //! primitives in `crate::core::path_translation` don't change.
 //!
-//! ## Stdio no-op
+//! ## Single-ref / stdio no-op
 //!
-//! In single-daemon / stdio mode the caller's worktree is the same path the
-//! server uses internally, so `rewrite_paths_in_text` fast-paths through
-//! (the text already contains the absolute root), and
-//! `translate_input_path` for relative args is a pass-through.  Existing
-//! stdio-only deployments are entirely unaffected.
+//! In single-daemon and stdio modes there are no other refs whose absolute
+//! prefix could leak into a tool result, so `dispatch_with_translation`
+//! passes `foreign_roots = &[]`. Output rewriting is identity; the only
+//! translation that runs is input-side rejection of out-of-tree path args
+//! (the safety net that should always be on). Existing stdio-only
+//! deployments see no observable difference.
 //!
 //! # Environment variables
 //!
@@ -332,7 +333,20 @@ pub async fn dispatch_with_translation(
     let raw_result = server.dispatch(tool_name, translated_args).await;
 
     // --- Output translation ---
-    path_translation::translate_output_result(raw_result, caller_root)
+    //
+    // Single-ref mode: `foreign_roots` is empty. The output rewriter is an
+    // identity — we don't try to upgrade repo-relative paths to absolute
+    // because doing so naively (regex-rewriting "anything that looks like a
+    // path") mangles tool labels and scope-relative outputs. The U5
+    // invariant ("B never sees A's path") is trivially satisfied today
+    // because there's only one ref; the only way A's path could appear in
+    // B's output is via a foreign-root absolute prefix that doesn't exist.
+    //
+    // Real multi-ref dispatch (U4-bis) replaces this with the list of
+    // OTHER attached refs' canonical worktree paths, so any cached entry
+    // built under another ref gets translated before reaching this caller.
+    let foreign_roots: &[&Path] = &[];
+    path_translation::translate_output_result(raw_result, caller_root, foreign_roots)
 }
 
 /// Return the caller's worktree root for the current (single-ref) configuration.
@@ -702,96 +716,121 @@ mod tests {
 
     // ── Output translation ────────────────────────────────────────────────────
 
-    /// A tool result with relative paths gets prefixed with caller_root.
+    /// In single-ref mode (`foreign_roots = &[]`) output is identity.
+    /// Repo-relative paths are NOT upgraded to absolute — that mangles tool
+    /// labels and scope-relative paths. The caller (Claude / Codex) reads
+    /// repo-relative paths as workspace-rooted naturally.
     #[test]
-    fn translate_output_result_prefixes_relative_paths() {
+    fn translate_output_result_single_ref_is_identity() {
         use crate::core::path_translation::translate_output_result;
 
         let caller_root = std::path::Path::new("/workspace/wt-a");
-        // Simulate a tool result with a relative path in text.
-        let content = rmcp::model::Content::text("1. src/auth.rs (90% total)");
+        let original = "1. src/auth.rs (90% total)\n[/workspace/cluster-label]";
+        let content = rmcp::model::Content::text(original);
         let raw = rmcp::model::CallToolResult::success(vec![content]);
-        let translated = translate_output_result(raw, caller_root);
+        let translated = translate_output_result(raw, caller_root, &[]);
 
         let text = first_text(&translated);
-        assert!(
-            text.contains("/workspace/wt-a/src/auth.rs"),
-            "expected absolute path in output, got: {text}"
-        );
+        assert_eq!(text, original, "single-ref mode must be identity");
     }
 
     /// Output already containing absolute paths for the caller's root is
-    /// left unchanged (stdio no-op path).
+    /// left unchanged.
     #[test]
-    fn translate_output_result_noop_when_already_absolute() {
+    fn translate_output_result_absolute_caller_paths_unchanged() {
         use crate::core::path_translation::translate_output_result;
 
         let caller_root = std::path::Path::new("/workspace/primary");
         let text = "1. /workspace/primary/src/main.rs (99% total)";
         let content = rmcp::model::Content::text(text);
         let raw = rmcp::model::CallToolResult::success(vec![content]);
-        let translated = translate_output_result(raw, caller_root);
+        let translated = translate_output_result(raw, caller_root, &[]);
         assert_eq!(first_text(&translated), text);
     }
 
     // ── THE LEAKAGE TEST ─────────────────────────────────────────────────────
     //
-    // This is the load-bearing test for U5. It proves that the dispatch layer
-    // ensures B's tool result never contains A's worktree path string anywhere
-    // in the response JSON, even when both sessions share the same underlying
-    // content (chunk learned from the same repo).
+    // This is the load-bearing test for U5. It proves that when the daemon
+    // serves multiple refs and a cached tool result built under ref A's
+    // worktree leaks into ref B's response, B's session NEVER sees A's
+    // absolute prefix — it gets rewritten to B's caller_root.
 
     #[tokio::test]
     async fn leakage_test_b_result_never_contains_a_worktree_path_via_dispatch() {
         use crate::core::path_translation::translate_output_result;
 
-        // Simulate the shared raw tool output as if both sessions hit the same
-        // chunk index (repo-relative paths, no worktree prefix).
-        let shared_tool_output = "1. src/shared/utils.rs (88% total)\n   Snippet: helper fn\n2. src/core/engine.rs (75% total)";
+        // Simulate the shared raw tool output as if it was authored under
+        // ref A's worktree (e.g. cached SearchIndex result built when only A
+        // was attached). A's absolute prefix appears in the text.
+        let shared_tool_output = "1. /workspace/worktree-a/src/shared/utils.rs (88% total)\n   Snippet: helper fn\n2. /workspace/worktree-a/src/core/engine.rs (75% total)";
 
         let wt_a = std::path::Path::new("/workspace/worktree-a");
         let wt_b = std::path::Path::new("/workspace/worktree-b");
 
-        // Produce per-session results by applying output translation.
+        // Session A receives the result with no foreign_roots — its own root
+        // is the only one in scope, and the absolute paths already match.
         let result_for_a = {
             let content = rmcp::model::Content::text(shared_tool_output);
             let raw = rmcp::model::CallToolResult::success(vec![content]);
-            translate_output_result(raw, wt_a)
+            translate_output_result(raw, wt_a, &[])
         };
+
+        // Session B receives the same raw output; its dispatch passes A's
+        // root in `foreign_roots` because A is currently attached. The
+        // rewriter substitutes A's prefix with B's.
+        let foreign_for_b: &[&Path] = &[wt_a];
         let result_for_b = {
             let content = rmcp::model::Content::text(shared_tool_output);
             let raw = rmcp::model::CallToolResult::success(vec![content]);
-            translate_output_result(raw, wt_b)
+            translate_output_result(raw, wt_b, foreign_for_b)
         };
 
-        // A's result must contain A's absolute paths.
+        // A's result must still contain A's paths verbatim.
         let text_a = first_text(&result_for_a);
         assert!(
             text_a.contains("/workspace/worktree-a/src/shared/utils.rs"),
             "A: {text_a}"
         );
 
-        // B's result must contain B's absolute paths.
+        // B's result must show paths rooted at B.
         let text_b = first_text(&result_for_b);
         assert!(
             text_b.contains("/workspace/worktree-b/src/shared/utils.rs"),
             "B: {text_b}"
         );
 
-        // *** THE LEAKAGE INVARIANT ***: serialize B's result to JSON and assert
-        // that A's worktree path string is nowhere in B's response.
+        // *** THE LEAKAGE INVARIANT ***: serialize B's result to JSON and
+        // assert that A's worktree path string is nowhere in B's response.
         let b_json = serde_json::to_value(&result_for_b).unwrap();
         assert!(
             !json_has(&b_json, "/workspace/worktree-a"),
             "LEAKAGE: B's result JSON contains A's worktree path!\nB JSON: {b_json}"
         );
+    }
 
-        // Also check in the other direction: A's result doesn't contain B's path.
-        let a_json = serde_json::to_value(&result_for_a).unwrap();
-        assert!(
-            !json_has(&a_json, "/workspace/worktree-b"),
-            "LEAKAGE: A's result JSON contains B's worktree path!\nA JSON: {a_json}"
-        );
+    /// `semantic_navigate`-style cluster labels and scope-relative paths
+    /// must NOT be mangled. Regression guard against the previous design
+    /// that scanned for "anything path-shaped" and prefixed it.
+    #[test]
+    fn translate_output_result_does_not_mangle_navigate_labels() {
+        use crate::core::path_translation::translate_output_result;
+
+        let caller_root = std::path::Path::new("/workspace");
+        // Realistic semantic_navigate output: cluster headers look like
+        // paths but aren't real paths, and inner file paths are relative
+        // to a sub-scope (here `apps/emr-api/src`).
+        let navigate_text = "Semantic Navigator: 25 files\n\
+                             [Project] (25 files)\n  \
+                             [plugins + observability + config] (10 files)\n    \
+                             config/config.test.ts\n    \
+                             plugins/health.ts\n    \
+                             observability/security-events.ts";
+        let content = rmcp::model::Content::text(navigate_text);
+        let raw = rmcp::model::CallToolResult::success(vec![content]);
+        let translated = translate_output_result(raw, caller_root, &[]);
+
+        let text = first_text(&translated);
+        assert_eq!(text, navigate_text, "single-ref output must not be mangled");
     }
 
     // ── stdio mode (no daemon) ────────────────────────────────────────────────
