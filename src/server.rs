@@ -1971,39 +1971,7 @@ impl ServerHandler for ContextPlusServer {
         }
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-
-        // Route through U5's path-translation boundary.
-        //
-        // Today (single-ref): `caller_root` resolves via
-        // [`crate::transport::dispatch::caller_root_from_default_ref`], which
-        // reads `SharedState.default_ref().root_dir`. In stdio mode the caller
-        // root equals the server root and `translate_*` short-circuits to a
-        // no-op, preserving legacy behavior.
-        //
-        // U4 seam: per-session `RefIndex` lookup via `session.ref_id` once the
-        // rmcp `RequestContext` carries a session id from `register_session`.
-        // Until then, every request resolves to the singleton default ref —
-        // identical to the un-translated behavior except for the safety nets
-        // (out-of-tree path rejection, repo-relative output prefixing) that
-        // are stable across the U4 transition.
-        match crate::transport::dispatch::caller_root_from_default_ref(&self.state) {
-            Some(caller_root) => Ok(crate::transport::dispatch::dispatch_with_translation(
-                self,
-                &name,
-                args,
-                &caller_root,
-            )
-            .await),
-            None => {
-                // Registry tampered with externally — fall back to direct
-                // dispatch so we don't lose the request entirely. Logged at
-                // warn so the operator can see the abnormal state.
-                tracing::warn!(
-                    "default_ref missing from registry; bypassing path translation for tool {name}"
-                );
-                Ok(self.dispatch(&name, args).await)
-            }
-        }
+        Ok(self.dispatch(&name, args).await)
     }
 }
 
