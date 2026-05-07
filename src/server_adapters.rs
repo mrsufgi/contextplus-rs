@@ -59,8 +59,21 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
         let ollama = self.ollama.clone();
         let state = self.state.clone();
         Box::pin(async move {
-            let embedding_cache = &state.embedding_cache;
-            let store_root = &state.root_dir;
+            // `CachedWalkerIndexer` is constructed with an `Arc<SharedState>` and has
+            // no per-session `RefId`.  It always operates on the default ref.  This is
+            // correct for the warmup path and for single-ref stdio mode.  Per-session
+            // dispatch via `ContextPlusServer::handle_semantic_code_search` obtains the
+            // ref-appropriate `search_index_cache` before constructing this walker and
+            // passes it directly — so the embedding cache here only needs to be the
+            // default ref's cache for the file-embedding step.
+            let default_ref = state
+                .default_ref()
+                .expect("default_ref always present in CachedWalkerIndexer");
+            // Clone the Arcs so we can drop `default_ref` and avoid lifetime issues
+            // with borrowing into the async block.
+            let embedding_cache = Arc::clone(&default_ref.embedding_cache);
+            let store_root = default_ref.root_dir.clone();
+            drop(default_ref);
             let entries = walk_with_config(&root, &config);
 
             let max_file_size = config.max_embed_file_size as u64;
