@@ -2026,12 +2026,13 @@ impl ServerHandler for ContextPlusServer {
                 &name,
                 args,
                 &caller_root,
-                // U9 seam: pass `None` until U9 wires `session_ref_id` into
-                // `ContextPlusServer`. Once U9 merges, replace with
-                // `self.session_ref_id` so the caller's own ref is excluded
-                // from `foreign_roots` and cross-ref leakage protection
-                // activates correctly.
-                None,
+                // U9 + U14 wiring: `self.session_ref_id` is set per-connection by
+                // `daemon::serve_connection` after `register_session`. Passing it
+                // to `dispatch_with_translation` lets `foreign_roots_for_session`
+                // exclude the caller's own ref from the foreign-roots list and
+                // include only OTHER attached refs — activating cross-ref
+                // leakage protection for multi-ref daemons.
+                self.session_ref_id,
             )
             .await),
             None => {
