@@ -82,6 +82,18 @@ const INSTRUCTIONS_SOURCE_URL: &str = "https://contextplus.vercel.app/api/instru
 const INSTRUCTIONS_RESOURCE_URI: &str = "contextplus://instructions";
 
 /// Shared state accessible by all tool handlers.
+///
+/// ## U10 migration note
+///
+/// The per-ref cache fields (`embedding_cache`, `identifier_index`,
+/// `search_index_cache`, `cache_generation`, `tracker_handle`, `project_cache`)
+/// are now owned by [`crate::ref_index::RefIndex`].  During the U10→U11
+/// transition they are kept here as **`Arc` clones** of the default ref's
+/// fields.  This means all existing call sites (`state.embedding_cache.read()`,
+/// etc.) continue to compile and operate on the correct data.
+///
+/// U11 will mechanically migrate the ~57 call sites to use
+/// `state.ref_index(session.ref_id).embedding_cache` instead.
 pub struct SharedState {
     pub config: Config,
     pub root_dir: PathBuf,
@@ -91,16 +103,21 @@ pub struct SharedState {
     pub canonical_root: PathBuf,
     pub ollama: OllamaClient,
     pub memory_graph: Arc<GraphStore>,
-    pub project_cache: RwLock<Option<Arc<ProjectCache>>>,
-    /// Cached embedding vectors keyed by relative file path.
-    /// Uses CacheEntry (hash + vector) for content-hash invalidation.
-    /// Persisted to disk via rkyv_store for cross-restart survival.
-    pub embedding_cache: RwLock<HashMap<String, CacheEntry>>,
-    /// Cached identifier index — avoids re-embedding all symbols on each call.
-    pub identifier_index: RwLock<Option<Arc<IdentifierIndex>>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `project_cache`. Shares the same underlying `RwLock` as the default
+    /// `RefIndex` entry. U11 will migrate call sites to use the per-ref field.
+    pub project_cache: Arc<RwLock<Option<Arc<ProjectCache>>>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `embedding_cache`. All reads/writes go through the same lock as
+    /// `state.default_ref().embedding_cache`. U11 migrates to per-ref.
+    pub embedding_cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `identifier_index`. U11 migrates to per-ref.
+    pub identifier_index: Arc<RwLock<Option<Arc<IdentifierIndex>>>>,
     /// Cached SearchIndex for semantic_code_search — reused when the walk fingerprint
     /// is unchanged, eliminating the per-request HNSW rebuild for large corpora.
-    /// Wrapped in `Arc` so background rebuild tasks can hold a clone of the lock.
+    /// `Arc`-wrapped so background rebuild tasks can hold a clone.
+    /// **U10**: also stored in the default ref's `search_index_cache` (same Arc).
     pub search_index_cache:
         Arc<RwLock<Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>>>,
     /// Monotonic counter incremented by the embedding tracker whenever a file-change
@@ -109,11 +126,13 @@ pub struct SharedState {
     /// changes since the last build and the filesystem walk can be skipped entirely.
     /// When the tracker is disabled the counter stays at 0 and the fingerprint-based
     /// fallback takes over.
+    /// **U10**: same Arc stored in the default ref's `cache_generation`.
     pub cache_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Cached instructions content — fetched once from remote, then served from memory.
     pub instructions_cache: OnceCell<String>,
-    /// Tracker handle for lazy-start mode.
-    pub tracker_handle: std::sync::Mutex<Option<EmbeddingTrackerHandle>>,
+    /// **Backward-compat shim (U10).** Arc clone of the default ref's
+    /// `tracker_handle`. U11 migrates to per-ref.
+    pub tracker_handle: Arc<std::sync::Mutex<Option<EmbeddingTrackerHandle>>>,
     /// Idle monitor handle — tool handlers touch this to reset the idle timer.
     pub idle_monitor: RwLock<Option<Arc<crate::core::process_lifecycle::IdleMonitor>>>,
     /// Drain flag — set when the parent process dies (or another graceful
@@ -124,16 +143,13 @@ pub struct SharedState {
     /// of `dispatch_inner` via an `InflightGuard`; decremented on drop. The
     /// drain watcher exits the process once draining is true and this hits 0.
     pub inflight: Arc<std::sync::atomic::AtomicUsize>,
-    /// **Multi-ref scaffolding (U3).** Registry of `RefId → RefIndex` for
-    /// all worktrees this daemon serves. In U3 the registry is populated
-    /// with exactly one entry — `default_ref_id` — and per-ref heavy state
-    /// (cache, tracker, memory graph) still lives on `SharedState` directly.
-    /// U4 will route `register_session` calls through this registry; U6 + U7
-    /// will migrate the heavy state into `RefIndex`. See [`crate::ref_index`].
+    /// Registry of `RefId → RefIndex` for all worktrees this daemon serves.
+    /// Each `RefIndex` carries its own per-ref caches (U10+).
+    /// The registry is `RwLock`-wrapped so attach/detach don't block tool calls.
     pub refs: crate::ref_index::RefRegistry,
-    /// `RefId` of the singleton ref served today. Tool dispatches that don't
-    /// carry an explicit `RefId` use this. U4 replaces the implicit-default
-    /// path with explicit per-session routing.
+    /// `RefId` of the default (primary) ref. Tool dispatches that don't
+    /// carry an explicit `RefId` use this. U4 / U11 will migrate to explicit
+    /// per-session routing via `session_ref_id`.
     pub default_ref_id: crate::ref_index::RefId,
 }
 
@@ -327,14 +343,26 @@ impl ContextPlusServer {
         // Canonicalize once at construction so resolve_root() can skip per-request syscalls.
         let canonical_root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
 
-        // Build the multi-ref scaffolding: registry containing the singleton
-        // default ref. U4 will register additional refs via session handshake.
+        // Build the default ref with the disk-loaded embedding cache (U10).
+        // All other per-ref caches start empty.
         let default_ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_root);
-        let default_ref = Arc::new(crate::ref_index::RefIndex::new(
+        let default_ref = Arc::new(crate::ref_index::RefIndex::with_preloaded_cache(
             root_dir.clone(),
             canonical_root.clone(),
-            None, // primary ref has no parent
+            initial_cache,
         ));
+
+        // Clone the per-ref Arcs so SharedState can expose them as backward-compat
+        // shims.  Both SharedState and the RefIndex entry point at the SAME
+        // underlying RwLock / Mutex — writes through one are visible through the
+        // other.  U11 will migrate call sites to go through RefIndex directly.
+        let embedding_cache = Arc::clone(&default_ref.embedding_cache);
+        let identifier_index = Arc::clone(&default_ref.identifier_index);
+        let search_index_cache = Arc::clone(&default_ref.search_index_cache);
+        let cache_generation = Arc::clone(&default_ref.cache_generation);
+        let tracker_handle = Arc::clone(&default_ref.tracker_handle);
+        let project_cache = Arc::clone(&default_ref.project_cache);
+
         let refs = crate::ref_index::new_registry_with_default(default_ref_id, default_ref);
 
         let state = Arc::new(SharedState {
@@ -343,13 +371,13 @@ impl ContextPlusServer {
             root_dir,
             ollama,
             memory_graph,
-            project_cache: RwLock::new(None),
-            embedding_cache: RwLock::new(initial_cache),
-            identifier_index: RwLock::new(None),
-            search_index_cache: Arc::new(RwLock::new(None)),
-            cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            project_cache,
+            embedding_cache,
+            identifier_index,
+            search_index_cache,
+            cache_generation,
             instructions_cache: OnceCell::new(),
-            tracker_handle: std::sync::Mutex::new(None),
+            tracker_handle,
             idle_monitor: RwLock::new(None),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4156,5 +4184,136 @@ mod tests {
 
         assert_eq!(s_a.session_ref_id, Some(id_a));
         assert_eq!(s_b.session_ref_id, Some(id_b));
+    }
+
+    // ── U10: per-ref state / backward-compat shims ───────────────────────────
+
+    /// `state.embedding_cache` and `default_ref().embedding_cache` must share
+    /// the same `Arc` — writes through one are visible through the other.
+    #[tokio::test]
+    async fn sharedstate_embedding_cache_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(&server.state.embedding_cache, &default_ref.embedding_cache),
+            "SharedState.embedding_cache must be the same Arc as default_ref().embedding_cache"
+        );
+    }
+
+    /// `state.project_cache` and `default_ref().project_cache` share the same Arc.
+    #[tokio::test]
+    async fn sharedstate_project_cache_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(&server.state.project_cache, &default_ref.project_cache),
+            "SharedState.project_cache must share the Arc with default_ref().project_cache"
+        );
+    }
+
+    /// `state.identifier_index` and `default_ref().identifier_index` share the same Arc.
+    #[tokio::test]
+    async fn sharedstate_identifier_index_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(
+                &server.state.identifier_index,
+                &default_ref.identifier_index
+            ),
+            "SharedState.identifier_index must share the Arc with default_ref().identifier_index"
+        );
+    }
+
+    /// `state.search_index_cache` and `default_ref().search_index_cache` share Arc.
+    #[tokio::test]
+    async fn sharedstate_search_index_cache_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(
+                &server.state.search_index_cache,
+                &default_ref.search_index_cache
+            ),
+            "SharedState.search_index_cache must share the Arc with default_ref().search_index_cache"
+        );
+    }
+
+    /// `state.cache_generation` and `default_ref().cache_generation` share Arc.
+    #[tokio::test]
+    async fn sharedstate_cache_generation_shares_arc_with_default_ref() {
+        let server = test_server();
+        let default_ref = server
+            .state
+            .default_ref()
+            .expect("default ref always present");
+
+        assert!(
+            Arc::ptr_eq(
+                &server.state.cache_generation,
+                &default_ref.cache_generation
+            ),
+            "SharedState.cache_generation must share the Arc with default_ref().cache_generation"
+        );
+    }
+
+    /// Writes through a non-default ref's `embedding_cache` do NOT appear in
+    /// the default ref's (i.e. `SharedState`'s) cache.
+    #[tokio::test]
+    async fn non_default_ref_cache_is_isolated_from_default() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+
+        // Attach a synthetic worktree ref.
+        let worktree_path = std::path::PathBuf::from("/tmp/u10-compat-isolation-wt");
+        let wt_ref_id = RefId::for_canonical_path(&worktree_path);
+        let wt_ref_arc = server
+            .state
+            .attach_ref(wt_ref_id, || {
+                Arc::new(RefIndex::new(
+                    worktree_path.clone(),
+                    worktree_path.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        // Write into the worktree ref's cache.
+        wt_ref_arc.embedding_cache.write().await.insert(
+            "worktree_only.rs".to_string(),
+            CacheEntry {
+                hash: "wt_hash".to_string(),
+                vector: vec![9.9],
+            },
+        );
+
+        // The default ref (and SharedState shim) must not see this entry.
+        assert!(
+            !server
+                .state
+                .embedding_cache
+                .read()
+                .await
+                .contains_key("worktree_only.rs"),
+            "default ref cache must not contain worktree-only keys"
+        );
     }
 }

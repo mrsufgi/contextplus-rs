@@ -428,12 +428,30 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     let ref_arc = server
         .state
         .attach_ref(ref_id, || {
-            Arc::new(RefIndex::new_with_head(
-                client_root.clone(),
-                canonical_root.clone(),
-                parent_ref_id,
-                head_sha.clone(),
-            ))
+            // Build the per-ref state.  For non-default (worktree) refs we
+            // attach a fresh CoW memory-graph overlay so the merge ladder can
+            // fold their nodes into the primary graph when their HEAD becomes
+            // an ancestor.  The default ref has no overlay (it IS the primary).
+            //
+            // `new_with_head` leaves `memory_overlay = None` for backward
+            // compat with U13 tests; we override it here using struct update
+            // syntax so existing tests remain valid.
+            let memory_overlay = if parent_ref_id.is_some() {
+                Some(Arc::new(tokio::sync::RwLock::new(
+                    crate::core::memory_graph::MemoryGraph::new(),
+                )))
+            } else {
+                None
+            };
+            Arc::new(RefIndex {
+                memory_overlay,
+                ..RefIndex::new_with_head(
+                    client_root.clone(),
+                    canonical_root.clone(),
+                    parent_ref_id,
+                    head_sha.clone(),
+                )
+            })
         })
         .await;
 
