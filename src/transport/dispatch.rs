@@ -51,6 +51,7 @@ use rmcp::ServiceExt;
 use crate::config::Config;
 use crate::core::path_translation;
 use crate::core::process_lifecycle;
+use crate::ref_index::RefId;
 use crate::server::ContextPlusServer;
 use crate::transport::paths::MCP_DATA_DIR;
 
@@ -301,6 +302,11 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
 /// 2. **Output translation**: after the tool returns, all relative-path
 ///    strings in the text content are prefixed with `caller_root`.
 ///
+/// **U9 seam:** `caller_ref_id` is `None` until U9 lands and wires
+/// `session_ref_id` into `ContextPlusServer`. Once U9 merges, the
+/// `call_tool` handler passes `self.session_ref_id` so that only the
+/// caller's own ref is excluded from `foreign_roots`.
+///
 /// **U4 seam:** `caller_root` today comes from `SharedState.default_ref()`.
 /// When U4 introduces `session.ref_id`, replace the call site with
 /// `state.ref_index(session.ref_id).root_dir`.
@@ -313,6 +319,7 @@ pub async fn dispatch_with_translation(
     tool_name: &str,
     args: serde_json::Map<String, serde_json::Value>,
     caller_root: &Path,
+    caller_ref_id: Option<RefId>,
 ) -> rmcp::model::CallToolResult {
     // --- Input translation ---
     let translated_args = match path_translation::translate_input_args(args, caller_root) {
@@ -334,19 +341,21 @@ pub async fn dispatch_with_translation(
 
     // --- Output translation ---
     //
-    // Single-ref mode: `foreign_roots` is empty. The output rewriter is an
-    // identity — we don't try to upgrade repo-relative paths to absolute
-    // because doing so naively (regex-rewriting "anything that looks like a
-    // path") mangles tool labels and scope-relative outputs. The U5
-    // invariant ("B never sees A's path") is trivially satisfied today
-    // because there's only one ref; the only way A's path could appear in
-    // B's output is via a foreign-root absolute prefix that doesn't exist.
+    // Compute the canonical worktree paths of all OTHER attached refs.
+    // When the registry has only one ref (the caller's), this returns empty
+    // and output rewriting is identity — no overhead and no risk of mangling.
     //
-    // Real multi-ref dispatch (U4-bis) replaces this with the list of
-    // OTHER attached refs' canonical worktree paths, so any cached entry
-    // built under another ref gets translated before reaching this caller.
-    let foreign_roots: &[&Path] = &[];
-    path_translation::translate_output_result(raw_result, caller_root, foreign_roots)
+    // In the multi-ref case, any cached entry whose absolute prefix was
+    // authored under a foreign ref gets translated to the caller's root
+    // before being returned, satisfying the U5 leakage invariant:
+    // "B's response must never contain A's absolute worktree prefix."
+    //
+    // U9 seam: `caller_ref_id` is `None` today. When U9 wires
+    // `session_ref_id` into `ContextPlusServer`, passing the real id
+    // ensures the caller's own ref is correctly excluded from `foreign_roots`.
+    let foreign_root_bufs = foreign_roots_for_session(&server.state, caller_ref_id);
+    let foreign_root_refs: Vec<&Path> = foreign_root_bufs.iter().map(|p| p.as_path()).collect();
+    path_translation::translate_output_result(raw_result, caller_root, &foreign_root_refs)
 }
 
 /// Return the caller's worktree root for the current (single-ref) configuration.
@@ -392,6 +401,33 @@ pub fn caller_root_for_session(
         }
         None => caller_root_from_default_ref(state),
     }
+}
+
+/// Collect canonical worktree paths of all attached refs EXCEPT the caller's.
+///
+/// Used to populate `foreign_roots` for path translation at the dispatch
+/// boundary. Any absolute prefix from a foreign ref that leaks into a cached
+/// tool result will be rewritten to the caller's root before being returned.
+///
+/// **On contention:** uses `try_read` so that an in-progress attach/detach
+/// write does not block dispatch. On contention the function returns an empty
+/// `Vec`, making output rewriting a no-op — translation degrades gracefully to
+/// identity rather than deadlocking or delaying the tool call.
+pub fn foreign_roots_for_session(
+    state: &crate::server::SharedState,
+    caller_ref_id: Option<crate::ref_index::RefId>,
+) -> Vec<PathBuf> {
+    // try_read: attach/detach may be writing; on contention return empty
+    // (translation no-ops — leakage *risk* exists only when two refs are
+    // simultaneously attached, which is exactly when a write lock might be
+    // held; the window is bounded to the duration of attach/detach).
+    let Ok(refs) = state.refs.try_read() else {
+        return Vec::new();
+    };
+    refs.iter()
+        .filter(|(id, _)| Some(**id) != caller_ref_id)
+        .map(|(_, ref_arc)| ref_arc.canonical_root.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -686,7 +722,8 @@ mod tests {
         );
 
         let wt_root = tmp.path();
-        let result = dispatch_with_translation(&server, "get_file_skeleton", args, wt_root).await;
+        let result =
+            dispatch_with_translation(&server, "get_file_skeleton", args, wt_root, None).await;
 
         // Must be an error result.
         assert_eq!(result.is_error, Some(true));
@@ -713,7 +750,7 @@ mod tests {
         );
 
         let result =
-            dispatch_with_translation(&server, "get_file_skeleton", args, tmp.path()).await;
+            dispatch_with_translation(&server, "get_file_skeleton", args, tmp.path(), None).await;
         // The tool either succeeds or returns a content error, but must NOT
         // produce an "outside the caller's worktree root" rejection.
         let text = first_text(&result);
@@ -739,7 +776,7 @@ mod tests {
         );
 
         let result =
-            dispatch_with_translation(&server, "get_file_skeleton", args, tmp.path()).await;
+            dispatch_with_translation(&server, "get_file_skeleton", args, tmp.path(), None).await;
         // Same as above: must not reject as out-of-tree.
         let text = first_text(&result);
         assert!(
@@ -886,7 +923,8 @@ mod tests {
 
         // In stdio mode, caller_root == server_root (same worktree).
         let result =
-            dispatch_with_translation(&server, "semantic_code_search", args, &server_root).await;
+            dispatch_with_translation(&server, "semantic_code_search", args, &server_root, None)
+                .await;
 
         // Must not error with a path translation error.
         let text = first_text(&result);
@@ -903,7 +941,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp.path());
         let args = serde_json::Map::new();
-        let result = dispatch_with_translation(&server, "no_such_tool", args, tmp.path()).await;
+        let result =
+            dispatch_with_translation(&server, "no_such_tool", args, tmp.path(), None).await;
         let text = first_text(&result);
         assert!(
             text.contains("Unknown tool") || text.contains("Error"),
@@ -1004,5 +1043,245 @@ mod tests {
 
         // Clean up: detach to avoid Arc leaks in short-lived tests.
         server.state.detach_ref(wt_ref_id, 0).await;
+    }
+
+    // ── foreign_roots_for_session ─────────────────────────────────────────────
+    //
+    // These tests exercise the helper that computes "all attached refs minus
+    // the caller's ref". They use real SharedState registries populated with
+    // synthetic RefIndex entries so we can control exactly which refs are
+    // present without spawning a full server or daemon.
+
+    /// Helper: insert a second ref into an existing server's registry.
+    /// Returns the RefId that was inserted so tests can pass it as the
+    /// caller id or verify exclusion.
+    fn insert_foreign_ref(
+        server: &crate::server::ContextPlusServer,
+        canonical_root: PathBuf,
+    ) -> crate::ref_index::RefId {
+        use crate::ref_index::{RefId, RefIndex};
+        let id = RefId::for_canonical_path(&canonical_root);
+        let ref_index = Arc::new(RefIndex::new(canonical_root.clone(), canonical_root, None));
+        // blocking_write is safe in synchronous test context (not inside async).
+        server.state.refs.blocking_write().insert(id, ref_index);
+        id
+    }
+
+    /// Single-ref registry: caller is the only ref → `foreign_roots` empty.
+    #[test]
+    fn foreign_roots_single_ref_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+        // Caller is the default ref — nothing else is attached.
+        let roots = foreign_roots_for_session(&server.state, Some(server.state.default_ref_id));
+        assert!(
+            roots.is_empty(),
+            "single-ref: expected empty foreign_roots, got: {roots:?}"
+        );
+    }
+
+    /// Two refs attached; caller is ref A → `foreign_roots` contains B's root.
+    #[test]
+    fn foreign_roots_two_refs_excludes_caller() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp_a.path());
+        let caller_id = server.state.default_ref_id;
+
+        // Attach a second ref (ref B).
+        let tmp_b = tempfile::tempdir().unwrap();
+        let canonical_b = tmp_b
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_b.path().to_path_buf());
+        let _ref_b_id = insert_foreign_ref(&server, canonical_b.clone());
+
+        let roots = foreign_roots_for_session(&server.state, Some(caller_id));
+
+        // B's canonical root must be in foreign_roots; caller's root must NOT be.
+        let canonical_a = tmp_a
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_a.path().to_path_buf());
+        assert!(
+            roots.contains(&canonical_b),
+            "foreign_roots must contain B's root; got: {roots:?}"
+        );
+        assert!(
+            !roots.contains(&canonical_a),
+            "foreign_roots must NOT contain caller A's root; got: {roots:?}"
+        );
+        assert_eq!(
+            roots.len(),
+            1,
+            "exactly one foreign root for two-ref registry"
+        );
+    }
+
+    /// Three refs attached; caller is ref A → `foreign_roots` contains B and C.
+    #[test]
+    fn foreign_roots_three_refs_returns_multiple_peers() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp_a.path());
+        let caller_id = server.state.default_ref_id;
+
+        let tmp_b = tempfile::tempdir().unwrap();
+        let canonical_b = tmp_b
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_b.path().to_path_buf());
+
+        let tmp_c = tempfile::tempdir().unwrap();
+        let canonical_c = tmp_c
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_c.path().to_path_buf());
+
+        insert_foreign_ref(&server, canonical_b.clone());
+        insert_foreign_ref(&server, canonical_c.clone());
+
+        let roots = foreign_roots_for_session(&server.state, Some(caller_id));
+
+        assert_eq!(roots.len(), 2, "two foreign roots for three-ref registry");
+        assert!(
+            roots.contains(&canonical_b),
+            "must contain B; got: {roots:?}"
+        );
+        assert!(
+            roots.contains(&canonical_c),
+            "must contain C; got: {roots:?}"
+        );
+    }
+
+    /// Caller id is `None` (U9 not yet wired): all refs in the registry are
+    /// returned. In the single-ref case (default only) this still returns empty
+    /// because the only ref is the caller's — but because we don't know which
+    /// ref is the caller, we return all. In practice, the single-ref case means
+    /// the result contains just the default ref's root; the rewriter sees it as
+    /// "foreign" but it equals `caller_root` so no actual substitution fires
+    /// (substring replace of caller_root with caller_root is identity).
+    ///
+    /// This test documents the behaviour rather than asserting a specific set
+    /// (the key invariant is that it never panics and returns at least as many
+    /// roots as real foreign refs present).
+    #[test]
+    fn foreign_roots_none_caller_ref_returns_all_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp.path());
+
+        let tmp_b = tempfile::tempdir().unwrap();
+        let canonical_b = tmp_b
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_b.path().to_path_buf());
+        insert_foreign_ref(&server, canonical_b.clone());
+
+        // caller_ref_id = None → no filter, all refs returned
+        let roots = foreign_roots_for_session(&server.state, None);
+        // Must include at least B's root (the known foreign ref).
+        assert!(
+            roots.contains(&canonical_b),
+            "None caller_ref_id: must include B; got: {roots:?}"
+        );
+    }
+
+    /// Drain does not break: holding a write lock on refs while calling
+    /// `foreign_roots_for_session` causes `try_read` to fail, and the function
+    /// must return empty without panicking.
+    ///
+    /// Simulates the race between a concurrent attach/detach write and a
+    /// dispatch: degraded gracefully to identity translation (no leakage
+    /// protection during the brief window, but no deadlock or panic either).
+    ///
+    /// Note: this must be a `#[tokio::test]` so we are inside a tokio runtime
+    /// that owns the lock — `tokio::sync::RwLock::write()` is async, so we
+    /// hold it across the `foreign_roots_for_session` call without blocking.
+    #[tokio::test]
+    async fn foreign_roots_returns_empty_when_registry_write_locked() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp_a.path());
+
+        // Add a second ref so that, if try_read succeeded, we'd get a non-empty result.
+        // We must use the async write lock here (inside async context), not blocking_write.
+        let tmp_b = tempfile::tempdir().unwrap();
+        let canonical_b = tmp_b
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_b.path().to_path_buf());
+        {
+            use crate::ref_index::{RefId, RefIndex};
+            let id = RefId::for_canonical_path(&canonical_b);
+            let ref_index = Arc::new(RefIndex::new(
+                canonical_b.clone(),
+                canonical_b.clone(),
+                None,
+            ));
+            server.state.refs.write().await.insert(id, ref_index);
+        }
+
+        // Hold the write lock — simulates an in-progress attach/detach.
+        let _write_guard = server.state.refs.write().await;
+
+        // try_read must fail (lock is exclusively held), so the function returns empty.
+        let roots = foreign_roots_for_session(&server.state, Some(server.state.default_ref_id));
+        assert!(
+            roots.is_empty(),
+            "must return empty when registry is write-locked; got: {roots:?}"
+        );
+    }
+
+    // ── E2E leakage via foreign_roots_for_session ─────────────────────────────
+    //
+    // End-to-end cross-ref leakage test using the registry. Simulates:
+    //   - Registry has refs A and B.
+    //   - A cached tool result was authored with B's absolute prefix.
+    //   - A's dispatch session calls foreign_roots_for_session → gets B's root.
+    //   - Output translation replaces B's prefix with A's root.
+
+    #[test]
+    fn e2e_cross_ref_leakage_protection_via_registry() {
+        use crate::core::path_translation::translate_output_result;
+
+        let tmp_a = tempfile::tempdir().unwrap();
+        let server = make_test_server(tmp_a.path());
+        let caller_a_id = server.state.default_ref_id;
+        let canonical_a = server.state.default_ref().unwrap().canonical_root.clone();
+
+        // Attach a second ref (ref B).
+        let tmp_b = tempfile::tempdir().unwrap();
+        let canonical_b = tmp_b
+            .path()
+            .canonicalize()
+            .unwrap_or(tmp_b.path().to_path_buf());
+        insert_foreign_ref(&server, canonical_b.clone());
+
+        // Simulate a cached tool result built under B's root.
+        let b_abs = canonical_b.join("src/shared/utils.rs");
+        let shared_output = format!("1. {} (88% total)\n   Snippet: helper fn", b_abs.display());
+
+        // A's session uses foreign_roots_for_session to find B's root.
+        let foreign_roots = foreign_roots_for_session(&server.state, Some(caller_a_id));
+        assert!(
+            foreign_roots.contains(&canonical_b),
+            "B must be in A's foreign_roots"
+        );
+
+        // Run output translation for A's session.
+        let foreign_root_refs: Vec<&Path> = foreign_roots.iter().map(|p| p.as_path()).collect();
+        let content = rmcp::model::Content::text(&shared_output);
+        let raw = rmcp::model::CallToolResult::success(vec![content]);
+        let result_for_a = translate_output_result(raw, &canonical_a, &foreign_root_refs);
+
+        let text = first_text(&result_for_a);
+
+        // A's response must NOT contain B's absolute prefix.
+        assert!(
+            !text.contains(canonical_b.to_str().unwrap()),
+            "LEAKAGE: A's result contains B's worktree prefix!\ntext: {text}"
+        );
+        // A's response must contain A's canonical root instead.
+        assert!(
+            text.contains(canonical_a.to_str().unwrap()),
+            "A's result must reference A's root; text: {text}"
+        );
     }
 }

@@ -2026,6 +2026,12 @@ impl ServerHandler for ContextPlusServer {
                 &name,
                 args,
                 &caller_root,
+                // U9 seam: pass `None` until U9 wires `session_ref_id` into
+                // `ContextPlusServer`. Once U9 merges, replace with
+                // `self.session_ref_id` so the caller's own ref is excluded
+                // from `foreign_roots` and cross-ref leakage protection
+                // activates correctly.
+                None,
             )
             .await),
             None => {
