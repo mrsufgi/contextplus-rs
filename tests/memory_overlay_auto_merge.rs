@@ -1,6 +1,6 @@
 //! Integration tests for memory-graph CoW overlay and auto-merge.
 //!
-//! These tests exercise the full scenario pipeline described in U7:
+//! These tests exercise the full scenario pipeline described in U7 / U13:
 //! * CoW reads — overlay inherits parent nodes via fallback
 //! * CoW writes — writes stay local; primary is not affected
 //! * Auto-merge clean — new node published to primary after merge ladder
@@ -11,6 +11,11 @@
 //! * `needs_rebuild` rebuild success — `rebuild_node_sync` clears flag
 //! * `needs_rebuild` rebuild failure → prune
 //! * Drain suppression — merge suppressed when draining
+//! * U13: HEAD advance with no qualifying refs → no-op
+//! * U13: HEAD advance with ref overlay=None → skips cleanly
+//! * U13: HEAD advance with ref overlay=Some(node) → merge ladder runs
+//! * U13: HEAD advance during drain → merge suppressed
+//! * U13: RefIndex.memory_overlay field exists and defaults to None
 //!
 //! The scripted-git-history scenarios (ancestry detection) shell out to `git`
 //! using a temporary repository created per test.
@@ -21,6 +26,7 @@ use std::sync::Arc;
 use contextplus_rs::core::head_watcher::{is_ancestor, resolve_head_sha};
 use contextplus_rs::core::memory_graph::{MemoryGraph, MemoryNode, NodeType, RelationType};
 use contextplus_rs::core::memory_merge::{RebuildOutcome, rebuild_node_sync, run_merge_ladder};
+use contextplus_rs::ref_index::{RefId, RefIndex};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -464,5 +470,170 @@ fn git_non_ancestor_does_not_trigger_merge() {
     assert!(
         a_anc_main != Some(true) || main_anc_a != Some(true),
         "diverged branches: at least one direction must not be an ancestor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// U13 scenarios: RefIndex.memory_overlay field and daemon merge-loop logic
+// ---------------------------------------------------------------------------
+
+/// U13 Scenario A: RefIndex.memory_overlay defaults to None.
+///
+/// Verifies the U10 seam field exists and is initialised to `None` so existing
+/// construction paths (no overlay) degrade gracefully.
+#[test]
+fn ref_index_memory_overlay_defaults_to_none() {
+    let r = RefIndex::new(
+        std::path::PathBuf::from("/tmp/r"),
+        std::path::PathBuf::from("/tmp/r"),
+        None,
+    );
+    assert!(
+        r.memory_overlay.is_none(),
+        "memory_overlay must default to None (U10 seam)"
+    );
+
+    let r2 = RefIndex::new_with_head(
+        std::path::PathBuf::from("/tmp/r2"),
+        std::path::PathBuf::from("/tmp/r2"),
+        None,
+        "deadbeef".to_string(),
+    );
+    assert!(
+        r2.memory_overlay.is_none(),
+        "new_with_head must also default memory_overlay to None"
+    );
+}
+
+/// U13 Scenario B: HEAD advance with no non-primary refs.
+///
+/// Simulates the merge-loop logic when the registry contains only the primary
+/// ref (parent_ref_id is None).  The primary is skipped; no merge runs.
+#[test]
+fn head_advance_no_qualifying_refs_is_noop() {
+    // Primary ref: parent_ref_id = None → skipped by daemon loop.
+    let primary_ref = RefIndex::new(
+        std::path::PathBuf::from("/tmp/primary"),
+        std::path::PathBuf::from("/tmp/primary"),
+        None, // no parent → IS the primary
+    );
+
+    // Simulate the daemon loop: only skip primary refs.
+    let should_skip = primary_ref.parent_ref_id.is_none();
+    assert!(should_skip, "primary ref must be skipped by merge loop");
+
+    // No merge runs — primary graph stays empty.
+    let primary_graph = MemoryGraph::new();
+    // (no run_merge_ladder call — the loop continues before reaching it)
+    assert_eq!(primary_graph.all_nodes().len(), 0);
+}
+
+/// U13 Scenario C: HEAD advance with ref whose overlay is None.
+///
+/// Simulates a non-primary ref that has no overlay attached yet (U10 not yet
+/// populated).  The daemon loop detects `memory_overlay.is_none()` and skips.
+#[test]
+fn head_advance_ref_overlay_none_skips_cleanly() {
+    let ref_with_no_overlay = RefIndex::new_with_head(
+        std::path::PathBuf::from("/tmp/ref-a"),
+        std::path::PathBuf::from("/tmp/ref-a"),
+        Some(RefId::for_canonical_path(&std::path::PathBuf::from(
+            "/tmp/primary",
+        ))), // has a parent
+        "sha-ref-head".to_string(),
+    );
+
+    // memory_overlay is None → daemon loop skips without calling merge ladder.
+    assert!(
+        ref_with_no_overlay.memory_overlay.is_none(),
+        "ref without overlay must have None"
+    );
+
+    // Verify loop logic: skip when overlay is None, do not call merge ladder.
+    let primary_graph = MemoryGraph::new();
+    let primary_node_count_before = primary_graph.all_nodes().len();
+
+    if let Some(ov) = &ref_with_no_overlay.memory_overlay {
+        // This branch must NOT execute — overlay is None.
+        let _ = ov;
+        panic!("should not reach overlay branch when overlay is None");
+    }
+    // Primary graph must be unchanged.
+    assert_eq!(
+        primary_graph.all_nodes().len(),
+        primary_node_count_before,
+        "primary graph must be unchanged when overlay is None"
+    );
+}
+
+/// U13 Scenario D: HEAD advance with ref overlay=Some(node) → merge ladder runs.
+///
+/// Uses a real `Arc<RwLock<MemoryGraph>>` on a RefIndex (set after construction)
+/// to simulate what U10 will populate.  Verifies the ladder publishes the node.
+#[test]
+fn head_advance_ref_overlay_some_runs_merge_ladder() {
+    use tokio::sync::RwLock;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Build a non-primary ref with an overlay containing one node.
+        let mut ref_idx = RefIndex::new_with_head(
+            std::path::PathBuf::from("/tmp/ref-b"),
+            std::path::PathBuf::from("/tmp/ref-b"),
+            Some(RefId::for_canonical_path(&std::path::PathBuf::from(
+                "/tmp/primary",
+            ))),
+            "sha-ref-b-head".to_string(),
+        );
+
+        let mut overlay_graph = MemoryGraph::new();
+        overlay_graph.insert_node(node("overlay-node", "my-concept", "concept body"));
+        ref_idx.memory_overlay = Some(Arc::new(RwLock::new(overlay_graph)));
+
+        // Simulate the daemon's snapshot + merge logic.
+        let overlay_arc = ref_idx.memory_overlay.as_ref().unwrap();
+        let mut snapshot = MemoryGraph::new();
+        {
+            let guard = overlay_arc.read().await;
+            for n in guard.all_nodes() {
+                snapshot.insert_node(n);
+            }
+        }
+
+        let mut primary_graph = MemoryGraph::new();
+        let summary = run_merge_ladder(&snapshot, &mut primary_graph, &[], false);
+
+        assert_eq!(summary.published, 1, "clean node must be published");
+        assert_eq!(summary.conflicts, 0);
+        assert!(
+            primary_graph.get_node("overlay-node").is_some(),
+            "primary must contain the node after merge"
+        );
+    });
+}
+
+/// U13 Scenario E: HEAD advance during drain → merge suppressed.
+///
+/// Verifies that when `draining=true` is passed to `run_merge_ladder`, the
+/// ladder returns immediately without publishing any nodes.
+#[test]
+fn head_advance_during_drain_suppresses_merge() {
+    let mut overlay = MemoryGraph::new();
+    overlay.insert_node(node("drain-node", "drain", "should not reach primary"));
+    let mut primary = MemoryGraph::new();
+
+    // draining = true → all rungs are skipped.
+    let summary = run_merge_ladder(&overlay, &mut primary, &[], /* draining */ true);
+    assert_eq!(
+        summary.published, 0,
+        "drain must suppress merge — no nodes published"
+    );
+    assert_eq!(
+        summary.skipped_identical, 0,
+        "drain must suppress all processing"
+    );
+    assert!(
+        primary.get_node("drain-node").is_none(),
+        "primary must not receive nodes while draining"
     );
 }

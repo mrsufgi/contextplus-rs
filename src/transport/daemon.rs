@@ -644,9 +644,9 @@ fn spawn_head_watcher_task(
 
             // Suppress merges during drain.
             if state.draining.load(std::sync::atomic::Ordering::Acquire) {
-                tracing::debug!(
-                    "head_watcher: daemon draining — skipping merge for HEAD {}",
-                    new_sha
+                tracing::info!(
+                    new_sha = %new_sha,
+                    "head_watcher: HEAD advance during drain — deferring merge"
                 );
                 continue;
             }
@@ -684,25 +684,51 @@ fn spawn_head_watcher_task(
                     "head_watcher: ref HEAD is ancestor of primary — entering merge ladder"
                 );
 
-                // U4/U7 seam: when RefIndex carries its own MemoryGraph
-                // overlay, the merge runs here.  Today there is no overlay
-                // stored on RefIndex so we run a no-op merge (empty overlay).
-                //
-                // Pattern to extend when U4 lands:
-                //   let overlay = ref_index.memory_graph_overlay();
-                //   let summary = run_merge_ladder(&overlay, &mut primary_graph, &[], draining);
-                let overlay = MemoryGraph::new(); // empty — no-op
-                let _ = state
+                // U10 seam: use the ref's CoW memory-graph overlay when
+                // available.  If none is attached yet (U10 hasn't landed or
+                // this ref was registered before U10), log and skip so the
+                // rest of the merge loop is not blocked.
+                let overlay_arc = match &ref_index.memory_overlay {
+                    Some(a) => Arc::clone(a),
+                    None => {
+                        tracing::debug!(
+                            ref_id = ?ref_id,
+                            "head_watcher: no overlay attached — skipping merge for this ref"
+                        );
+                        continue;
+                    }
+                };
+
+                // Take a snapshot of the overlay graph under a read lock so
+                // we don't hold the lock across the async `get_graph` call.
+                let overlay_snapshot = {
+                    let overlay_read = overlay_arc.read().await;
+                    // Clone the node list out — MemoryGraph::new() + insert_node
+                    // is cheap for the typical small overlay.
+                    let mut snap = MemoryGraph::new();
+                    for node in overlay_read.all_nodes() {
+                        snap.insert_node(node);
+                    }
+                    snap
+                };
+
+                let draining_now = state.draining.load(std::sync::atomic::Ordering::Acquire);
+                let summary = state
                     .memory_graph
                     .get_graph(&root_str, |primary_graph| {
-                        run_merge_ladder(
-                            &overlay,
-                            primary_graph,
-                            &[],
-                            state.draining.load(std::sync::atomic::Ordering::Acquire),
-                        )
+                        run_merge_ladder(&overlay_snapshot, primary_graph, &[], draining_now)
                     })
-                    .await;
+                    .await
+                    .unwrap_or_default();
+
+                tracing::info!(
+                    ref_id = ?ref_id,
+                    published = summary.published,
+                    skipped_identical = summary.skipped_identical,
+                    smart_merged = summary.smart_merged,
+                    conflicts = summary.conflicts,
+                    "head_watcher: merge ladder complete"
+                );
             }
         }
         tracing::debug!("head_watcher: event channel closed — merge task exiting");

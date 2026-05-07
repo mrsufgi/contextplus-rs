@@ -41,6 +41,8 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::RwLock;
 
+use crate::core::memory_graph::MemoryGraph;
+
 /// Stable identifier for a ref (worktree + HEAD).
 ///
 /// Derived from the canonical path of the worktree root. Identical canonical
@@ -118,6 +120,14 @@ pub struct RefIndex {
     /// `SharedState::attach_ref`, decremented by `detach_ref`. When it
     /// reaches zero the ref enters the TTL eviction queue.
     pub session_count: Arc<AtomicUsize>,
+    /// **U10 seam** — per-ref CoW memory-graph overlay.  `None` until U10
+    /// populates it when the ref is first attached.  The merge ladder in
+    /// `daemon::spawn_head_watcher_task` reads this field; if it is `None`
+    /// the ref is skipped with a debug log ("no overlay attached").
+    ///
+    /// The `Arc<RwLock<…>>` lets the daemon merge task hold a clone without
+    /// blocking session handlers that might be reading the same overlay.
+    pub memory_overlay: Option<Arc<RwLock<MemoryGraph>>>,
 }
 
 impl RefIndex {
@@ -131,6 +141,7 @@ impl RefIndex {
             head_sha: None,
             cas_ref_id_hex: id.to_hex(),
             session_count: Arc::new(AtomicUsize::new(0)),
+            memory_overlay: None,
         }
     }
 
@@ -150,6 +161,7 @@ impl RefIndex {
             head_sha: Some(head_sha),
             cas_ref_id_hex: id.to_hex(),
             session_count: Arc::new(AtomicUsize::new(0)),
+            memory_overlay: None,
         }
     }
 
