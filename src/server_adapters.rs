@@ -189,50 +189,61 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 "semantic_code_search embedding cache hit/miss"
             );
 
-            // Embed only uncached files — TIME-BOXED.
+            // Embed only uncached files — TIME-BOXED with PER-BATCH TIMEOUT.
             //
-            // The historical bug here: when uncached_indices is large (cache
-            // recently invalidated by tracker, or fresh attach with no warmup),
-            // synchronously embedding 3000+ files at ~7s/batch on CPU Ollama
-            // takes 12-18 minutes. Codex's `tool_timeout_sec` (15 min default)
-            // fires, the bridge closes the stream, and the user sees
-            // "Transport closed" while the daemon is happily still working.
+            // Two failure modes to defend against:
             //
-            // Fix: cap embed work per call at `EMBED_BUDGET_MS`. After the
-            // budget, stop fetching new embeddings and return partial results
-            // — files without a vector yet are simply absent from this query's
-            // ranking. The embedding tracker keeps filling the cache in the
-            // background; the next query benefits.
+            // 1. Many uncached batches: embedding 3000+ files at ~7s/batch on
+            //    CPU Ollama can take 12-18 min. Codex's bridge times out and
+            //    closes the connection.
             //
-            // The user-visible degradation is minor: a fresh call against a
-            // cold corpus returns slightly less complete results, not
-            // "Transport closed". `EMBED_BUDGET_MS` is intentionally
-            // conservative (60s) so it stays well under any reasonable client
-            // timeout.
-            const EMBED_BUDGET_MS: u128 = 60_000;
+            // 2. A single batch hangs: on a slow CPU Ollama, one batch can
+            //    take 60+ s on its own. Without a per-batch timeout, the
+            //    global budget check (which only runs between batches) never
+            //    fires while we wait for the slow batch.
+            //
+            // Fix: maintain a global deadline (`EMBED_BUDGET_MS`) AND wrap
+            // each Ollama call in `tokio::time::timeout(remaining)`. If
+            // either trigger fires, fill the rest with empty vectors and
+            // bail. The empty vectors are skipped at insert time, so the
+            // partial result still ranks the cached + freshly-embedded
+            // files correctly. Background tracker fills the rest.
+            //
+            // Budget is deliberately tight (20 s) so we never block any
+            // reasonable MCP client's per-call timeout.
+            const EMBED_BUDGET_MS: u128 = 20_000;
             if !uncached_texts.is_empty() {
                 let embed_start = std::time::Instant::now();
                 let batch_size = config.embed_batch_size.max(1);
                 let mut new_vectors = Vec::with_capacity(uncached_texts.len());
                 let mut budget_exceeded = false;
                 for chunk in uncached_texts.chunks(batch_size) {
-                    if embed_start.elapsed().as_millis() >= EMBED_BUDGET_MS {
-                        // Fill remaining slots with empty vectors so indexing
-                        // alignment with `uncached_indices` stays correct;
-                        // empty vectors are skipped at insert time below.
+                    let elapsed_ms = embed_start.elapsed().as_millis();
+                    if elapsed_ms >= EMBED_BUDGET_MS {
                         for _ in chunk {
                             new_vectors.push(Vec::new());
                         }
                         budget_exceeded = true;
                         continue;
                     }
-                    match ollama.embed(chunk).await {
-                        Ok(embeddings) => new_vectors.extend(embeddings),
-                        Err(e) => {
+                    let remaining_ms = (EMBED_BUDGET_MS - elapsed_ms) as u64;
+                    let remaining = std::time::Duration::from_millis(remaining_ms);
+                    match tokio::time::timeout(remaining, ollama.embed(chunk)).await {
+                        Ok(Ok(embeddings)) => new_vectors.extend(embeddings),
+                        Ok(Err(e)) => {
                             tracing::warn!("Embedding batch failed: {e}, filling with None");
                             for _ in chunk {
                                 new_vectors.push(Vec::new());
                             }
+                        }
+                        Err(_) => {
+                            // Hard per-batch timeout: a single Ollama batch
+                            // cannot exceed the global deadline. Fill this
+                            // and remaining batches with empty vectors.
+                            for _ in chunk {
+                                new_vectors.push(Vec::new());
+                            }
+                            budget_exceeded = true;
                         }
                     }
                 }
