@@ -818,12 +818,18 @@ async fn resolve_embeddings(
         let mut chunk_vectors = ollama.embed(chunk_texts).await?;
 
         // Store this chunk's vectors in cache, then drop lock BEFORE disk I/O.
+        // Empty vectors (failed Ollama batches, time-box partials) are skipped
+        // so 0-length entries can't pollute the cache and trip simsimd at
+        // search time.
         let store_to_save = {
             let mut cache_write = embedding_cache.write().await;
             for (local_j, &file_idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate()
             {
                 if local_j < chunk_vectors.len() {
                     let vec = std::mem::take(&mut chunk_vectors[local_j]);
+                    if vec.is_empty() {
+                        continue;
+                    }
                     cache_write.insert(
                         files[file_idx].relative_path.clone(),
                         CacheEntry {

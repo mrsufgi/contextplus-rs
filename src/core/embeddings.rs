@@ -1100,15 +1100,47 @@ impl VectorStore {
         if cache.is_empty() {
             return None;
         }
-        let n = cache.len();
-        let dims = cache.values().next()?.vector.len() as u32;
-        let mut keys = Vec::with_capacity(n);
-        let mut hashes = Vec::with_capacity(n);
-        let mut vectors = Vec::with_capacity(n * dims as usize);
+        // Pick `dims` from the first entry whose vector is non-empty. Cache
+        // entries with `vector.len() == 0` can leak in via legacy on-disk
+        // payloads or budget-exceeded paths that recorded a placeholder.
+        // Filter them at this boundary so the flat `vectors` buffer stays
+        // aligned with `keys` (one slice of length `dims` per key) and the
+        // HNSW build below never sees a zero-length slice — which manifests
+        // at query time as `simsimd cosine returned None a_len=N b_len=0`.
+        let dims = cache.values().map(|e| e.vector.len()).find(|&l| l > 0)? as u32;
+        let valid_count = cache
+            .values()
+            .filter(|e| e.vector.len() == dims as usize)
+            .count();
+        if valid_count == 0 {
+            return None;
+        }
+        let mut skipped_empty = 0usize;
+        let mut skipped_mismatch = 0usize;
+        let mut keys = Vec::with_capacity(valid_count);
+        let mut hashes = Vec::with_capacity(valid_count);
+        let mut vectors = Vec::with_capacity(valid_count * dims as usize);
         for (key, entry) in cache {
+            if entry.vector.is_empty() {
+                skipped_empty += 1;
+                continue;
+            }
+            if entry.vector.len() != dims as usize {
+                skipped_mismatch += 1;
+                continue;
+            }
             keys.push(key.clone());
             hashes.push(entry.hash.clone());
             vectors.extend_from_slice(&entry.vector);
+        }
+        if skipped_empty > 0 || skipped_mismatch > 0 {
+            tracing::warn!(
+                skipped_empty,
+                skipped_mismatch,
+                kept = valid_count,
+                dims,
+                "VectorStore::from_cache: dropped cache entries with bad vector length"
+            );
         }
         Some(Self::new_with_tuning(
             dims,
