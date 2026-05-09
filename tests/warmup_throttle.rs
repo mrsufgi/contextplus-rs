@@ -33,7 +33,6 @@
 // Bring in the shared mock harness.
 mod common;
 use common::mock_ollama::MockOllamaServer;
-use serial_test::serial;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -239,21 +238,23 @@ async fn bridge_call(
 // Config builder helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `Config` with `OLLAMA_HOST` set to the mock server's URI and
-/// `CONTEXTPLUS_EMBED_TRACKER=off` so the background tracker does not
-/// interfere with embed-call counters.
+/// Build a `Config` rooted at `Config::from_env()` but with mock-friendly
+/// defaults set DIRECTLY on the struct — never via env vars.
+///
+/// Process-global env mutation (the historical pattern) is racy: every test
+/// in this binary shares the env, so two tests setting different
+/// `CONTEXTPLUS_REF_WARMUP_MODE` values flip each other's view mid-flight.
+/// Setting fields on the returned `Config` instead keeps each test's
+/// configuration local to its own daemon.
 fn config_with_mock(mock_uri: &str) -> Config {
-    // SAFETY: test-only env mutation.  Each test owns its own mock server URI
-    // and tests that touch these env vars run with their own daemon instances.
-    unsafe {
-        std::env::set_var("OLLAMA_HOST", mock_uri);
-        // Disable background tracker so it doesn't produce spurious embed calls.
-        std::env::set_var("CONTEXTPLUS_EMBED_TRACKER", "off");
-        // Disable warmup-on-start to prevent the primary ref from triggering
-        // embed calls before the test's own warmup phase begins.
-        std::env::set_var("CONTEXTPLUS_WARMUP_ON_START", "false");
-    }
-    Config::from_env()
+    let mut config = Config::from_env();
+    config.ollama_host = mock_uri.to_string();
+    // Disable background tracker so it doesn't produce spurious embed calls.
+    config.embed_tracker_mode = contextplus_rs::config::TrackerMode::Off;
+    // Disable warmup-on-start to prevent the primary ref from triggering
+    // embed calls before the test's own warmup phase begins.
+    config.warmup_on_start = false;
+    config
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +272,6 @@ fn config_with_mock(mock_uri: &str) -> Config {
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn shallow_warmup_makes_no_ollama_calls() {
     let td = TempDir::new().unwrap();
     // 5 files — enough for the walker to produce project_cache entries.
@@ -279,10 +279,8 @@ async fn shallow_warmup_makes_no_ollama_calls() {
 
     let mock = MockOllamaServer::start(0).await;
 
-    unsafe {
-        std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "shallow");
-    }
-    let config = config_with_mock(mock.uri());
+    let mut config = config_with_mock(mock.uri());
+    config.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Shallow;
     let (handle, socket) = spawn_daemon_with_config(&repo, config).await;
 
     // Register a session — this triggers warmup (U18).
@@ -328,7 +326,6 @@ async fn shallow_warmup_makes_no_ollama_calls() {
 // ACTIVATION: remove `#[ignore]` when U16 + U17 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn full_warmup_respects_concurrency_cap() {
     let td = TempDir::new().unwrap();
     // 20 files — enough to expose concurrency behaviour even with small batches.
@@ -337,11 +334,9 @@ async fn full_warmup_respects_concurrency_cap() {
     // 80 ms delay makes concurrent overlap easily observable.
     let mock = MockOllamaServer::start(80).await;
 
-    unsafe {
-        std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "full");
-        std::env::set_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "2");
-    }
-    let config = config_with_mock(mock.uri());
+    let mut config = config_with_mock(mock.uri());
+    config.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Full;
+    config.ollama_max_concurrent = 2;
     let (handle, socket) = spawn_daemon_with_config(&repo, config).await;
 
     let _session_ready = register_session(&socket, &repo).await;
@@ -377,7 +372,6 @@ async fn full_warmup_respects_concurrency_cap() {
 // ACTIVATION: remove `#[ignore]` when U16 + U17 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn concurrent_attaches_share_one_ollama_budget() {
     let td = TempDir::new().unwrap();
     // Primary repo (daemon is rooted here).
@@ -394,11 +388,9 @@ async fn concurrent_attaches_share_one_ollama_budget() {
     // 80 ms delay makes concurrent overlap observable.
     let mock = MockOllamaServer::start(80).await;
 
-    unsafe {
-        std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "full");
-        std::env::set_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "2");
-    }
-    let config = config_with_mock(mock.uri());
+    let mut config = config_with_mock(mock.uri());
+    config.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Full;
+    config.ollama_max_concurrent = 2;
     let (handle, socket) = spawn_daemon_with_config(&primary, config).await;
 
     // Attach 4 sessions concurrently (primary + 3 worktrees).
@@ -457,17 +449,14 @@ async fn concurrent_attaches_share_one_ollama_budget() {
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn off_mode_skips_warmup_entirely() {
     let td = TempDir::new().unwrap();
     let repo = make_repo_with_files(td.path(), "repo", 5);
 
     let mock = MockOllamaServer::start(0).await;
 
-    unsafe {
-        std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "off");
-    }
-    let config = config_with_mock(mock.uri());
+    let mut config = config_with_mock(mock.uri());
+    config.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Off;
     let (handle, socket) = spawn_daemon_with_config(&repo, config).await;
 
     let _session_ready = register_session(&socket, &repo).await;
@@ -511,7 +500,6 @@ async fn off_mode_skips_warmup_entirely() {
 // ACTIVATION: remove `#[ignore]` when U18 is merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn idempotent_attach_does_not_duplicate_warmup() {
     const FILE_COUNT: usize = 5;
     const ATTACH_COUNT: usize = 5;
@@ -521,11 +509,9 @@ async fn idempotent_attach_does_not_duplicate_warmup() {
 
     let mock = MockOllamaServer::start(50).await;
 
-    unsafe {
-        std::env::set_var("CONTEXTPLUS_REF_WARMUP_MODE", "full");
-        std::env::set_var("CONTEXTPLUS_OLLAMA_MAX_CONCURRENT", "4");
-    }
-    let config = config_with_mock(mock.uri());
+    let mut config = config_with_mock(mock.uri());
+    config.ref_warmup_mode = contextplus_rs::config::RefWarmupMode::Full;
+    config.ollama_max_concurrent = 4;
     let (handle, socket) = spawn_daemon_with_config(&repo, config).await;
 
     // Attach the same root 5 times concurrently.
@@ -671,7 +657,6 @@ fn text_from_resp(resp: &Value) -> String {
 //     project_cache.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn shallow_attach_inherits_primary_baseline_zero_ollama() {
     let td = TempDir::new().unwrap();
     // Primary repo: 5 small Rust source files.
@@ -783,7 +768,6 @@ async fn shallow_attach_inherits_primary_baseline_zero_ollama() {
 //   - mock.total_calls() <= 3  (≤ 2 misses; the 3 shared files are CAS hits)
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn full_attach_inherits_baseline_then_embeds_diff_only() {
     let td = TempDir::new().unwrap();
 
@@ -895,7 +879,6 @@ async fn full_attach_inherits_baseline_then_embeds_diff_only() {
 //   - semantic_code_search triggers ≥ 1 Ollama call (query embed → lazy path).
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn shallow_attach_to_unrelated_root_falls_through_to_lazy() {
     let td = TempDir::new().unwrap();
     // Fresh repo with no prior embed history.

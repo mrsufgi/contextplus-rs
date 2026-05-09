@@ -45,7 +45,6 @@
 // Bring in the shared mock harness (used by U21 test).
 mod common;
 
-use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -344,7 +343,6 @@ fn extract_text(resp: &Value) -> String {
 // pass today without any U10/U11 dependency.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn primary_finds_primary_only_symbol() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -389,7 +387,6 @@ async fn primary_finds_primary_only_symbol() {
 // between the first and second connection — proving one daemon, not two.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn single_daemon_serves_both_worktrees() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -491,7 +488,6 @@ async fn single_daemon_serves_both_worktrees() {
 // ACTIVATION: remove `#[ignore]` when U10 is merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn worktree_finds_worktree_only_symbol() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -545,7 +541,6 @@ async fn worktree_finds_worktree_only_symbol() {
 
 #[ignore = "U10 dependency: per-ref scoping not yet enforced; passes today by accident (primary cache never sees worktree files)"]
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn primary_does_not_find_worktree_only_symbol() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -596,7 +591,6 @@ async fn primary_does_not_find_worktree_only_symbol() {
 
 #[ignore = "U14 dependency: per-ref output path rewriting not yet wired; leakage check is vacuous without absolute path output"]
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn worktree_does_not_find_primary_only_symbol_via_path_leak() {
     use contextplus_rs::core::path_translation::json_contains_string;
 
@@ -637,7 +631,6 @@ async fn worktree_does_not_find_primary_only_symbol_via_path_leak() {
 // `attach_ref`.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn worktree_bridge_gets_valid_session_ready() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -702,7 +695,6 @@ async fn worktree_bridge_gets_valid_session_ready() {
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn worktree_attach_triggers_shallow_warmup() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -777,7 +769,6 @@ async fn worktree_attach_triggers_shallow_warmup() {
 // path is already non-fatal; the warmup error path needs the same guard).
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn attach_warmup_failure_is_nonfatal() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -847,7 +838,6 @@ async fn attach_warmup_failure_is_nonfatal() {
 // is a pure filesystem + git-pointer resolution test.
 
 #[tokio::test]
-#[serial]
 async fn daemon_socket_path_for_worktree_equals_primary() {
     let td = TempDir::new().unwrap();
     let primary = td.path().join("repo");
@@ -910,7 +900,6 @@ async fn daemon_socket_path_for_worktree_equals_primary() {
 // query — the worktree is searchable immediately after shallow attach.
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn worktree_searchable_immediately_after_shallow_attach() {
     use common::mock_ollama::MockOllamaServer;
 
