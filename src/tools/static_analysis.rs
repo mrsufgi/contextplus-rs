@@ -63,9 +63,14 @@ struct LinterConfig {
 
 fn get_linter_config(ext: &str) -> Option<LinterConfig> {
     if is_ts_extension(ext) {
+        // `--skipLibCheck` skips type-checking declaration files (`*.d.ts`).
+        // Without it, tsc reports thousands of errors from `node_modules/**`
+        // type definitions whenever any dep ships imperfect types — drowning
+        // out signal from the user's own code. The TypeScript handbook
+        // recommends `--skipLibCheck` as the default for application code.
         return Some(LinterConfig {
             cmd: "npx",
-            args: &["tsc", "--build", "--noEmit", "--pretty"],
+            args: &["tsc", "--build", "--noEmit", "--pretty", "--skipLibCheck"],
             config_file: Some("tsconfig.json"),
         });
     }
@@ -144,6 +149,32 @@ async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> LintResult {
     }
 }
 
+/// Strip diagnostics whose source location lives in `node_modules/`.
+///
+/// Even with `--skipLibCheck`, tsc occasionally surfaces dep-internal
+/// errors when a downstream package imports a type with a real bug.
+/// Those errors are noise from the user's perspective: they can't fix
+/// dep code from their workspace. This pass drops any line that begins
+/// with a path containing `node_modules/`. Multi-line diagnostics
+/// (header line + indented detail/code-frame lines) are kept or
+/// dropped together: when a header line is dropped, all following
+/// indented lines until the next non-indented line are dropped too.
+fn strip_node_modules_diagnostics(raw: &str) -> String {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut dropping = false;
+    for line in raw.lines() {
+        let starts_indented = line.starts_with(' ') || line.starts_with('\t');
+        if !starts_indented {
+            // New header line — decide drop/keep.
+            dropping = line.contains("node_modules/");
+        }
+        if !dropping {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim_end().to_string()
+}
+
 /// Check if a config file exists in the root directory.
 async fn config_exists(root_dir: &Path, config_file: &str) -> bool {
     tokio::fs::metadata(root_dir.join(config_file))
@@ -192,8 +223,10 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
         //   - JS / Python: append the file path to the linter's static args slice.
         //   - All others (Rust, Go, …): run the linter's args as-is (project-wide only).
         let result = if is_ts_extension(ext.as_str()) {
-            let args: Vec<&str> = vec!["tsc", "--noEmit", target_str.as_str()];
-            run_command(linter.cmd, &args, &options.root_dir).await
+            let args: Vec<&str> = vec!["tsc", "--noEmit", "--skipLibCheck", target_str.as_str()];
+            let mut r = run_command(linter.cmd, &args, &options.root_dir).await;
+            r.output = strip_node_modules_diagnostics(&r.output);
+            r
         } else if matches!(ext.as_str(), ".js" | ".py") {
             let mut args: Vec<&str> = linter.args.to_vec();
             args.push(target_str.as_str());
@@ -236,8 +269,12 @@ pub async fn run_static_analysis(options: StaticAnalysisOptions) -> Result<Strin
     for (file_ext, linter) in available {
         let cwd = root_clone.clone();
         let ext_str = file_ext.to_string();
+        let is_ts = is_ts_extension(file_ext);
         join_set.spawn(async move {
-            let result = run_command(linter.cmd, linter.args, &cwd).await;
+            let mut result = run_command(linter.cmd, linter.args, &cwd).await;
+            if is_ts {
+                result.output = strip_node_modules_diagnostics(&result.output);
+            }
             (ext_str, result)
         });
     }
@@ -436,5 +473,42 @@ mod tests {
         let result = run_command("echo", &["hello"], dir.path()).await;
         assert_eq!(result.exit_code, 0);
         assert!(result.output.contains("hello"));
+    }
+
+    #[test]
+    fn test_strip_node_modules_drops_dep_diagnostics() {
+        // Realistic tsc output: a dep diagnostic with a code-frame, then
+        // a user-code diagnostic. Only the user-code diagnostic should
+        // survive.
+        let raw = "\
+node_modules/some-pkg/dist/types.d.ts(42,3): error TS2304: Cannot find name 'Foo'.\n\
+\n  42   declare const Foo: unknown;\n     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\
+src/main.ts(10,5): error TS7006: Parameter 'x' implicitly has an 'any' type.\n\
+\n  10   function f(x) { return x }\n         ~\n";
+        let filtered = strip_node_modules_diagnostics(raw);
+        assert!(
+            !filtered.contains("node_modules/"),
+            "filter must drop node_modules header AND its indented detail lines; got:\n{filtered}"
+        );
+        assert!(
+            filtered.contains("src/main.ts(10,5)"),
+            "user-code diagnostic must survive; got:\n{filtered}"
+        );
+        assert!(
+            filtered.contains("implicitly has an 'any' type"),
+            "user-code diagnostic detail must survive"
+        );
+    }
+
+    #[test]
+    fn test_strip_node_modules_keeps_clean_output() {
+        let raw = "src/main.ts(1,1): error TS2304: Cannot find name 'X'.\n";
+        let filtered = strip_node_modules_diagnostics(raw);
+        assert!(filtered.contains("src/main.ts"));
+    }
+
+    #[test]
+    fn test_strip_node_modules_handles_empty() {
+        assert_eq!(strip_node_modules_diagnostics(""), "");
     }
 }
