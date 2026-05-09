@@ -26,6 +26,7 @@
 
 #![cfg(unix)]
 
+use serial_test::serial;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -194,6 +195,7 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn daemon_serves_get_context_tree_over_unix_socket() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
     std::fs::write(dir.path().join("hello.txt"), "hello daemon").unwrap();
@@ -209,6 +211,7 @@ async fn daemon_serves_get_context_tree_over_unix_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn daemon_serves_two_concurrent_clients() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
     std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
@@ -229,6 +232,7 @@ async fn daemon_serves_two_concurrent_clients() {
 }
 
 #[tokio::test]
+#[serial]
 async fn lock_serializes_two_daemon_attempts() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -251,6 +255,7 @@ async fn lock_serializes_two_daemon_attempts() {
 }
 
 #[tokio::test]
+#[serial]
 async fn bind_recovers_from_stale_socket_file() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -267,6 +272,7 @@ async fn bind_recovers_from_stale_socket_file() {
 /// spawning a second one. We assert by counting that the socket is unchanged
 /// before and after the call.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn client_connect_to_existing_daemon_skips_spawn() {
     use contextplus_rs::transport::client;
 
@@ -298,6 +304,7 @@ async fn client_connect_to_existing_daemon_skips_spawn() {
 }
 
 #[test]
+#[serial]
 fn path_helpers_consistent() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -316,6 +323,7 @@ fn path_helpers_consistent() {
 /// after the timer fires. We use a very short timeout (50 ms) to keep the
 /// test fast.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn idle_timer_shuts_down_daemon_when_no_clients() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
@@ -353,6 +361,7 @@ async fn idle_timer_shuts_down_daemon_when_no_clients() {
 /// then try to connect a second client; the second stream should be dropped
 /// immediately (we see EOF very quickly) rather than being served.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn daemon_drops_connections_when_draining() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
 
@@ -375,6 +384,7 @@ async fn daemon_drops_connections_when_draining() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn write_pid_file_creates_file_with_pid() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -400,6 +410,7 @@ fn write_pid_file_creates_file_with_pid() {
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+#[serial]
 fn idle_secs_zero_disables_timer() {
     let _g = ENV_MUTEX.lock().unwrap();
     unsafe {
@@ -412,6 +423,7 @@ fn idle_secs_zero_disables_timer() {
 }
 
 #[test]
+#[serial]
 fn idle_secs_explicit_value_is_respected() {
     let _g = ENV_MUTEX.lock().unwrap();
     unsafe {
@@ -428,6 +440,7 @@ fn idle_secs_explicit_value_is_respected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn bind_fresh_dir_creates_socket_file() {
     // No pre-existing stale file: bind_listener should create a fresh socket.
     let dir = TempDir::new().unwrap();
@@ -446,6 +459,7 @@ async fn bind_fresh_dir_creates_socket_file() {
 /// in-process pipes. The bridge should transfer all bytes from one side to the
 /// other and return Ok when the source closes.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn bridge_transfers_bytes_and_returns_ok() {
     use tokio::net::UnixListener;
 
@@ -489,6 +503,7 @@ async fn bridge_transfers_bytes_and_returns_ok() {
 /// NOTE: We can't test the "successfully spawns + connects" path without a
 /// real contextplus binary, but we exercise all the error-handling branches.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn connect_or_spawn_times_out_when_no_daemon_binary() {
     let dir = TempDir::new().unwrap();
     // Override socket path env so no other daemon can accidentally satisfy us.
@@ -529,6 +544,7 @@ async fn connect_or_spawn_times_out_when_no_daemon_binary() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn acquire_outcome_variants_are_distinct() {
     // Exercise AcquireOutcome::{Acquired, AlreadyRunning} in a way that
     // confirms the enum arms are reachable and distinct.
@@ -566,6 +582,7 @@ fn acquire_outcome_variants_are_distinct() {
 /// verify it serves a request, then trigger shutdown by flipping `draining`
 /// and closing the listener.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn daemon_run_shutdown_via_draining_flag() {
     use std::sync::atomic::Ordering;
 
@@ -624,6 +641,7 @@ async fn daemon_run_shutdown_via_draining_flag() {
 /// being set; subsequent reconnects see the daemon shut down quickly.
 /// This exercises the drain watcher code path without a racy connect.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn daemon_shuts_down_after_client_disconnects_and_drain_set() {
     use std::sync::atomic::Ordering;
 
@@ -685,6 +703,7 @@ async fn daemon_shuts_down_after_client_disconnects_and_drain_set() {
 /// `run_if_owner` should return `Ok(false)` when another daemon already holds
 /// the lock. This exercises the `AcquireOutcome::AlreadyRunning` branch.
 #[tokio::test]
+#[serial]
 async fn run_if_owner_returns_false_when_already_running() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
@@ -712,6 +731,7 @@ async fn run_if_owner_returns_false_when_already_running() {
 /// After `bind_listener` the socket file must be mode 0o600 so other users
 /// on a shared host cannot connect to this workspace's daemon.
 #[tokio::test]
+#[serial]
 async fn socket_permissions_are_0o600_after_bind() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -751,6 +771,7 @@ async fn socket_permissions_are_0o600_after_bind() {
 // it within one process. Convert to subprocess-based test in a followup.
 #[ignore = "same-process flock simulation is filesystem-dependent; see comment"]
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn connect_or_spawn_does_not_unlink_socket_when_daemon_lock_held() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
@@ -789,6 +810,7 @@ async fn connect_or_spawn_does_not_unlink_socket_when_daemon_lock_held() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn socket_override_env_affects_all_helpers() {
     let _g = ENV_MUTEX.lock().unwrap();
     let dir = TempDir::new().unwrap();
@@ -974,6 +996,7 @@ fn rpc_initialize_sync(stream: &mut std::os::unix::net::UnixStream) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 #[cfg(unix)]
 fn daemon_subcommand_binds_socket_then_shuts_down_on_sigterm() {
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1060,6 +1083,7 @@ fn daemon_subcommand_binds_socket_then_shuts_down_on_sigterm() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 #[cfg(unix)]
 fn stale_socket_file_is_recovered_by_fresh_daemon() {
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1146,6 +1170,7 @@ fn drive_client_initialize(child: &mut std::process::Child) -> serde_json::Value
 }
 
 #[test]
+#[serial]
 #[cfg(unix)]
 fn two_clients_share_one_daemon() {
     let dir = TempDir::new().unwrap();
@@ -1229,6 +1254,7 @@ fn two_clients_share_one_daemon() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 #[cfg(unix)]
 fn client_subcommand_auto_spawns_daemon_when_socket_missing() {
     use std::io::{BufRead, BufReader, Write};
@@ -1317,6 +1343,7 @@ fn client_subcommand_auto_spawns_daemon_when_socket_missing() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 #[cfg(unix)]
 fn sighup_drains_daemon() {
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1403,6 +1430,7 @@ async fn connect_and_register(socket_path: &Path, root_dir: &Path) -> (UnixStrea
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn register_session_happy_path_primary_ref() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
     std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
@@ -1464,6 +1492,7 @@ async fn register_session_happy_path_primary_ref() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn register_session_two_different_roots_get_different_refs() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
     let primary_root = dir.path().to_path_buf();
@@ -1498,6 +1527,7 @@ async fn register_session_two_different_roots_get_different_refs() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn register_session_same_root_concurrent_share_ref() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
     let root = dir.path().to_path_buf();
@@ -1533,6 +1563,7 @@ async fn register_session_same_root_concurrent_share_ref() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn register_session_unknown_head_sha_falls_back_gracefully() {
     let (dir, handle, socket_path) = spawn_daemon_for_test().await;
     let root = dir.path().to_path_buf();
@@ -1572,6 +1603,7 @@ async fn register_session_unknown_head_sha_falls_back_gracefully() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn register_session_rejected_when_draining() {
     // Spin up an in-process daemon that we can control (set draining before
     // it starts accepting).
@@ -1654,6 +1686,7 @@ async fn register_session_rejected_when_draining() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn ttl_eviction_removes_ref_after_session_ends() {
     // Spin up an in-process daemon with explicit state so we can inspect it.
     let dir = TempDir::new().unwrap();
@@ -1744,6 +1777,7 @@ async fn ttl_eviction_removes_ref_after_session_ends() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn drain_mid_session_evicts_refs_cleanly() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
@@ -1865,6 +1899,7 @@ async fn call_get_context_tree(stream: UnixStream) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn u9_session_ref_id_routes_tool_call_to_registered_worktree() {
     // Primary daemon root — has a known file.
     let (primary_dir, handle, socket_path) = spawn_daemon_for_test().await;

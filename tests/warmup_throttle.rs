@@ -33,6 +33,7 @@
 // Bring in the shared mock harness.
 mod common;
 use common::mock_ollama::MockOllamaServer;
+use serial_test::serial;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -270,6 +271,7 @@ fn config_with_mock(mock_uri: &str) -> Config {
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn shallow_warmup_makes_no_ollama_calls() {
     let td = TempDir::new().unwrap();
     // 5 files — enough for the walker to produce project_cache entries.
@@ -326,6 +328,7 @@ async fn shallow_warmup_makes_no_ollama_calls() {
 // ACTIVATION: remove `#[ignore]` when U16 + U17 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn full_warmup_respects_concurrency_cap() {
     let td = TempDir::new().unwrap();
     // 20 files — enough to expose concurrency behaviour even with small batches.
@@ -374,6 +377,7 @@ async fn full_warmup_respects_concurrency_cap() {
 // ACTIVATION: remove `#[ignore]` when U16 + U17 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn concurrent_attaches_share_one_ollama_budget() {
     let td = TempDir::new().unwrap();
     // Primary repo (daemon is rooted here).
@@ -453,6 +457,7 @@ async fn concurrent_attaches_share_one_ollama_budget() {
 // ACTIVATION: remove `#[ignore]` when U16 + U18 are merged.
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn off_mode_skips_warmup_entirely() {
     let td = TempDir::new().unwrap();
     let repo = make_repo_with_files(td.path(), "repo", 5);
@@ -506,6 +511,7 @@ async fn off_mode_skips_warmup_entirely() {
 // ACTIVATION: remove `#[ignore]` when U18 is merged.
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn idempotent_attach_does_not_duplicate_warmup() {
     const FILE_COUNT: usize = 5;
     const ATTACH_COUNT: usize = 5;
@@ -665,6 +671,7 @@ fn text_from_resp(resp: &Value) -> String {
 //     project_cache.
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn shallow_attach_inherits_primary_baseline_zero_ollama() {
     let td = TempDir::new().unwrap();
     // Primary repo: 5 small Rust source files.
@@ -776,6 +783,7 @@ async fn shallow_attach_inherits_primary_baseline_zero_ollama() {
 //   - mock.total_calls() <= 3  (≤ 2 misses; the 3 shared files are CAS hits)
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn full_attach_inherits_baseline_then_embeds_diff_only() {
     let td = TempDir::new().unwrap();
 
@@ -887,6 +895,7 @@ async fn full_attach_inherits_baseline_then_embeds_diff_only() {
 //   - semantic_code_search triggers ≥ 1 Ollama call (query embed → lazy path).
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn shallow_attach_to_unrelated_root_falls_through_to_lazy() {
     let td = TempDir::new().unwrap();
     // Fresh repo with no prior embed history.
