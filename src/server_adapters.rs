@@ -189,71 +189,159 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 "semantic_code_search embedding cache hit/miss"
             );
 
-            // Embed only uncached files — TIME-BOXED with PER-BATCH TIMEOUT.
+            // Embed only uncached files — TIME-BOXED, PER-BATCH TIMEOUT,
+            // and CONCURRENT up to `ollama_max_concurrent`.
             //
-            // Two failure modes to defend against:
+            // Three failure modes this defends against:
             //
-            // 1. Many uncached batches: embedding 3000+ files at ~7s/batch on
-            //    CPU Ollama can take 12-18 min. Codex's bridge times out and
-            //    closes the connection.
+            // 1. Many uncached batches: embedding 3000+ files sequentially at
+            //    ~7s/batch on CPU Ollama can take 12-18 min. Codex's bridge
+            //    times out and closes the connection.
             //
             // 2. A single batch hangs: on a slow CPU Ollama, one batch can
-            //    take 60+ s on its own. Without a per-batch timeout, the
-            //    global budget check (which only runs between batches) never
-            //    fires while we wait for the slow batch.
+            //    take 60+ s. Without a per-batch timeout, a global "elapsed"
+            //    check between batches never fires while one batch is stuck.
             //
-            // Fix: maintain a global deadline (`EMBED_BUDGET_MS`) AND wrap
-            // each Ollama call in `tokio::time::timeout(remaining)`. If
-            // either trigger fires, fill the rest with empty vectors and
-            // bail. The empty vectors are skipped at insert time, so the
-            // partial result still ranks the cached + freshly-embedded
-            // files correctly. Background tracker fills the rest.
+            // 3. Sequential under-utilization: with `ollama_max_concurrent=4`
+            //    the server can sustain 4 in-flight HTTP requests, but a
+            //    one-at-a-time loop only ever uses one. Within the same 20s
+            //    budget, parallel issue gets ~Nx more vectors filled before
+            //    we bail.
             //
-            // Budget is deliberately tight (20 s) so we never block any
-            // reasonable MCP client's per-call timeout.
+            // The pipeline:
+            //   - Pre-build per-batch chunks.
+            //   - Issue up to `ollama_max_concurrent` in flight at once via
+            //     `JoinSet`, each wrapped in `tokio::time::timeout(remaining)`.
+            //   - On every completion: queue the next pending chunk if budget
+            //     remains; otherwise drain in-flight tasks (each bounded by
+            //     its own remaining budget) and exit.
+            //   - Reassemble results in order so `new_vectors` aligns with
+            //     `uncached_indices` exactly as before.
+            //
+            // OllamaClient already gates HTTP concurrency via its own
+            // semaphore (U17), so even if we somehow over-spawn, only
+            // `ollama_max_concurrent` requests reach the wire.
+            //
+            // Budget is deliberately tight (20 s).
             const EMBED_BUDGET_MS: u128 = 20_000;
             if !uncached_texts.is_empty() {
                 let embed_start = std::time::Instant::now();
                 let batch_size = config.embed_batch_size.max(1);
-                let mut new_vectors = Vec::with_capacity(uncached_texts.len());
+                let max_concurrent = config.ollama_max_concurrent.max(1);
+
+                let chunks: Vec<Vec<String>> = uncached_texts
+                    .chunks(batch_size)
+                    .map(|c| c.to_vec())
+                    .collect();
+                let n_chunks = chunks.len();
+                let chunk_sizes: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
+                let mut per_chunk_results: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_chunks];
+
                 let mut budget_exceeded = false;
-                for chunk in uncached_texts.chunks(batch_size) {
+                // (chunk_idx, outer = timeout result, inner = embed result)
+                type EmbedBatchOutcome = (
+                    usize,
+                    std::result::Result<Result<Vec<Vec<f32>>>, tokio::time::error::Elapsed>,
+                );
+                let mut join_set: tokio::task::JoinSet<EmbedBatchOutcome> =
+                    tokio::task::JoinSet::new();
+                let mut next_idx = 0usize;
+
+                // Spawn helper closure to keep the seed and drain loops in sync.
+                let spawn_one = |join_set: &mut tokio::task::JoinSet<_>,
+                                 idx: usize,
+                                 chunk: Vec<String>,
+                                 ollama: OllamaClient,
+                                 remaining: std::time::Duration| {
+                    join_set.spawn(async move {
+                        (
+                            idx,
+                            tokio::time::timeout(
+                                remaining,
+                                async move { ollama.embed(&chunk).await },
+                            )
+                            .await,
+                        )
+                    });
+                };
+
+                // Seed: spawn up to max_concurrent batches.
+                while next_idx < n_chunks && join_set.len() < max_concurrent {
                     let elapsed_ms = embed_start.elapsed().as_millis();
                     if elapsed_ms >= EMBED_BUDGET_MS {
-                        for _ in chunk {
-                            new_vectors.push(Vec::new());
-                        }
                         budget_exceeded = true;
-                        continue;
+                        break;
                     }
-                    let remaining_ms = (EMBED_BUDGET_MS - elapsed_ms) as u64;
-                    let remaining = std::time::Duration::from_millis(remaining_ms);
-                    match tokio::time::timeout(remaining, ollama.embed(chunk)).await {
-                        Ok(Ok(embeddings)) => new_vectors.extend(embeddings),
-                        Ok(Err(e)) => {
-                            tracing::warn!("Embedding batch failed: {e}, filling with None");
-                            for _ in chunk {
-                                new_vectors.push(Vec::new());
-                            }
+                    let remaining =
+                        std::time::Duration::from_millis((EMBED_BUDGET_MS - elapsed_ms) as u64);
+                    let chunk = chunks[next_idx].clone();
+                    spawn_one(&mut join_set, next_idx, chunk, ollama.clone(), remaining);
+                    next_idx += 1;
+                }
+
+                // Drain: collect each completion, queue the next chunk while
+                // budget remains, and let in-flight tasks finish under their
+                // own per-batch deadline once budget is exceeded.
+                while let Some(joined) = join_set.join_next().await {
+                    match joined {
+                        Ok((idx, Ok(Ok(embeddings)))) => {
+                            per_chunk_results[idx] = embeddings;
                         }
-                        Err(_) => {
-                            // Hard per-batch timeout: a single Ollama batch
-                            // cannot exceed the global deadline. Fill this
-                            // and remaining batches with empty vectors.
-                            for _ in chunk {
-                                new_vectors.push(Vec::new());
-                            }
+                        Ok((idx, Ok(Err(e)))) => {
+                            tracing::warn!(chunk_idx = idx, "Embedding batch failed: {e}");
+                        }
+                        Ok((idx, Err(_elapsed))) => {
+                            tracing::warn!(
+                                chunk_idx = idx,
+                                "Embedding batch timed out within budget"
+                            );
                             budget_exceeded = true;
+                        }
+                        Err(join_err) => {
+                            tracing::warn!("Embedding task join failed: {join_err}");
+                        }
+                    }
+
+                    let elapsed_ms = embed_start.elapsed().as_millis();
+                    if elapsed_ms >= EMBED_BUDGET_MS {
+                        budget_exceeded = true;
+                    }
+                    if !budget_exceeded && next_idx < n_chunks {
+                        let remaining =
+                            std::time::Duration::from_millis((EMBED_BUDGET_MS - elapsed_ms) as u64);
+                        let chunk = chunks[next_idx].clone();
+                        spawn_one(&mut join_set, next_idx, chunk, ollama.clone(), remaining);
+                        next_idx += 1;
+                    }
+                }
+
+                // Flatten per-chunk results back to a flat `new_vectors`
+                // aligned with `uncached_indices`. Missing slots (failed
+                // batches, never scheduled, timed out) become empty vectors;
+                // the cache writer below skips them.
+                let mut new_vectors: Vec<Vec<f32>> = Vec::with_capacity(uncached_texts.len());
+                for (i, results) in per_chunk_results.iter_mut().enumerate() {
+                    let expected = chunk_sizes[i];
+                    if results.len() == expected {
+                        new_vectors.append(results);
+                    } else {
+                        for _ in 0..expected {
+                            new_vectors.push(Vec::new());
                         }
                     }
                 }
-                if budget_exceeded {
+
+                let chunks_skipped = next_idx < n_chunks;
+                if budget_exceeded || chunks_skipped {
                     let still_uncached = new_vectors.iter().filter(|v| v.is_empty()).count();
                     tracing::warn!(
                         budget_ms = EMBED_BUDGET_MS as u64,
                         elapsed_ms = embed_start.elapsed().as_millis() as u64,
                         embedded = uncached_texts.len() - still_uncached,
                         skipped = still_uncached,
+                        chunks_scheduled = next_idx,
+                        chunks_total = n_chunks,
+                        concurrency = max_concurrent,
                         "semantic_code_search embed budget exceeded — returning partial results; tracker will fill remaining in background"
                     );
                 }
