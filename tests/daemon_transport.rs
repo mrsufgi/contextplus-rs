@@ -745,7 +745,7 @@ async fn socket_permissions_are_0o600_after_bind() {
 // on overlayfs, fails on CI tmpfs). Production scenario is cross-process
 // (daemon holds, client probes) which is well-defined; this test models
 // it within one process. Convert to subprocess-based test in a followup.
-#[serial(daemon_subprocess)]
+#[serial(daemon_env)]
 #[ignore = "same-process flock simulation is filesystem-dependent; see comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_or_spawn_does_not_unlink_socket_when_daemon_lock_held() {
@@ -786,7 +786,7 @@ async fn connect_or_spawn_does_not_unlink_socket_when_daemon_lock_held() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[serial(env_socket_path)]
+#[serial(daemon_env)]
 fn socket_override_env_affects_all_helpers() {
     let _g = ENV_MUTEX.lock().unwrap();
     let dir = TempDir::new().unwrap();
@@ -971,7 +971,7 @@ fn rpc_initialize_sync(stream: &mut std::os::unix::net::UnixStream) -> String {
 //         cleanly after SIGTERM.
 // ---------------------------------------------------------------------------
 
-#[serial(daemon_subprocess)]
+#[serial(daemon_env)]
 #[test]
 #[cfg(unix)]
 fn daemon_subcommand_binds_socket_then_shuts_down_on_sigterm() {
@@ -1058,7 +1058,7 @@ fn daemon_subcommand_binds_socket_then_shuts_down_on_sigterm() {
 // Test 2: stale socket file is recovered by a fresh daemon.
 // ---------------------------------------------------------------------------
 
-#[serial(daemon_subprocess)]
+#[serial(daemon_env)]
 #[test]
 #[cfg(unix)]
 fn stale_socket_file_is_recovered_by_fresh_daemon() {
@@ -1145,7 +1145,7 @@ fn drive_client_initialize(child: &mut std::process::Child) -> serde_json::Value
     serde_json::from_str(line.trim()).expect("client response is valid JSON")
 }
 
-#[serial(daemon_subprocess)]
+#[serial(daemon_env)]
 #[test]
 #[cfg(unix)]
 fn two_clients_share_one_daemon() {
@@ -1229,7 +1229,7 @@ fn two_clients_share_one_daemon() {
 // Test 4: client subcommand auto-spawns a daemon when socket is missing.
 // ---------------------------------------------------------------------------
 
-#[serial(daemon_subprocess)]
+#[serial(daemon_env)]
 #[test]
 #[cfg(unix)]
 fn client_subcommand_auto_spawns_daemon_when_socket_missing() {
@@ -1318,7 +1318,7 @@ fn client_subcommand_auto_spawns_daemon_when_socket_missing() {
 // Test 5: SIGHUP drains the daemon (covers spawn_signal_listener SIGHUP arm).
 // ---------------------------------------------------------------------------
 
-#[serial(daemon_subprocess)]
+#[serial(daemon_env)]
 #[test]
 #[cfg(unix)]
 fn sighup_drains_daemon() {
