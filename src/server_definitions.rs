@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use rmcp::model::Tool;
 use serde_json::Value;
 
-/// All 22 tool definitions. Built once at first access, reused for every list_tools call.
+/// All 26 tool definitions. Built once at first access, reused for every list_tools call.
 static TOOL_DEFINITIONS: LazyLock<Vec<Tool>> = LazyLock::new(build_tool_definitions);
 
 /// Returns the static tool definitions slice. O(1) after first call.
@@ -243,8 +243,33 @@ fn build_tool_definitions() -> Vec<Tool> {
                 "target_path",
                 "string",
                 false,
-                "Specific file or folder to lint (relative to root). Omit for full project.",
+                "Specific file or folder to lint. Relative to the active ref's root, or absolute — absolute paths under a registered worktree's root auto-route the linter to that worktree. Omit for full project.",
             )],
+        ),
+        make_tool(
+            "attach_worktree",
+            "Register a worktree directory as a ref that inherits the primary ref's embedding cache via CoW (CAS parent pointer + memory-graph overlay), then spawns per-ref warmup. Required for analyzing worktrees outside the daemon's primary root without a per-worktree MCP handshake. Idempotent.",
+            &[(
+                "path",
+                "string",
+                true,
+                "Absolute or relative path to the worktree directory; will be canonicalized. Must exist and be a directory.",
+            )],
+        ),
+        make_tool(
+            "detach_worktree",
+            "Detach a previously-attached worktree. Decrements its session count; once it reaches zero the ref enters the TTL eviction queue. Refuses to detach the primary ref.",
+            &[(
+                "path",
+                "string",
+                true,
+                "Worktree path used at attach time (or any path that canonicalizes to the same root).",
+            )],
+        ),
+        make_tool(
+            "list_worktrees",
+            "List every ref currently in the registry — the primary plus any attached worktrees — with their canonical roots, session counts, and HEAD SHAs.",
+            &[],
         ),
         make_tool(
             "propose_commit",

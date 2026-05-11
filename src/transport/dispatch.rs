@@ -322,17 +322,66 @@ pub async fn dispatch_with_translation(
     caller_ref_id: Option<RefId>,
 ) -> rmcp::model::CallToolResult {
     // --- Input translation ---
-    let translated_args = match path_translation::translate_input_args(args, caller_root) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(
-                tool = tool_name,
-                caller_root = %caller_root.display(),
-                "Rejecting tool call: {e}"
-            );
-            return rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(format!(
-                "Error: {e}"
-            ))]);
+    //
+    // Two carve-outs to the strict "all absolute paths must be under
+    // caller_root" rule:
+    //
+    // 1. `attach_worktree` / `detach_worktree` / `list_worktrees` exist
+    //    precisely to manage out-of-tree refs — their `path` argument is, by
+    //    contract, absolute and outside `caller_root`. Bypass translation
+    //    entirely; the handlers canonicalize and enforce their own checks
+    //    (directory existence, primary-ref carve-out, etc.).
+    //
+    // 2. `run_static_analysis` supports auto-routing: an absolute
+    //    `target_path` that lives under any registered ref's `canonical_root`
+    //    is forwarded to the handler unchanged so `route_static_analysis_target`
+    //    can pick the right ref. Path-translation would otherwise reject the
+    //    foreign-but-known-good absolute path before the handler ever runs.
+    let bypass_input_translation = matches!(
+        tool_name,
+        "attach_worktree" | "detach_worktree" | "list_worktrees"
+    );
+    let translated_args = if bypass_input_translation {
+        args
+    } else {
+        // For run_static_analysis (and any future routing-aware tool),
+        // collect the canonical roots of registered foreign refs and accept
+        // absolute paths that fall under them.
+        let allowed_extra_root_bufs: Vec<PathBuf> = if tool_name == "run_static_analysis" {
+            let refs = server.state.refs.read().await;
+            refs.values()
+                .filter_map(|r| {
+                    if r.canonical_root == caller_root {
+                        None
+                    } else {
+                        Some(r.canonical_root.clone())
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let allowed_extra_root_refs: Vec<&Path> = allowed_extra_root_bufs
+            .iter()
+            .map(|p| p.as_path())
+            .collect();
+
+        match path_translation::translate_input_args_with_allowed_roots(
+            args,
+            caller_root,
+            &allowed_extra_root_refs,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    caller_root = %caller_root.display(),
+                    "Rejecting tool call: {e}"
+                );
+                return rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(
+                    format!("Error: {e}"),
+                )]);
+            }
         }
     };
 
@@ -353,6 +402,16 @@ pub async fn dispatch_with_translation(
     // U9 seam: `caller_ref_id` is `None` today. When U9 wires
     // `session_ref_id` into `ContextPlusServer`, passing the real id
     // ensures the caller's own ref is correctly excluded from `foreign_roots`.
+    //
+    // Output bypass: the worktree-management tools deliberately surface
+    // foreign worktree paths in their output (that's the entire point of
+    // `list_worktrees` and the success message of `attach_worktree`). Scrubbing
+    // foreign prefixes there would print the caller's root in place of the
+    // attached worktree's canonical_root, which is misleading. Same input-side
+    // carve-out, same reasoning — skip output translation for these tools.
+    if bypass_input_translation {
+        return raw_result;
+    }
     let foreign_root_bufs = foreign_roots_for_session(&server.state, caller_ref_id);
     let foreign_root_refs: Vec<&Path> = foreign_root_bufs.iter().map(|p| p.as_path()).collect();
     path_translation::translate_output_result(raw_result, caller_root, &foreign_root_refs)
