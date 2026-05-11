@@ -481,6 +481,17 @@ impl ContextPlusServer {
         })
     }
 
+    /// Start the embedding tracker for a specific ref if not already running
+    /// and mode is not Off.
+    ///
+    /// Routes through `with_session(ref_id)` so the tracker's refresh callback
+    /// and `incremental_reembed` invocations land on that ref's caches
+    /// (`embedding_cache`, `search_index_cache`, `cache_generation`) rather
+    /// than the default ref's.
+    pub fn ensure_tracker_started_for(&self, ref_id: crate::ref_index::RefId) {
+        self.with_session(ref_id).ensure_tracker_started();
+    }
+
     /// Start the embedding tracker if not already running and mode is not Off.
     pub fn ensure_tracker_started(&self) {
         if self.state.config.embed_tracker_mode == TrackerMode::Off {
@@ -2108,6 +2119,15 @@ impl ContextPlusServer {
 
         // Per-ref warmup (idempotent). Off / Shallow / Full per RefWarmupMode.
         self.spawn_ref_warmup(ref_id);
+
+        // U11: Eager mode mirrors the daemon's startup behaviour for the
+        // default ref — attached worktrees should also pick up live edits
+        // without waiting for a tool call. Lazy mode lets the first tool
+        // call start it on demand (via `ensure_tracker_started` through the
+        // session-scoped server clone).
+        if self.state.config.embed_tracker_mode == TrackerMode::Eager {
+            self.ensure_tracker_started_for(ref_id);
+        }
 
         let head_display = ref_arc
             .head_sha
@@ -4564,6 +4584,128 @@ mod tests {
         );
         let result = server.handle_attach_worktree(args).await.unwrap();
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_eager_mode_starts_per_ref_tracker() {
+        // U11: attaching a worktree in Eager tracker mode must start an
+        // embedding tracker scoped to the new ref, not the default ref. This
+        // is the live-edit pickup path — without it, an attached worktree's
+        // caches only refresh on full warmup.
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Eager;
+        // Avoid background warmup interfering with the test — the tracker
+        // start is independent of warmup mode.
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(server_root_tmp.path().to_path_buf(), config);
+
+        // Default ref should NOT have a tracker yet — we never called
+        // `ensure_tracker_started` for it in this test path.
+        let default_ref = server.state.default_ref().expect("default ref present");
+        assert!(
+            default_ref.tracker_handle.lock().unwrap().is_none(),
+            "default ref tracker should not start as a side-effect of attach"
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let result = server.handle_attach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        let wt_ref = server
+            .state
+            .ref_index(ref_id)
+            .expect("worktree ref attached");
+
+        assert!(
+            wt_ref.tracker_handle.lock().unwrap().is_some(),
+            "Eager mode must start a tracker on the attached worktree ref"
+        );
+        // Per-ref isolation: the default ref's handle must still be untouched.
+        assert!(
+            default_ref.tracker_handle.lock().unwrap().is_none(),
+            "default ref tracker must not start when only a worktree was attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_lazy_mode_defers_tracker_start() {
+        // Counterpoint to the eager test: Lazy mode must NOT start the
+        // tracker at attach time. It starts on the first tool call against
+        // the ref's session (handled by `ensure_tracker_started` via
+        // `current_ref()`).
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Lazy;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(server_root_tmp.path().to_path_buf(), config);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let _ = server.handle_attach_worktree(args).await.unwrap();
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        let wt_ref = server
+            .state
+            .ref_index(ref_id)
+            .expect("worktree ref attached");
+        assert!(
+            wt_ref.tracker_handle.lock().unwrap().is_none(),
+            "Lazy mode must not eagerly start the worktree tracker"
+        );
+
+        // First tool-style invocation through a session-scoped clone starts it.
+        server.ensure_tracker_started_for(ref_id);
+        assert!(
+            wt_ref.tracker_handle.lock().unwrap().is_some(),
+            "ensure_tracker_started_for(ref_id) must start the worktree's tracker"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_tracker_started_for_off_mode_is_noop() {
+        // Sanity: Off mode is a hard no-op regardless of call site.
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(server_root_tmp.path().to_path_buf(), config);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let _ = server.handle_attach_worktree(args).await.unwrap();
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        let wt_ref = server
+            .state
+            .ref_index(ref_id)
+            .expect("worktree ref attached");
+        // Even an explicit call must be a no-op under Off mode.
+        server.ensure_tracker_started_for(ref_id);
+        assert!(
+            wt_ref.tracker_handle.lock().unwrap().is_none(),
+            "Off mode must never start a tracker"
+        );
     }
 
     #[tokio::test]

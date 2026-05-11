@@ -481,6 +481,16 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     // reconnects from the same worktree root.
     server.spawn_ref_warmup(ref_id);
 
+    // ── Step 2d: per-ref embedding tracker (U11) ─────────────────────────────
+    // Mirror the daemon's startup behaviour for the default ref so attached
+    // worktree refs also pick up live file changes in Eager mode. Lazy mode
+    // defers tracker startup until the first tool call on the session, which
+    // resolves to this ref via `session_ref_id` and calls
+    // `ensure_tracker_started` automatically.
+    if server.state.config.embed_tracker_mode == crate::config::TrackerMode::Eager {
+        server.ensure_tracker_started_for(ref_id);
+    }
+
     // ── Step 3: send session_ready ───────────────────────────────────────────
     let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
     // For now we always reply Ready.
