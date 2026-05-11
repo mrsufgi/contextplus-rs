@@ -1672,6 +1672,9 @@ impl ContextPlusServer {
             "detect_dependency_loops" => self.handle_detect_dependency_loops(args).await,
             "check_embedding_quality" => self.handle_check_embedding_quality(args).await,
             "lexical_search" => self.handle_lexical_search(args).await,
+            "attach_worktree" => self.handle_attach_worktree(args).await,
+            "detach_worktree" => self.handle_detach_worktree(args).await,
+            "list_worktrees" => self.handle_list_worktrees(args).await,
             _ => Ok(Self::err_text(format!("Unknown tool: {}", name))),
         }
     }
@@ -1977,16 +1980,294 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        let root = self.resolve_root(&args);
         let target_path = Self::get_str(&args, "target_path");
+        let (root_dir, target_path) = self.route_static_analysis_target(&args, target_path).await;
 
         let options = crate::tools::static_analysis::StaticAnalysisOptions {
-            root_dir: root,
+            root_dir,
             target_path,
         };
 
         let result = crate::tools::static_analysis::run_static_analysis(options).await?;
         Ok(Self::ok_text(result))
+    }
+
+    /// Register an out-of-server-root worktree as a `RefIndex` in the registry,
+    /// chaining its CAS manifest to the primary ref's so embedding lookups
+    /// inherit the baseline. Mirrors `daemon::serve_connection`'s attach flow
+    /// (CoW memory overlay, `fork_from`, per-ref warmup) — the difference is
+    /// the trigger: an in-band MCP tool call instead of a network handshake.
+    ///
+    /// Idempotent: re-attaching the same canonical path returns the existing
+    /// ref without bumping `session_count`, mirroring the daemon's behavior
+    /// when a duplicate session connects (though there it bumps; here we
+    /// keep the pin to "exactly one logical attach" so a single `detach_worktree`
+    /// undoes it).
+    ///
+    /// CoW chain:
+    /// 1. `RefIndex::new_with_head` + `memory_overlay = Some(...)` so the
+    ///    merge ladder can fold worktree nodes back into the primary.
+    /// 2. `fork_from(mcp_data, model, primary_ref)` writes the parent pointer
+    ///    in the CAS directory so chunk hashes chain through the primary's
+    ///    manifest — this is what lets the worktree reuse the base cache.
+    /// 3. `spawn_ref_warmup` triggers shallow warmup (per config) so the next
+    ///    semantic call hits a warm HNSW built from CAS-imported vectors.
+    async fn handle_attach_worktree(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        let path = Self::get_str(&args, "path")
+            .ok_or_else(|| ContextPlusError::Other("path is required".into()))?;
+        let raw = PathBuf::from(&path);
+        let canonical = match raw.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Self::err_text(format!(
+                    "Cannot canonicalize {}: {}",
+                    path, e
+                )));
+            }
+        };
+        if !canonical.is_dir() {
+            return Ok(Self::err_text(format!(
+                "Not a directory: {}",
+                canonical.display()
+            )));
+        }
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+
+        // Fast path: already attached. Don't double-bump session_count.
+        {
+            let guard = self.state.refs.read().await;
+            if let Some(existing) = guard.get(&ref_id) {
+                return Ok(Self::ok_text(format!(
+                    "Worktree already attached: {} (ref_id={}, sessions={})",
+                    existing.canonical_root.display(),
+                    ref_id.0,
+                    existing
+                        .session_count
+                        .load(std::sync::atomic::Ordering::Acquire)
+                )));
+            }
+        }
+
+        let parent_ref_id = if ref_id != self.state.default_ref_id {
+            Some(self.state.default_ref_id)
+        } else {
+            None
+        };
+
+        // Optional: read HEAD from the worktree's git index. Tolerates non-git
+        // dirs (returns None → stored as None on the ref).
+        let head_sha = crate::core::head_watcher::resolve_head_sha(&canonical);
+
+        // Build the ref with CoW memory overlay (only for non-primary refs).
+        // `attach_ref` is idempotent under concurrent calls — the closure runs
+        // only on first insert, so duplicate construction is impossible.
+        let raw_for_closure = raw.clone();
+        let canonical_for_closure = canonical.clone();
+        let head_sha_for_closure = head_sha.clone();
+        let ref_arc = self
+            .state
+            .attach_ref(ref_id, move || {
+                let memory_overlay = if parent_ref_id.is_some() {
+                    Some(std::sync::Arc::new(tokio::sync::RwLock::new(
+                        crate::core::memory_graph::MemoryGraph::new(),
+                    )))
+                } else {
+                    None
+                };
+                std::sync::Arc::new(crate::ref_index::RefIndex {
+                    memory_overlay,
+                    ..crate::ref_index::RefIndex::new_with_head(
+                        raw_for_closure,
+                        canonical_for_closure,
+                        parent_ref_id,
+                        head_sha_for_closure.unwrap_or_default(),
+                    )
+                })
+            })
+            .await;
+
+        // CAS init: chain the parent manifest so chunk lookups inherit the
+        // baseline. Non-fatal: if disk is read-only or the CAS dir is unusable,
+        // log and continue — the ref still functions for non-semantic tools
+        // like `run_static_analysis`.
+        {
+            let mcp_data = self.state.root_dir.join(".mcp_data");
+            let model = self.state.config.ollama_embed_model.clone();
+            let parent_ref_opt = parent_ref_id.and_then(|pid| self.state.ref_index(pid));
+            if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
+                tracing::warn!(
+                    ref_id = ref_id.0,
+                    "attach_worktree CAS fork_from failed (non-fatal): {e}"
+                );
+            }
+        }
+
+        // Per-ref warmup (idempotent). Off / Shallow / Full per RefWarmupMode.
+        self.spawn_ref_warmup(ref_id);
+
+        let head_display = ref_arc
+            .head_sha
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s[..s.len().min(8)].to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        Ok(Self::ok_text(format!(
+            "Worktree attached: {}\n  ref_id  = {}\n  parent  = {}\n  head    = {}\n  sessions= {}\n  warmup  = {}",
+            ref_arc.canonical_root.display(),
+            ref_id.0,
+            parent_ref_id
+                .map(|p| p.0.to_string())
+                .unwrap_or_else(|| "<none (this IS the primary)>".to_string()),
+            head_display,
+            ref_arc
+                .session_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.state.config.ref_warmup_mode,
+        )))
+    }
+
+    /// Detach a previously-attached worktree. Decrements session_count; once it
+    /// reaches zero the ref enters the TTL eviction queue (`cache_ttl_secs` from
+    /// config). Refuses to detach the primary ref.
+    async fn handle_detach_worktree(
+        &self,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        let path = Self::get_str(&args, "path")
+            .ok_or_else(|| ContextPlusError::Other("path is required".into()))?;
+        let raw = PathBuf::from(&path);
+        let canonical = match raw.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Self::err_text(format!(
+                    "Cannot canonicalize {}: {}",
+                    path, e
+                )));
+            }
+        };
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+
+        if ref_id == self.state.default_ref_id {
+            return Ok(Self::err_text(
+                "Cannot detach the primary ref; the daemon owns its lifetime.".into(),
+            ));
+        }
+        {
+            let guard = self.state.refs.read().await;
+            if !guard.contains_key(&ref_id) {
+                return Ok(Self::err_text(format!(
+                    "Not attached: {} (ref_id={})",
+                    canonical.display(),
+                    ref_id.0
+                )));
+            }
+        }
+
+        let ttl = self.state.config.cache_ttl_secs;
+        self.state.detach_ref(ref_id, ttl).await;
+
+        Ok(Self::ok_text(format!(
+            "Worktree detach scheduled: {} (ref_id={}, ttl={}s)",
+            canonical.display(),
+            ref_id.0,
+            ttl
+        )))
+    }
+
+    /// List every ref currently in the registry (primary + attached worktrees).
+    async fn handle_list_worktrees(
+        &self,
+        _args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        let guard = self.state.refs.read().await;
+        let mut rows: Vec<(u64, PathBuf, bool, usize, Option<String>)> = guard
+            .iter()
+            .map(|(id, r)| {
+                (
+                    id.0,
+                    r.canonical_root.clone(),
+                    *id == self.state.default_ref_id,
+                    r.session_count.load(std::sync::atomic::Ordering::Acquire),
+                    r.head_sha.clone(),
+                )
+            })
+            .collect();
+        drop(guard);
+        // Primary first, then alphabetical by path — predictable output.
+        rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+
+        if rows.is_empty() {
+            return Ok(Self::ok_text("No refs registered.".into()));
+        }
+        let mut out = String::from("Registered refs:\n");
+        for (id, path, is_primary, sessions, head) in rows {
+            let tag = if is_primary { " [primary]" } else { "" };
+            let head_str = head
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" head={}", &s[..s.len().min(8)]))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- {}{} (ref_id={}, sessions={}{})\n",
+                path.display(),
+                tag,
+                id,
+                sessions,
+                head_str
+            ));
+        }
+        Ok(Self::ok_text(out))
+    }
+
+    /// If `target_path` is absolute and lives under a registered ref's
+    /// canonical_root, route the linter to run from that ref's root with a
+    /// relative target. This is what lets a session attached to the primary
+    /// workspace lint a sibling worktree the daemon has already registered
+    /// (e.g. `~/worktrees/<feature>`), without needing a per-worktree session.
+    ///
+    /// Falls back to `resolve_root(&args)` and the original `target_path`
+    /// otherwise. The longest (most specific) matching ref wins, so nested
+    /// worktrees route to the innermost one.
+    async fn route_static_analysis_target(
+        &self,
+        args: &serde_json::Map<String, Value>,
+        target_path: Option<String>,
+    ) -> (PathBuf, Option<String>) {
+        if let Some(target) = target_path.as_deref()
+            && std::path::Path::new(target).is_absolute()
+        {
+            let target_pb = PathBuf::from(target);
+            let canonical_target = target_pb
+                .canonicalize()
+                .unwrap_or_else(|_| target_pb.clone());
+
+            let refs = self.state.refs.read().await;
+            let mut best: Option<(PathBuf, PathBuf)> = None;
+            for ref_idx in refs.values() {
+                if canonical_target.starts_with(&ref_idx.canonical_root) {
+                    let prev_len = best.as_ref().map(|(_, r)| r.as_os_str().len()).unwrap_or(0);
+                    if ref_idx.canonical_root.as_os_str().len() >= prev_len {
+                        best = Some((ref_idx.root_dir.clone(), ref_idx.canonical_root.clone()));
+                    }
+                }
+            }
+            drop(refs);
+
+            if let Some((ref_root, canonical_root)) = best {
+                let rel = canonical_target
+                    .strip_prefix(&canonical_root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty());
+                return (ref_root, rel);
+            }
+        }
+        (self.resolve_root(args), target_path)
     }
 
     async fn handle_propose_commit(
@@ -3309,9 +3590,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_23_tools() {
+    fn tool_definitions_returns_all_26_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 23, "expected 23 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 26, "expected 26 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -3350,6 +3631,9 @@ mod tests {
             "detect_dependency_loops",
             "check_embedding_quality",
             "lexical_search",
+            "attach_worktree",
+            "detach_worktree",
+            "list_worktrees",
         ];
         for name in expected {
             assert!(names.contains(&name), "missing tool: {}", name);
@@ -3982,6 +4266,322 @@ mod tests {
         args.insert("rootDir".to_string(), json!("../../etc"));
         let root = server.resolve_root(&args);
         assert_eq!(root, server.state.root_dir);
+    }
+
+    // ---------------------------------------------------------------
+    // route_static_analysis_target — absolute target_path auto-routes
+    // to a registered worktree's root (out-of-server-root paths).
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn route_static_analysis_target_falls_back_for_relative_target() {
+        let server = test_server();
+        let args = serde_json::Map::new();
+        let (root, target) = server
+            .route_static_analysis_target(&args, Some("src/lib.rs".to_string()))
+            .await;
+        // Relative target — no routing, falls back to resolve_root (= server root)
+        // and preserves the relative target string verbatim.
+        assert_eq!(root, server.state.root_dir);
+        assert_eq!(target.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn route_static_analysis_target_routes_to_registered_worktree() {
+        // Server lives at `server_root` (the "primary" /workspace analogue).
+        // A separate, sibling worktree is registered at `wt_root` — outside
+        // `server_root`. An absolute target_path under `wt_root` should route
+        // the linter to run from `wt_root` with a rebased relative target.
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let wt_root = wt_tmp.path().to_path_buf();
+        let canonical_wt = wt_root.canonicalize().unwrap();
+        // Create a file under the worktree so canonicalize succeeds on the target.
+        let src_dir = canonical_wt.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let target_file = src_dir.join("lib.rs");
+        std::fs::write(&target_file, "// stub\n").unwrap();
+
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        // Register the worktree as a non-default ref.
+        let wt_ref = crate::ref_index::RefIndex::new(wt_root.clone(), canonical_wt.clone(), None);
+        let wt_ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        {
+            let mut guard = server.state.refs.write().await;
+            guard.insert(wt_ref_id, std::sync::Arc::new(wt_ref));
+        }
+
+        let args = serde_json::Map::new();
+        let (root, target) = server
+            .route_static_analysis_target(&args, Some(target_file.to_string_lossy().into_owned()))
+            .await;
+
+        assert_eq!(root, wt_root, "linter should run from the worktree's root");
+        assert_eq!(
+            target.as_deref(),
+            Some("src/lib.rs"),
+            "target_path should be rebased relative to the routed worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_registers_external_directory() {
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+
+        let result = server.handle_attach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        let registered = {
+            let guard = server.state.refs.read().await;
+            guard.get(&ref_id).cloned()
+        };
+        let registered = registered.expect("worktree should be in registry");
+        assert_eq!(registered.canonical_root, canonical_wt);
+        // Session_count bumped to 1 by attach_ref — pinned until matching detach.
+        assert_eq!(
+            registered
+                .session_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        // CoW chain: non-primary refs carry a memory overlay so the merge ladder
+        // can fold their nodes back into the primary graph.
+        assert!(
+            registered.memory_overlay.is_some(),
+            "non-primary worktree ref must have a memory_overlay"
+        );
+        // Parent pointer chains to the primary ref so CAS lookups inherit the baseline.
+        assert_eq!(registered.parent_ref_id, Some(server.state.default_ref_id));
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_cas_chain_writes_parent_pointer() {
+        // The CoW chain on disk: attach_worktree must write a `parent` pointer
+        // inside the worktree's CAS dir so chunk lookups chain to the primary's
+        // manifest. This is the on-disk half of the "build on top of base cache"
+        // contract — verifying the in-memory `parent_ref_id` only catches half.
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let _ = server.handle_attach_worktree(args).await.unwrap();
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        let ref_arc = server.state.ref_index(ref_id).expect("ref attached");
+        let mcp_data = server.state.root_dir.join(".mcp_data");
+        let ref_dir = mcp_data.join("refs").join(&ref_arc.cas_ref_id_hex);
+        assert!(
+            ref_dir.exists(),
+            "CAS ref dir must be created by fork_from at {}",
+            ref_dir.display()
+        );
+        // Manifest is written by fork_ref so the chain is fully initialized.
+        assert!(
+            ref_dir.join("manifest.rkyv").exists(),
+            "fork_from must write an empty manifest at {}/manifest.rkyv",
+            ref_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_worktree_decrements_and_schedules_eviction() {
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+        // ttl=0 so eviction is immediate-ish; tokio::spawn still runs async.
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 0);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let _ = server.handle_attach_worktree(args.clone()).await.unwrap();
+
+        let result = server.handle_detach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+
+        // Yield so the spawned eviction task can run (ttl=0 → no sleep).
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let guard = server.state.refs.read().await;
+            let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+            if !guard.contains_key(&ref_id) {
+                return;
+            }
+        }
+        panic!("worktree ref should have been evicted after detach with ttl=0");
+    }
+
+    #[tokio::test]
+    async fn detach_worktree_refuses_primary() {
+        let server = test_server();
+        let primary_path = server.state.root_dir.clone();
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(primary_path.to_string_lossy().to_string()),
+        );
+        let result = server.handle_detach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn detach_worktree_errors_on_unknown() {
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(wt_tmp.path().to_string_lossy().to_string()),
+        );
+        let result = server.handle_detach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn list_worktrees_marks_primary_and_includes_attached() {
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let _ = server.handle_attach_worktree(attach_args).await.unwrap();
+
+        let result = server
+            .handle_list_worktrees(serde_json::Map::new())
+            .await
+            .unwrap();
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert!(text.contains("[primary]"), "primary tag missing: {text}");
+        assert!(
+            text.contains(&canonical_wt.to_string_lossy().to_string()),
+            "attached worktree path missing: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_is_idempotent() {
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+
+        let _ = server.handle_attach_worktree(args.clone()).await.unwrap();
+        let result2 = server.handle_attach_worktree(args).await.unwrap();
+        let text = match &result2.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert!(
+            text.contains("already attached"),
+            "second attach should be idempotent; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_then_static_analysis_routes_to_it() {
+        let server_root_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        let canonical_wt = wt_tmp.path().canonicalize().unwrap();
+        let src_dir = canonical_wt.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let target_file = src_dir.join("lib.rs");
+        std::fs::write(&target_file, "// stub\n").unwrap();
+
+        let server = server_with_root_and_ttl(server_root_tmp.path().to_path_buf(), 300);
+
+        // Attach via the new MCP tool.
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let _ = server.handle_attach_worktree(attach_args).await.unwrap();
+
+        // Now static-analysis with an absolute path under the worktree must route.
+        let args = serde_json::Map::new();
+        let (root, target) = server
+            .route_static_analysis_target(&args, Some(target_file.to_string_lossy().into_owned()))
+            .await;
+        // Use canonical_wt for the comparison: on macOS, /var/folders/... is a
+        // symlink to /private/var/folders/..., and attach_worktree canonicalizes
+        // before storing root_dir. Comparing against wt_tmp.path() would fail
+        // there.
+        assert_eq!(root, canonical_wt);
+        assert_eq!(target.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_rejects_missing_path_arg() {
+        let server = test_server();
+        let result = server.handle_attach_worktree(serde_json::Map::new()).await;
+        assert!(result.is_err(), "missing path should be a hard error");
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_rejects_nonexistent_path() {
+        let server = test_server();
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!("/nonexistent/contextplus-attach-test-xyz"),
+        );
+        let result = server.handle_attach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn route_static_analysis_target_falls_back_when_no_ref_matches() {
+        let server = test_server();
+        // Absolute path that lives nowhere near any registered ref.
+        let unrelated = std::env::temp_dir().join("nowhere-cp-route-test-xyz/file.rs");
+        let args = serde_json::Map::new();
+        let (root, target) = server
+            .route_static_analysis_target(&args, Some(unrelated.to_string_lossy().into_owned()))
+            .await;
+        // No matching ref → fall back to resolve_root, which returns server root,
+        // and the absolute target stays as-is (caller's problem if it doesn't fit).
+        assert_eq!(root, server.state.root_dir);
+        assert_eq!(
+            target.as_deref(),
+            Some(unrelated.to_string_lossy().as_ref())
+        );
     }
 
     // ---------------------------------------------------------------

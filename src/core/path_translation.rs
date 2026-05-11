@@ -213,16 +213,55 @@ pub fn json_contains_string(value: &serde_json::Value, needle: &str) -> bool {
 /// Returns `Ok(translated_args)` on success, or the first
 /// [`PathTranslationError`] encountered.
 pub fn translate_input_args(
+    args: serde_json::Map<String, serde_json::Value>,
+    caller_root: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, PathTranslationError> {
+    translate_input_args_with_allowed_roots(args, caller_root, &[])
+}
+
+/// Like [`translate_input_args`] but also accepts absolute paths that fall
+/// under any of `allowed_extra_roots` — those paths are passed through
+/// **unchanged** (not rewritten relative).
+///
+/// The intent: some tools route to OTHER registered worktrees (e.g.
+/// `run_static_analysis` with an absolute `target_path` under a foreign ref).
+/// Those calls are not a leakage risk because:
+///
+/// 1. The path is opt-in — the caller supplied it.
+/// 2. The destination ref is one the daemon already has in its registry
+///    (registered explicitly via `attach_worktree`, or via a per-worktree
+///    session handshake).
+///
+/// Translation strips the caller_root prefix, which would corrupt foreign
+/// absolute paths; instead we pass them through and let the tool handler do
+/// the registry-aware routing.
+pub fn translate_input_args_with_allowed_roots(
     mut args: serde_json::Map<String, serde_json::Value>,
     caller_root: &Path,
+    allowed_extra_roots: &[&Path],
 ) -> Result<serde_json::Map<String, serde_json::Value>, PathTranslationError> {
     const PATH_KEYS: &[&str] = &["file_path", "path", "root_dir", "target_path", "rootDir"];
 
     for key in PATH_KEYS {
         if let Some(serde_json::Value::String(raw)) = args.get(*key) {
             let raw_clone = raw.clone();
-            let translated = translate_input_path(&raw_clone, caller_root)?;
-            args.insert(key.to_string(), serde_json::Value::String(translated));
+            // Try caller_root first (preserves the relative-rewrite behavior).
+            match translate_input_path(&raw_clone, caller_root) {
+                Ok(translated) => {
+                    args.insert(key.to_string(), serde_json::Value::String(translated));
+                }
+                Err(e) => {
+                    // Out of caller's tree — accept only if the absolute path
+                    // lives under a registered foreign ref. Pass through verbatim.
+                    let p = Path::new(&raw_clone);
+                    let allowed =
+                        p.is_absolute() && allowed_extra_roots.iter().any(|r| p.starts_with(r));
+                    if !allowed {
+                        return Err(e);
+                    }
+                    // Pass through unchanged.
+                }
+            }
         }
     }
 
