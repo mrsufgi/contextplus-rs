@@ -6451,8 +6451,11 @@ mod tests {
 
         server.spawn_ref_warmup(ref_id);
 
-        // Wait up to 3 s for the background task to populate the cache.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Wait up to 10 s for the background task to populate the cache.
+        // 3 s was tight enough on slow CI runners (notably Ubuntu under load)
+        // that the walk + tree-sitter parse occasionally missed the window;
+        // 10 s gives generous headroom without slowing the happy path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             {
                 let ref_index = server.state.ref_index(ref_id).unwrap();
@@ -6462,7 +6465,7 @@ mod tests {
                 }
             }
             if std::time::Instant::now() > deadline {
-                panic!("ref_warmup shallow: project_cache never populated within 3s");
+                panic!("ref_warmup shallow: project_cache never populated within 10s");
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
