@@ -180,8 +180,11 @@ pub struct RefIndex {
     /// dropped, decrementing the tracker handle's Arc; when the last clone is
     /// dropped the tracker stops automatically.
     ///
-    /// TODO(U11): wire per-ref `ensure_tracker_started` so non-default refs
-    /// start their own trackers on `canonical_root`, not the primary root.
+    /// Started lazily by `ContextPlusServer::ensure_tracker_started` (for the
+    /// current session's ref) or eagerly at attach time via
+    /// `ensure_tracker_started_for(ref_id)` — both route through
+    /// `with_session` so the refresh callback and `incremental_reembed` touch
+    /// this ref's caches, not the default ref's.
     pub tracker_handle: Arc<std::sync::Mutex<Option<EmbeddingTrackerHandle>>>,
 
     /// Cached project state (walked file entries + raw content).
