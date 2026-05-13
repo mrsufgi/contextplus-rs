@@ -229,6 +229,11 @@ async fn daemon_serves_two_concurrent_clients() {
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 }
 
+// Serialized under the existing daemon_env group: parallel macOS load can
+// leave flock not yet released between the drop and the next acquire on the
+// same path, even though the test logic is correct in isolation. Routing all
+// flock-touching tests through one well-ordered group makes this deterministic.
+#[serial(daemon_env)]
 #[tokio::test]
 async fn lock_serializes_two_daemon_attempts() {
     let dir = TempDir::new().unwrap();
@@ -524,6 +529,9 @@ async fn connect_or_spawn_times_out_when_no_daemon_binary() {
 // since main.rs fns are private, but we can check the daemon enum variants)
 // ---------------------------------------------------------------------------
 
+// Serialized for the same reason as lock_serializes_two_daemon_attempts above:
+// flock release latency on parallel macOS runners.
+#[serial(daemon_env)]
 #[test]
 fn acquire_outcome_variants_are_distinct() {
     // Exercise AcquireOutcome::{Acquired, AlreadyRunning} in a way that
