@@ -58,7 +58,7 @@ fn build_tool_definitions() -> Vec<Tool> {
         ),
         make_tool(
             "get_blast_radius",
-            "Find every file that imports or references a symbol. Maps the full impact of changing it.",
+            "Find every file that imports or references a symbol. Maps the full impact of changing it. Scans one worktree's indexed tree, so a zero-usage result only means \"unused in the scanned worktree\" — not globally unused.",
             &[
                 (
                     "symbol_name",
@@ -71,6 +71,12 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "string",
                     false,
                     "The file where the symbol is defined. Excludes the definition line from results.",
+                ),
+                (
+                    "path",
+                    "string",
+                    false,
+                    "Root of an attached worktree to scan instead of the current one. Must already be attached via attach_worktree. Use this to trace a symbol on a feature branch from the primary checkout.",
                 ),
             ],
         ),
@@ -452,7 +458,7 @@ fn build_tool_definitions() -> Vec<Tool> {
         // --- 5 new tools wired in this PR ---
         make_tool(
             "find_dead_code",
-            "Heuristic scan for potentially unused symbols. Reports symbols whose names do not appear as tokens in any other indexed file. Advisory only.",
+            "Heuristic scan for potentially unused symbols. Reports symbols whose names do not appear as tokens in any other indexed file. Advisory only — scans one worktree's indexed tree, so a symbol used on another branch/worktree can show up as a false positive.",
             &[
                 (
                     "ignore_kinds",
@@ -471,6 +477,12 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "integer",
                     false,
                     "Cap on number of reported candidates (default 200).",
+                ),
+                (
+                    "path",
+                    "string",
+                    false,
+                    "Root of an attached worktree to scan instead of the current one. Must already be attached via attach_worktree.",
                 ),
             ],
         ),

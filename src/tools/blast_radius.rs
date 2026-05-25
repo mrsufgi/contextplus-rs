@@ -121,13 +121,27 @@ pub fn find_symbol_usages(
     BlastRadiusResult { by_file }
 }
 
-/// Format blast radius results as text output (matching TS format).
-pub fn format_blast_radius(symbol_name: &str, result: &BlastRadiusResult) -> String {
+/// Format blast radius results as text output.
+///
+/// `scanned_root` and `files_scanned` describe the worktree that was actually
+/// searched. They are surfaced on the zero-result path so a negative cannot be
+/// mistaken for a global "this symbol does not exist" truth: blast radius only
+/// sees one worktree's indexed tree, so a symbol defined on another branch or
+/// in an unattached worktree reads as zero usages here. Callers use this output
+/// to judge dead code, so an unscoped "used nowhere" is a dangerous over-claim.
+pub fn format_blast_radius(
+    symbol_name: &str,
+    result: &BlastRadiusResult,
+    scanned_root: &str,
+    files_scanned: usize,
+) -> String {
     let total = result.total_usages();
     if total == 0 {
         return format!(
-            "Symbol \"{}\" is not used anywhere in the codebase.",
-            symbol_name
+            "Symbol \"{symbol_name}\" has no references in {scanned_root} ({files_scanned} files scanned).\n\
+             \u{26A0} This result is scoped to the worktree that was scanned — it is NOT proof the symbol is unused everywhere. \
+             If the symbol lives on another branch or in a separate worktree, attach that worktree with `attach_worktree` \
+             and pass its `path` to `get_blast_radius` before concluding the code is dead."
         );
     }
 
@@ -186,7 +200,12 @@ pub async fn get_blast_radius(
 
     let result = find_symbol_usages(symbol_name, options.file_context.as_deref(), &file_content);
 
-    Ok(format_blast_radius(symbol_name, &result))
+    Ok(format_blast_radius(
+        symbol_name,
+        &result,
+        &options.root_dir.display().to_string(),
+        file_content.len(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -294,10 +313,18 @@ mod tests {
         let result = BlastRadiusResult {
             by_file: HashMap::new(),
         };
-        let output = format_blast_radius("myFunc", &result);
-        assert_eq!(
-            output,
-            "Symbol \"myFunc\" is not used anywhere in the codebase."
+        let output = format_blast_radius("myFunc", &result, "/repo/main", 1234);
+        // The zero-result message must NOT assert a global truth, and must name
+        // the scanned scope so a wrong-worktree negative is self-evident.
+        assert!(
+            !output.contains("not used anywhere in the codebase"),
+            "zero-result must not over-claim global absence, got: {output}"
+        );
+        assert!(output.contains("no references in /repo/main"));
+        assert!(output.contains("1234 files scanned"));
+        assert!(
+            output.contains("attach_worktree"),
+            "zero-result must point the caller at attach_worktree, got: {output}"
         );
     }
 
@@ -311,7 +338,7 @@ mod tests {
         let mut by_file = HashMap::new();
         by_file.insert("src/handler.ts".to_string(), vec![usage]);
         let result = BlastRadiusResult { by_file };
-        let output = format_blast_radius("myFunc", &result);
+        let output = format_blast_radius("myFunc", &result, "/repo", 10);
         assert!(output.contains("LOW USAGE"));
         assert!(output.contains("1 time(s)"));
     }
@@ -343,7 +370,7 @@ mod tests {
             }],
         );
         let result = BlastRadiusResult { by_file };
-        let output = format_blast_radius("myFunc", &result);
+        let output = format_blast_radius("myFunc", &result, "/repo", 42);
         assert!(output.contains("3 usages in 2 files"));
         assert!(output.contains("src/a.ts:"));
         assert!(output.contains("src/b.ts:"));
@@ -375,7 +402,7 @@ mod tests {
         let mut by_file = HashMap::new();
         by_file.insert("src/handler.ts".to_string(), vec![usage]);
         let result = BlastRadiusResult { by_file };
-        let output = format_blast_radius("myFunc", &result);
+        let output = format_blast_radius("myFunc", &result, "/repo", 10);
         assert!(
             output.contains("\u{26A0} LOW USAGE"),
             "Low usage warning should use warning emoji, got: {}",

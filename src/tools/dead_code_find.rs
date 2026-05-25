@@ -140,15 +140,32 @@ fn collect_dead(
     }
 }
 
-/// Format a list of dead symbols as text for tool output.
-pub fn format_dead_symbols(items: &[DeadSymbol]) -> String {
+/// Format dead-symbol candidates as text output.
+///
+/// `scanned_root` and `files_scanned` describe the worktree that was actually
+/// searched. The "dead" verdict is computed from cross-file token usage inside
+/// that single tree, so a symbol referenced only on another branch or in an
+/// unattached worktree shows up here as a false positive. Both the empty and
+/// non-empty paths surface the scope so the result is never mistaken for a
+/// cross-worktree "this is safe to delete" guarantee.
+pub fn format_dead_symbols(
+    items: &[DeadSymbol],
+    scanned_root: &str,
+    files_scanned: usize,
+) -> String {
     if items.is_empty() {
-        return "No dead-symbol candidates found.".to_string();
+        return format!(
+            "No dead-symbol candidates found in {scanned_root} ({files_scanned} files scanned)."
+        );
     }
-    let mut lines = vec![format!("Found {} dead-symbol candidate(s):", items.len())];
+    let mut lines = vec![format!(
+        "Found {} dead-symbol candidate(s) in {scanned_root} ({files_scanned} files scanned):",
+        items.len()
+    )];
     lines.push(
-        "(Heuristic — verify before deletion. Public APIs, trait methods, \
-         and reflection-invoked symbols may show up here.)"
+        "(Heuristic — verify before deletion. This only scans the worktree above; public APIs, \
+         trait methods, reflection-invoked symbols, and references on other branches/worktrees \
+         may show up here. Attach the relevant worktree and pass its `path` before deleting.)"
             .to_string(),
     );
     lines.push(String::new());
@@ -332,7 +349,9 @@ mod tests {
 
     #[test]
     fn format_output_handles_empty() {
-        assert_eq!(format_dead_symbols(&[]), "No dead-symbol candidates found.");
+        let out = format_dead_symbols(&[], "/repo/main", 1234);
+        assert!(out.contains("No dead-symbol candidates found in /repo/main"));
+        assert!(out.contains("1234 files scanned"));
     }
 
     #[test]
@@ -343,10 +362,13 @@ mod tests {
             kind: "function".to_string(),
             line: 42,
         }];
-        let out = format_dead_symbols(&items);
+        let out = format_dead_symbols(&items, "/repo", 7);
         assert!(out.contains("src/foo.rs:42"));
         assert!(out.contains("function bar"));
         assert!(out.contains("1 dead-symbol candidate"));
+        // Scope must be surfaced so a candidate list isn't read as global truth.
+        assert!(out.contains("/repo") && out.contains("7 files scanned"));
+        assert!(out.contains("other branches/worktrees"));
     }
 
     /// End-to-end: parse TypeScript with a destructure binding, then run the
