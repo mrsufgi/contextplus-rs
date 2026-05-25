@@ -1084,8 +1084,20 @@ impl ContextPlusServer {
     /// All filesystem I/O runs inside `spawn_blocking`.
     /// Uses Arc to avoid deep-cloning the entire cache on every tool call.
     async fn ensure_project_cache(&self) -> Result<Arc<ProjectCache>> {
-        let ttl_secs = self.state.config.cache_ttl_secs;
         let ref_index = self.current_ref();
+        self.ensure_project_cache_for(&ref_index).await
+    }
+
+    /// Build-or-reuse the walked file cache for a **specific** ref, rather than
+    /// the session's `current_ref()`. Used by tools that can be directed at an
+    /// attached worktree (e.g. `get_blast_radius` with a `path` arg) so the scan
+    /// runs against the worktree the caller asked for instead of silently
+    /// answering from the connection's primary ref.
+    async fn ensure_project_cache_for(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+    ) -> Result<Arc<ProjectCache>> {
+        let ttl_secs = self.state.config.cache_ttl_secs;
 
         // Fast path: cache exists and is fresh — just clone the Arc (cheap)
         {
@@ -1820,6 +1832,37 @@ impl ContextPlusServer {
         Ok(Self::ok_text(result))
     }
 
+    /// Resolve which worktree a scope-limited read tool should scan.
+    ///
+    /// Default: the session's `current_ref()`. When `path` is provided it must
+    /// be an **already-attached** worktree (registered via `attach_worktree`);
+    /// otherwise we return an error result instead of silently scanning a
+    /// different tree. That silent fallback is exactly what made `get_blast_radius`
+    /// and `find_dead_code` report symbols defined on another branch as
+    /// "used nowhere" / "dead". `Err` carries a ready-to-return error result.
+    fn resolve_scan_target(
+        &self,
+        args: &serde_json::Map<String, Value>,
+        tool: &str,
+    ) -> std::result::Result<Arc<crate::ref_index::RefIndex>, CallToolResult> {
+        let Some(path) = Self::get_str(args, "path") else {
+            return Ok(self.current_ref());
+        };
+        let canonical = PathBuf::from(&path)
+            .canonicalize()
+            .map_err(|e| Self::err_text(format!("Cannot canonicalize path {path}: {e}")))?;
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        self.state.ref_index(ref_id).ok_or_else(|| {
+            Self::err_text(format!(
+                "Worktree not attached: {}\n\
+                 Call `attach_worktree` with this path first, then retry `{tool}` with the same \
+                 `path`. Without an attached ref the scan would fall back to a different worktree \
+                 and could wrongly report the symbol as unused/dead.",
+                canonical.display()
+            ))
+        })
+    }
+
     async fn handle_blast_radius(
         &self,
         args: serde_json::Map<String, Value>,
@@ -1828,16 +1871,30 @@ impl ContextPlusServer {
             .ok_or_else(|| ContextPlusError::Other("symbol_name is required".into()))?;
         let file_context = Self::get_str(&args, "file_context");
 
-        let cache = self.ensure_project_cache().await?;
+        // Optional `path` targets an attached worktree (e.g. reviewing a feature
+        // branch from the primary). Defaults to the session's current ref.
+        let ref_index = match self.resolve_scan_target(&args, "get_blast_radius") {
+            Ok(r) => r,
+            Err(err) => return Ok(err),
+        };
+
+        let scanned_root = ref_index.root_dir.display().to_string();
+        let cache = self.ensure_project_cache_for(&ref_index).await?;
 
         // find_symbol_usages scans all file content — CPU-bound, run in blocking thread pool.
         let formatted = tokio::task::spawn_blocking(move || {
+            let files_scanned = cache.file_content.len();
             let result = crate::tools::blast_radius::find_symbol_usages(
                 &symbol_name,
                 file_context.as_deref(),
                 &cache.file_content,
             );
-            crate::tools::blast_radius::format_blast_radius(&symbol_name, &result)
+            crate::tools::blast_radius::format_blast_radius(
+                &symbol_name,
+                &result,
+                &scanned_root,
+                files_scanned,
+            )
         })
         .await
         .map_err(|e| ContextPlusError::Other(format!("blast_radius spawn_blocking failed: {e}")))?;
@@ -2554,7 +2611,15 @@ impl ContextPlusServer {
             DeadCodeOptions, find_dead_symbols, format_dead_symbols,
         };
 
-        let cache = self.ensure_project_cache().await?;
+        // Optional `path` targets an attached worktree. Defaults to the session's
+        // current ref. Routing only via `current_ref()` would let a symbol used
+        // on another branch be reported as dead from the wrong tree.
+        let ref_index = match self.resolve_scan_target(&args, "find_dead_code") {
+            Ok(r) => r,
+            Err(err) => return Ok(err),
+        };
+        let scanned_root = ref_index.root_dir.display().to_string();
+        let cache = self.ensure_project_cache_for(&ref_index).await?;
 
         let ignore_kinds: Option<std::collections::HashSet<String>> =
             Self::get_string_array(&args, "ignore_kinds")
@@ -2567,6 +2632,7 @@ impl ContextPlusServer {
         let max_results = Self::get_usize(&args, "max_results").filter(|&n| n > 0);
 
         let formatted = tokio::task::spawn_blocking(move || {
+            let files_scanned = cache.file_content.len();
             let symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
                 build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
             let mut tokens_by_file: HashMap<PathBuf, std::collections::HashSet<String>> =
@@ -2594,7 +2660,7 @@ impl ContextPlusServer {
             }
 
             let dead = find_dead_symbols(&symbols_by_file, &tokens_by_file, &opts);
-            format_dead_symbols(&dead)
+            format_dead_symbols(&dead, &scanned_root, files_scanned)
         })
         .await
         .map_err(|e| {
@@ -5048,6 +5114,195 @@ mod tests {
             text.contains("symbol_name is required"),
             "expected symbol_name error, got: {}",
             text
+        );
+    }
+
+    #[tokio::test]
+    async fn blast_radius_path_to_unattached_worktree_returns_actionable_error() {
+        // A `path` that is a real directory but was never `attach_worktree`d must
+        // NOT silently fall back to the current ref (that fallback is what made
+        // the tool scan the wrong tree). It must error and tell the caller to
+        // attach first.
+        let primary = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let server = server_with_root_and_ttl(primary.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert("symbol_name".to_string(), json!("doThing"));
+        args.insert(
+            "path".to_string(),
+            json!(
+                other
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            ),
+        );
+
+        let result = server.dispatch("get_blast_radius", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("not attached") && text.contains("attach_worktree"),
+            "expected actionable not-attached error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blast_radius_path_routes_to_attached_worktree_not_primary() {
+        // Regression: reviewing a feature branch from the primary checkout.
+        // The symbol exists ONLY in the attached worktree. Routing via the
+        // session's primary ref (default, as in stdio mode) reported it as
+        // "used nowhere"; passing the worktree `path` must find the real usages.
+        let primary = tempfile::tempdir().unwrap();
+        // Primary tree has the symbol's *name* nowhere.
+        std::fs::write(primary.path().join("main.ts"), "export const z = 1;\n").unwrap();
+        let server = server_with_root_and_ttl(primary.path().to_path_buf(), 300);
+
+        // Build a separate worktree on disk that *does* use the symbol.
+        let wt = tempfile::tempdir().unwrap();
+        let canonical_wt = wt.path().canonicalize().unwrap();
+        std::fs::create_dir_all(canonical_wt.join("src")).unwrap();
+        std::fs::write(
+            canonical_wt.join("src/app.ts"),
+            "import { rlsAutoTxExtension } from './rls';\nprisma.$extends(rlsAutoTxExtension);\n",
+        )
+        .unwrap();
+
+        // Register the worktree as an attached ref (what attach_worktree does).
+        let wt_ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        {
+            let mut guard = server.state.refs.write().await;
+            guard.insert(
+                wt_ref_id,
+                std::sync::Arc::new(crate::ref_index::RefIndex::new(
+                    canonical_wt.clone(),
+                    canonical_wt.clone(),
+                    None,
+                )),
+            );
+        }
+
+        // Without `path`: scans the primary, finds nothing → scoped zero-result
+        // that does NOT claim global absence.
+        let mut bare = serde_json::Map::new();
+        bare.insert("symbol_name".to_string(), json!("rlsAutoTxExtension"));
+        let bare_text = match &server.dispatch("get_blast_radius", bare).await.content[0].raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(
+            bare_text.contains("no references") && !bare_text.contains("anywhere in the codebase"),
+            "primary scan should be a scoped miss, got: {bare_text}"
+        );
+
+        // With `path`: routes to the attached worktree and finds the usages.
+        let mut targeted = serde_json::Map::new();
+        targeted.insert("symbol_name".to_string(), json!("rlsAutoTxExtension"));
+        targeted.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let result = server.dispatch("get_blast_radius", targeted).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert!(
+            text.contains("src/app.ts") && text.contains("usages"),
+            "targeted scan should find usages in the attached worktree, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_dead_code_path_to_unattached_worktree_returns_actionable_error() {
+        // Same routing guard as blast radius: a non-attached `path` must error,
+        // and the error must name `find_dead_code` (verifies the helper threads
+        // the tool name through).
+        let primary = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let server = server_with_root_and_ttl(primary.path().to_path_buf(), 300);
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(
+                other
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            ),
+        );
+
+        let result = server.dispatch("find_dead_code", args).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("not attached") && text.contains("attach_worktree"),
+            "expected actionable not-attached error, got: {text}"
+        );
+        assert!(
+            text.contains("find_dead_code"),
+            "error should name the calling tool, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_dead_code_path_routes_to_attached_worktree() {
+        // The dead-code scan must run against the attached worktree, not the
+        // session's primary ref — otherwise it judges "dead" from the wrong tree.
+        let primary = tempfile::tempdir().unwrap();
+        std::fs::write(primary.path().join("p.ts"), "export const z = 1;\n").unwrap();
+        let server = server_with_root_and_ttl(primary.path().to_path_buf(), 300);
+
+        let wt = tempfile::tempdir().unwrap();
+        let canonical_wt = wt.path().canonicalize().unwrap();
+        std::fs::create_dir_all(canonical_wt.join("src")).unwrap();
+        std::fs::write(
+            canonical_wt.join("src/lib.ts"),
+            "export function unusedThing() { return 1; }\n",
+        )
+        .unwrap();
+
+        let wt_ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        {
+            let mut guard = server.state.refs.write().await;
+            guard.insert(
+                wt_ref_id,
+                std::sync::Arc::new(crate::ref_index::RefIndex::new(
+                    canonical_wt.clone(),
+                    canonical_wt.clone(),
+                    None,
+                )),
+            );
+        }
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        let result = server.dispatch("find_dead_code", args).await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        // The scope line names the scanned root, proving routing hit the worktree.
+        assert!(
+            text.contains(&canonical_wt.display().to_string()),
+            "find_dead_code should scope output to the attached worktree, got: {text}"
         );
     }
 
