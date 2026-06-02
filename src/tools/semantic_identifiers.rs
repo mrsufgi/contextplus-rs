@@ -13,7 +13,9 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::error::{ContextPlusError, Result};
-use crate::tools::scoring::{DEFAULT_TOP_K, clamp01, keyword_coverage, normalize_weight};
+use crate::tools::scoring::{
+    DEFAULT_TOP_K, clamp01, keyword_coverage, normalize_weight, truncate_on_char_boundary,
+};
 use crate::tools::semantic_search::{cosine, sanitize_query, split_camel_case};
 
 // ---------------------------------------------------------------------------
@@ -360,11 +362,7 @@ pub fn rank_call_sites(
             }
 
             let context = line.trim();
-            let context = if context.len() > 220 {
-                &context[..220]
-            } else {
-                context
-            };
+            let context = truncate_on_char_boundary(context, 220);
             // Reuse buffer instead of format! allocation per iteration
             keyword_buf.clear();
             keyword_buf.push_str(file);
@@ -401,11 +399,7 @@ pub fn rank_call_sites(
             let (file, lines) = &file_entries[*fi];
             let raw_line = lines[*line_idx];
             let context = raw_line.trim();
-            let context = if context.len() > 220 {
-                &context[..220]
-            } else {
-                context
-            };
+            let context = truncate_on_char_boundary(context, 220);
 
             let semantic_score = callsite_vectors
                 .and_then(|provider| {

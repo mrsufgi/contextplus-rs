@@ -63,6 +63,26 @@ pub fn keyword_coverage(query_terms: &HashSet<String>, doc_tokens: &HashSet<Stri
     matched as f64 / query_terms.len() as f64
 }
 
+/// Truncate `s` to at most `max_bytes` bytes **without splitting a UTF-8
+/// character**.
+///
+/// Plain `&s[..max_bytes]` panics when `max_bytes` lands inside a multi-byte
+/// char (e.g. the box-drawing `═`, U+2550, is 3 bytes) — this is exactly the
+/// crash that took down the semantic-search daemon on markdown banner lines
+/// like `# ═══…`.  This helper floors the cut to the nearest preceding char
+/// boundary instead, and returns `s` unchanged when it already fits.
+#[inline]
+pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -126,5 +146,27 @@ mod tests {
         let query: HashSet<String> = HashSet::new();
         let doc: HashSet<String> = ["get"].iter().map(|s| s.to_string()).collect();
         assert_eq!(keyword_coverage(&query, &doc), 0.0);
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_caps_ascii_exactly() {
+        assert_eq!(truncate_on_char_boundary("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_short_string_unchanged() {
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_does_not_split_multibyte() {
+        // Regression: box-drawing '═' (U+2550) is 3 bytes; a banner line that
+        // exceeds the cap must not panic and must not split the char. This is
+        // the exact input that crashed the daemon on '# ═══…' markdown banners.
+        let banner = format!("# {}", "═".repeat(60)); // 2 + 60*3 = 182 bytes
+        let out = truncate_on_char_boundary(&banner, 120);
+        assert!(out.len() <= 120);
+        assert!(banner.starts_with(out));
+        assert!(out.chars().all(|c| c == '#' || c == ' ' || c == '═'));
     }
 }

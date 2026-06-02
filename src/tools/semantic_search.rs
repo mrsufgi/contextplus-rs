@@ -18,7 +18,7 @@ use crate::core::embeddings::VectorStore;
 use crate::error::{ContextPlusError, Result};
 use crate::tools::scoring::{
     DEFAULT_KEYWORD_WEIGHT, DEFAULT_SEMANTIC_WEIGHT, DEFAULT_TOP_K, clamp01, keyword_coverage,
-    normalize_weight,
+    normalize_weight, truncate_on_char_boundary,
 };
 
 /// Maximum additive bonus from recency (kept small so it nudges ties, not
@@ -96,11 +96,7 @@ pub fn extract_plain_text_header(content: &str) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        let capped = if trimmed.len() > 120 {
-            &trimmed[..120]
-        } else {
-            trimmed
-        };
+        let capped = truncate_on_char_boundary(trimmed, 120);
         header_lines.push(capped);
         if header_lines.len() >= 2 {
             break;
