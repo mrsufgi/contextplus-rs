@@ -1,8 +1,8 @@
 // File-system embedding tracker for realtime cache refresh on source changes
 // Watches for file modifications and triggers debounced embedding refreshes
 
-use notify_debouncer_full::notify::RecursiveMode;
-use notify_debouncer_full::{DebounceEventResult, new_debouncer};
+use notify_debouncer_full::notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -289,7 +289,21 @@ pub fn start_tracker(
         }
     };
 
-    let mut debouncer = new_debouncer(Duration::from_millis(debounce_ms), None, event_handler)?;
+    // NoCache + follow_symlinks(false): the default FileIdMap cache walks the
+    // whole tree with follow_links(true) to fingerprint every file, and the
+    // inotify backend likewise descends into symlinked directories. A symlink
+    // inside the root that points at a large external tree (e.g.
+    // `.worktrees -> ~/worktrees`) turns startup into a multi-million-inode
+    // walk that starves the daemon accept loop. File-id rename pairing is not
+    // needed here: the handler only collects paths, and the metadata cache
+    // already dedupes spurious events per path.
+    let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+        Duration::from_millis(debounce_ms),
+        None,
+        event_handler,
+        NoCache,
+        NotifyConfig::default().with_follow_symlinks(false),
+    )?;
 
     debouncer.watch(&root_dir, RecursiveMode::Recursive)?;
 
@@ -815,6 +829,50 @@ mod tests {
             Ok(None) | Err(_) => {
                 // Expected: no event received (timeout or channel closed)
             }
+        }
+
+        handle.stop().await;
+    }
+
+    /// A symlink inside the watch root pointing at a directory outside it
+    /// must not be descended into: neither inotify watches nor debouncer
+    /// file-id scans may escape the root. Guards against workspace symlinks
+    /// (e.g. `.worktrees -> ~/worktrees`) pulling millions of external
+    /// inodes into the watcher during startup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracker_does_not_follow_symlinked_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let external = tempfile::TempDir::new().unwrap();
+        let external_src = external.path().join("big");
+        std::fs::create_dir_all(&external_src).unwrap();
+        std::os::unix::fs::symlink(&external_src, root.join("linked")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<Vec<String>>(16);
+        let callback: RefreshCallback = Arc::new(move |_root, files| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(files).await;
+                (0, 0)
+            })
+        });
+
+        let config = EmbeddingTrackerConfig {
+            debounce_ms: 200,
+            max_files_per_tick: 8,
+            ignore_dirs: default_ignore_dirs(),
+        };
+
+        let handle = start_tracker(root.clone(), config, callback).expect("tracker should start");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(external_src.join("escape.rs"), "fn main() {}").unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        if let Ok(Some(files)) = result {
+            panic!("watcher followed symlink out of root, got: {:?}", files);
         }
 
         handle.stop().await;
