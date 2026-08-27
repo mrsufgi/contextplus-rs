@@ -1,8 +1,9 @@
 // File-system embedding tracker for realtime cache refresh on source changes
 // Watches for file modifications and triggers debounced embedding refreshes
 
+use ignore::WalkBuilder;
 use notify_debouncer_full::notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -133,6 +134,80 @@ fn normalize_relative_path(path: &Path) -> String {
     s.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
+/// Hard ceiling on directories the watcher registers. A pathological root
+/// (e.g. a symlink into a machine-wide tree that is not ignored) loses
+/// watch coverage past this point instead of exhausting the OS watch table
+/// and starving the daemon.
+const MAX_WATCHED_DIRS: usize = 100_000;
+
+/// Register a NonRecursive watch on every directory under `start_dir` that
+/// the indexer would visit, mirroring walker::walk_directory's semantics:
+/// hidden and gitignored paths are pruned, `ignore_dirs` segments are
+/// pruned, and symlinked directories are followed. Pruning at install time
+/// (not just event time) is what keeps a symlink to a huge external tree
+/// (e.g. `.worktrees -> ~/worktrees`) from exploding the watch table, while
+/// a symlinked source directory still gets watched like any other.
+///
+/// With `collect_files` the walk also returns the normalized relative path
+/// of every file it passes — used by the dynamic-add path so files written
+/// into a directory before its watch existed are still picked up.
+fn install_dir_watches(
+    debouncer: &mut Debouncer<RecommendedWatcher, NoCache>,
+    root_dir: &Path,
+    start_dir: &Path,
+    ignore_dirs: &HashSet<String>,
+    watched_dirs: &mut usize,
+    collect_files: bool,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut builder = WalkBuilder::new(start_dir);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .follow_links(true);
+    for entry in builder.build().flatten() {
+        let path = entry.path();
+        let relative = match path.strip_prefix(root_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if !should_track(relative, ignore_dirs) {
+            continue;
+        }
+        if !entry.file_type().is_some_and(|t| t.is_dir()) {
+            if collect_files {
+                let normalized = normalize_relative_path(relative);
+                if !normalized.is_empty() {
+                    files.push(normalized);
+                }
+            }
+            continue;
+        }
+        if *watched_dirs >= MAX_WATCHED_DIRS {
+            warn!(
+                "Embedding tracker watch cap ({}) reached at {}; further directories are not watched",
+                MAX_WATCHED_DIRS,
+                path.display()
+            );
+            return files;
+        }
+        match debouncer.watch(path, RecursiveMode::NonRecursive) {
+            Ok(()) => *watched_dirs += 1,
+            Err(e) => debug!(
+                "Embedding tracker could not watch {}: {}",
+                path.display(),
+                e
+            ),
+        }
+    }
+    files
+}
+
 /// Handle for controlling a running embedding tracker.
 /// Dropping this handle will stop the tracker.
 pub struct EmbeddingTrackerHandle {
@@ -190,6 +265,12 @@ pub fn start_tracker(
     // diff` would starve the debouncer.
     let (hook_tx, mut hook_rx) = mpsc::channel::<String>(16);
 
+    // Directories that appear after startup (created, renamed in, or
+    // symlinked in) need their own watches. The notify handler pushes them
+    // here; the consumer task, which owns the debouncer, installs the
+    // watches and heals over any files that landed before the watch existed.
+    let (watch_tx, mut watch_rx) = mpsc::channel::<PathBuf>(64);
+
     // Per-tracker mtime+size cache so spurious watcher events (e.g. chmod,
     // touch-without-change, atime updates) for unchanged files are dropped
     // before we incur file-read + hashing cost downstream.
@@ -214,9 +295,11 @@ pub fn start_tracker(
     let handler_meta_cache = metadata_cache.clone();
     let handler_sentinel_dir = sentinel_dir.clone();
     let handler_hook_tx = hook_tx.clone();
-    // Clone event_tx for the resolver task; the handler closure below takes
-    // ownership of the original.
+    let handler_watch_tx = watch_tx.clone();
+    // Clone event_tx for the resolver task and the consumer's dynamic-watch
+    // heal path; the handler closure below takes ownership of the original.
     let resolver_event_tx = event_tx.clone();
+    let consumer_event_tx = event_tx.clone();
 
     let event_handler = move |result: DebounceEventResult| match result {
         Ok(events) => {
@@ -245,6 +328,19 @@ pub fn start_tracker(
                         Err(_) => continue,
                     };
                     if !should_track(&relative, &ignore_dirs) {
+                        continue;
+                    }
+                    // A directory event means new watchable ground, not a
+                    // file change: queue it for watch installation and let
+                    // the install-time scan surface any files inside.
+                    if path.is_dir() {
+                        if let Err(e) = handler_watch_tx.try_send(path.clone()) {
+                            debug!(
+                                "Embedding tracker watch queue full, dropping {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
                         continue;
                     }
                     let normalized = normalize_relative_path(&relative);
@@ -289,23 +385,35 @@ pub fn start_tracker(
         }
     };
 
-    // NoCache + follow_symlinks(false): the default FileIdMap cache walks the
-    // whole tree with follow_links(true) to fingerprint every file, and the
-    // inotify backend likewise descends into symlinked directories. A symlink
-    // inside the root that points at a large external tree (e.g.
-    // `.worktrees -> ~/worktrees`) turns startup into a multi-million-inode
-    // walk that starves the daemon accept loop. File-id rename pairing is not
-    // needed here: the handler only collects paths, and the metadata cache
-    // already dedupes spurious events per path.
+    // NoCache: the default FileIdMap cache fingerprints every file under
+    // each watch root up front (a WalkDir with follow_links(true)) — on a
+    // root with a symlink to a huge external tree that walk alone starves
+    // the daemon. Rename pairing is not needed here: the handler only
+    // collects paths, and the metadata cache already dedupes per path.
     let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
         Duration::from_millis(debounce_ms),
         None,
         event_handler,
         NoCache,
-        NotifyConfig::default().with_follow_symlinks(false),
+        NotifyConfig::default(),
     )?;
 
-    debouncer.watch(&root_dir, RecursiveMode::Recursive)?;
+    // Per-directory NonRecursive watches over the same tree the indexer
+    // walks, instead of one Recursive watch on the root: RecursiveMode
+    // cannot be pruned, so it descends into every ignored and symlinked
+    // tree. See install_dir_watches for the semantics.
+    debouncer.watch(&root_dir, RecursiveMode::NonRecursive)?;
+    let mut watched_dirs = 1usize;
+    let walk_ignore_dirs = config.ignore_dirs.clone();
+    install_dir_watches(
+        &mut debouncer,
+        &root_dir,
+        &root_dir,
+        &walk_ignore_dirs,
+        &mut watched_dirs,
+        false,
+    );
+    info!("Embedding tracker watching {} directories", watched_dirs);
 
     // Second watch on the sentinel dir. Non-recursive: nothing nested in
     // `.mcp_data/hooks/` concerns us. Failure here is logged but not fatal —
@@ -380,9 +488,12 @@ pub fn start_tracker(
     // Spawn async task to process batched events
     let root_for_task = root_dir.clone();
     let consumer_meta_cache = metadata_cache.clone();
+    let consumer_ignore_dirs = config.ignore_dirs.clone();
     tokio::spawn(async move {
-        // Keep debouncer alive in this task so it's not dropped
-        let _debouncer = debouncer;
+        // The consumer owns the debouncer: keeps it alive and is the only
+        // place watches are added after startup.
+        let mut debouncer = debouncer;
+        let mut watched_dirs = watched_dirs;
         let mut pending_set: HashSet<String> = HashSet::new();
 
         loop {
@@ -391,6 +502,24 @@ pub fn start_tracker(
                 _ = shutdown_rx.recv() => {
                     debug!("Embedding tracker shutting down");
                     break;
+                }
+                Some(new_dir) = watch_rx.recv() => {
+                    let fresh = install_dir_watches(
+                        &mut debouncer,
+                        &root_for_task,
+                        &new_dir,
+                        &consumer_ignore_dirs,
+                        &mut watched_dirs,
+                        true,
+                    );
+                    // Files written into the directory before its watch
+                    // existed never produced an event — re-inject them
+                    // through the normal event path.
+                    if !fresh.is_empty()
+                        && let Err(e) = consumer_event_tx.try_send(fresh)
+                    {
+                        warn!("Embedding tracker watch heal send failed: {}", e);
+                    }
                 }
                 Some(files) = event_rx.recv() => {
                     let mut dropped: Vec<String> = Vec::new();
@@ -834,23 +963,8 @@ mod tests {
         handle.stop().await;
     }
 
-    /// A symlink inside the watch root pointing at a directory outside it
-    /// must not be descended into: neither inotify watches nor debouncer
-    /// file-id scans may escape the root. Guards against workspace symlinks
-    /// (e.g. `.worktrees -> ~/worktrees`) pulling millions of external
-    /// inodes into the watcher during startup.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn tracker_does_not_follow_symlinked_dirs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_path_buf();
-
-        let external = tempfile::TempDir::new().unwrap();
-        let external_src = external.path().join("big");
-        std::fs::create_dir_all(&external_src).unwrap();
-        std::os::unix::fs::symlink(&external_src, root.join("linked")).unwrap();
-
-        let (tx, mut rx) = mpsc::channel::<Vec<String>>(16);
+    fn capture_callback() -> (RefreshCallback, mpsc::Receiver<Vec<String>>) {
+        let (tx, rx) = mpsc::channel::<Vec<String>>(16);
         let callback: RefreshCallback = Arc::new(move |_root, files| {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -858,21 +972,188 @@ mod tests {
                 (0, 0)
             })
         });
+        (callback, rx)
+    }
 
-        let config = EmbeddingTrackerConfig {
+    fn test_config() -> EmbeddingTrackerConfig {
+        EmbeddingTrackerConfig {
             debounce_ms: 200,
             max_files_per_tick: 8,
             ignore_dirs: default_ignore_dirs(),
-        };
+        }
+    }
 
-        let handle = start_tracker(root.clone(), config, callback).expect("tracker should start");
+    /// A visible, non-ignored symlinked directory is part of the workspace:
+    /// files behind it must produce events like any other source file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracker_watches_visible_symlinked_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let external = tempfile::TempDir::new().unwrap();
+        let target = external.path().join("shared");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("linked")).unwrap();
+
+        let (callback, mut rx) = capture_callback();
+        let handle =
+            start_tracker(root.clone(), test_config(), callback).expect("tracker should start");
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        std::fs::write(external_src.join("escape.rs"), "fn main() {}").unwrap();
+        std::fs::write(target.join("shared_lib.rs"), "fn main() {}").unwrap();
 
-        let result = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
-        if let Ok(Some(files)) = result {
-            panic!("watcher followed symlink out of root, got: {:?}", files);
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(files)) => {
+                assert!(
+                    files.iter().any(|f| f.contains("shared_lib.rs")),
+                    "expected event for file behind visible symlink, got: {:?}",
+                    files
+                );
+            }
+            Ok(None) => panic!("channel closed without receiving event"),
+            Err(_) => {
+                eprintln!("WARNING: file watcher timeout -- may not work in this environment");
+            }
+        }
+
+        handle.stop().await;
+    }
+
+    /// A symlink whose name is on the ignore list must not be watched:
+    /// pruning happens at watch-install time, not just event time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracker_skips_ignored_symlinked_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let external = tempfile::TempDir::new().unwrap();
+        let target = external.path().join("pkgs");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("node_modules")).unwrap();
+
+        let (callback, mut rx) = capture_callback();
+        let handle =
+            start_tracker(root.clone(), test_config(), callback).expect("tracker should start");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(target.join("index.js"), "module.exports = {}").unwrap();
+
+        if let Ok(Some(files)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            panic!(
+                "should not receive events through ignored symlink, got: {:?}",
+                files
+            );
+        }
+
+        handle.stop().await;
+    }
+
+    /// Regression: a hidden symlink like `.worktrees -> ~/worktrees` must
+    /// not be watched at all — before install-time pruning this pulled
+    /// millions of external inodes into the watch table during startup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracker_skips_hidden_symlinked_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let external = tempfile::TempDir::new().unwrap();
+        let target = external.path().join("worktrees");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join(".worktrees")).unwrap();
+
+        let (callback, mut rx) = capture_callback();
+        let handle =
+            start_tracker(root.clone(), test_config(), callback).expect("tracker should start");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(target.join("escape.rs"), "fn main() {}").unwrap();
+
+        if let Ok(Some(files)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            panic!(
+                "should not receive events through hidden symlink, got: {:?}",
+                files
+            );
+        }
+
+        handle.stop().await;
+    }
+
+    /// A gitignored symlink must not be watched — the watcher honors the
+    /// same gitignore rules as the indexer's walk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracker_skips_gitignored_symlinked_dirs() {
+        use std::process::Command;
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("SKIP: git not available");
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        if !Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("SKIP: git init failed");
+            return;
+        }
+        std::fs::write(root.join(".gitignore"), "linked\n").unwrap();
+
+        let external = tempfile::TempDir::new().unwrap();
+        let target = external.path().join("farm");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("linked")).unwrap();
+
+        let (callback, mut rx) = capture_callback();
+        let handle =
+            start_tracker(root.clone(), test_config(), callback).expect("tracker should start");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(target.join("escape.rs"), "fn main() {}").unwrap();
+
+        if let Ok(Some(files)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            panic!(
+                "should not receive events through gitignored symlink, got: {:?}",
+                files
+            );
+        }
+
+        handle.stop().await;
+    }
+
+    /// Directories created while the tracker runs get watches installed
+    /// dynamically, and files that land before the watch exists are healed
+    /// over by the install-time scan.
+    #[tokio::test]
+    async fn tracker_watches_dirs_created_after_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let (callback, mut rx) = capture_callback();
+        let handle =
+            start_tracker(root.clone(), test_config(), callback).expect("tracker should start");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let new_dir = root.join("newdir");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("late.rs"), "fn late() {}").unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(files)) => {
+                assert!(
+                    files.iter().any(|f| f.contains("late.rs")),
+                    "expected event for file in newly created dir, got: {:?}",
+                    files
+                );
+            }
+            Ok(None) => panic!("channel closed without receiving event"),
+            Err(_) => {
+                eprintln!("WARNING: file watcher timeout -- may not work in this environment");
+            }
         }
 
         handle.stop().await;
