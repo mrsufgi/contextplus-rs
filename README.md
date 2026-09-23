@@ -201,15 +201,14 @@ contextplus-rs tree --max-tokens 5000
 
 ## Tools
 
-Six tools, named for what an agent is doing. Each description says when to use it, so no
+Five tools, named for what an agent is doing. Each description says when to use it, so no
 separate instructions are needed.
 
 | Tool | Use it to | Wraps |
 |------|-----------|-------|
 | `explore` | find code by what it does: files (`kind: files`, default), functions and classes with call sites (`identifiers`), or the codebase grouped by topic (`clusters`); `match: keywords` for exact identifiers without embeddings | `semantic_code_search`, `semantic_identifier_search`, `semantic_navigate`, `lexical_search` |
 | `outline` | see a file's signatures and line ranges, or a directory's file and symbol tree, before reading anything | `get_file_skeleton`, `get_context_tree` |
-| `impact` | learn what breaks if a symbol changes (`what: symbol`, default), the project's import cycles (`cycles`), or symbols nothing references (`dead`) | `get_blast_radius`, `detect_dependency_loops`, `find_dead_code` |
-| `review` | risk-rank a unified diff: changed symbols, two-hop dependents, files to read first | `review_pr_diff` |
+| `impact` | learn what breaks if a symbol changes (`what: symbol`, default) or what a whole diff touches (`diff`), the project's import cycles (`cycles`), or symbols nothing references (`dead`) | `get_blast_radius`, `review_pr_diff`, `detect_dependency_loops`, `find_dead_code` |
 | `check` | run the project's linters and compilers on a path (`what: lint`, default) or audit the embedding cache (`embeddings`) | `run_static_analysis`, `check_embedding_quality` |
 | `worktrees` | list, attach or detach git worktrees (`action`); attaching also happens automatically when a call names a path inside one | `list_worktrees`, `attach_worktree`, `detach_worktree` |
 
