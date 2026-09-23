@@ -2938,10 +2938,10 @@ impl ServerHandler for ContextPlusServer {
         .with_instructions(
             "Context+ semantic code analysis server. Provides semantic search, \
              blast radius analysis, context trees, file skeletons, navigation, \
-             memory graph, and more. Working in a git worktree of this repo: pass \
-             absolute paths inside the worktree; the call runs against that \
-             worktree (attached on first use, forked from the primary's cache). \
-             Relative paths resolve against the server's root.",
+             memory graph, and more. Calls run against the git worktree of this \
+             repo that your process is in, or that an absolute path argument \
+             points into (attached on first use, forked from the primary's \
+             cache); relative paths are resolved from that worktree's root.",
         )
     }
 
@@ -3011,7 +3011,18 @@ impl ServerHandler for ContextPlusServer {
             monitor.touch();
         }
         let name = request.name.to_string();
-        let args = request.arguments.unwrap_or_default();
+        let mut args = request.arguments.unwrap_or_default();
+        // Over stdio this process is the host's child, so its parent's cwd is
+        // the agent's; the daemon bridge injects the same argument itself.
+        if self.session_ref_id.is_none()
+            && !args.contains_key(crate::core::client_cwd::CWD_ARG)
+            && let Some(cwd) = crate::core::client_cwd::parent_process_cwd()
+        {
+            args.insert(
+                crate::core::client_cwd::CWD_ARG.to_string(),
+                Value::String(cwd.to_string_lossy().into_owned()),
+            );
+        }
 
         // Tool-call entry log — pairs with an exit log below. Lets daemon-log
         // operators correlate "Transport closed" / "completed without a

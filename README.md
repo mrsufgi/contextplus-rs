@@ -166,6 +166,15 @@ Add to your MCP config (`~/.claude/mcp.json` or project `.mcp.json`):
 
 > **Note:** `think: false` is sent automatically to the chat model to avoid slow thinking-mode responses. Models like `qwen3.5:9b` produce cluster labels in <1s with thinking disabled vs 45s+ with thinking enabled.
 
+#### Git worktrees
+
+One `--root-dir` (the primary checkout) serves every worktree of the repo. A tool call runs
+against the worktree the host process is in (Claude Code's `EnterWorktree`, Codex started
+inside a worktree) or the one an absolute path argument points into; relative paths resolve
+from that worktree's root. A worktree is attached on first use, forking the primary's
+embedding cache, so no `attach_worktree` call is needed. The host's cwd is read from
+`/proc/<parent pid>/cwd`, so the automatic part is Linux-only; absolute paths route everywhere.
+
 ### CLI subcommands
 
 ```bash

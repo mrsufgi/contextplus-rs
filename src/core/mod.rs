@@ -1,3 +1,4 @@
+pub mod client_cwd;
 pub mod clustering;
 pub mod dependent_expand;
 pub mod embedding_tracker;

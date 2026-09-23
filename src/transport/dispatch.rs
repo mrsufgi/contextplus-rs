@@ -521,31 +521,46 @@ async fn ref_containing(server: &ContextPlusServer, canonical_path: &Path) -> Op
 /// Pick the ref a tool call runs against when one of its path arguments
 /// points outside the session's own root.
 ///
-/// An absolute path under an attached worktree routes the call to that
-/// worktree. An absolute path under a linked git worktree of the same repo
+/// The call is routed by, in order: an absolute path argument outside the
+/// session's root, then the host's working directory (the `_cwd` argument
+/// the bridge adds) when no absolute path argument pins the call to the
+/// session's own root. A location under an attached worktree routes the
+/// call to that worktree; one under a linked git worktree of the same repo
 /// that is not attached yet attaches it first (forking the primary's cache
 /// the same way `attach_worktree` does). Routed path arguments are rewritten
 /// relative to the target root, which also covers paths reached through a
-/// symlink. Anything else is returned unchanged and left to the
-/// path-translation boundary to accept or reject.
+/// symlink; relative arguments then resolve against the target root.
+/// Anything else is returned unchanged and left to the path-translation
+/// boundary to accept or reject. `_cwd` is always removed.
 pub async fn route_to_worktree_ref(
     server: &ContextPlusServer,
     tool_name: &str,
     mut args: serde_json::Map<String, serde_json::Value>,
 ) -> (Option<RefId>, serde_json::Map<String, serde_json::Value>) {
+    let cwd = args
+        .remove(crate::core::client_cwd::CWD_ARG)
+        .and_then(|v| v.as_str().map(|s| canonicalize_lenient(Path::new(s))));
     if manages_worktrees(tool_name) {
         return (None, args);
     }
     let session_root = server.current_ref().canonical_root.clone();
-    let foreign = PATH_ARG_KEYS.iter().find_map(|key| {
-        let raw = args.get(*key)?.as_str()?;
-        let p = Path::new(raw);
-        if !p.is_absolute() {
-            return None;
-        }
-        let canonical = canonicalize_lenient(p);
-        (!canonical.starts_with(&session_root)).then_some(canonical)
-    });
+    let absolute_args: Vec<PathBuf> = PATH_ARG_KEYS
+        .iter()
+        .filter_map(|key| {
+            let p = Path::new(args.get(*key)?.as_str()?);
+            p.is_absolute().then(|| canonicalize_lenient(p))
+        })
+        .collect();
+    let foreign = absolute_args
+        .iter()
+        .find(|p| !p.starts_with(&session_root))
+        .cloned()
+        .or_else(|| {
+            if !absolute_args.is_empty() {
+                return None;
+            }
+            cwd.filter(|c| !c.starts_with(&session_root))
+        });
     let Some(foreign) = foreign else {
         return (None, args);
     };
@@ -1087,6 +1102,102 @@ mod tests {
         let text = first_text(&result);
         assert_ne!(result.is_error, Some(true), "got: {text}");
         assert!(text.contains("worktree_only_fn"), "got: {text}");
+    }
+
+    fn with_cwd(
+        mut args: serde_json::Map<String, serde_json::Value>,
+        cwd: &Path,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        args.insert(
+            crate::core::client_cwd::CWD_ARG.to_string(),
+            serde_json::Value::String(cwd.to_string_lossy().to_string()),
+        );
+        args
+    }
+
+    #[tokio::test]
+    async fn cwd_inside_unattached_worktree_routes_relative_path_and_attaches() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                with_cwd(
+                    file_path_args(Path::new("src/only_in_worktree.rs")),
+                    &wt.join("src"),
+                ),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("worktree_only_fn"), "got: {text}");
+        let listed = server
+            .call_tool_routed("list_worktrees", serde_json::Map::new())
+            .await;
+        assert!(first_text(&listed).contains(&*wt.to_string_lossy()));
+    }
+
+    #[tokio::test]
+    async fn cwd_inside_primary_leaves_call_on_primary() {
+        let (_tmp, primary, _wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                with_cwd(
+                    file_path_args(Path::new("src/main.rs")),
+                    &primary.join("src"),
+                ),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("main"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn explicit_primary_path_wins_over_worktree_cwd() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                with_cwd(file_path_args(&primary.join("src/main.rs")), &wt),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("main"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn cwd_arg_never_reaches_the_tool() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let (routed, args) = route_to_worktree_ref(
+            &server,
+            "get_file_skeleton",
+            with_cwd(file_path_args(Path::new("src/only_in_worktree.rs")), &wt),
+        )
+        .await;
+        assert!(routed.is_some());
+        assert!(!args.contains_key(crate::core::client_cwd::CWD_ARG));
+
+        let (routed, args) = route_to_worktree_ref(
+            &server,
+            "get_file_skeleton",
+            with_cwd(file_path_args(Path::new("src/main.rs")), &primary),
+        )
+        .await;
+        assert!(routed.is_none());
+        assert!(!args.contains_key(crate::core::client_cwd::CWD_ARG));
     }
 
     #[tokio::test]
