@@ -7,14 +7,13 @@ use std::sync::Arc;
 use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
-use crate::core::parser::detect_language;
 use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::Result;
 use crate::server::{SharedState, cache_name};
 use crate::tools::semantic_search::{
-    EmbedFn, MAX_TEXT_DOC_CHARS, SearchDocument, SymbolSearchEntry, WalkAndIndexFn,
-    extract_plain_text_header, is_text_index_candidate,
+    EmbedFn, SearchDocument, SymbolSearchEntry, WalkAndIndexFn, extract_plain_text_header,
+    is_text_index_candidate, semantic_embedding_content,
 };
 
 // --- OllamaEmbedder ---
@@ -114,9 +113,9 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
 
                 // Text/data file path: index raw content for semantic search
                 if is_text_index_candidate(rel_path) {
-                    let truncated: String = content.chars().take(MAX_TEXT_DOC_CHARS).collect();
+                    let truncated = semantic_embedding_content(rel_path, content);
                     let header = extract_plain_text_header(&truncated);
-                    content_hashes.push((rel_path.clone(), content_hash(&truncated)));
+                    content_hashes.push((rel_path.clone(), content_hash(content)));
                     docs.push(SearchDocument::new(
                         rel_path.clone(),
                         header,
@@ -144,12 +143,8 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     })
                     .collect();
 
-                let doc_content = format!(
-                    "{} {}",
-                    detect_language(rel_path).unwrap_or("unknown"),
-                    content.chars().take(500).collect::<String>()
-                );
-                content_hashes.push((rel_path.clone(), content_hash(&doc_content)));
+                let doc_content = semantic_embedding_content(rel_path, content);
+                content_hashes.push((rel_path.clone(), content_hash(content)));
 
                 docs.push(SearchDocument::new(
                     rel_path.clone(),
