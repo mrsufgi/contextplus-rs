@@ -214,19 +214,15 @@ contextplus-rs tree --max-tokens 5000
 |------|-------------|
 | `semantic_code_search` | Hybrid semantic + keyword file search via Ollama embeddings |
 | `semantic_identifier_search` | Find functions/classes by meaning with call-site ranking |
+| `lexical_search` | Fast TF-IDF keyword search for exact identifiers and camelCase names; no embeddings |
 | `semantic_navigate` | Cluster files by semantic similarity (spectral clustering) |
 
-### File Management
+### Worktrees
 | Tool | Description |
 |------|-------------|
-| `propose_commit` | Write files with validation and shadow restore points |
-| `list_restore_points` | List all shadow restore points |
-| `undo_change` | Restore files from a restore point |
-
-### Navigation
-| Tool | Description |
-|------|-------------|
-| `get_feature_hub` | Navigate Obsidian-style wikilinks between feature docs |
+| `attach_worktree` | Register a git worktree as a ref that forks the primary's caches; also happens automatically when a call names a path inside one |
+| `detach_worktree` | Release a worktree ref; it is evicted after the TTL once no session uses it |
+| `list_worktrees` | Show the primary and every attached worktree with root, session count and HEAD |
 
 ## Architecture
 

@@ -5,7 +5,6 @@ pub mod embedding_tracker;
 pub mod embeddings;
 pub mod git_worktree;
 pub mod head_watcher;
-pub mod hub;
 pub mod import_resolver;
 pub mod parser;
 pub mod path_translation;

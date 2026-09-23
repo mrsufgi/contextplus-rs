@@ -76,7 +76,7 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "path",
                     "string",
                     false,
-                    "Root of an attached worktree to scan instead of the current one. Must already be attached via attach_worktree. Use this to trace a symbol on a feature branch from the primary checkout.",
+                    "Root of another worktree of this repository to scan instead of the current one (attached on first use).",
                 ),
             ],
         ),
@@ -219,30 +219,6 @@ fn build_tool_definitions() -> Vec<Tool> {
             ],
         ),
         make_tool(
-            "get_feature_hub",
-            "Navigate Obsidian-style wikilinks to discover feature hubs and their connections.",
-            &[
-                (
-                    "hub_path",
-                    "string",
-                    false,
-                    "Path to a specific hub .md file (relative to root)",
-                ),
-                (
-                    "feature_name",
-                    "string",
-                    false,
-                    "Feature name to search for. Finds matching hub file automatically.",
-                ),
-                (
-                    "show_orphans",
-                    "boolean",
-                    false,
-                    "If true, lists all source files not linked to any hub.",
-                ),
-            ],
-        ),
-        make_tool(
             "run_static_analysis",
             "Run available linters (tsc, eslint, cargo check, ruff) on the project or a specific file.",
             &[(
@@ -253,8 +229,26 @@ fn build_tool_definitions() -> Vec<Tool> {
             )],
         ),
         make_tool(
+            "lexical_search",
+            "Fast in-process TF-IDF lexical search over all indexed files. Complements semantic_code_search for exact-keyword and camelCase identifier queries.",
+            &[
+                (
+                    "query",
+                    "string",
+                    true,
+                    "Keyword or identifier query (camelCase is split into sub-tokens automatically).",
+                ),
+                (
+                    "top_k",
+                    "integer",
+                    false,
+                    "Number of results to return (default 10).",
+                ),
+            ],
+        ),
+        make_tool(
             "attach_worktree",
-            "Register a worktree directory as a ref that inherits the primary ref's embedding cache via CoW (CAS parent pointer + memory-graph overlay), then spawns per-ref warmup. Required for analyzing worktrees outside the daemon's primary root without a per-worktree MCP handshake. Idempotent.",
+            "Register a worktree directory as a ref that inherits the primary ref's embedding cache via CoW (CAS parent pointer), then spawns per-ref warmup. Required for analyzing worktrees outside the daemon's primary root without a per-worktree MCP handshake. Idempotent.",
             &[(
                 "path",
                 "string",
@@ -276,40 +270,6 @@ fn build_tool_definitions() -> Vec<Tool> {
             "list_worktrees",
             "List every ref currently in the registry — the primary plus any attached worktrees — with their canonical roots, session counts, and HEAD SHAs.",
             &[],
-        ),
-        make_tool(
-            "propose_commit",
-            "Write a file with validation (header, comments, nesting, line count) and create a shadow restore point for undo.",
-            &[
-                (
-                    "file_path",
-                    "string",
-                    true,
-                    "Where to save the file (relative to project root)",
-                ),
-                (
-                    "new_content",
-                    "string",
-                    true,
-                    "The complete file content to save",
-                ),
-                ("description", "string", false, "Description of the change"),
-            ],
-        ),
-        make_tool(
-            "list_restore_points",
-            "List all shadow restore points created by propose_commit.",
-            &[],
-        ),
-        make_tool(
-            "undo_change",
-            "Restore files from a shadow restore point created by propose_commit.",
-            &[(
-                "point_id",
-                "string",
-                true,
-                "The restore point ID (format: rp-timestamp-hash). Get from list_restore_points.",
-            )],
         ),
         // --- 5 new tools wired in this PR ---
         make_tool(
@@ -338,7 +298,7 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "path",
                     "string",
                     false,
-                    "Root of an attached worktree to scan instead of the current one. Must already be attached via attach_worktree.",
+                    "Root of another worktree of this repository to scan instead of the current one (attached on first use).",
                 ),
             ],
         ),
@@ -380,24 +340,6 @@ fn build_tool_definitions() -> Vec<Tool> {
                 false,
                 "Expected embedding dimensionality. Auto-detected from first cached vector if omitted.",
             )],
-        ),
-        make_tool(
-            "lexical_search",
-            "Fast in-process TF-IDF lexical search over all indexed files. Complements semantic_code_search for exact-keyword and camelCase identifier queries.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Keyword or identifier query (camelCase is split into sub-tokens automatically).",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "Number of results to return (default 10).",
-                ),
-            ],
         ),
     ]
 }

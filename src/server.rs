@@ -49,32 +49,6 @@ pub struct IdentifierIndex {
 
 const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
 
-/// Format a Unix timestamp (seconds since epoch) as ISO 8601 string.
-fn format_unix_timestamp(ts: u64) -> String {
-    const SECS_PER_DAY: u64 = 86400;
-    const SECS_PER_HOUR: u64 = 3600;
-    const SECS_PER_MIN: u64 = 60;
-    let days = ts / SECS_PER_DAY;
-    let time_of_day = ts % SECS_PER_DAY;
-    let hours = time_of_day / SECS_PER_HOUR;
-    let minutes = (time_of_day % SECS_PER_HOUR) / SECS_PER_MIN;
-    let seconds = time_of_day % SECS_PER_MIN;
-    let z = days as i64 + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m, d, hours, minutes, seconds
-    )
-}
-
 /// URL to fetch the instructions resource content from.
 const INSTRUCTIONS_SOURCE_URL: &str = "https://contextplus.vercel.app/api/instructions";
 /// MCP resource URI for the instructions resource.
@@ -1689,11 +1663,7 @@ impl ContextPlusServer {
             "semantic_code_search" => self.handle_semantic_code_search(args).await,
             "semantic_identifier_search" => self.handle_semantic_identifier_search(args).await,
             "semantic_navigate" => self.handle_semantic_navigate(args).await,
-            "get_feature_hub" => self.handle_feature_hub(args).await,
             "run_static_analysis" => self.handle_static_analysis(args).await,
-            "propose_commit" => self.handle_propose_commit(args).await,
-            "list_restore_points" => self.handle_list_restore_points(args).await,
-            "undo_change" => self.handle_undo_change(args).await,
             "find_dead_code" => self.handle_find_dead_code(args).await,
             "review_pr_diff" => self.handle_review_pr_diff(args).await,
             "detect_dependency_loops" => self.handle_detect_dependency_loops(args).await,
@@ -2030,24 +2000,6 @@ impl ContextPlusServer {
         Ok(Self::ok_text(result))
     }
 
-    async fn handle_feature_hub(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let root = self.resolve_root(&args);
-        let hub_path = Self::get_str(&args, "hub_path");
-
-        let options = crate::tools::feature_hub::FeatureHubOptions {
-            root_dir: root.to_string_lossy().into(),
-            hub_path,
-            feature_name: Self::get_str(&args, "feature_name"),
-            show_orphans: Self::get_bool(&args, "show_orphans"),
-        };
-
-        let result = crate::tools::feature_hub::get_feature_hub(options).await?;
-        Ok(Self::ok_text(result))
-    }
-
     async fn handle_static_analysis(
         &self,
         args: serde_json::Map<String, Value>,
@@ -2339,81 +2291,6 @@ impl ContextPlusServer {
         }
         (self.resolve_root(args), target_path)
     }
-
-    async fn handle_propose_commit(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let file_path = Self::get_str(&args, "file_path")
-            .ok_or_else(|| ContextPlusError::Other("file_path is required".into()))?;
-        let content = Self::get_str(&args, "new_content")
-            .ok_or_else(|| ContextPlusError::Other("new_content is required".into()))?;
-        let description = Self::get_str(&args, "description");
-        let root = self.resolve_root(&args);
-
-        let result = crate::tools::propose_commit::propose_commit(
-            &root,
-            &file_path,
-            &content,
-            description.as_deref(),
-        )
-        .await?;
-
-        // Invalidate project cache after file write (matches TS invalidateSearchCache behavior)
-        self.invalidate_project_cache().await;
-
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_list_restore_points(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let root = self.resolve_root(&args);
-        let points = crate::git::shadow::list_restore_points(&root).await?;
-
-        if points.is_empty() {
-            return Ok(Self::ok_text("No restore points found.".to_string()));
-        }
-
-        let mut output = String::from("Restore Points:\n\n");
-        for pt in &points {
-            let file_names: Vec<&str> = pt.files.iter().map(|f| f.original_path.as_str()).collect();
-            let iso_ts = format_unix_timestamp(pt.timestamp);
-            output.push_str(&format!(
-                "{} | {} | {} | {}\n",
-                pt.id,
-                iso_ts,
-                file_names.join(", "),
-                pt.description,
-            ));
-        }
-        Ok(Self::ok_text(output))
-    }
-
-    async fn handle_undo_change(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let restore_point_id = Self::get_str(&args, "point_id")
-            .ok_or_else(|| ContextPlusError::Other("point_id is required".into()))?;
-        let root = self.resolve_root(&args);
-
-        let restored = crate::git::shadow::restore_from_point(&root, &restore_point_id).await?;
-
-        // Invalidate project cache after file restore (matches TS invalidateSearchCache behavior)
-        self.invalidate_project_cache().await;
-
-        let msg = format!(
-            "Restored {} file(s) from restore point {}:\n  {}",
-            restored.len(),
-            restore_point_id,
-            restored.join("\n  ")
-        );
-        Ok(Self::ok_text(msg))
-    }
-
-    // --- Helpers ---
 
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
         let ref_index = self.current_ref();
@@ -3536,9 +3413,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_19_tools() {
+    fn tool_definitions_returns_all_15_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 19, "expected 19 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 15, "expected 15 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -3560,11 +3437,7 @@ mod tests {
             "semantic_code_search",
             "semantic_identifier_search",
             "semantic_navigate",
-            "get_feature_hub",
             "run_static_analysis",
-            "propose_commit",
-            "list_restore_points",
-            "undo_change",
             "find_dead_code",
             "review_pr_diff",
             "detect_dependency_loops",
@@ -3601,18 +3474,6 @@ mod tests {
             text.contains("Unknown tool"),
             "expected 'Unknown tool' in error text, got: {}",
             text
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_list_restore_points_succeeds_with_empty_state() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("list_restore_points", args).await;
-        assert_eq!(
-            result.is_error,
-            Some(false),
-            "list_restore_points should not error on empty state"
         );
     }
 
@@ -5113,58 +4974,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_propose_commit_missing_file_path_returns_error() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("propose_commit", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("file_path is required"),
-            "expected file_path error, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_propose_commit_missing_content_returns_error() {
-        let server = test_server();
-        let mut args = serde_json::Map::new();
-        args.insert("file_path".to_string(), json!("test.txt"));
-        let result = server.dispatch("propose_commit", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("new_content is required"),
-            "expected new_content error, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_undo_change_missing_restore_point_id_returns_error() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("undo_change", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("point_id is required"),
-            "expected point_id error, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
     async fn dispatch_semantic_code_search_missing_query_returns_error() {
         let server = test_server();
         let args = serde_json::Map::new();
@@ -5216,20 +5025,6 @@ mod tests {
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(req_strs.contains(&"symbol_name"));
-    }
-
-    #[test]
-    fn tool_definitions_propose_commit_requires_file_path_and_content() {
-        let defs = tool_definitions();
-        let tool = defs
-            .iter()
-            .find(|t| t.name.as_ref() == "propose_commit")
-            .unwrap();
-        let schema = tool.input_schema.as_ref();
-        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
-        let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(req_strs.contains(&"file_path"));
-        assert!(req_strs.contains(&"new_content"));
     }
 
     #[test]
@@ -5419,36 +5214,6 @@ mod tests {
         });
 
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn format_unix_epoch() {
-        assert_eq!(format_unix_timestamp(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn format_known_timestamp() {
-        // 2024-01-15T12:30:45Z = 1705318245
-        assert_eq!(format_unix_timestamp(1705318245), "2024-01-15T11:30:45Z");
-    }
-
-    #[test]
-    fn format_y2k_timestamp() {
-        // 2000-01-01T00:00:00Z = 946684800
-        assert_eq!(format_unix_timestamp(946684800), "2000-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn restore_point_pipe_format() {
-        let iso_ts = format_unix_timestamp(1705318245);
-        let line = format!(
-            "{} | {} | {} | {}\n",
-            "rp-123-abc456", iso_ts, "src/main.rs, src/lib.rs", "test restore",
-        );
-        assert_eq!(
-            line,
-            "rp-123-abc456 | 2024-01-15T11:30:45Z | src/main.rs, src/lib.rs | test restore\n"
-        );
     }
 
     // ---------------------------------------------------------------
@@ -5925,7 +5690,7 @@ mod tests {
 
         let server = test_server();
         let _ = server
-            .dispatch("list_restore_points", serde_json::Map::new())
+            .dispatch("list_worktrees", serde_json::Map::new())
             .await;
         assert_eq!(server.state.inflight.load(Ordering::Acquire), 0);
     }

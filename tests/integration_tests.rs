@@ -525,7 +525,7 @@ async fn drain_flag_rejects_new_calls_but_lets_inflight_finish() {
     let dir = TempDir::new().unwrap();
     let server = test_server_in(dir.path());
 
-    // Kick off an "in-flight" call: list_restore_points with no draining set.
+    // Kick off an "in-flight" call: list_worktrees with no draining set.
     // This proves the call path completes after the drain flag flips _during_
     // a separate later call. We can't easily pause dispatch mid-flight without
     // a sleep tool, so we approximate the spec's requirement by:
@@ -535,7 +535,7 @@ async fn drain_flag_rejects_new_calls_but_lets_inflight_finish() {
     // The "in-flight survives" property is exercised by the unit test in
     // process_lifecycle::tests::drain_watcher_exits_when_inflight_hits_zero.
     let r1 = server
-        .dispatch("list_restore_points", serde_json::Map::new())
+        .dispatch("list_worktrees", serde_json::Map::new())
         .await;
     assert_eq!(r1.is_error, Some(false), "pre-drain call should succeed");
     assert_eq!(
@@ -548,7 +548,7 @@ async fn drain_flag_rejects_new_calls_but_lets_inflight_finish() {
     server.state.draining.store(true, Ordering::Release);
 
     let r2 = server
-        .dispatch("list_restore_points", serde_json::Map::new())
+        .dispatch("list_worktrees", serde_json::Map::new())
         .await;
     assert_eq!(
         r2.is_error,
