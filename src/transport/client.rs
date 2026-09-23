@@ -52,6 +52,161 @@ pub struct RegisterSession {
     pub head_sha: String,
     /// PID of the bridge process (advisory; used for logging).
     pub client_pid: u32,
+    /// Search configuration seen by the bridge. Optional for compatibility
+    /// with bridges built before configuration reporting was added.
+    #[serde(default)]
+    pub search_config: Option<SearchConfig>,
+}
+
+/// Configuration that can change search results or embedding-cache contents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchConfig {
+    pub ollama_embed_model: String,
+    pub ollama_chat_model: String,
+    pub ollama_host: String,
+    pub embed_tracker_mode: String,
+    pub ignore_dirs: Vec<String>,
+    pub max_embed_file_size: usize,
+    pub embed_num_gpu: Option<i32>,
+    pub embed_main_gpu: Option<i32>,
+    pub embed_num_thread: Option<i32>,
+    pub embed_num_batch: Option<i32>,
+    pub embed_num_ctx: Option<i32>,
+    pub embed_low_vram: Option<bool>,
+    pub embed_chunk_chars: usize,
+    pub warmup_on_start: bool,
+    pub hnsw_ef_construction: usize,
+    pub hnsw_ef_search: usize,
+    pub ref_warmup_mode: String,
+}
+
+impl From<&crate::config::Config> for SearchConfig {
+    fn from(config: &crate::config::Config) -> Self {
+        let mut ignore_dirs: Vec<_> = config.ignore_dirs.iter().cloned().collect();
+        ignore_dirs.sort();
+        Self {
+            ollama_embed_model: config.ollama_embed_model.clone(),
+            ollama_chat_model: config.ollama_chat_model.clone(),
+            ollama_host: config.ollama_host.clone(),
+            embed_tracker_mode: config.embed_tracker_mode.to_string(),
+            ignore_dirs,
+            max_embed_file_size: config.max_embed_file_size,
+            embed_num_gpu: config.embed_num_gpu,
+            embed_main_gpu: config.embed_main_gpu,
+            embed_num_thread: config.embed_num_thread,
+            embed_num_batch: config.embed_num_batch,
+            embed_num_ctx: config.embed_num_ctx,
+            embed_low_vram: config.embed_low_vram,
+            embed_chunk_chars: config.embed_chunk_chars,
+            warmup_on_start: config.warmup_on_start,
+            hnsw_ef_construction: config.hnsw_ef_construction,
+            hnsw_ef_search: config.hnsw_ef_search,
+            ref_warmup_mode: config.ref_warmup_mode.to_string(),
+        }
+    }
+}
+
+impl SearchConfig {
+    pub(crate) fn reported_fields(&self) -> Vec<(&'static str, String)> {
+        fn option<T: ToString>(value: Option<T>) -> String {
+            value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<unset>".to_string())
+        }
+
+        vec![
+            ("OLLAMA_EMBED_MODEL", self.ollama_embed_model.clone()),
+            ("OLLAMA_CHAT_MODEL", self.ollama_chat_model.clone()),
+            ("OLLAMA_HOST", self.ollama_host.clone()),
+            ("CONTEXTPLUS_EMBED_TRACKER", self.embed_tracker_mode.clone()),
+            ("CONTEXTPLUS_IGNORE_DIRS", self.ignore_dirs.join(",")),
+            (
+                "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",
+                self.max_embed_file_size.to_string(),
+            ),
+            ("CONTEXTPLUS_EMBED_NUM_GPU", option(self.embed_num_gpu)),
+            ("CONTEXTPLUS_EMBED_MAIN_GPU", option(self.embed_main_gpu)),
+            (
+                "CONTEXTPLUS_EMBED_NUM_THREAD",
+                option(self.embed_num_thread),
+            ),
+            ("CONTEXTPLUS_EMBED_NUM_BATCH", option(self.embed_num_batch)),
+            ("CONTEXTPLUS_EMBED_NUM_CTX", option(self.embed_num_ctx)),
+            ("CONTEXTPLUS_EMBED_LOW_VRAM", option(self.embed_low_vram)),
+            (
+                "CONTEXTPLUS_EMBED_CHUNK_CHARS",
+                self.embed_chunk_chars.to_string(),
+            ),
+            (
+                "CONTEXTPLUS_WARMUP_ON_START",
+                self.warmup_on_start.to_string(),
+            ),
+            (
+                "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
+                self.hnsw_ef_construction.to_string(),
+            ),
+            (
+                "CONTEXTPLUS_HNSW_EF_SEARCH",
+                self.hnsw_ef_search.to_string(),
+            ),
+            ("CONTEXTPLUS_REF_WARMUP_MODE", self.ref_warmup_mode.clone()),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod register_session_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct LegacyRegisterSession {
+        client_root: std::path::PathBuf,
+        head_sha: String,
+        client_pid: u32,
+    }
+
+    #[test]
+    fn register_session_round_trips_search_config() {
+        let config = crate::config::Config::from_env();
+        let register = RegisterSession {
+            client_root: "/tmp/project".into(),
+            head_sha: "deadbeef".into(),
+            client_pid: 42,
+            search_config: Some(SearchConfig::from(&config)),
+        };
+
+        let encoded = serde_json::to_vec(&register).unwrap();
+        let decoded: RegisterSession = serde_json::from_slice(&encoded).unwrap();
+        let legacy: LegacyRegisterSession = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, register);
+        assert_eq!(legacy.client_root, register.client_root);
+        assert_eq!(legacy.head_sha, register.head_sha);
+        assert_eq!(legacy.client_pid, register.client_pid);
+    }
+
+    #[test]
+    fn register_session_deserializes_old_frame_without_search_config() {
+        let old_frame = br#"{
+            "client_root":"/tmp/project",
+            "head_sha":"deadbeef",
+            "client_pid":42
+        }"#;
+
+        let decoded: RegisterSession = serde_json::from_slice(old_frame).unwrap();
+
+        assert_eq!(
+            decoded.client_root,
+            std::path::PathBuf::from("/tmp/project")
+        );
+        assert_eq!(decoded.head_sha, "deadbeef");
+        assert_eq!(decoded.client_pid, 42);
+        assert_eq!(decoded.search_config, None);
+
+        let reencoded = serde_json::to_vec(&decoded).unwrap();
+        let round_tripped: RegisterSession = serde_json::from_slice(&reencoded).unwrap();
+        assert_eq!(round_tripped, decoded);
+    }
 }
 
 /// Response the daemon sends back.
@@ -134,18 +289,33 @@ pub const SPAWN_POLL: Duration = Duration::from_millis(50);
 /// passthrough loop. If the daemon responds with `RejectedDraining` the
 /// function returns `Ok(())` immediately (bridge exits 0, clean shutdown).
 pub async fn run(root_dir: &Path) -> Result<()> {
+    run_with_config(root_dir, &crate::config::Config::from_env()).await
+}
+
+/// Connect using an already-resolved bridge configuration.
+pub async fn run_with_config(root_dir: &Path, config: &crate::config::Config) -> Result<()> {
     let stream = connect_or_spawn(root_dir).await?;
-    run_with_handshake(root_dir, stream).await
+    run_with_handshake_config(root_dir, config, stream).await
 }
 
 /// Perform the register_session handshake and then bridge stdio. Exposed for
 /// tests so they can inject a pre-connected stream.
-pub async fn run_with_handshake(root_dir: &Path, mut stream: UnixStream) -> Result<()> {
+pub async fn run_with_handshake(root_dir: &Path, stream: UnixStream) -> Result<()> {
+    run_with_handshake_config(root_dir, &crate::config::Config::from_env(), stream).await
+}
+
+/// Perform the handshake using an already-resolved bridge configuration.
+pub async fn run_with_handshake_config(
+    root_dir: &Path,
+    config: &crate::config::Config,
+    mut stream: UnixStream,
+) -> Result<()> {
     let head_sha = resolve_head_sha(root_dir);
     let reg = RegisterSession {
         client_root: root_dir.to_path_buf(),
         head_sha,
         client_pid: std::process::id(),
+        search_config: Some(SearchConfig::from(config)),
     };
     write_frame(&mut stream, &reg)
         .await

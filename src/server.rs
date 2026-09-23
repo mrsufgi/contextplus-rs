@@ -275,6 +275,12 @@ pub struct ContextPlusServer {
     /// `register_session` completes. `None` means "stdio mode or no
     /// handshake" — all tool calls fall back to `default_ref`.
     pub session_ref_id: Option<crate::ref_index::RefId>,
+    session_config_warning: Option<Arc<SessionConfigWarning>>,
+}
+
+struct SessionConfigWarning {
+    text: String,
+    shown: std::sync::atomic::AtomicBool,
 }
 
 impl ContextPlusServer {
@@ -287,7 +293,46 @@ impl ContextPlusServer {
         Self {
             state: Arc::clone(&self.state),
             session_ref_id: Some(ref_id),
+            session_config_warning: self.session_config_warning.clone(),
         }
+    }
+
+    pub(crate) fn with_session_config_warning(
+        &self,
+        ref_id: crate::ref_index::RefId,
+        warning: Option<String>,
+    ) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            session_ref_id: Some(ref_id),
+            session_config_warning: warning.map(|text| {
+                Arc::new(SessionConfigWarning {
+                    text,
+                    shown: std::sync::atomic::AtomicBool::new(false),
+                })
+            }),
+        }
+    }
+
+    fn prepend_session_config_warning(&self, mut result: CallToolResult) -> CallToolResult {
+        let Some(warning) = &self.session_config_warning else {
+            return result;
+        };
+        if warning
+            .shown
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return result;
+        }
+
+        if let Some(first) = result.content.first_mut()
+            && let RawContent::Text(text) = &mut first.raw
+        {
+            text.text = format!("{}\n{}", warning.text, text.text);
+        } else {
+            result.content.insert(0, Content::text(&warning.text));
+        }
+        result
     }
 
     /// Resolve the per-ref state for the current session.
@@ -525,6 +570,7 @@ impl ContextPlusServer {
         Self {
             state,
             session_ref_id: None,
+            session_config_warning: None,
         }
     }
 
@@ -2335,7 +2381,12 @@ impl ContextPlusServer {
         if rows.is_empty() {
             return Ok(Self::ok_text("No refs registered.".into()));
         }
-        let mut out = String::from("Registered refs:\n");
+        let mut out = format!(
+            "Daemon search config: OLLAMA_EMBED_MODEL={}, OLLAMA_CHAT_MODEL={}, OLLAMA_HOST={}\nRegistered refs:\n",
+            self.state.config.ollama_embed_model,
+            self.state.config.ollama_chat_model,
+            self.state.config.ollama_host
+        );
         for (id, path, is_primary, sessions, head) in rows {
             let tag = if is_primary { " [primary]" } else { "" };
             let head_str = head
@@ -2996,7 +3047,8 @@ impl ContextPlusServer {
         let (routed, args) =
             crate::transport::dispatch::route_to_worktree_ref(self, name, args).await;
         if let Some(ref_id) = routed {
-            return Box::pin(self.with_session(ref_id).call_tool_routed(name, args)).await;
+            let result = Box::pin(self.with_session(ref_id).call_tool_routed(name, args)).await;
+            return self.prepend_session_config_warning(result);
         }
 
         // Route through U5's path-translation boundary.
@@ -3016,7 +3068,7 @@ impl ContextPlusServer {
         // (listing other refs' roots as `foreign_roots`) is reserved for U10+.
         let caller_root_opt =
             crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id);
-        match caller_root_opt {
+        let result = match caller_root_opt {
             Some(caller_root) => {
                 crate::transport::dispatch::dispatch_with_translation(
                     self,
@@ -3041,7 +3093,8 @@ impl ContextPlusServer {
                 );
                 self.dispatch(name, args).await
             }
-        }
+        };
+        self.prepend_session_config_warning(result)
     }
 }
 
@@ -4765,6 +4818,24 @@ mod tests {
         assert!(
             text.contains(&canonical_wt.to_string_lossy().to_string()),
             "attached worktree path missing: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "OLLAMA_EMBED_MODEL={}",
+                server.state.config.ollama_embed_model
+            )),
+            "daemon embed model missing: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "OLLAMA_CHAT_MODEL={}",
+                server.state.config.ollama_chat_model
+            )),
+            "daemon chat model missing: {text}"
+        );
+        assert!(
+            text.contains(&format!("OLLAMA_HOST={}", server.state.config.ollama_host)),
+            "daemon Ollama host missing: {text}"
         );
     }
 

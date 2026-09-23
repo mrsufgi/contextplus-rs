@@ -149,7 +149,7 @@ pub async fn run_implicit_default(
     let want_daemon = resolve_want_daemon(mode, &root_dir);
 
     if want_daemon {
-        match crate::transport::client::run(&root_dir).await {
+        match crate::transport::client::run_with_config(&root_dir, &config).await {
             Ok(()) => return Ok(()),
             Err(e) if mode == TransportMode::Auto => {
                 tracing::warn!("daemon transport failed ({e}); falling back to stdio");
