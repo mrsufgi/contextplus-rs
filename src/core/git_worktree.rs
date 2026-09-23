@@ -76,6 +76,64 @@ pub fn resolve_primary_worktree(root: &Path) -> PathBuf {
     }
 }
 
+/// The git directories behind a working tree: its own gitdir (HEAD,
+/// ORIG_HEAD, index) and the common dir that holds `refs/heads` and
+/// `packed-refs`. Equal for a primary checkout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDirs {
+    pub gitdir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+impl GitDirs {
+    /// Whether an event at `path` can mean HEAD moved: a HEAD-like file or
+    /// a branch ref, in this worktree's gitdir or the shared common dir.
+    pub fn is_ref_update(&self, path: &Path) -> bool {
+        if !(path.starts_with(&self.gitdir) || path.starts_with(&self.common_dir)) {
+            return false;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        name.ends_with("HEAD")
+            || name == "packed-refs"
+            || path.starts_with(self.common_dir.join("refs").join("heads"))
+            || path.starts_with(self.gitdir.join("refs").join("heads"))
+    }
+}
+
+/// Resolve [`GitDirs`] for `root` without invoking git. `None` when `root` is
+/// not a git working tree or its pointers do not resolve.
+pub fn git_dirs(root: &Path) -> Option<GitDirs> {
+    let dot_git = root.join(".git");
+    let meta = fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        let gitdir = dot_git.canonicalize().unwrap_or(dot_git);
+        return Some(GitDirs {
+            common_dir: gitdir.clone(),
+            gitdir,
+        });
+    }
+    let pointer = parse_gitdir_pointer(&fs::read_to_string(&dot_git).ok()?)?;
+    let gitdir = if pointer.is_absolute() {
+        pointer
+    } else {
+        root.join(pointer)
+    };
+    let gitdir = gitdir.canonicalize().ok()?;
+    let common_dir = match fs::read_to_string(gitdir.join("commondir")) {
+        Ok(contents) => {
+            let raw = Path::new(contents.trim());
+            let common = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                gitdir.join(raw)
+            };
+            common.canonicalize().unwrap_or(common)
+        }
+        Err(_) => gitdir.clone(),
+    };
+    Some(GitDirs { gitdir, common_dir })
+}
+
 /// Slow path: `<root>/.git` is a file. Parse the `gitdir:` pointer and walk
 /// to the primary's `.git/` via the linked-worktree gitdir's `commondir` file.
 fn resolve_linked_worktree_primary(root: &Path) -> Result<PathBuf, ResolveError> {
@@ -338,6 +396,33 @@ mod tests {
             parse_gitdir_pointer("\n\ngitdir: /a/b/c\n"),
             Some(PathBuf::from("/a/b/c"))
         );
+    }
+
+    #[test]
+    fn git_dirs_for_primary_and_linked_worktree() {
+        let td = TempDir::new().unwrap();
+        let primary = make_primary(&td);
+        let (wt_root, wt_gitdir) = make_linked_worktree(&td, &primary, "feat-y");
+
+        let p = git_dirs(&primary).unwrap();
+        assert_eq!(p.gitdir, primary.join(".git").canonicalize().unwrap());
+        assert_eq!(p.common_dir, p.gitdir);
+
+        let w = git_dirs(&wt_root).unwrap();
+        assert_eq!(w.gitdir, wt_gitdir.canonicalize().unwrap());
+        assert_eq!(w.common_dir, primary.join(".git").canonicalize().unwrap());
+
+        assert!(w.is_ref_update(&w.gitdir.join("HEAD")));
+        assert!(w.is_ref_update(&w.gitdir.join("ORIG_HEAD")));
+        assert!(w.is_ref_update(&w.common_dir.join("packed-refs")));
+        assert!(w.is_ref_update(&w.common_dir.join("refs/heads/feat/y")));
+        assert!(!w.is_ref_update(&w.gitdir.join("index")));
+        assert!(!w.is_ref_update(&w.common_dir.join("refs/remotes/origin/main")));
+        assert!(!w.is_ref_update(&wt_root.join("src/HEAD")));
+
+        let plain = td.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(git_dirs(&plain), None);
     }
 
     #[test]
