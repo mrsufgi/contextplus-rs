@@ -2,6 +2,7 @@
 // Watches for file modifications and triggers debounced embedding refreshes
 
 use ignore::WalkBuilder;
+use notify_debouncer_full::notify::event::{EventKind, ModifyKind};
 use notify_debouncer_full::notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 use std::collections::{HashMap, HashSet};
@@ -83,7 +84,28 @@ const MAX_FILES_PER_TICK: usize = 200;
 const MIN_DEBOUNCE_MS: u64 = 100;
 
 /// Maximum number of pending file change events before new events are dropped.
-const MAX_PENDING_FILES: usize = 50;
+/// A git-derived list (a large pull) is authoritative and bounded by the repo,
+/// so the cap only guards against a runaway watcher; batches of
+/// `max_files_per_tick` drain it at the embedder's pace.
+const MAX_PENDING_FILES: usize = 5_000;
+
+/// Whether an event can mean content changed. notify's inotify backend also
+/// subscribes to open/close, so every read the indexer, a warmup or the heal
+/// walk performs arrives here as an `Access` event for the file or directory;
+/// those must never count as changes, or the tracker feeds on its own walks.
+fn is_change_event(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_))
+}
+
+/// Whether a directory event means a directory appeared (created or moved
+/// in) and needs a watch, as opposed to being read or having its metadata
+/// touched.
+fn is_new_dir_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
 
 /// Resolver signal for "HEAD may have moved"; distinct from every managed hook name.
 const HEAD_SIGNAL: &str = "HEAD";
@@ -342,6 +364,9 @@ pub fn start_tracker(
         Ok(events) => {
             let mut new_files = Vec::new();
             for event in &events {
+                if !is_change_event(&event.kind) {
+                    continue;
+                }
                 for path in &event.paths {
                     // Detect sentinel events first. A sentinel touch represents
                     // a git event (commit/merge/checkout), not a file edit —
@@ -378,6 +403,9 @@ pub fn start_tracker(
                     // file change: queue it for watch installation and let
                     // the install-time scan surface any files inside.
                     if path.is_dir() {
+                        if !is_new_dir_event(&event.kind) {
+                            continue;
+                        }
                         if let Err(e) = handler_watch_tx.try_send(path.clone()) {
                             debug!(
                                 "Embedding tracker watch queue full, dropping {}: {}",
@@ -1118,6 +1146,73 @@ mod tests {
         let seen = wait_for_file(&mut rx, "from_main.rs", 8).await;
         handle.stop().await;
         assert!(seen, "worktree HEAD move did not refresh src/from_main.rs");
+    }
+
+    #[test]
+    fn access_events_are_not_changes() {
+        use notify_debouncer_full::notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode,
+        };
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_change_event(&EventKind::Access(AccessKind::Read)));
+        assert!(is_change_event(&EventKind::Create(CreateKind::File)));
+        assert!(is_change_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_change_event(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_change_event(&EventKind::Any));
+
+        assert!(is_new_dir_event(&EventKind::Create(CreateKind::Folder)));
+        assert!(is_new_dir_event(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        assert!(!is_new_dir_event(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        ))));
+        assert!(!is_new_dir_event(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+    }
+
+    /// Reading the tree, which the indexer, warmups and the heal walk all do,
+    /// must not produce refresh batches; a real write afterwards must.
+    #[tokio::test]
+    async fn tracker_ignores_reads_of_the_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for d in ["src/a", "src/b"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("src/a/one.rs"), "fn one() {}").unwrap();
+        std::fs::write(root.join("src/b/two.rs"), "fn two() {}").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "mod a;").unwrap();
+
+        let (handle, mut rx) = tracker_with_capture(root.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        for _ in 0..3 {
+            for entry in WalkBuilder::new(&root).build().flatten() {
+                if entry.file_type().is_some_and(|t| t.is_file()) {
+                    let _ = std::fs::read(entry.path());
+                } else {
+                    let _ = std::fs::read_dir(entry.path()).map(|it| it.count());
+                }
+            }
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .is_err();
+        assert!(quiet, "reading the tree produced a refresh batch");
+
+        std::fs::write(root.join("src/lib.rs"), "mod a; mod b;").unwrap();
+        let seen = wait_for_file(&mut rx, "lib.rs", 5).await;
+        handle.stop().await;
+        assert!(seen, "a real write was not reported");
     }
 
     #[tokio::test]
