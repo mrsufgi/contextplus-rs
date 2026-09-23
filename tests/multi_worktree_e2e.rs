@@ -254,6 +254,7 @@ async fn bridge_call(
         client_root: client_root.to_path_buf(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg)
         .await
@@ -407,6 +408,7 @@ async fn single_daemon_serves_both_worktrees() {
         client_root: primary.clone(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream_a, &reg_a).await.unwrap();
     let ready_a: SessionReady = read_frame(&mut stream_a).await.unwrap();
@@ -427,6 +429,7 @@ async fn single_daemon_serves_both_worktrees() {
         client_root: wt.clone(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream_b, &reg_b).await.unwrap();
     let ready_b: SessionReady = read_frame(&mut stream_b).await.unwrap();
@@ -646,6 +649,7 @@ async fn worktree_bridge_gets_valid_session_ready() {
         client_root: wt.clone(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg).await.unwrap();
     let session_ready: SessionReady = read_frame(&mut stream).await.unwrap();
@@ -797,6 +801,7 @@ async fn attach_warmup_failure_is_nonfatal() {
             client_root: wt.clone(),
             head_sha: "deadbeef".to_owned(),
             client_pid: std::process::id(),
+            search_config: None,
         };
         write_frame(&mut stream, &reg)
             .await
@@ -930,6 +935,7 @@ async fn worktree_searchable_immediately_after_shallow_attach() {
         client_root: primary.clone(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg).await.unwrap();
     let _: SessionReady = read_frame(&mut stream).await.unwrap();
@@ -962,6 +968,7 @@ async fn worktree_searchable_immediately_after_shallow_attach() {
         client_root: primary.clone(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream_p, &reg_p).await.unwrap();
     let _: SessionReady = read_frame(&mut stream_p).await.unwrap();
@@ -977,6 +984,7 @@ async fn worktree_searchable_immediately_after_shallow_attach() {
             client_root: wt.clone(),
             head_sha: "deadbeef".to_owned(),
             client_pid: std::process::id(),
+            search_config: None,
         };
         write_frame(&mut stream_wt, &reg_wt).await.unwrap();
         let ready: SessionReady = read_frame(&mut stream_wt).await.unwrap();

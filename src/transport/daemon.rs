@@ -44,8 +44,56 @@ use crate::config::Config;
 use crate::core::process_lifecycle;
 use crate::ref_index::{RefId, RefIndex};
 use crate::server::ContextPlusServer;
-use crate::transport::client::{RegisterSession, SessionReady, read_frame, write_frame};
+use crate::transport::client::{
+    RegisterSession, SearchConfig, SessionReady, read_frame, write_frame,
+};
 use crate::transport::paths;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ConfigDifference {
+    pub field: &'static str,
+    pub daemon_value: String,
+    pub bridge_value: String,
+}
+
+pub(crate) fn compare_search_config(
+    daemon: &Config,
+    bridge: &SearchConfig,
+) -> Vec<ConfigDifference> {
+    let daemon = SearchConfig::from(daemon);
+    daemon
+        .reported_fields()
+        .into_iter()
+        .zip(bridge.reported_fields())
+        .filter_map(|((field, daemon_value), (bridge_field, bridge_value))| {
+            debug_assert_eq!(field, bridge_field);
+            (daemon_value != bridge_value).then_some(ConfigDifference {
+                field,
+                daemon_value,
+                bridge_value,
+            })
+        })
+        .collect()
+}
+
+fn config_warning(differences: &[ConfigDifference]) -> Option<String> {
+    if differences.is_empty() {
+        return None;
+    }
+    let details = differences
+        .iter()
+        .map(|difference| {
+            format!(
+                "{}={} but your MCP config sets {}",
+                difference.field, difference.daemon_value, difference.bridge_value
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "contextplus warning: this daemon runs {details}; restart the daemon from a session with the right config."
+    ))
+}
 
 /// Environment variable for the ref TTL (seconds) after the last session
 /// disconnects. Default 24 h. `0` means immediate eviction.
@@ -394,6 +442,21 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         "register_session received"
     );
 
+    let differences = reg
+        .search_config
+        .as_ref()
+        .map(|bridge| compare_search_config(&server.state.config, bridge))
+        .unwrap_or_default();
+    for difference in &differences {
+        tracing::warn!(
+            field = difference.field,
+            daemon_value = difference.daemon_value,
+            bridge_value = difference.bridge_value,
+            "bridge search configuration differs from daemon"
+        );
+    }
+    let warning = config_warning(&differences);
+
     // Reject immediately if draining.
     if server.state.draining.load(Ordering::Acquire) {
         let _ = write_frame(&mut stream, &SessionReady::RejectedDraining).await;
@@ -484,7 +547,7 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     // Build a session-scoped server: clone shares the Arc<SharedState> but
     // sets session_ref_id so every subsequent tool call resolves to this
     // connection's registered worktree (U9).
-    let session_server = server.with_session(ref_id);
+    let session_server = server.with_session_config_warning(ref_id, warning);
     let state = Arc::clone(&session_server.state);
     let (read_half, write_half) = stream.into_split();
     match session_server.serve((read_half, write_half)).await {
@@ -587,6 +650,35 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_config_comparison_lists_exactly_differing_fields() {
+        // Compare the full protocol snapshot, not selected daemon fields.
+        let daemon = Config::from_env();
+        let mut bridge = crate::transport::client::SearchConfig::from(&daemon);
+        bridge.ollama_embed_model = "nomic-embed-text".into();
+        bridge.ollama_host = "http://bridge-ollama:11434".into();
+        bridge.max_embed_file_size += 1;
+
+        let differences = compare_search_config(&daemon, &bridge);
+        let names: Vec<_> = differences.iter().map(|diff| diff.field).collect();
+
+        assert_eq!(
+            names,
+            [
+                "OLLAMA_EMBED_MODEL",
+                "OLLAMA_HOST",
+                "CONTEXTPLUS_MAX_EMBED_FILE_SIZE"
+            ]
+        );
+        let warning = config_warning(&differences).unwrap();
+        for field in names {
+            assert!(
+                warning.contains(field),
+                "warning omitted {field}: {warning}"
+            );
+        }
+    }
 
     /// All env-driven cases live in a single test so they don't race against
     /// each other on the shared `DAEMON_IDLE_SECS_ENV` var. cargo runs tests
