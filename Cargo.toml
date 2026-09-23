@@ -64,7 +64,6 @@ nalgebra = "0.33"
 # determinism, scrambling the navigate-labels.json cache key.)
 
 # Graph
-petgraph = "0.7"
 
 # File walking (gitignore-aware, from ripgrep)
 ignore = "0.4"

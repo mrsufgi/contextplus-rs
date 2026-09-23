@@ -18,7 +18,6 @@ use crate::core::embedding_tracker::{
     EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
 };
 use crate::core::embeddings::{CacheEntry, OllamaClient};
-use crate::core::memory_graph::GraphStore;
 use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::{ContextPlusError, Result};
@@ -102,7 +101,6 @@ pub struct SharedState {
     /// calling canonicalize() on every tool request.
     pub canonical_root: PathBuf,
     pub ollama: OllamaClient,
-    pub memory_graph: Arc<GraphStore>,
     /// **Backward-compat shim (U10).** Arc clone of the default ref's
     /// `project_cache`. Shares the same underlying `RwLock` as the default
     /// `RefIndex` entry. U11 will migrate call sites to use the per-ref field.
@@ -371,7 +369,6 @@ impl ContextPlusServer {
         let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
             .with_semaphore(Arc::clone(&ollama_semaphore));
-        let memory_graph = Arc::new(GraphStore::new());
 
         let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
 
@@ -425,7 +422,6 @@ impl ContextPlusServer {
             canonical_root,
             root_dir,
             ollama,
-            memory_graph,
             project_cache,
             embedding_cache,
             identifier_index,
@@ -995,10 +991,6 @@ impl ContextPlusServer {
                 "ref_warmup full: complete"
             );
         });
-    }
-
-    fn root_dir(&self) -> PathBuf {
-        self.current_ref().root_dir.clone()
     }
 
     /// Fetch instructions content (cached after first successful fetch).
@@ -1702,13 +1694,6 @@ impl ContextPlusServer {
             "propose_commit" => self.handle_propose_commit(args).await,
             "list_restore_points" => self.handle_list_restore_points(args).await,
             "undo_change" => self.handle_undo_change(args).await,
-            "upsert_memory_node" => self.handle_upsert_memory_node(args).await,
-            "create_relation" => self.handle_create_relation(args).await,
-            "search_memory_graph" => self.handle_search_memory_graph(args).await,
-            "prune_stale_links" => self.handle_prune_stale_links(args).await,
-            "add_interlinked_context" => self.handle_add_interlinked_context(args).await,
-            "retrieve_with_traversal" => self.handle_retrieve_with_traversal(args).await,
-            "delete_memory_node" => self.handle_delete_memory_node(args).await,
             "find_dead_code" => self.handle_find_dead_code(args).await,
             "review_pr_diff" => self.handle_review_pr_diff(args).await,
             "detect_dependency_loops" => self.handle_detect_dependency_loops(args).await,
@@ -2092,8 +2077,7 @@ impl ContextPlusServer {
     /// undoes it).
     ///
     /// CoW chain:
-    /// 1. `RefIndex::new_with_head` + `memory_overlay = Some(...)` so the
-    ///    merge ladder can fold worktree nodes back into the primary.
+    /// 1. `RefIndex::new_with_head` registers the ref with the primary as parent.
     /// 2. `fork_from(mcp_data, model, primary_ref)` writes the parent pointer
     ///    in the CAS directory so chunk hashes chain through the primary's
     ///    manifest — this is what lets the worktree reuse the base cache.
@@ -2149,7 +2133,7 @@ impl ContextPlusServer {
         // dirs (returns None → stored as None on the ref).
         let head_sha = crate::core::head_watcher::resolve_head_sha(&canonical);
 
-        // Build the ref with CoW memory overlay (only for non-primary refs).
+        // Build the ref.
         // `attach_ref` is idempotent under concurrent calls — the closure runs
         // only on first insert, so duplicate construction is impossible.
         let raw_for_closure = raw.clone();
@@ -2158,22 +2142,12 @@ impl ContextPlusServer {
         let ref_arc = self
             .state
             .attach_ref(ref_id, move || {
-                let memory_overlay = if parent_ref_id.is_some() {
-                    Some(std::sync::Arc::new(tokio::sync::RwLock::new(
-                        crate::core::memory_graph::MemoryGraph::new(),
-                    )))
-                } else {
-                    None
-                };
-                std::sync::Arc::new(crate::ref_index::RefIndex {
-                    memory_overlay,
-                    ..crate::ref_index::RefIndex::new_with_head(
-                        raw_for_closure,
-                        canonical_for_closure,
-                        parent_ref_id,
-                        head_sha_for_closure.unwrap_or_default(),
-                    )
-                })
+                std::sync::Arc::new(crate::ref_index::RefIndex::new_with_head(
+                    raw_for_closure,
+                    canonical_for_closure,
+                    parent_ref_id,
+                    head_sha_for_closure.unwrap_or_default(),
+                ))
             })
             .await;
 
@@ -2437,166 +2411,6 @@ impl ContextPlusServer {
             restored.join("\n  ")
         );
         Ok(Self::ok_text(msg))
-    }
-
-    async fn handle_upsert_memory_node(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let options = crate::tools::memory_tools::UpsertMemoryNodeOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            node_type: Self::get_str(&args, "type").unwrap_or_else(|| "concept".to_string()),
-            label: Self::get_str(&args, "label")
-                .ok_or_else(|| ContextPlusError::Other("label is required".into()))?,
-            content: Self::get_str(&args, "content")
-                .ok_or_else(|| ContextPlusError::Other("content is required".into()))?,
-            metadata: parse_metadata(&args),
-        };
-
-        let store = &self.state.memory_graph;
-        let result =
-            crate::tools::memory_tools::tool_upsert_memory_node(store, &self.state.ollama, options)
-                .await?;
-
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_create_relation(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let options = crate::tools::memory_tools::CreateRelationOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            // TS API: source_id / target_id (direct node IDs)
-            source_id: Self::get_str(&args, "source_id"),
-            source_label: Self::get_str(&args, "source_label"),
-            source_type: Self::get_str(&args, "source_type")
-                .unwrap_or_else(|| "concept".to_string()),
-            target_id: Self::get_str(&args, "target_id"),
-            target_label: Self::get_str(&args, "target_label"),
-            target_type: Self::get_str(&args, "target_type")
-                .unwrap_or_else(|| "concept".to_string()),
-            relation: Self::get_str(&args, "relation").unwrap_or_else(|| "relates_to".to_string()),
-            weight: Self::get_f64(&args, "weight").map(|w| w as f32),
-            metadata: parse_metadata(&args),
-        };
-
-        let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_create_relation(store, options).await?;
-
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_search_memory_graph(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let options = crate::tools::memory_tools::SearchMemoryGraphOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            query: Self::get_str(&args, "query")
-                .ok_or_else(|| ContextPlusError::Other("query is required".into()))?,
-            max_depth: Self::get_usize(&args, "max_depth"),
-            top_k: Self::get_usize(&args, "top_k"),
-            edge_filter: Self::get_string_array(&args, "edge_filter"),
-        };
-
-        let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_search_memory_graph(
-            store,
-            &self.state.ollama,
-            options,
-        )
-        .await?;
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_prune_stale_links(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let options = crate::tools::memory_tools::PruneStaleLinksOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            threshold: Self::get_f64(&args, "threshold"),
-        };
-
-        let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_prune_stale_links(store, options).await?;
-
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_add_interlinked_context(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let items = args
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        let obj = item.as_object()?;
-                        Some(crate::tools::memory_tools::InterlinkedItem {
-                            node_type: Self::get_str(obj, "type")
-                                .unwrap_or_else(|| "concept".to_string()),
-                            label: Self::get_str(obj, "label")?,
-                            content: Self::get_str(obj, "content")?,
-                            metadata: parse_metadata(obj),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let options = crate::tools::memory_tools::AddInterlinkedContextOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            items,
-            auto_link: Self::get_bool(&args, "auto_link"),
-        };
-
-        let store = &self.state.memory_graph;
-        let result = crate::tools::memory_tools::tool_add_interlinked_context(
-            store,
-            &self.state.ollama,
-            options,
-        )
-        .await?;
-
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_retrieve_with_traversal(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let options = crate::tools::memory_tools::RetrieveWithTraversalOptions {
-            root_dir: self.root_dir().to_string_lossy().into(),
-            node_id: Self::get_str(&args, "start_node_id")
-                .ok_or_else(|| ContextPlusError::Other("start_node_id is required".into()))?,
-            max_depth: Self::get_usize(&args, "max_depth"),
-            max_nodes: Self::get_usize(&args, "max_nodes"),
-            edge_filter: Self::get_string_array(&args, "edge_filter"),
-        };
-
-        let store = &self.state.memory_graph;
-        let result =
-            crate::tools::memory_tools::tool_retrieve_with_traversal(store, options).await?;
-        Ok(Self::ok_text(result))
-    }
-
-    async fn handle_delete_memory_node(
-        &self,
-        args: serde_json::Map<String, Value>,
-    ) -> Result<CallToolResult> {
-        let root_dir = self.root_dir().to_string_lossy().into_owned();
-        let node_id = Self::get_str(&args, "node_id")
-            .ok_or_else(|| ContextPlusError::Other("node_id is required".into()))?;
-
-        let store = &self.state.memory_graph;
-        let result =
-            crate::tools::memory_tools::tool_delete_memory_node(store, &root_dir, &node_id).await?;
-
-        Ok(Self::ok_text(result))
     }
 
     // --- Helpers ---
@@ -3190,16 +3004,6 @@ where
 
 // --- Metadata helper ---
 
-fn parse_metadata(
-    args: &serde_json::Map<String, Value>,
-) -> Option<std::collections::HashMap<String, String>> {
-    args.get("metadata").and_then(|v| v.as_object()).map(|obj| {
-        obj.iter()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-            .collect()
-    })
-}
-
 // make_tool() is re-exported from server_definitions — see imports at top of this file.
 
 // ---------------------------------------------------------------------------
@@ -3545,7 +3349,7 @@ async fn embed_diff_chunks(
                     header,
                     symbols,
                     Vec::new(),
-                    content.as_str().to_string(),
+                    (**content).clone(),
                 );
                 let vec = embedding_snap.get(rel_path).cloned();
                 docs.push(doc);
@@ -3732,9 +3536,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_26_tools() {
+    fn tool_definitions_returns_all_19_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 26, "expected 26 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 19, "expected 19 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -3761,13 +3565,6 @@ mod tests {
             "propose_commit",
             "list_restore_points",
             "undo_change",
-            "upsert_memory_node",
-            "create_relation",
-            "search_memory_graph",
-            "prune_stale_links",
-            "add_interlinked_context",
-            "retrieve_with_traversal",
-            "delete_memory_node",
             "find_dead_code",
             "review_pr_diff",
             "detect_dependency_loops",
@@ -3932,25 +3729,6 @@ mod tests {
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0].as_str(), Some("required_param"));
-    }
-
-    #[test]
-    fn parse_metadata_extracts_map() {
-        let mut args = serde_json::Map::new();
-        let mut meta = serde_json::Map::new();
-        meta.insert("source".to_string(), json!("test"));
-        meta.insert("priority".to_string(), json!("high"));
-        args.insert("metadata".to_string(), Value::Object(meta));
-
-        let result = parse_metadata(&args).unwrap();
-        assert_eq!(result.get("source"), Some(&"test".to_string()));
-        assert_eq!(result.get("priority"), Some(&"high".to_string()));
-    }
-
-    #[test]
-    fn parse_metadata_returns_none_when_missing() {
-        let args = serde_json::Map::new();
-        assert!(parse_metadata(&args).is_none());
     }
 
     // --- ProjectCache tests ---
@@ -4498,12 +4276,6 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             1
         );
-        // CoW chain: non-primary refs carry a memory overlay so the merge ladder
-        // can fold their nodes back into the primary graph.
-        assert!(
-            registered.memory_overlay.is_some(),
-            "non-primary worktree ref must have a memory_overlay"
-        );
         // Parent pointer chains to the primary ref so CAS lookups inherit the baseline.
         assert_eq!(registered.parent_ref_id, Some(server.state.default_ref_id));
     }
@@ -4991,46 +4763,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // parse_metadata edge cases
     // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_metadata_returns_none_for_non_object_metadata() {
-        let mut args = serde_json::Map::new();
-        args.insert("metadata".to_string(), json!("not-an-object"));
-        assert!(parse_metadata(&args).is_none());
-    }
-
-    #[test]
-    fn parse_metadata_returns_none_for_array_metadata() {
-        let mut args = serde_json::Map::new();
-        args.insert("metadata".to_string(), json!(["a", "b"]));
-        assert!(parse_metadata(&args).is_none());
-    }
-
-    #[test]
-    fn parse_metadata_converts_non_string_values_to_empty_string() {
-        let mut args = serde_json::Map::new();
-        let mut meta = serde_json::Map::new();
-        meta.insert("count".to_string(), json!(42));
-        meta.insert("flag".to_string(), json!(true));
-        meta.insert("valid".to_string(), json!("ok"));
-        args.insert("metadata".to_string(), Value::Object(meta));
-
-        let result = parse_metadata(&args).unwrap();
-        // Non-string values get as_str() => None => unwrap_or("") => ""
-        assert_eq!(result.get("count"), Some(&"".to_string()));
-        assert_eq!(result.get("flag"), Some(&"".to_string()));
-        assert_eq!(result.get("valid"), Some(&"ok".to_string()));
-    }
-
-    #[test]
-    fn parse_metadata_handles_empty_object() {
-        let mut args = serde_json::Map::new();
-        args.insert("metadata".to_string(), json!({}));
-        let result = parse_metadata(&args).unwrap();
-        assert!(result.is_empty());
-    }
 
     // ---------------------------------------------------------------
     // code_sym_to_tree_sym / code_sym_to_skel_sym
@@ -5432,73 +5165,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_upsert_memory_node_missing_label_returns_error() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("upsert_memory_node", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("label is required"),
-            "expected label error, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_create_relation_missing_source_returns_failure() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("create_relation", args).await;
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("source_id or source_label is required"),
-            "expected source_id/source_label failure, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_search_memory_graph_missing_query_returns_error() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("search_memory_graph", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("query is required"),
-            "expected query error, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_retrieve_with_traversal_missing_node_id_returns_error() {
-        let server = test_server();
-        let args = serde_json::Map::new();
-        let result = server.dispatch("retrieve_with_traversal", args).await;
-        assert_eq!(result.is_error, Some(true));
-        let text = match &result.content[0].raw {
-            RawContent::Text(t) => t.text.as_str(),
-            _ => panic!("expected text content"),
-        };
-        assert!(
-            text.contains("start_node_id is required"),
-            "expected start_node_id error, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
     async fn dispatch_semantic_code_search_missing_query_returns_error() {
         let server = test_server();
         let args = serde_json::Map::new();
@@ -5619,7 +5285,10 @@ mod tests {
         let root = PathBuf::from("/tmp/test-root");
         let config = Config::from_env();
         let server = ContextPlusServer::new(root.clone(), config);
-        assert_eq!(server.root_dir(), PathBuf::from("/tmp/test-root"));
+        assert_eq!(
+            server.current_ref().root_dir,
+            PathBuf::from("/tmp/test-root")
+        );
         assert_eq!(server.state.root_dir, root);
     }
 

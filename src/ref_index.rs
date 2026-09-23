@@ -41,7 +41,6 @@
 //! - `tracker_handle` — per-ref notify-rs embedding tracker.
 //! - `cache_generation` — monotonic counter bumped by the tracker on file events.
 //! - `project_cache` — walked file entries and raw content for this ref.
-//! - `memory_overlay` — CoW MemoryGraph overlay seam (was already present as a stub).
 //!
 //! For the **default ref**, these fields are initialized from disk (embedding
 //! cache) or empty (everything else) at daemon start, matching the prior
@@ -61,7 +60,6 @@ use tokio::sync::RwLock;
 
 use crate::core::embedding_tracker::EmbeddingTrackerHandle;
 use crate::core::embeddings::CacheEntry;
-use crate::core::memory_graph::MemoryGraph;
 use crate::server::{IdentifierIndex, ProjectCache};
 use crate::tools::semantic_search::CachedSearchIndex;
 
@@ -128,7 +126,6 @@ impl RefId {
 /// - `tracker_handle` — per-ref notify-rs embedding tracker (one per worktree).
 /// - `cache_generation` — bumped on each tracker file-change event.
 /// - `project_cache` — walked file entries and raw content for this ref.
-/// - `memory_overlay` — CoW MemoryGraph overlay (populated at attach time).
 ///
 /// Wrap in `Arc` for cheap cloning across handler dispatches.
 pub struct RefIndex {
@@ -190,13 +187,6 @@ pub struct RefIndex {
     /// Cached project state (walked file entries + raw content).
     /// `Arc`-wrapped for the backward-compat shim.
     pub project_cache: Arc<RwLock<Option<Arc<ProjectCache>>>>,
-
-    /// Per-ref CoW memory-graph overlay.  `None` for the primary ref.
-    /// Populated by `daemon::serve_connection` (U10) for non-default refs.
-    ///
-    /// The merge ladder in `daemon::spawn_head_watcher_task` reads this field;
-    /// if it is `None` the ref is skipped with a debug log.
-    pub memory_overlay: Option<Arc<RwLock<MemoryGraph>>>,
 }
 
 impl RefIndex {
@@ -221,7 +211,6 @@ impl RefIndex {
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
-            memory_overlay: None,
         }
     }
 
@@ -230,11 +219,6 @@ impl RefIndex {
     /// Used by `daemon::serve_connection` when a non-default worktree ref is
     /// registered for the first time (the bridge announces its `head_sha`).
     ///
-    /// `memory_overlay` is intentionally left `None` here so the caller
-    /// (`daemon::serve_connection`) can decide whether to attach a CoW overlay
-    /// based on runtime context (e.g. whether the ref is truly non-primary).
-    /// The daemon attaches the overlay immediately after calling `attach_ref`.
-    /// Tests that check "overlay is None → daemon skips merge" remain valid.
     pub fn new_with_head(
         root_dir: PathBuf,
         canonical_root: PathBuf,
@@ -255,7 +239,6 @@ impl RefIndex {
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
-            memory_overlay: None,
         }
     }
 
@@ -286,7 +269,6 @@ impl RefIndex {
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
-            memory_overlay: None, // primary ref has no overlay
         }
     }
 
@@ -508,20 +490,6 @@ mod tests {
         assert!(r.tracker_handle.lock().unwrap().is_none());
         // project_cache starts None
         assert!(r.project_cache.try_read().unwrap().is_none());
-        // primary ref has no memory overlay
-        assert!(r.memory_overlay.is_none());
-    }
-
-    /// `RefIndex::new_with_head` leaves `memory_overlay = None` — the daemon
-    /// attaches the overlay after construction (see `daemon::serve_connection`).
-    #[test]
-    fn ref_index_new_with_head_has_no_overlay_by_default() {
-        let p = PathBuf::from("/tmp/u10-test-overlay");
-        let r = RefIndex::new_with_head(p.clone(), p, None, "abcdef".to_string());
-        assert!(
-            r.memory_overlay.is_none(),
-            "new_with_head must not pre-attach an overlay — daemon does it post-construction"
-        );
     }
 
     /// `RefIndex::with_preloaded_cache` carries the supplied embedding map.
@@ -542,7 +510,6 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key("src/main.rs"));
         // primary ref built with this constructor has no overlay
-        assert!(r.memory_overlay.is_none());
     }
 
     /// Writes to one ref's `embedding_cache` do NOT appear in another ref's cache.

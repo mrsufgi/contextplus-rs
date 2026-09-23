@@ -123,44 +123,6 @@ Each file's content is hashed (via `hash_content()`) before embedding. On subseq
 files whose hash differs from the cached hash are re-embedded. Unchanged files skip the Ollama API
 call entirely, making warm searches near-instant.
 
-## Memory Graph
-
-The memory graph (`core/memory_graph.rs`) provides a persistent, semantic knowledge store for
-agent-managed notes, concepts, and cross-file relationships.
-
-### Data Structure
-
-```
-MemoryGraph {
-    graph: RwLock<petgraph::StableGraph<MemoryNode, MemoryEdge, Directed>>
-    node_index: RwLock<HashMap<String, NodeIndex>>  -- O(1) lookup by node ID
-    embed_cache: RwLock<HashMap<String, Vec<f32>>>  -- per-node embedding cache
-}
-```
-
-`petgraph::StableGraph` is used (not `Graph`) because node indices must remain stable across
-removals — `prune_stale_links` deletes decayed edges and orphan nodes without invalidating
-surviving indices.
-
-### Persistence (rkyv)
-
-The graph is serialized to disk via `rkyv` into `.mcp_data/memory_graph.rkyv`. On load, the entire
-file is mmap'd and the rkyv archive is validated with `bytecheck` before access. This gives
-zero-copy read performance for large graphs while maintaining safe deserialization.
-
-**Write path:** `upsert_memory_node` → acquire write lock → insert/update node → serialize entire
-graph to disk (atomic rename). Graph mutations are infrequent so full re-serialization is
-acceptable.
-
-**Read path:** `search_memory_graph` → acquire read lock → compute query embedding → cosine scan
-all node embeddings → BFS from top-k results to expand neighborhood.
-
-### BFS Traversal
-
-`retrieve_with_traversal` and `search_memory_graph` both use BFS from seed nodes, bounded by a
-configurable `max_depth` and `max_nodes` limit. The traversal respects edge weights — decayed edges
-(weight below threshold) are skipped during traversal even if not yet pruned.
-
 ## Spectral Clustering
 
 `semantic_navigate` uses spectral clustering to group semantically similar files into labeled
