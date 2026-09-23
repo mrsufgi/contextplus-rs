@@ -6,7 +6,8 @@ use std::sync::{Arc, LazyLock};
 use rmcp::model::Tool;
 use serde_json::Value;
 
-/// All 26 tool definitions. Built once at first access, reused for every list_tools call.
+/// The six tools the server lists. Built once at first access, reused for every list_tools call.
+/// The pre-facade names still dispatch (see `ContextPlusServer::dispatch_inner`) but are not listed.
 static TOOL_DEFINITIONS: LazyLock<Vec<Tool>> = LazyLock::new(build_tool_definitions);
 
 /// Returns the static tool definitions slice. O(1) after first call.
@@ -17,329 +18,150 @@ pub fn tool_definitions() -> &'static [Tool] {
 fn build_tool_definitions() -> Vec<Tool> {
     vec![
         make_tool(
-            "get_context_tree",
-            "Build a token-aware context tree showing file structure and symbols. Prunes detail levels based on max_tokens budget.",
+            "explore",
+            "Find code by what it does. Start here for any question about where something lives or how a concept is implemented; results carry file paths and line ranges to pass to outline.",
             &[
                 (
-                    "target_path",
+                    "query",
+                    "string",
+                    true,
+                    "What you are looking for: plain words for match = meaning, the exact identifier or keyword for match = keywords.",
+                ),
+                (
+                    "kind",
                     "string",
                     false,
-                    "Specific directory or file to analyze (relative to project root)",
+                    "files (default): ranked source files; identifiers: functions, classes and variables with their call sites; clusters: the codebase grouped by topic.",
                 ),
                 (
-                    "depth_limit",
+                    "match",
+                    "string",
+                    false,
+                    "meaning (default): embedding similarity plus keyword overlap; keywords: exact tokens and camelCase parts only, no embeddings, fastest.",
+                ),
+                (
+                    "top_k",
                     "integer",
                     false,
-                    "How many folder levels deep to scan. Use 1-2 for large projects.",
+                    "Number of results (default 5, max 50).",
                 ),
                 (
-                    "include_symbols",
-                    "boolean",
+                    "path",
+                    "string",
                     false,
-                    "Include function/class/enum names in the tree (default true)",
+                    "Directory to scope the search, or a path inside another worktree of this repo to search there.",
+                ),
+            ],
+        ),
+        make_tool(
+            "outline",
+            "Structure without reading bodies: a file's signatures and line ranges, or a directory's file and symbol tree. Call on a file before reading it and on a directory before exploring it.",
+            &[
+                (
+                    "path",
+                    "string",
+                    true,
+                    "A file or a directory, relative to the worktree root or absolute.",
+                ),
+                (
+                    "depth",
+                    "integer",
+                    false,
+                    "Directories only: how many folder levels to include (1-2 for large trees).",
                 ),
                 (
                     "max_tokens",
                     "integer",
                     false,
-                    "Maximum tokens for output. Auto-prunes if exceeded (default 20000)",
+                    "Directories only: output budget; detail is pruned to fit (default 20000).",
                 ),
             ],
         ),
         make_tool(
-            "get_file_skeleton",
-            "Get function signatures, class definitions, and line ranges for a file without reading full content.",
-            &[(
-                "file_path",
-                "string",
-                true,
-                "Path to the file to inspect (relative to project root)",
-            )],
-        ),
-        make_tool(
-            "get_blast_radius",
-            "Find every file that imports or references a symbol. Maps the full impact of changing it. Scans one worktree's indexed tree, so a zero-usage result only means \"unused in the scanned worktree\" — not globally unused.",
+            "impact",
+            "What breaks if this changes. Call before modifying or deleting any symbol: every file and line that imports or references it, or the project's import cycles, or symbols nothing references.",
             &[
                 (
-                    "symbol_name",
-                    "string",
-                    true,
-                    "The function, class, or variable name to trace across the codebase",
-                ),
-                (
-                    "file_context",
+                    "symbol",
                     "string",
                     false,
-                    "The file where the symbol is defined. Excludes the definition line from results.",
+                    "Function, class, type or variable name (required for what = symbol).",
+                ),
+                (
+                    "file",
+                    "string",
+                    false,
+                    "File that defines the symbol, when the name is ambiguous.",
+                ),
+                (
+                    "what",
+                    "string",
+                    false,
+                    "symbol (default): users of the symbol; cycles: import cycles (Tarjan SCC); dead: symbols no other indexed file names, advisory only.",
                 ),
                 (
                     "path",
                     "string",
                     false,
-                    "Root of another worktree of this repository to scan instead of the current one (attached on first use).",
-                ),
-            ],
-        ),
-        make_tool(
-            "semantic_code_search",
-            "Search code files semantically using natural language queries. Combines embedding similarity with keyword matching for hybrid ranking.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Natural language description of what you're looking for",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "Number of matches to return (default 5, max 50)",
-                ),
-                (
-                    "semantic_weight",
-                    "number",
-                    false,
-                    "Weight for embedding similarity in hybrid ranking (default 0.72)",
-                ),
-                (
-                    "keyword_weight",
-                    "number",
-                    false,
-                    "Weight for keyword overlap in hybrid ranking (default 0.28)",
-                ),
-                (
-                    "min_semantic_score",
-                    "number",
-                    false,
-                    "Minimum semantic score filter (0-1 or 0-100)",
-                ),
-                (
-                    "min_keyword_score",
-                    "number",
-                    false,
-                    "Minimum keyword score filter (0-1 or 0-100)",
-                ),
-                (
-                    "min_combined_score",
-                    "number",
-                    false,
-                    "Minimum final score filter (0-1 or 0-100)",
-                ),
-                (
-                    "require_keyword_match",
-                    "boolean",
-                    false,
-                    "When true, only return files with keyword overlap",
-                ),
-                (
-                    "require_semantic_match",
-                    "boolean",
-                    false,
-                    "When true, only return files with positive semantic similarity",
-                ),
-            ],
-        ),
-        make_tool(
-            "semantic_identifier_search",
-            "Search for functions, classes, and variables by semantic meaning. Returns identifiers with call-site rankings.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Natural language intent to match identifiers and usages",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "How many identifiers to return (default 5)",
-                ),
-                (
-                    "top_calls_per_identifier",
-                    "integer",
-                    false,
-                    "How many ranked call sites per identifier (default 10)",
-                ),
-                (
-                    "include_kinds",
-                    "array",
-                    false,
-                    "Optional kinds filter, e.g. [\"function\", \"method\", \"variable\"]",
-                ),
-                (
-                    "semantic_weight",
-                    "number",
-                    false,
-                    "Weight for semantic similarity score (default 0.78)",
-                ),
-                (
-                    "keyword_weight",
-                    "number",
-                    false,
-                    "Weight for keyword overlap score (default 0.22)",
-                ),
-            ],
-        ),
-        make_tool(
-            "semantic_navigate",
-            "Cluster files by semantic similarity using spectral clustering. Returns labeled groups for codebase navigation. Pass rootDir to scope to a subdirectory.",
-            &[
-                (
-                    "rootDir",
-                    "string",
-                    false,
-                    "Directory to navigate (default: workspace root). Must be within the workspace.",
-                ),
-                (
-                    "max_depth",
-                    "integer",
-                    false,
-                    "Maximum nesting depth of clusters (default 3)",
-                ),
-                (
-                    "max_clusters",
-                    "integer",
-                    false,
-                    "Maximum sub-clusters per group at depth 1+ (default 20). Top-level groups are based on directory structure and not limited by this parameter.",
-                ),
-                (
-                    "min_clusters",
-                    "integer",
-                    false,
-                    "Minimum sub-clusters per group (default 2). Increase to force finer-grained splitting.",
-                ),
-                (
-                    "mode",
-                    "string",
-                    false,
-                    "Clustering mode: 'hybrid' (default, directory-based + spectral, best for CPU), 'semantic' (pure spectral clustering like original contextplus, best with GPU), or 'imports' (blends embedding similarity with import-graph adjacency for structure-aware clustering).",
-                ),
-            ],
-        ),
-        make_tool(
-            "run_static_analysis",
-            "Run available linters (tsc, eslint, cargo check, ruff) on the project or a specific file.",
-            &[(
-                "target_path",
-                "string",
-                false,
-                "Specific file or folder to lint. Relative to the active ref's root, or absolute — absolute paths under a registered worktree's root auto-route the linter to that worktree. Omit for full project.",
-            )],
-        ),
-        make_tool(
-            "lexical_search",
-            "Fast in-process TF-IDF lexical search over all indexed files. Complements semantic_code_search for exact-keyword and camelCase identifier queries.",
-            &[
-                (
-                    "query",
-                    "string",
-                    true,
-                    "Keyword or identifier query (camelCase is split into sub-tokens automatically).",
-                ),
-                (
-                    "top_k",
-                    "integer",
-                    false,
-                    "Number of results to return (default 10).",
-                ),
-            ],
-        ),
-        make_tool(
-            "attach_worktree",
-            "Register a worktree directory as a ref that inherits the primary ref's embedding cache via CoW (CAS parent pointer), then spawns per-ref warmup. Required for analyzing worktrees outside the daemon's primary root without a per-worktree MCP handshake. Idempotent.",
-            &[(
-                "path",
-                "string",
-                true,
-                "Absolute or relative path to the worktree directory; will be canonicalized. Must exist and be a directory.",
-            )],
-        ),
-        make_tool(
-            "detach_worktree",
-            "Detach a previously-attached worktree. Decrements its session count; once it reaches zero the ref enters the TTL eviction queue. Refuses to detach the primary ref.",
-            &[(
-                "path",
-                "string",
-                true,
-                "Worktree path used at attach time (or any path that canonicalizes to the same root).",
-            )],
-        ),
-        make_tool(
-            "list_worktrees",
-            "List every ref currently in the registry — the primary plus any attached worktrees — with their canonical roots, session counts, and HEAD SHAs.",
-            &[],
-        ),
-        // --- 5 new tools wired in this PR ---
-        make_tool(
-            "find_dead_code",
-            "Heuristic scan for potentially unused symbols. Reports symbols whose names do not appear as tokens in any other indexed file. Advisory only — scans one worktree's indexed tree, so a symbol used on another branch/worktree can show up as a false positive.",
-            &[
-                (
-                    "ignore_kinds",
-                    "array",
-                    false,
-                    "Symbol kinds to skip (default: [\"mod\",\"impl\",\"trait\",\"test\"]). Pass [] to include all.",
-                ),
-                (
-                    "ignore_names",
-                    "array",
-                    false,
-                    "Symbol names to skip (default: common entry-points like \"main\",\"new\",\"default\"). Pass [] to include all.",
+                    "Root of another worktree of this repo to scan instead of the current one.",
                 ),
                 (
                     "max_results",
                     "integer",
                     false,
-                    "Cap on number of reported candidates (default 200).",
+                    "what = dead: cap on reported symbols.",
+                ),
+            ],
+        ),
+        make_tool(
+            "review",
+            "Risk-rank a unified diff before review: the changed symbols, their dependents up to two hops away, and the files to read first.",
+            &[
+                ("diff", "string", true, "The unified diff text."),
+                (
+                    "max_hops",
+                    "integer",
+                    false,
+                    "How far to follow dependents (default 2).",
+                ),
+                ("max_files", "integer", false, "Cap on files in the report."),
+            ],
+        ),
+        make_tool(
+            "check",
+            "Run the project's own linters and compilers after an edit (tsc, eslint, cargo check, ruff), or audit the search index when results look wrong.",
+            &[
+                (
+                    "path",
+                    "string",
+                    false,
+                    "File or directory to check; omit for the whole project. A path inside another worktree checks that worktree.",
+                ),
+                (
+                    "what",
+                    "string",
+                    false,
+                    "lint (default): linters and compilers on the target; embeddings: zero, NaN, mismatched or duplicate vectors in the embedding cache.",
+                ),
+            ],
+        ),
+        make_tool(
+            "worktrees",
+            "Show or pin git worktrees. Any call whose path lies inside a worktree attaches it automatically; attach pins one for the session, detach releases it.",
+            &[
+                (
+                    "action",
+                    "string",
+                    false,
+                    "list (default), attach or detach.",
                 ),
                 (
                     "path",
                     "string",
                     false,
-                    "Root of another worktree of this repository to scan instead of the current one (attached on first use).",
+                    "Worktree directory for attach and detach.",
                 ),
             ],
-        ),
-        make_tool(
-            "review_pr_diff",
-            "Analyse a unified diff and produce a risk-ranked impact report. Identifies changed symbols, expands to 2-hop dependent files, and ranks all affected files by composite risk score.",
-            &[
-                (
-                    "diff",
-                    "string",
-                    true,
-                    "Unified diff text (output of `git diff` or similar).",
-                ),
-                (
-                    "max_hops",
-                    "integer",
-                    false,
-                    "Dependency expansion depth (default 2).",
-                ),
-                (
-                    "max_files",
-                    "integer",
-                    false,
-                    "Cap on total files surfaced (default 500).",
-                ),
-            ],
-        ),
-        make_tool(
-            "detect_dependency_loops",
-            "Detect import cycles in the project using Tarjan SCC algorithm. Returns all strongly-connected components with >= 2 files, plus self-importing files.",
-            &[],
-        ),
-        make_tool(
-            "check_embedding_quality",
-            "Diagnose the in-memory embedding cache: reports zero vectors, NaN/Inf values, dimension mismatches, and duplicate vectors.",
-            &[(
-                "expected_dim",
-                "integer",
-                false,
-                "Expected embedding dimensionality. Auto-detected from first cached vector if omitted.",
-            )],
         ),
     ]
 }

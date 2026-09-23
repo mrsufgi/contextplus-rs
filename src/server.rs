@@ -1657,6 +1657,13 @@ impl ContextPlusServer {
             crate::core::process_lifecycle::InflightGuard::new(Arc::clone(&self.state.inflight));
 
         match name {
+            "explore" => self.handle_explore(args).await,
+            "outline" => self.handle_outline(args).await,
+            "impact" => self.handle_impact(args).await,
+            "review" => self.handle_review_pr_diff(args).await,
+            "check" => self.handle_check(args).await,
+            "worktrees" => self.handle_worktrees(args).await,
+            // Pre-facade names: still dispatch for one release, not listed.
             "get_context_tree" => self.handle_context_tree(args).await,
             "get_file_skeleton" => self.handle_file_skeleton(args).await,
             "get_blast_radius" => self.handle_blast_radius(args).await,
@@ -2292,6 +2299,102 @@ impl ContextPlusServer {
         (self.resolve_root(args), target_path)
     }
 
+    // --- Facade: the six listed tools, mapped onto the handlers above ---
+
+    fn move_arg(args: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+        if let Some(v) = args.remove(from) {
+            args.insert(to.to_string(), v);
+        }
+    }
+
+    fn arg_or(args: &mut serde_json::Map<String, Value>, key: &str, default: &str) -> String {
+        let v = Self::get_str(args, key).unwrap_or_else(|| default.to_string());
+        args.remove(key);
+        v
+    }
+
+    async fn handle_explore(
+        &self,
+        mut args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        let kind = Self::arg_or(&mut args, "kind", "files");
+        let matching = Self::arg_or(&mut args, "match", "meaning");
+        Self::move_arg(&mut args, "path", "rootDir");
+        match (kind.as_str(), matching.as_str()) {
+            ("identifiers", _) => self.handle_semantic_identifier_search(args).await,
+            ("clusters", _) => self.handle_semantic_navigate(args).await,
+            (_, "keywords") => self.handle_lexical_search(args).await,
+            _ => self.handle_semantic_code_search(args).await,
+        }
+    }
+
+    async fn handle_outline(
+        &self,
+        mut args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        let path = Self::get_str(&args, "path")
+            .ok_or_else(|| ContextPlusError::Other("path is required".into()))?;
+        let abs = if std::path::Path::new(&path).is_absolute() {
+            PathBuf::from(&path)
+        } else {
+            self.current_ref().root_dir.join(&path)
+        };
+        if abs.is_dir() {
+            Self::move_arg(&mut args, "path", "target_path");
+            Self::move_arg(&mut args, "depth", "depth_limit");
+            self.handle_context_tree(args).await
+        } else {
+            Self::move_arg(&mut args, "path", "file_path");
+            args.remove("depth");
+            args.remove("max_tokens");
+            self.handle_file_skeleton(args).await
+        }
+    }
+
+    async fn handle_impact(
+        &self,
+        mut args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        match Self::arg_or(&mut args, "what", "symbol").as_str() {
+            "cycles" => self.handle_detect_dependency_loops(args).await,
+            "dead" => self.handle_find_dead_code(args).await,
+            _ => {
+                if Self::get_str(&args, "symbol").is_none() {
+                    return Err(ContextPlusError::Other(
+                        "symbol is required (or set what to cycles or dead)".into(),
+                    ));
+                }
+                Self::move_arg(&mut args, "symbol", "symbol_name");
+                Self::move_arg(&mut args, "file", "file_context");
+                self.handle_blast_radius(args).await
+            }
+        }
+    }
+
+    async fn handle_check(
+        &self,
+        mut args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        match Self::arg_or(&mut args, "what", "lint").as_str() {
+            "embeddings" => self.handle_check_embedding_quality(args).await,
+            _ => {
+                Self::move_arg(&mut args, "path", "target_path");
+                self.handle_static_analysis(args).await
+            }
+        }
+    }
+
+    async fn handle_worktrees(
+        &self,
+        mut args: serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult> {
+        match Self::arg_or(&mut args, "action", "list").as_str() {
+            "attach" => self.handle_attach_worktree(args).await,
+            "detach" => self.handle_detach_worktree(args).await,
+            _ => self.handle_list_worktrees(args).await,
+        }
+    }
+
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
         let ref_index = self.current_ref();
         if let Some(requested) = Self::get_str(args, "rootDir") {
@@ -2646,12 +2749,14 @@ impl ServerHandler for ContextPlusServer {
             env!("CARGO_PKG_VERSION"),
         ))
         .with_instructions(
-            "Context+ semantic code analysis server. Provides semantic search, \
-             blast radius analysis, context trees, file skeletons, navigation, \
-             memory graph, and more. Calls run against the git worktree of this \
-             repo that your process is in, or that an absolute path argument \
-             points into (attached on first use, forked from the primary's \
-             cache); relative paths are resolved from that worktree's root.",
+            "Code intelligence for this repository, six tools: explore (find code by \
+             what it does; start here), outline (a file's signatures or a directory's \
+             tree; call before reading a file), impact (who uses a symbol; call before \
+             changing one), review (risk-rank a diff), check (the project's linters, \
+             or the search index), worktrees (list, attach, detach). Calls run against \
+             the git worktree your process is in, or the one an absolute path points \
+             into, attached on first use; relative paths resolve from that worktree's \
+             root.",
         )
     }
 
@@ -3413,9 +3518,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_all_15_tools() {
+    fn tool_definitions_returns_the_six_facade_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 15, "expected 15 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 6, "expected 6 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -3430,26 +3535,131 @@ mod tests {
     fn tool_definitions_contain_expected_names() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_ref()).collect();
-        let expected = [
-            "get_context_tree",
-            "get_file_skeleton",
-            "get_blast_radius",
-            "semantic_code_search",
-            "semantic_identifier_search",
-            "semantic_navigate",
-            "run_static_analysis",
-            "find_dead_code",
-            "review_pr_diff",
-            "detect_dependency_loops",
-            "check_embedding_quality",
-            "lexical_search",
-            "attach_worktree",
-            "detach_worktree",
-            "list_worktrees",
-        ];
-        for name in expected {
+        for name in [
+            "explore",
+            "outline",
+            "impact",
+            "review",
+            "check",
+            "worktrees",
+        ] {
             assert!(names.contains(&name), "missing tool: {}", name);
         }
+        assert!(
+            !names.contains(&"get_file_skeleton"),
+            "pre-facade names must not be listed"
+        );
+    }
+
+    fn facade_server() -> (tempfile::TempDir, ContextPlusServer) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/auth.rs"),
+            "pub fn verify_token(t: &str) -> bool { t.len() > 3 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/main.rs"),
+            "mod auth;\nfn main() { auth::verify_token(\"x\"); }\n",
+        )
+        .unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        (tmp, server)
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        match &result.content[0].raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn outline_routes_files_to_skeleton_and_directories_to_tree() {
+        let (_tmp, server) = facade_server();
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), json!("src/auth.rs"));
+        let file = server.dispatch("outline", args).await;
+        assert_eq!(file.is_error, Some(false), "{}", text_of(&file));
+        assert!(
+            text_of(&file).contains("verify_token"),
+            "{}",
+            text_of(&file)
+        );
+
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), json!("src"));
+        args.insert("depth".into(), json!(1));
+        let dir = server.dispatch("outline", args).await;
+        assert_eq!(dir.is_error, Some(false), "{}", text_of(&dir));
+        assert!(text_of(&dir).contains("auth.rs"), "{}", text_of(&dir));
+    }
+
+    #[tokio::test]
+    async fn impact_routes_by_what_and_requires_symbol() {
+        let (_tmp, server) = facade_server();
+        let mut args = serde_json::Map::new();
+        args.insert("symbol".into(), json!("verify_token"));
+        let users = server.dispatch("impact", args).await;
+        assert_eq!(users.is_error, Some(false), "{}", text_of(&users));
+        assert!(text_of(&users).contains("main.rs"), "{}", text_of(&users));
+
+        let mut args = serde_json::Map::new();
+        args.insert("what".into(), json!("cycles"));
+        let cycles = server.dispatch("impact", args).await;
+        assert_eq!(cycles.is_error, Some(false), "{}", text_of(&cycles));
+
+        let missing = server.dispatch("impact", serde_json::Map::new()).await;
+        assert_eq!(missing.is_error, Some(true));
+        assert!(text_of(&missing).contains("symbol is required"));
+    }
+
+    #[tokio::test]
+    async fn explore_requires_query_and_keywords_mode_needs_no_embeddings() {
+        let (_tmp, server) = facade_server();
+        let missing = server.dispatch("explore", serde_json::Map::new()).await;
+        assert_eq!(missing.is_error, Some(true));
+        assert!(text_of(&missing).contains("query is required"));
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("verify_token"));
+        args.insert("match".into(), json!("keywords"));
+        let hits = server.dispatch("explore", args).await;
+        assert_eq!(hits.is_error, Some(false), "{}", text_of(&hits));
+        assert!(text_of(&hits).contains("auth.rs"), "{}", text_of(&hits));
+    }
+
+    #[tokio::test]
+    async fn check_and_worktrees_route_by_argument() {
+        let (_tmp, server) = facade_server();
+        let mut args = serde_json::Map::new();
+        args.insert("what".into(), json!("embeddings"));
+        let audit = server.dispatch("check", args).await;
+        assert_eq!(audit.is_error, Some(false), "{}", text_of(&audit));
+        assert!(
+            text_of(&audit).contains("Embedding quality"),
+            "{}",
+            text_of(&audit)
+        );
+
+        let list = server.dispatch("worktrees", serde_json::Map::new()).await;
+        assert_eq!(list.is_error, Some(false), "{}", text_of(&list));
+        assert!(text_of(&list).contains("primary"), "{}", text_of(&list));
+    }
+
+    #[tokio::test]
+    async fn pre_facade_names_still_dispatch() {
+        let (_tmp, server) = facade_server();
+        let mut args = serde_json::Map::new();
+        args.insert("file_path".into(), json!("src/auth.rs"));
+        let legacy = server.dispatch("get_file_skeleton", args).await;
+        assert_eq!(legacy.is_error, Some(false), "{}", text_of(&legacy));
+        assert!(text_of(&legacy).contains("verify_token"));
     }
 
     #[tokio::test]
@@ -5015,30 +5225,23 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn tool_definitions_blast_radius_requires_symbol_name() {
+    fn tool_definitions_outline_requires_path() {
         let defs = tool_definitions();
-        let tool = defs
-            .iter()
-            .find(|t| t.name.as_ref() == "get_blast_radius")
-            .unwrap();
+        let tool = defs.iter().find(|t| t.name.as_ref() == "outline").unwrap();
         let schema = tool.input_schema.as_ref();
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let req_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(req_strs.contains(&"symbol_name"));
+        assert!(req_strs.contains(&"path"));
     }
 
     #[test]
-    fn tool_definitions_context_tree_has_no_required_params() {
+    fn tool_definitions_impact_has_no_required_params() {
         let defs = tool_definitions();
-        let tool = defs
-            .iter()
-            .find(|t| t.name.as_ref() == "get_context_tree")
-            .unwrap();
+        let tool = defs.iter().find(|t| t.name.as_ref() == "impact").unwrap();
         let schema = tool.input_schema.as_ref();
-        // get_context_tree has no required params
         assert!(
             schema.get("required").is_none(),
-            "get_context_tree should have no required params"
+            "impact should have no required params (symbol is needed only for what = symbol)"
         );
     }
 
