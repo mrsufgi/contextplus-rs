@@ -89,11 +89,9 @@ pub const MAX_FILES_PER_LABEL: usize = 5;
 /// 0.9 means 90% embedding + 10% import adjacency for gentle structural nudging.
 pub const IMPORT_BLEND_ALPHA: f64 = 0.9;
 
-/// Build the navigate cache file name for a given embedding model.
-/// Uses server::sanitize_model_name for filesystem safety
-/// (e.g., "unclemusclez/jina-embeddings-v2-base-code" → "navigate-unclemusclez-jina-embeddings-v2-base-code")
-pub fn nav_cache_name(model: &str) -> String {
-    format!("navigate-{}", crate::server::sanitize_model_name(model))
+/// Build the navigate cache file name for the document embedding settings.
+pub fn nav_cache_name(config: &crate::config::Config) -> String {
+    crate::server::cache_name("navigate", config)
 }
 
 #[cfg(test)]

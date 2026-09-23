@@ -73,7 +73,7 @@ async fn main() {
     );
 
     // Load existing cache
-    let cache_name = nav_cache_name(&config.ollama_embed_model);
+    let cache_name = nav_cache_name(&config);
     let mut cache: HashMap<String, CacheEntry> = HashMap::new();
     if let Ok(Some(store)) = rkyv_store::mmap_vector_store(root, &cache_name) {
         let dims = store.dims();
@@ -134,7 +134,7 @@ async fn main() {
             texts.len()
         );
 
-        match ollama.embed(&texts).await {
+        match ollama.embed_documents(&texts).await {
             Ok(vectors) => {
                 for (j, (file_idx, _)) in chunk.iter().enumerate() {
                     if j < vectors.len() {

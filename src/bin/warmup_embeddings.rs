@@ -18,7 +18,7 @@ use contextplus_rs::core::embeddings::{CacheEntry, OllamaClient, VectorStore};
 use contextplus_rs::core::parser::hash_content;
 use contextplus_rs::core::tree_sitter::get_supported_extensions;
 use contextplus_rs::core::walker;
-use contextplus_rs::server::cache_name;
+use contextplus_rs::server::{build_embedding_document, cache_name};
 use futures::future;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -77,7 +77,9 @@ async fn main() {
                 return None;
             }
             let hash = hash_content(&content);
-            Some((entry.relative_path.clone(), hash, content))
+            let document =
+                build_embedding_document(&entry.relative_path, &content, config.embed_doc_shape);
+            Some((entry.relative_path.clone(), hash, document))
         })
         .collect();
 
@@ -97,7 +99,7 @@ async fn main() {
     }
 
     // Step 2: load existing cache; partition into hits / misses
-    let cache_name_str = cache_name("embeddings", &config.ollama_embed_model);
+    let cache_name_str = cache_name("embeddings", &config);
 
     // Load into a HashMap so we can merge new entries later without losing
     // anything previously persisted by another writer (e.g. the live MCP).
@@ -176,7 +178,7 @@ async fn main() {
         // batch_data and ollama — both outlive the join_all await point.
         let results = future::join_all(batch_data.iter().map(
             |(batch_idx, chunk_start, chunk_end, n, texts)| async {
-                let r = ollama.embed(texts).await;
+                let r = ollama.embed_documents(texts).await;
                 (*batch_idx, *chunk_start, *chunk_end, *n, r)
             },
         ))
