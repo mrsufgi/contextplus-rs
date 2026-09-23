@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use rmcp::model::Tool;
 use serde_json::Value;
 
-/// The six tools the server lists. Built once at first access, reused for every list_tools call.
+/// The five tools the server lists. Built once at first access, reused for every list_tools call.
 /// The pre-facade names still dispatch (see `ContextPlusServer::dispatch_inner`) but are not listed.
 static TOOL_DEFINITIONS: LazyLock<Vec<Tool>> = LazyLock::new(build_tool_definitions);
 
@@ -79,13 +79,31 @@ fn build_tool_definitions() -> Vec<Tool> {
         ),
         make_tool(
             "impact",
-            "What breaks if this changes. Call before modifying or deleting any symbol: every file and line that imports or references it, or the project's import cycles, or symbols nothing references.",
+            "What breaks if this changes. Call before modifying or deleting any symbol: every file and line that imports or references it. Give it a unified diff instead to risk-rank a whole change (changed symbols, dependents two hops out, files to read first). Also: the project's import cycles, or symbols nothing references.",
             &[
                 (
                     "symbol",
                     "string",
                     false,
-                    "Function, class, type or variable name (required for what = symbol).",
+                    "Function, class, type or variable name (required for what = symbol unless diff is given).",
+                ),
+                (
+                    "diff",
+                    "string",
+                    false,
+                    "A unified diff to rank instead of a single symbol.",
+                ),
+                (
+                    "max_hops",
+                    "integer",
+                    false,
+                    "diff only: how far to follow dependents (default 2).",
+                ),
+                (
+                    "max_files",
+                    "integer",
+                    false,
+                    "diff only: cap on files in the report.",
                 ),
                 (
                     "file",
@@ -111,20 +129,6 @@ fn build_tool_definitions() -> Vec<Tool> {
                     false,
                     "what = dead: cap on reported symbols.",
                 ),
-            ],
-        ),
-        make_tool(
-            "review",
-            "Risk-rank a unified diff before review: the changed symbols, their dependents up to two hops away, and the files to read first.",
-            &[
-                ("diff", "string", true, "The unified diff text."),
-                (
-                    "max_hops",
-                    "integer",
-                    false,
-                    "How far to follow dependents (default 2).",
-                ),
-                ("max_files", "integer", false, "Cap on files in the report."),
             ],
         ),
         make_tool(

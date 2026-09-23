@@ -1660,7 +1660,6 @@ impl ContextPlusServer {
             "explore" => self.handle_explore(args).await,
             "outline" => self.handle_outline(args).await,
             "impact" => self.handle_impact(args).await,
-            "review" => self.handle_review_pr_diff(args).await,
             "check" => self.handle_check(args).await,
             "worktrees" => self.handle_worktrees(args).await,
             // Pre-facade names: still dispatch for one release, not listed.
@@ -2355,13 +2354,17 @@ impl ContextPlusServer {
         &self,
         mut args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
+        if Self::get_str(&args, "diff").is_some() {
+            args.remove("what");
+            return self.handle_review_pr_diff(args).await;
+        }
         match Self::arg_or(&mut args, "what", "symbol").as_str() {
             "cycles" => self.handle_detect_dependency_loops(args).await,
             "dead" => self.handle_find_dead_code(args).await,
             _ => {
                 if Self::get_str(&args, "symbol").is_none() {
                     return Err(ContextPlusError::Other(
-                        "symbol is required (or set what to cycles or dead)".into(),
+                        "symbol or diff is required (or set what to cycles or dead)".into(),
                     ));
                 }
                 Self::move_arg(&mut args, "symbol", "symbol_name");
@@ -2752,8 +2755,8 @@ impl ServerHandler for ContextPlusServer {
             "Code intelligence for this repository, six tools: explore (find code by \
              what it does; start here), outline (a file's signatures or a directory's \
              tree; call before reading a file), impact (who uses a symbol; call before \
-             changing one), review (risk-rank a diff), check (the project's linters, \
-             or the search index), worktrees (list, attach, detach). Calls run against \
+             changing one; give it a diff to rank a whole change), check (the \
+             project's linters, or the search index), worktrees (list, attach, detach). Calls run against \
              the git worktree your process is in, or the one an absolute path points \
              into, attached on first use; relative paths resolve from that worktree's \
              root.",
@@ -3518,9 +3521,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_returns_the_six_facade_tools() {
+    fn tool_definitions_returns_the_five_facade_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 6, "expected 6 tools, got {}", defs.len());
+        assert_eq!(defs.len(), 5, "expected 5 tools, got {}", defs.len());
         for tool in defs {
             assert!(!tool.name.is_empty(), "tool name must not be empty");
             assert!(
@@ -3535,14 +3538,7 @@ mod tests {
     fn tool_definitions_contain_expected_names() {
         let defs = tool_definitions();
         let names: Vec<&str> = defs.iter().map(|t| t.name.as_ref()).collect();
-        for name in [
-            "explore",
-            "outline",
-            "impact",
-            "review",
-            "check",
-            "worktrees",
-        ] {
+        for name in ["explore", "outline", "impact", "check", "worktrees"] {
             assert!(names.contains(&name), "missing tool: {}", name);
         }
         assert!(
@@ -3616,7 +3612,16 @@ mod tests {
 
         let missing = server.dispatch("impact", serde_json::Map::new()).await;
         assert_eq!(missing.is_error, Some(true));
-        assert!(text_of(&missing).contains("symbol is required"));
+        assert!(text_of(&missing).contains("symbol or diff is required"));
+
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "diff".into(),
+            json!("--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -1,1 +1,1 @@\n-pub fn verify_token(t: &str) -> bool { t.len() > 3 }\n+pub fn verify_token(t: &str) -> bool { t.len() > 4 }\n"),
+        );
+        let ranked = server.dispatch("impact", args).await;
+        assert_eq!(ranked.is_error, Some(false), "{}", text_of(&ranked));
+        assert!(text_of(&ranked).contains("auth.rs"), "{}", text_of(&ranked));
     }
 
     #[tokio::test]
