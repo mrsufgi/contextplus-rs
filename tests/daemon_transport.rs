@@ -32,7 +32,9 @@ use std::time::Duration;
 
 use contextplus_rs::config::Config;
 use contextplus_rs::server::ContextPlusServer;
-use contextplus_rs::transport::client::{RegisterSession, SessionReady, read_frame, write_frame};
+use contextplus_rs::transport::client::{
+    RegisterSession, SearchConfig, SessionReady, read_frame, write_frame,
+};
 use contextplus_rs::transport::daemon::{self, AcquireOutcome, LockGuard};
 use contextplus_rs::transport::paths;
 use serde_json::json;
@@ -102,6 +104,7 @@ async fn do_register_session(stream: &mut UnixStream, root_dir: &Path) -> Sessio
         client_root: root_dir.to_path_buf(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(stream, &reg)
         .await
@@ -190,6 +193,61 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> String {
     buf
 }
 
+async fn call_list_worktrees_twice(
+    mut stream: UnixStream,
+    root_dir: &Path,
+    search_config: SearchConfig,
+) -> [String; 2] {
+    let register = RegisterSession {
+        client_root: root_dir.to_path_buf(),
+        head_sha: "deadbeef".to_owned(),
+        client_pid: std::process::id(),
+        search_config: Some(search_config),
+    };
+    write_frame(&mut stream, &register).await.unwrap();
+    let _: SessionReady = read_frame(&mut stream).await.unwrap();
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_line(
+        &mut write_half,
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                       "clientInfo": {"name": "config-test", "version": "0.0.0"}}
+        }),
+    )
+    .await;
+    let _ = read_line(&mut reader).await;
+    write_line(
+        &mut write_half,
+        &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await;
+
+    let mut results = Vec::new();
+    for id in [2, 3] {
+        write_line(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "list_worktrees", "arguments": {}}
+            }),
+        )
+        .await;
+        let response: serde_json::Value =
+            serde_json::from_str(&read_line(&mut reader).await).unwrap();
+        results.push(
+            response
+                .pointer("/result/content/0/text")
+                .and_then(|value| value.as_str())
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    results.try_into().unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -224,6 +282,39 @@ async fn daemon_serves_two_concurrent_clients() {
     );
     assert!(!t1.is_empty(), "client 1 got empty tree");
     assert!(!t2.is_empty(), "client 2 got empty tree");
+
+    handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_warning_appears_only_on_first_mismatched_result() {
+    let daemon_config = Config::from_env();
+    let matching_config = SearchConfig::from(&daemon_config);
+    let (dir, handle, socket_path) = spawn_daemon_for_test().await;
+
+    let mut mismatched_config = matching_config.clone();
+    mismatched_config.ollama_embed_model = "bridge-only-model".into();
+    mismatched_config.ollama_host = "http://bridge-only-ollama:11434".into();
+    let mismatch_stream = UnixStream::connect(&socket_path).await.unwrap();
+    let [first, second] =
+        call_list_worktrees_twice(mismatch_stream, dir.path(), mismatched_config).await;
+    assert!(first.starts_with("contextplus warning:"), "{first}");
+    assert!(first.contains("OLLAMA_EMBED_MODEL="), "{first}");
+    assert!(first.contains("OLLAMA_HOST="), "{first}");
+    assert!(!second.contains("contextplus warning:"), "{second}");
+
+    let matching_stream = UnixStream::connect(&socket_path).await.unwrap();
+    let [matching_first, matching_second] =
+        call_list_worktrees_twice(matching_stream, dir.path(), matching_config).await;
+    assert!(
+        !matching_first.contains("contextplus warning:"),
+        "{matching_first}"
+    );
+    assert!(
+        !matching_second.contains("contextplus warning:"),
+        "{matching_second}"
+    );
 
     handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
@@ -949,6 +1040,7 @@ fn rpc_initialize_sync(stream: &mut std::os::unix::net::UnixStream) -> String {
         client_root: std::path::PathBuf::from("/tmp/test"),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame_sync(stream, &reg);
     // Read back session_ready (we don't validate the content, just drain it).
@@ -1400,6 +1492,7 @@ async fn connect_and_register(socket_path: &Path, root_dir: &Path) -> (UnixStrea
         client_root: root_dir.to_path_buf(),
         head_sha: "cafebabe".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg)
         .await
@@ -1557,6 +1650,7 @@ async fn register_session_unknown_head_sha_falls_back_gracefully() {
         // A SHA that is very unlikely to be in any real repo.
         head_sha: "0000000000000000000000000000000000000000deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg)
         .await
@@ -1636,6 +1730,7 @@ async fn register_session_rejected_when_draining() {
         client_root: root2.clone(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     // The daemon drops the stream immediately when draining, so write_frame
     // may fail with a broken-pipe, or read_frame may fail with EOF.

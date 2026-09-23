@@ -10,7 +10,7 @@ use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
 use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::Result;
-use crate::server::{SharedState, cache_name};
+use crate::server::{SharedState, build_embedding_document, cache_name};
 use crate::tools::semantic_search::{
     EmbedFn, SearchDocument, SymbolSearchEntry, WalkAndIndexFn, extract_plain_text_header,
     is_text_index_candidate, semantic_embedding_content,
@@ -28,7 +28,7 @@ impl EmbedFn for OllamaEmbedder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>>
     {
         let texts = texts.to_vec();
-        Box::pin(async move { self.0.embed(&texts).await })
+        Box::pin(async move { self.0.embed_queries(&texts).await })
     }
 }
 
@@ -104,6 +104,7 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
 
             let mut docs = Vec::new();
             let mut content_hashes = Vec::new();
+            let mut embedding_texts = Vec::new();
 
             for (_, rel_path, maybe_content) in &file_contents {
                 let content = match maybe_content {
@@ -116,6 +117,11 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     let truncated = semantic_embedding_content(rel_path, content);
                     let header = extract_plain_text_header(&truncated);
                     content_hashes.push((rel_path.clone(), content_hash(content)));
+                    embedding_texts.push(build_embedding_document(
+                        rel_path,
+                        content,
+                        config.embed_doc_shape,
+                    ));
                     docs.push(SearchDocument::new(
                         rel_path.clone(),
                         header,
@@ -144,7 +150,10 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     .collect();
 
                 let doc_content = semantic_embedding_content(rel_path, content);
+                let embedding_text =
+                    build_embedding_document(rel_path, content, config.embed_doc_shape);
                 content_hashes.push((rel_path.clone(), content_hash(content)));
+                embedding_texts.push(embedding_text);
 
                 docs.push(SearchDocument::new(
                     rel_path.clone(),
@@ -174,7 +183,7 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 }
                 vectors.push(None);
                 uncached_indices.push(i);
-                uncached_texts.push(docs[i].content.clone());
+                uncached_texts.push(embedding_texts[i].clone());
             }
             drop(cache_read);
 
@@ -251,10 +260,9 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     join_set.spawn(async move {
                         (
                             idx,
-                            tokio::time::timeout(
-                                remaining,
-                                async move { ollama.embed(&chunk).await },
-                            )
+                            tokio::time::timeout(remaining, async move {
+                                ollama.embed_documents(&chunk).await
+                            })
                             .await,
                         )
                     });
@@ -374,7 +382,7 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 // silently drop entries written by warmup_embeddings or a second
                 // MCP instance racing on the same cache file.
                 if let Some(store) = store_to_save {
-                    let code_cache_name = cache_name("embeddings", &config.ollama_embed_model);
+                    let code_cache_name = cache_name("embeddings", &config);
                     let root = store_root.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         rkyv_store::save_vector_store_merged(&root, &code_cache_name, &store)

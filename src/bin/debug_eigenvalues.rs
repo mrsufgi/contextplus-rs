@@ -1,6 +1,7 @@
 //! Debug tool: load cached embeddings, run spectral clustering, print eigenvalue spectrum.
 
 use contextplus_rs::cache::rkyv_store;
+use contextplus_rs::config::Config;
 use contextplus_rs::core::clustering::{
     build_affinity_matrix, find_optimal_k, full_eigen, normalized_laplacian,
     spectral_cluster_with_min,
@@ -19,9 +20,8 @@ fn main() {
         .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
     let root = root.as_path();
 
-    let model =
-        std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string());
-    let cache_name = nav_cache_name(&model);
+    let config = Config::from_env();
+    let cache_name = nav_cache_name(&config);
 
     println!("Root path: {}", root.display());
     println!("Cache name: {cache_name}");

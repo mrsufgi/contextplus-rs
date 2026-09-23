@@ -91,6 +91,9 @@ ollama pull qwen3.5:9b                # chat (for cluster labeling)
 | `OLLAMA_API_KEY` | _(none)_ | Optional API key |
 | `CONTEXTPLUS_EMBED_BATCH_SIZE` | `50` | Document embedding batch size (clamped 5–512) |
 | `CONTEXTPLUS_QUERY_BATCH_SIZE` | `1` | Query embedding batch size (number of query vectors sent per Ollama request) |
+| `CONTEXTPLUS_EMBED_QUERY_PREFIX` | Model-specific | Query prefix: `task: code retrieval \| query: ` for `embeddinggemma`, `query: ` for `snowflake-arctic-embed2`, empty otherwise. Set to an empty string to disable |
+| `CONTEXTPLUS_EMBED_DOC_PREFIX` | Model-specific | Document prefix: `title: none \| text: ` for `embeddinggemma`, empty otherwise. Set to an empty string to disable |
+| `CONTEXTPLUS_EMBED_DOC_SHAPE` | Model-specific | File document shape: `outline` for `embeddinggemma`, `head` otherwise |
 | `CONTEXTPLUS_EMBED_CHUNK_CHARS` | `2000` | Max chars per embedding input (clamped 256–8000). Oversized inputs are chunked and merged |
 | `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `51200` (50 KB) | Skip files larger than this (bytes) for embedding. Min 1 KB |
 | `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated), appended to the built-in list |

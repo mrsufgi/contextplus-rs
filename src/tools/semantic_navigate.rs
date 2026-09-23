@@ -352,7 +352,7 @@ pub async fn semantic_navigate(
     // Navigate uses its OWN embedding cache (not the shared one from semantic_code_search).
     // Navigate embeds with path-weighted text ("{path} {path} {path} {header} {content}")
     // which produces different vectors than search ("{lang} {content}").
-    let nav_cache_name = nav_cache_name(&config.ollama_embed_model);
+    let nav_cache_name = nav_cache_name(config);
     let mut nav_cache: HashMap<String, CacheEntry> = HashMap::new();
     if let Ok(Some(store)) = rkyv_store::mmap_vector_store(root_dir, &nav_cache_name) {
         let dims = store.dims();
@@ -815,7 +815,7 @@ async fn resolve_embeddings(
         let chunk_end = (chunk_start + chunk_size).min(uncached_indices.len());
         let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
-        let mut chunk_vectors = ollama.embed(chunk_texts).await?;
+        let mut chunk_vectors = ollama.embed_documents(chunk_texts).await?;
 
         // Store this chunk's vectors in cache, then drop lock BEFORE disk I/O.
         // Empty vectors (failed Ollama batches, time-box partials) are skipped

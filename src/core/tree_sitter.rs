@@ -390,7 +390,7 @@ fn collect_imports_from_node(
                 // Skip type-only declarations: `import type { … }` and
                 // `export type { … }` are erased at compile time and never
                 // create a runtime dependency. Keeping them in the graph
-                // produces false-positive cycles (e.g. the berries
+                // produces false-positive cycles (e.g. an application
                 // subscription-domain 3-file SCC).
                 if is_type_only_ts_import(&node) {
                     return;
@@ -575,7 +575,7 @@ fn extract_imports_regex(content: &str) -> Vec<String> {
 }
 
 /// Extract import paths from a source file using tree-sitter.
-/// Returns a list of raw import specifiers (e.g., "./billing-service", "@berries/lib-context", "fs/promises").
+/// Returns a list of raw import specifiers (e.g., "./billing-service", "@acme/lib-context", "fs/promises").
 pub fn extract_imports(path: &Path) -> Vec<String> {
     let ext = path
         .extension()
@@ -957,7 +957,7 @@ struct Rectangle {
     fn extract_imports_typescript_es_imports() {
         let code = r#"
 import { BillingService } from './billing-service';
-import * as context from '@berries/lib-context';
+import * as context from '@acme/lib-context';
 import fs from 'fs/promises';
 import type { Config } from '../config';
 
@@ -965,7 +965,7 @@ export function doStuff() {}
 "#;
         let imports = extract_imports_from_str(code, ".ts");
         assert!(imports.contains(&"./billing-service".to_string()));
-        assert!(imports.contains(&"@berries/lib-context".to_string()));
+        assert!(imports.contains(&"@acme/lib-context".to_string()));
         assert!(imports.contains(&"fs/promises".to_string()));
         // `import type { … }` is erased at compile time — it must NOT appear
         // in the runtime import list so it cannot form false dependency cycles.

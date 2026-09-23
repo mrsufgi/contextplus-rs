@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Client) => {
-            contextplus_rs::transport::client::run(&root_dir).await?;
+            contextplus_rs::transport::client::run_with_config(&root_dir, &config).await?;
         }
         Some(Commands::Init { target }) => {
             let binary_path = std::env::current_exe()

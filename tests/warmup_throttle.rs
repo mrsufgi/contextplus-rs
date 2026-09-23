@@ -147,6 +147,7 @@ async fn register_session(socket: &Path, client_root: &Path) -> SessionReady {
         client_root: client_root.to_path_buf(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg)
         .await
@@ -171,6 +172,7 @@ async fn bridge_call(
         client_root: client_root.to_path_buf(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg)
         .await
@@ -567,6 +569,7 @@ async fn bridge_call_throttle(
         client_root: client_root.to_path_buf(),
         head_sha: "deadbeef".to_owned(),
         client_pid: std::process::id(),
+        search_config: None,
     };
     write_frame(&mut stream, &reg)
         .await

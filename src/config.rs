@@ -28,6 +28,21 @@ pub enum RefWarmupMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedDocShape {
+    Head,
+    Outline,
+}
+
+impl fmt::Display for EmbedDocShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EmbedDocShape::Head => write!(f, "head"),
+            EmbedDocShape::Outline => write!(f, "outline"),
+        }
+    }
+}
+
 impl fmt::Display for RefWarmupMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -86,6 +101,9 @@ pub struct Config {
     pub ollama_embed_model: String,
     pub ollama_chat_model: String,
     pub ollama_api_key: Option<String>,
+    pub embed_query_prefix: String,
+    pub embed_doc_prefix: String,
+    pub embed_doc_shape: EmbedDocShape,
     pub embed_batch_size: usize,
     pub embed_tracker_mode: TrackerMode,
     pub embed_tracker_debounce_ms: u64,
@@ -157,6 +175,48 @@ const MIN_EMBED_BATCH_SIZE: usize = 5;
 const MAX_EMBED_BATCH_SIZE: usize = 512;
 const DEFAULT_MAX_EMBED_FILE_SIZE: usize = 50 * 1024;
 const MIN_MAX_EMBED_FILE_SIZE: usize = 1024;
+
+fn embed_model_base_name(model: &str) -> &str {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .split(':')
+        .next()
+        .unwrap_or(model)
+}
+
+fn default_embedding_settings(model: &str) -> (&'static str, &'static str, EmbedDocShape) {
+    match embed_model_base_name(model) {
+        "embeddinggemma" => (
+            "task: code retrieval | query: ",
+            "title: none | text: ",
+            EmbedDocShape::Outline,
+        ),
+        "snowflake-arctic-embed2" => ("query: ", "", EmbedDocShape::Head),
+        _ => ("", "", EmbedDocShape::Head),
+    }
+}
+
+fn parse_embed_doc_shape(value: Option<&str>, default: EmbedDocShape) -> EmbedDocShape {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(value) if value == "head" => EmbedDocShape::Head,
+        Some(value) if value == "outline" => EmbedDocShape::Outline,
+        None => default,
+        Some(unknown) => {
+            tracing::warn!(
+                value = unknown,
+                default = %default,
+                "unknown CONTEXTPLUS_EMBED_DOC_SHAPE value; falling back to model default"
+            );
+            default
+        }
+    }
+}
+
+fn embedding_settings_hash(value: &str) -> String {
+    crate::core::parser::hash_content(value)
+}
 
 /// Base directory names always excluded from walks.
 ///
@@ -257,15 +317,51 @@ fn build_ignore_dirs() -> HashSet<String> {
 }
 
 impl Config {
+    pub fn query_cache_identity(&self) -> String {
+        if self.embed_query_prefix.is_empty() {
+            self.ollama_embed_model.clone()
+        } else {
+            format!(
+                "q{}-{}",
+                embedding_settings_hash(&self.embed_query_prefix),
+                self.ollama_embed_model
+            )
+        }
+    }
+
+    pub fn document_cache_identity(&self) -> String {
+        if self.embed_doc_prefix.is_empty() && self.embed_doc_shape == EmbedDocShape::Head {
+            self.ollama_embed_model.clone()
+        } else {
+            format!(
+                "d{}-{}",
+                embedding_settings_hash(&format!(
+                    "{}\0{}",
+                    self.embed_doc_prefix, self.embed_doc_shape
+                )),
+                self.ollama_embed_model
+            )
+        }
+    }
+
     pub fn from_env() -> Self {
         let batch_size: usize = env_parse("CONTEXTPLUS_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
         let batch_size = batch_size.clamp(MIN_EMBED_BATCH_SIZE, MAX_EMBED_BATCH_SIZE);
+        let ollama_embed_model = env_or("OLLAMA_EMBED_MODEL", DEFAULT_EMBED_MODEL);
+        let (default_query_prefix, default_doc_prefix, default_doc_shape) =
+            default_embedding_settings(&ollama_embed_model);
 
         Config {
             ollama_host: env_or("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
-            ollama_embed_model: env_or("OLLAMA_EMBED_MODEL", DEFAULT_EMBED_MODEL),
+            ollama_embed_model,
             ollama_chat_model: env_or("OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
             ollama_api_key: env::var("OLLAMA_API_KEY").ok(),
+            embed_query_prefix: env_or("CONTEXTPLUS_EMBED_QUERY_PREFIX", default_query_prefix),
+            embed_doc_prefix: env_or("CONTEXTPLUS_EMBED_DOC_PREFIX", default_doc_prefix),
+            embed_doc_shape: parse_embed_doc_shape(
+                env::var("CONTEXTPLUS_EMBED_DOC_SHAPE").ok().as_deref(),
+                default_doc_shape,
+            ),
             embed_batch_size: batch_size,
             embed_tracker_mode: parse_tracker_mode(
                 env::var("CONTEXTPLUS_EMBED_TRACKER").ok().as_deref(),
@@ -368,9 +464,12 @@ mod tests {
         }
         f();
         for (key, old_val) in old_vals {
-            if let Some(v) = old_val {
-                // SAFETY: test-only, serialized by ENV_LOCK
-                unsafe { env::set_var(key, v) };
+            // SAFETY: test-only, serialized by ENV_LOCK
+            unsafe {
+                match old_val {
+                    Some(v) => env::set_var(key, v),
+                    None => env::remove_var(key),
+                }
             }
         }
     }
@@ -392,6 +491,9 @@ mod tests {
                 "CONTEXTPLUS_IDLE_TIMEOUT_MS",
                 "CONTEXTPLUS_PARENT_POLL_MS",
                 "CONTEXTPLUS_EMBED_CHUNK_CHARS",
+                "CONTEXTPLUS_EMBED_QUERY_PREFIX",
+                "CONTEXTPLUS_EMBED_DOC_PREFIX",
+                "CONTEXTPLUS_EMBED_DOC_SHAPE",
                 "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
                 "CONTEXTPLUS_REF_WARMUP_MODE",
@@ -403,6 +505,9 @@ mod tests {
                 assert_eq!(cfg.ollama_embed_model, "snowflake-arctic-embed2");
                 assert_eq!(cfg.ollama_chat_model, "llama3.2");
                 assert!(cfg.ollama_api_key.is_none());
+                assert_eq!(cfg.embed_query_prefix, "query: ");
+                assert_eq!(cfg.embed_doc_prefix, "");
+                assert_eq!(cfg.embed_doc_shape, EmbedDocShape::Head);
                 assert_eq!(cfg.embed_batch_size, 50);
                 assert_eq!(cfg.embed_tracker_mode, TrackerMode::Lazy);
                 assert_eq!(cfg.embed_tracker_debounce_ms, 700);
@@ -446,6 +551,65 @@ mod tests {
                 assert_eq!(cfg.embed_tracker_mode, TrackerMode::Off);
                 assert_eq!(cfg.embed_tracker_debounce_ms, 1500);
                 assert_eq!(cfg.embed_tracker_max_files, 20);
+            },
+        );
+    }
+
+    #[test]
+    fn embedding_defaults_follow_model_base_name() {
+        assert_eq!(
+            default_embedding_settings("embeddinggemma:300m"),
+            (
+                "task: code retrieval | query: ",
+                "title: none | text: ",
+                EmbedDocShape::Outline,
+            )
+        );
+        assert_eq!(
+            default_embedding_settings("snowflake-arctic-embed2:latest"),
+            ("query: ", "", EmbedDocShape::Head)
+        );
+        assert_eq!(
+            default_embedding_settings("nomic-embed-text:latest"),
+            ("", "", EmbedDocShape::Head)
+        );
+        assert_eq!(
+            default_embedding_settings("some-other-model"),
+            ("", "", EmbedDocShape::Head)
+        );
+
+        with_cleared_env(
+            &[
+                "OLLAMA_EMBED_MODEL",
+                "CONTEXTPLUS_EMBED_QUERY_PREFIX",
+                "CONTEXTPLUS_EMBED_DOC_PREFIX",
+                "CONTEXTPLUS_EMBED_DOC_SHAPE",
+            ],
+            || {
+                // SAFETY: test-only, serialized by ENV_LOCK
+                unsafe { env::set_var("OLLAMA_EMBED_MODEL", "registry/acme/embeddinggemma:300m") };
+                let config = Config::from_env();
+                assert_eq!(config.embed_query_prefix, "task: code retrieval | query: ");
+                assert_eq!(config.embed_doc_prefix, "title: none | text: ");
+                assert_eq!(config.embed_doc_shape, EmbedDocShape::Outline);
+            },
+        );
+    }
+
+    #[test]
+    fn embedding_prefix_env_overrides_preserve_explicit_empty_values() {
+        with_env(
+            &[
+                ("OLLAMA_EMBED_MODEL", "embeddinggemma:300m"),
+                ("CONTEXTPLUS_EMBED_QUERY_PREFIX", ""),
+                ("CONTEXTPLUS_EMBED_DOC_PREFIX", "custom document: "),
+                ("CONTEXTPLUS_EMBED_DOC_SHAPE", "head"),
+            ],
+            || {
+                let config = Config::from_env();
+                assert_eq!(config.embed_query_prefix, "");
+                assert_eq!(config.embed_doc_prefix, "custom document: ");
+                assert_eq!(config.embed_doc_shape, EmbedDocShape::Head);
             },
         );
     }
