@@ -2320,6 +2320,13 @@ impl ContextPlusServer {
         let matching = Self::arg_or(&mut args, "match", "meaning");
         Self::move_arg(&mut args, "path", "rootDir");
         match (kind.as_str(), matching.as_str()) {
+            ("identifiers", "keywords") => {
+                // Identifier search has no separate lexical path; rank by
+                // keyword coverage only so `keywords` means what it says.
+                args.insert("semantic_weight".into(), serde_json::json!(0.0));
+                args.insert("keyword_weight".into(), serde_json::json!(1.0));
+                self.handle_semantic_identifier_search(args).await
+            }
             ("identifiers", _) => self.handle_semantic_identifier_search(args).await,
             ("clusters", _) => self.handle_semantic_navigate(args).await,
             (_, "keywords") => self.handle_lexical_search(args).await,
@@ -3637,6 +3644,61 @@ mod tests {
         let hits = server.dispatch("explore", args).await;
         assert_eq!(hits.is_error, Some(false), "{}", text_of(&hits));
         assert!(text_of(&hits).contains("auth.rs"), "{}", text_of(&hits));
+    }
+
+    /// `kind: identifiers` with `match: keywords` must rank by keyword coverage
+    /// only: with a mock embedder that returns the same vector for everything,
+    /// semantic similarity is 100% for every identifier, so only keyword-only
+    /// weighting puts the exact name first with a score equal to its coverage.
+    #[tokio::test]
+    async fn explore_identifiers_with_keywords_ranks_by_keyword_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|req: &Request| {
+                let body: serde_json::Value = req.body_json().unwrap_or_default();
+                let n = body["input"].as_array().map_or(1, |a| a.len());
+                let vecs: Vec<Vec<f32>> = (0..n).map(|_| vec![0.6, 0.8, 0.0]).collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "embeddings": vecs }))
+            })
+            .mount(&ollama)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/auth.rs"),
+            "pub fn verify_token(t: &str) -> bool { t.len() > 3 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/util.rs"),
+            "pub fn unrelated_helper() {}\n",
+        )
+        .unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("verify token"));
+        args.insert("kind".into(), json!("identifiers"));
+        args.insert("match".into(), json!("keywords"));
+        let hits = server.dispatch("explore", args).await;
+        assert_eq!(hits.is_error, Some(false), "{}", text_of(&hits));
+        let text = text_of(&hits);
+        let first = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("1. "))
+            .unwrap_or("");
+        assert!(first.contains("verify_token"), "{text}");
+        assert!(
+            text.contains("Score: 100% | Semantic: 100% | Keyword: 100%"),
+            "keyword-only weighting must make the score equal the keyword coverage:\n{text}"
+        );
     }
 
     #[tokio::test]

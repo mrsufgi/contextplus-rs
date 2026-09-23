@@ -37,7 +37,7 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "match",
                     "string",
                     false,
-                    "meaning (default): embedding similarity plus keyword overlap; keywords: exact tokens and camelCase parts only, no embeddings, fastest.",
+                    "meaning (default): embedding similarity plus keyword overlap; keywords: exact tokens and camelCase parts only (for files: no embeddings, fastest; for identifiers: ranked by keyword coverage alone).",
                 ),
                 (
                     "top_k",

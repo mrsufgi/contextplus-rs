@@ -19,22 +19,44 @@ use crate::tools::semantic_search::{SearchDocument, split_camel_case};
 /// In-process inverted index over a [`SearchDocument`] slice.
 ///
 /// Construct via [`LexicalIndex::build`]. Each posting maps a lowercase token
-/// → sorted `Vec` of doc indices that contain it (binary presence — multiple
-/// occurrences do **not** inflate the posting list).
+/// → sorted `Vec` of `(doc index, occurrences)` for the documents that
+/// contain it.
 pub struct LexicalIndex {
-    /// token → sorted list of doc indices that contain the token.
-    posting: HashMap<String, Vec<usize>>,
+    /// token → sorted list of `(doc_idx, tf)` for documents containing the token.
+    posting: HashMap<String, Vec<(usize, u32)>>,
     doc_count: usize,
+}
+
+/// Lowercased tokens of `text` with their occurrence counts: the camelCase /
+/// snake_case parts every scorer uses, plus each whole identifier, so that
+/// `resolveScopeMode` is a token of its own and not only `resolve`, `scope`
+/// and `mode`, which almost every file contains.
+fn token_counts(text: &str) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for part in split_camel_case(text) {
+        *counts.entry(part).or_insert(0) += 1;
+    }
+    for word in text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| w.len() > 1)
+    {
+        let whole = word.to_lowercase();
+        let parts = split_camel_case(word);
+        if parts.len() != 1 || parts[0] != whole {
+            *counts.entry(whole).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 impl LexicalIndex {
     /// Build an index from a slice of [`SearchDocument`]s.
     ///
-    /// Tokenises `path + header + symbols.join(' ') + content` via
-    /// [`split_camel_case`], lowercases each token, and records the unique
-    /// `(token, doc_idx)` edges.
+    /// Tokenises `path + header + symbols.join(' ') + content` into the
+    /// camelCase / snake_case parts plus each whole identifier (see
+    /// `token_counts`) and records `(doc_idx, occurrences)` per token.
     pub fn build(docs: &[SearchDocument]) -> Self {
-        let mut posting: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut posting: HashMap<String, Vec<(usize, u32)>> = HashMap::new();
 
         for (idx, doc) in docs.iter().enumerate() {
             let raw = format!(
@@ -44,24 +66,13 @@ impl LexicalIndex {
                 doc.symbols.join(" "),
                 doc.content
             );
-            // Collect the unique lowercased tokens for this document.
-            let mut tokens: Vec<String> = split_camel_case(&raw)
-                .into_iter()
-                .map(|t| t.to_lowercase())
-                .collect();
-            tokens.sort_unstable();
-            tokens.dedup();
-
-            for token in tokens {
-                posting.entry(token).or_default().push(idx);
+            // Doc indices ascend with `idx`, so each posting list is built in order.
+            for (token, count) in token_counts(&raw) {
+                posting.entry(token).or_default().push((idx, count));
             }
         }
-
-        // Posting lists are already in ascending order because we iterate
-        // doc indices 0..N in order, but sort them explicitly for safety.
         for list in posting.values_mut() {
             list.sort_unstable();
-            list.dedup();
         }
 
         Self {
@@ -79,30 +90,25 @@ impl LexicalIndex {
     /// score)` pairs sorted by score descending (ties broken by smaller
     /// `doc_idx` first).
     ///
-    /// Score = Σ over query tokens of `idf(token) * tf_present(token, doc)`
+    /// Score = Σ over query tokens of `idf(token) * (1 + ln tf(token, doc))`
     ///
     /// * `idf(token) = ln((1 + doc_count) / (1 + df)) + 1`  (smoothed IDF)
-    /// * `tf_present` is binary: 1.0 if the doc contains the token, else 0.0
+    /// * `tf` is the number of occurrences in the document; a file that
+    ///   names an identifier many times outranks one that mentions it once
     pub fn search(&self, query: &str, top_k: usize) -> Vec<(usize, f64)> {
         if top_k == 0 || self.doc_count == 0 {
             return Vec::new();
         }
 
-        let query_tokens: Vec<String> = split_camel_case(query)
-            .into_iter()
-            .map(|t| t.to_lowercase())
-            .collect();
-
         // Accumulate per-doc scores.
         let mut scores: HashMap<usize, f64> = HashMap::new();
 
-        for token in &query_tokens {
+        for token in token_counts(query).keys() {
             if let Some(postings) = self.posting.get(token.as_str()) {
                 let df = postings.len() as f64;
                 let idf = ((1.0 + self.doc_count as f64) / (1.0 + df)).ln() + 1.0;
-                for &doc_idx in postings {
-                    // tf_present = 1.0 (binary)
-                    *scores.entry(doc_idx).or_insert(0.0) += idf;
+                for &(doc_idx, tf) in postings {
+                    *scores.entry(doc_idx).or_insert(0.0) += idf * (1.0 + f64::from(tf).ln());
                 }
             }
         }
@@ -175,6 +181,53 @@ mod tests {
     // -----------------------------------------------------------------------
     // LexicalIndex tests
     // -----------------------------------------------------------------------
+
+    /// A file that defines `resolveScopeMode` must outrank files that merely
+    /// contain the words resolve, scope and mode.
+    #[test]
+    fn exact_identifier_outranks_files_that_only_share_its_parts() {
+        let docs = vec![
+            make_doc(
+                "docs/a.md",
+                "",
+                &[],
+                "resolve the scope and the mode of a request",
+            ),
+            make_doc("docs/b.md", "", &[], "scope mode resolve resolve"),
+            make_doc(
+                "src/plugin.ts",
+                "",
+                &["resolveScopeMode"],
+                "function resolveScopeMode(request) { return scope; }",
+            ),
+        ];
+        let idx = LexicalIndex::build(&docs);
+        let results = idx.search("resolveScopeMode", 3);
+        assert_eq!(results[0].0, 2, "{results:?}");
+        assert!(results[0].1 > results[1].1, "{results:?}");
+    }
+
+    #[test]
+    fn repeated_occurrences_rank_higher() {
+        let docs = vec![
+            make_doc("a.rs", "", &[], "token"),
+            make_doc("b.rs", "", &[], "token token token token"),
+        ];
+        let idx = LexicalIndex::build(&docs);
+        let results = idx.search("token", 2);
+        assert_eq!(results[0].0, 1, "{results:?}");
+    }
+
+    #[test]
+    fn snake_case_identifier_is_a_token_of_its_own() {
+        let docs = vec![
+            make_doc("a.rs", "", &[], "verify the token"),
+            make_doc("b.rs", "", &["verify_token"], "fn verify_token() {}"),
+        ];
+        let idx = LexicalIndex::build(&docs);
+        let results = idx.search("verify_token", 2);
+        assert_eq!(results[0].0, 1, "{results:?}");
+    }
 
     #[test]
     fn empty_index_returns_no_results() {
