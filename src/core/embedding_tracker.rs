@@ -85,6 +85,33 @@ const MIN_DEBOUNCE_MS: u64 = 100;
 /// Maximum number of pending file change events before new events are dropped.
 const MAX_PENDING_FILES: usize = 50;
 
+/// Resolver signal for "HEAD may have moved"; distinct from every managed hook name.
+const HEAD_SIGNAL: &str = "HEAD";
+
+/// Files changed by a HEAD move since the last HEAD this tracker saw. Records
+/// the new HEAD; empty when HEAD did not move or cannot be read.
+fn head_changes_since_last(root: &Path, last_head: &Mutex<Option<String>>) -> Vec<String> {
+    let Some(new_sha) = crate::core::head_watcher::resolve_head_sha(root) else {
+        return Vec::new();
+    };
+    let old = {
+        let mut guard = last_head.lock().unwrap_or_else(|p| p.into_inner());
+        guard.replace(new_sha.clone())
+    };
+    match old {
+        Some(old) if old != new_sha => {
+            info!(
+                old = %old,
+                new = %new_sha,
+                root = %root.display(),
+                "Embedding tracker: HEAD moved, diffing for refresh"
+            );
+            crate::git::hooks::resolve_head_changes(root, &old, &new_sha)
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Configuration for the embedding tracker.
 #[derive(Debug, Clone)]
 pub struct EmbeddingTrackerConfig {
@@ -290,8 +317,18 @@ pub fn start_tracker(
         );
     }
 
+    // HEAD watch: a HEAD move (pull, merge, rebase, checkout, reset) becomes
+    // `git diff old new` for this root, the same way a hook sentinel does.
+    // Hook files are only an optimization; tools such as lefthook overwrite
+    // them, and shared hooks cannot tell which worktree they ran in.
+    let git_dirs = crate::core::git_worktree::git_dirs(&root_dir);
+    let last_head: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(
+        crate::core::head_watcher::resolve_head_sha(&root_dir),
+    ));
+
     // Set up notify debouncer with an event handler that filters and collects paths
     let handler_root = root_dir.clone();
+    let handler_git_dirs = git_dirs.clone();
     let handler_meta_cache = metadata_cache.clone();
     let handler_sentinel_dir = sentinel_dir.clone();
     let handler_hook_tx = hook_tx.clone();
@@ -320,6 +357,13 @@ pub fn start_tracker(
                         // signal here is preferable to blocking the notify
                         // thread on a full channel.
                         let _ = handler_hook_tx.try_send(name.to_string());
+                        continue;
+                    }
+
+                    if let Some(dirs) = &handler_git_dirs
+                        && dirs.is_ref_update(path)
+                    {
+                        let _ = handler_hook_tx.try_send(HEAD_SIGNAL.to_string());
                         continue;
                     }
 
@@ -436,15 +480,46 @@ pub fn start_tracker(
     // `event_tx` — the same path a plain file edit would take. Terminates
     // naturally when all senders on `hook_tx` drop (i.e. when the debouncer
     // closure is released by the consumer task on shutdown).
+    // Watches behind the HEAD signal: this worktree's gitdir (HEAD, ORIG_HEAD),
+    // the common dir (packed-refs) and the branch refs. A few directories,
+    // non-recursive except the small refs/heads tree.
+    if let Some(dirs) = &git_dirs {
+        let mut targets = vec![(dirs.gitdir.clone(), RecursiveMode::NonRecursive)];
+        if dirs.common_dir != dirs.gitdir {
+            targets.push((dirs.common_dir.clone(), RecursiveMode::NonRecursive));
+        }
+        targets.push((
+            dirs.common_dir.join("refs").join("heads"),
+            RecursiveMode::Recursive,
+        ));
+        for (dir, mode) in targets {
+            if dir.is_dir()
+                && let Err(e) = debouncer.watch(&dir, mode)
+            {
+                warn!(
+                    "Could not watch git dir {}: {} — HEAD moves will not refresh embeddings",
+                    dir.display(),
+                    e
+                );
+            }
+        }
+    }
+
     let resolver_root = root_dir.clone();
+    let resolver_last_head = last_head.clone();
     let resolver_meta_cache = metadata_cache.clone();
     let resolver_ignore_dirs = config.ignore_dirs.clone();
     tokio::spawn(async move {
         while let Some(hook_name) = hook_rx.recv().await {
             let root = resolver_root.clone();
             let name = hook_name.clone();
+            let last_head = resolver_last_head.clone();
             let changed: Vec<String> = match tokio::task::spawn_blocking(move || {
-                crate::git::hooks::resolve_hook_changes(&root, &name)
+                if name == HEAD_SIGNAL {
+                    head_changes_since_last(&root, &last_head)
+                } else {
+                    crate::git::hooks::resolve_hook_changes(&root, &name)
+                }
             })
             .await
             {
@@ -915,6 +990,134 @@ mod tests {
                 "WARNING: hook-sentinel integration path did not fire — inotify or git hooks may not work in this environment"
             );
         }
+    }
+
+    fn git_in(cwd: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {:?} failed in {}", args, cwd.display());
+    }
+
+    /// Wait up to `secs` for a callback batch naming `file`.
+    async fn wait_for_file(rx: &mut mpsc::Receiver<Vec<String>>, file: &str, secs: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while let Ok(Some(files)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if files.iter().any(|f| f.ends_with(file)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn tracker_with_capture(
+        root: PathBuf,
+    ) -> (EmbeddingTrackerHandle, mpsc::Receiver<Vec<String>>) {
+        let (tx, rx) = mpsc::channel::<Vec<String>>(16);
+        let callback: RefreshCallback = Arc::new(move |_root, files| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(files).await;
+                (1, 0)
+            })
+        });
+        let config = EmbeddingTrackerConfig {
+            debounce_ms: 200,
+            max_files_per_tick: 8,
+            ignore_dirs: default_ignore_dirs(),
+        };
+        let handle = start_tracker(root, config, callback).expect("tracker starts");
+        (handle, rx)
+    }
+
+    /// A HEAD move refreshes the files it changed with no hook file installed
+    /// (lefthook and similar tools overwrite `.git/hooks/*`). The file edit is
+    /// drained first, so the second report can only come from the HEAD watch.
+    #[tokio::test]
+    async fn tracker_fires_on_head_advance_without_hooks() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: git not available");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/seed.rs"), "fn seed() {}").unwrap();
+        git_in(&root, &["add", "."]);
+        git_in(&root, &["commit", "-q", "-m", "seed"]);
+
+        let (handle, mut rx) = tracker_with_capture(root.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        std::fs::write(root.join("src/new_feature.rs"), "fn f() {}").unwrap();
+        if !wait_for_file(&mut rx, "new_feature.rs", 5).await {
+            handle.stop().await;
+            eprintln!(
+                "WARNING: file watcher did not fire — inotify may not work in this environment"
+            );
+            return;
+        }
+
+        git_in(&root, &["add", "src/new_feature.rs"]);
+        git_in(&root, &["commit", "-q", "-m", "feat"]);
+        let seen = wait_for_file(&mut rx, "new_feature.rs", 8).await;
+        handle.stop().await;
+        assert!(seen, "HEAD advance did not refresh the committed file");
+    }
+
+    /// A linked worktree's tracker watches the shared `refs/heads`, so moving
+    /// its HEAD (`reset --soft`, which leaves the working tree untouched)
+    /// refreshes the files that differ between the two commits.
+    #[tokio::test]
+    async fn tracker_in_linked_worktree_refreshes_after_head_moves() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: git not available");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let primary = base.join("repo");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        git_in(&primary, &["init", "-q", "-b", "main"]);
+        std::fs::write(primary.join("src/seed.rs"), "fn seed() {}").unwrap();
+        git_in(&primary, &["add", "."]);
+        git_in(&primary, &["commit", "-q", "-m", "seed"]);
+        git_in(
+            &primary,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+
+        let (handle, mut rx) = tracker_with_capture(wt.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        std::fs::write(primary.join("src/from_main.rs"), "fn m() {}").unwrap();
+        git_in(&primary, &["add", "src/from_main.rs"]);
+        git_in(&primary, &["commit", "-q", "-m", "on main"]);
+        git_in(&wt, &["reset", "-q", "--soft", "main"]);
+
+        let seen = wait_for_file(&mut rx, "from_main.rs", 8).await;
+        handle.stop().await;
+        assert!(seen, "worktree HEAD move did not refresh src/from_main.rs");
     }
 
     #[tokio::test]

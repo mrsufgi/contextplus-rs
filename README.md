@@ -175,6 +175,12 @@ from that worktree's root. A worktree is attached on first use, forking the prim
 embedding cache, so no `attach_worktree` call is needed. The host's cwd is read from
 `/proc/<parent pid>/cwd`, so the automatic part is Linux-only; absolute paths route everywhere.
 
+Each worktree's tracker also watches its gitdir and the shared `refs/heads`: when HEAD moves
+(pull, merge, rebase, checkout, reset) the files that differ between the old and new commit are
+re-embedded for that worktree. The `contextplus-rs hooks install` sentinels remain an optional
+fast path; nothing depends on them, which matters when another tool (lefthook, husky) owns
+`.git/hooks`.
+
 ### CLI subcommands
 
 ```bash

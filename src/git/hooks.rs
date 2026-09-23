@@ -14,6 +14,10 @@
 //! Each managed hook is wrapped in BEGIN/END markers so re-installs are
 //! idempotent and uninstall removes only our block — preserving any
 //! user-authored hook content above or below.
+//!
+//! The hooks are an optimization, not a dependency: the tracker also watches
+//! the gitdir and refs directly (`embedding_tracker`), so a HEAD move is
+//! picked up even when another tool owns `.git/hooks` and overwrites these.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -238,13 +242,32 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
+/// Working-tree-relative paths that differ between two commits, for the
+/// tracker's HEAD watch. Empty when either sha is missing or unknown to git.
+pub fn resolve_head_changes(root_dir: &Path, old_sha: &str, new_sha: &str) -> Vec<String> {
+    if old_sha.is_empty() || new_sha.is_empty() || old_sha == new_sha {
+        return Vec::new();
+    }
+    run_git(root_dir, &["diff", "--name-only", old_sha, new_sha])
+        .map(|stdout| {
+            stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.replace('\\', "/"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Hooks are shared by every worktree of a repo, so the script touches the
+/// sentinel of the worktree it runs in; the installed path is the fallback
+/// outside a git working tree.
 fn block_for(hook: &str, sentinel_dir: &Path) -> String {
-    let sentinel = sentinel_dir.join(hook);
     format!(
-        "{}\n# Touch a sentinel that the running contextplus-rs MCP server picks up.\n# No-op when contextplus-rs isn't running — safe to leave installed.\nmkdir -p {} 2>/dev/null && touch {} 2>/dev/null || true\n{}",
+        "{}\n# Touch a sentinel that the running contextplus-rs MCP server picks up.\n# No-op when contextplus-rs isn't running — safe to leave installed.\nd=\"$(git rev-parse --show-toplevel 2>/dev/null)\"\nif [ -n \"$d\" ]; then d=\"$d/.mcp_data/hooks\"; else d={}; fi\nmkdir -p \"$d\" 2>/dev/null && touch \"$d/{}\" 2>/dev/null || true\n{}",
         BEGIN_MARK,
         shell_quote(sentinel_dir),
-        shell_quote(&sentinel),
+        hook,
         END_MARK,
     )
 }
@@ -392,7 +415,7 @@ mod tests {
             assert!(contents.starts_with("#!/usr/bin/env sh"));
             assert!(contents.contains(BEGIN_MARK));
             assert!(contents.contains(END_MARK));
-            assert!(contents.contains(".mcp_data/hooks/"));
+            assert!(contents.contains(".mcp_data/hooks"));
         }
     }
 
@@ -557,6 +580,40 @@ mod tests {
         fs::write(&abs, contents).unwrap();
         assert!(git(repo, &["add", rel_path]).status.success());
         assert!(git(repo, &["commit", "-q", "-m", msg]).status.success());
+    }
+
+    #[test]
+    fn block_for_resolves_the_running_worktree_toplevel() {
+        let b = block_for("post-merge", Path::new("/primary/.mcp_data/hooks"));
+        assert!(b.contains("git rev-parse --show-toplevel"), "{b}");
+        // The baked path stays as the fallback outside a git worktree.
+        assert!(b.contains("'/primary/.mcp_data/hooks'"), "{b}");
+    }
+
+    #[test]
+    fn resolve_head_changes_lists_files_between_two_commits() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        git_commit_file(tmp.path(), "src/a.rs", "fn a() {}", "a");
+        let sha = |rev: &str| {
+            String::from_utf8(git(tmp.path(), &["rev-parse", rev]).stdout)
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let old = sha("HEAD");
+        git_commit_file(tmp.path(), "src/b.rs", "fn b() {}", "b");
+        git_commit_file(tmp.path(), "src/c.rs", "fn c() {}", "c");
+        let new = sha("HEAD");
+
+        let mut changed = resolve_head_changes(tmp.path(), &old, &new);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec!["src/b.rs".to_string(), "src/c.rs".to_string()]
+        );
+        assert!(resolve_head_changes(tmp.path(), "", &new).is_empty());
+        assert!(resolve_head_changes(tmp.path(), "0000000", &new).is_empty());
     }
 
     #[test]
