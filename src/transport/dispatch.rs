@@ -322,7 +322,7 @@ pub async fn dispatch_with_translation(
     //    foreign-but-known-good absolute path before the handler ever runs.
     let bypass_input_translation = matches!(
         tool_name,
-        "attach_worktree" | "detach_worktree" | "list_worktrees"
+        "worktrees" | "attach_worktree" | "detach_worktree" | "list_worktrees"
     );
     let translated_args = if bypass_input_translation {
         args
@@ -452,7 +452,7 @@ const PATH_ARG_KEYS: &[&str] = &["file_path", "path", "root_dir", "target_path",
 fn manages_worktrees(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "attach_worktree" | "detach_worktree" | "list_worktrees"
+        "worktrees" | "attach_worktree" | "detach_worktree" | "list_worktrees"
     )
 }
 

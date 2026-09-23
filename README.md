@@ -201,28 +201,19 @@ contextplus-rs tree --max-tokens 5000
 
 ## Tools
 
-### Code Analysis
-| Tool | Description |
-|------|-------------|
-| `get_context_tree` | Token-aware file tree with symbols and line ranges. Supports `depth_limit` to cap directory depth and `max_tokens` (default 50K) for automatic pruning (Level 2 → 1 → 0) |
-| `get_file_skeleton` | Function signatures and structure without full file read |
-| `get_blast_radius` | Map every file that imports or references a symbol |
-| `run_static_analysis` | Run available linters (tsc with `--build` for project references, eslint, cargo check, ruff) |
+Six tools, named for what an agent is doing. Each description says when to use it, so no
+separate instructions are needed.
 
-### Semantic Search
-| Tool | Description |
-|------|-------------|
-| `semantic_code_search` | Hybrid semantic + keyword file search via Ollama embeddings |
-| `semantic_identifier_search` | Find functions/classes by meaning with call-site ranking |
-| `lexical_search` | Fast TF-IDF keyword search for exact identifiers and camelCase names; no embeddings |
-| `semantic_navigate` | Cluster files by semantic similarity (spectral clustering) |
+| Tool | Use it to | Wraps |
+|------|-----------|-------|
+| `explore` | find code by what it does: files (`kind: files`, default), functions and classes with call sites (`identifiers`), or the codebase grouped by topic (`clusters`); `match: keywords` for exact identifiers without embeddings | `semantic_code_search`, `semantic_identifier_search`, `semantic_navigate`, `lexical_search` |
+| `outline` | see a file's signatures and line ranges, or a directory's file and symbol tree, before reading anything | `get_file_skeleton`, `get_context_tree` |
+| `impact` | learn what breaks if a symbol changes (`what: symbol`, default), the project's import cycles (`cycles`), or symbols nothing references (`dead`) | `get_blast_radius`, `detect_dependency_loops`, `find_dead_code` |
+| `review` | risk-rank a unified diff: changed symbols, two-hop dependents, files to read first | `review_pr_diff` |
+| `check` | run the project's linters and compilers on a path (`what: lint`, default) or audit the embedding cache (`embeddings`) | `run_static_analysis`, `check_embedding_quality` |
+| `worktrees` | list, attach or detach git worktrees (`action`); attaching also happens automatically when a call names a path inside one | `list_worktrees`, `attach_worktree`, `detach_worktree` |
 
-### Worktrees
-| Tool | Description |
-|------|-------------|
-| `attach_worktree` | Register a git worktree as a ref that forks the primary's caches; also happens automatically when a call names a path inside one |
-| `detach_worktree` | Release a worktree ref; it is evicted after the TTL once no session uses it |
-| `list_worktrees` | Show the primary and every attached worktree with root, session count and HEAD |
+The pre-facade names in the last column still dispatch for one release but are not listed.
 
 ## Architecture
 
