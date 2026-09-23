@@ -1427,12 +1427,16 @@ impl ContextPlusServer {
             .count();
         let ref_index = self.current_ref();
 
-        // Fast path: index exists, TTL valid, file count unchanged — clone Arc (cheap)
+        // Fast path: index exists, TTL valid, file count unchanged — clone Arc (cheap).
+        // A warmup-built index carries docs but no vectors (dims == 0); serving
+        // it would score every identifier at zero similarity, so it does not
+        // count as built.
         {
             let guard = ref_index.identifier_index.read().await;
             if let Some(ref idx) = *guard
                 && idx.file_count == file_count
                 && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
+                && (idx.dims > 0 || idx.docs.is_empty())
             {
                 return Ok(Arc::clone(idx));
             }
@@ -6722,6 +6726,87 @@ mod tests {
     /// If `embed` were called it would try to connect and fail (which we'd see
     /// on the identifier_index). Since shallow mode doesn't touch embed, the
     /// task must succeed regardless.
+    /// The ref warmup installs an identifier index with the parsed docs and no
+    /// vectors (dims == 0) for the first real call to fill. Serving it from the
+    /// fast path scores every identifier at 0% semantic, so it must not count as
+    /// built even when file_count and TTL match.
+    #[tokio::test]
+    async fn identifier_search_embeds_when_index_has_no_vectors() {
+        use crate::tools::semantic_identifiers::IdentifierDoc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|req: &Request| {
+                let body: serde_json::Value = req.body_json().unwrap_or_default();
+                let n = body["input"].as_array().map_or(1, |a| a.len());
+                let vecs: Vec<Vec<f32>> = (0..n).map(|_| vec![0.6, 0.8, 0.0]).collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "embeddings": vecs }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("hello.rs"),
+            "fn hello() {}\nfn world() {}\n",
+        )
+        .unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let cache = server.ensure_project_cache().await.unwrap();
+        let file_count = cache
+            .file_entries
+            .iter()
+            .filter(|e| !e.is_directory)
+            .count();
+        let doc = IdentifierDoc {
+            id: "hello.rs:hello:1".into(),
+            path: "hello.rs".into(),
+            header: String::new(),
+            name: "hello".into(),
+            kind: "function".into(),
+            kind_lower: "function".into(),
+            line: 1,
+            end_line: 1,
+            signature: "fn hello() {}".into(),
+            parent_name: None,
+            text: "hello function fn hello() {} hello.rs".into(),
+            token_set: IdentifierDoc::build_token_set("hello", "fn hello() {}", "hello.rs", ""),
+        };
+        {
+            let ref_index = server.current_ref();
+            let mut guard = ref_index.identifier_index.write().await;
+            *guard = Some(Arc::new(IdentifierIndex {
+                docs: vec![doc],
+                vector_buffer: Vec::new(),
+                dims: 0,
+                file_count,
+                built_at: Instant::now(),
+            }));
+        }
+
+        let idx = server.ensure_identifier_index(&cache).await.unwrap();
+        assert_eq!(
+            idx.dims, 3,
+            "a vector-less index must be rebuilt with vectors"
+        );
+        assert_eq!(idx.vector_buffer.len(), idx.docs.len() * idx.dims);
+        assert!(!idx.docs.is_empty());
+        assert!(
+            ollama
+                .received_requests()
+                .await
+                .is_some_and(|r| !r.is_empty()),
+            "Ollama must have been called"
+        );
+    }
+
     #[tokio::test]
     async fn ref_warmup_shallow_populates_project_cache_no_embed() {
         use crate::config::RefWarmupMode;
