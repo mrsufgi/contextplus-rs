@@ -173,18 +173,6 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
 
     let server = ContextPlusServer::new(root_dir.clone(), config.clone());
 
-    let root_str = root_dir.to_string_lossy().to_string();
-    if let Err(e) = server
-        .state
-        .memory_graph
-        .get_graph(&root_str, |_graph| {})
-        .await
-    {
-        tracing::warn!("Failed to pre-load memory graph from disk: {e}");
-    }
-
-    let _debounce_handle = server.state.memory_graph.spawn_debounce_task();
-
     use crate::config::TrackerMode;
     tracing::info!(mode = %config.embed_tracker_mode, "Embedding tracker mode");
     if config.embed_tracker_mode == TrackerMode::Eager {
@@ -236,7 +224,6 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
         handle
     };
 
-    let memory_graph = Arc::clone(&server.state.memory_graph);
     let state_for_shutdown = server.state.clone();
 
     let transport = rmcp::transport::io::stdio();
@@ -274,10 +261,6 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
     }
 
     state_for_shutdown.ollama.flush_query_cache();
-
-    if let Err(e) = memory_graph.flush().await {
-        tracing::warn!("Failed to persist memory graph on shutdown: {e}");
-    }
 
     idle_monitor.stop();
     #[cfg(unix)]

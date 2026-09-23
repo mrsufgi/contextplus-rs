@@ -53,12 +53,10 @@ Rust eliminates all overhead via:
 - **Zero-copy cache** with `rkyv` + `memmap2` (no deserialization)
 - **SIMD cosine similarity** via `simsimd` (AVX-512/AVX2 auto-dispatch)
 - **Native tree-sitter** (compiled in, no WASM VM) — 15 languages + regex fallback
-- **Binary serialization** (rkyv replaces JSON for memory graph)
 - **Disk-persistent embedding cache** with content-hash staleness detection
 - **Adaptive embedding retry** with exponential backoff and cancellation tokens
 - **Automatic chunking** for oversized embedding inputs (chunk → embed → merge)
 - **Process lifecycle management** — idle timeout, parent PID orphan detection, SIGTERM/SIGHUP handling
-- **Memory graph disk persistence** with debounced flush on mutation
 
 ## Install
 
@@ -201,7 +199,7 @@ contextplus-rs tree --max-tokens 5000
 |-----|-------------|
 | `contextplus://instructions` | Returns tool usage instructions fetched from the Context+ API. Cached in memory after first fetch |
 
-## Tools (17)
+## Tools
 
 ### Code Analysis
 | Tool | Description |
@@ -225,16 +223,6 @@ contextplus-rs tree --max-tokens 5000
 | `list_restore_points` | List all shadow restore points |
 | `undo_change` | Restore files from a restore point |
 
-### Memory Graph
-| Tool | Description |
-|------|-------------|
-| `upsert_memory_node` | Create or update a memory graph node |
-| `create_relation` | Create or update edges between nodes |
-| `search_memory_graph` | Semantic search with BFS traversal |
-| `retrieve_with_traversal` | Retrieve node neighborhood via BFS |
-| `add_interlinked_context` | Batch-add nodes with auto-linking |
-| `prune_stale_links` | Remove decayed edges and orphan nodes |
-
 ### Navigation
 | Tool | Description |
 |------|-------------|
@@ -242,8 +230,8 @@ contextplus-rs tree --max-tokens 5000
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed internals (data flow, caching strategy, memory
-layout, performance architecture, and how to add new tools).
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed internals (data flow, caching strategy,
+performance architecture, and how to add new tools).
 
 ```
 src/
@@ -260,7 +248,6 @@ src/
     walker.rs                # gitignore-aware file walker (ignore crate)
     embedding_tracker.rs     # File watcher with lazy/eager/off modes
     clustering.rs            # Spectral clustering (nalgebra)
-    memory_graph.rs          # petgraph + rkyv disk persistence with debounced flush
     hub.rs                   # Wikilink parser
     process_lifecycle.rs     # Idle timeout + parent PID orphan detection
     safe_path.rs             # Path traversal prevention
@@ -284,7 +271,6 @@ Unsupported file types fall back to regex-based symbol extraction.
 | `simsimd` | SIMD-accelerated cosine distance |
 | `rkyv` + `memmap2` | Zero-copy cache persistence |
 | `tree-sitter` | Native code parsing (15 languages) |
-| `petgraph` | Memory graph with stable indices |
 | `nalgebra` | Spectral clustering (eigendecomposition) |
 | `notify` | File system watching |
 | `ignore` | gitignore-aware file walking |

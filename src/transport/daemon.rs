@@ -41,9 +41,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::config::Config;
-use crate::core::head_watcher::{HeadEvent, start_head_watcher};
-use crate::core::memory_graph::MemoryGraph;
-use crate::core::memory_merge::run_merge_ladder;
 use crate::core::process_lifecycle;
 use crate::ref_index::{RefId, RefIndex};
 use crate::server::ContextPlusServer;
@@ -369,11 +366,8 @@ pub async fn run(
     }
     let _ = std::fs::remove_file(&pid_path);
 
-    // Final flush: persist memory graph + query embeddings before exit.
+    // Final flush: persist query embeddings before exit.
     server.state.ollama.flush_query_cache();
-    if let Err(e) = server.state.memory_graph.flush().await {
-        tracing::warn!("memory graph flush failed at daemon shutdown: {e}");
-    }
 
     Ok(())
 }
@@ -428,30 +422,12 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     let ref_arc = server
         .state
         .attach_ref(ref_id, || {
-            // Build the per-ref state.  For non-default (worktree) refs we
-            // attach a fresh CoW memory-graph overlay so the merge ladder can
-            // fold their nodes into the primary graph when their HEAD becomes
-            // an ancestor.  The default ref has no overlay (it IS the primary).
-            //
-            // `new_with_head` leaves `memory_overlay = None` for backward
-            // compat with U13 tests; we override it here using struct update
-            // syntax so existing tests remain valid.
-            let memory_overlay = if parent_ref_id.is_some() {
-                Some(Arc::new(tokio::sync::RwLock::new(
-                    crate::core::memory_graph::MemoryGraph::new(),
-                )))
-            } else {
-                None
-            };
-            Arc::new(RefIndex {
-                memory_overlay,
-                ..RefIndex::new_with_head(
-                    client_root.clone(),
-                    canonical_root.clone(),
-                    parent_ref_id,
-                    head_sha.clone(),
-                )
-            })
+            Arc::new(RefIndex::new_with_head(
+                client_root.clone(),
+                canonical_root.clone(),
+                parent_ref_id,
+                head_sha.clone(),
+            ))
         })
         .await;
 
@@ -596,18 +572,6 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
 
     let server = ContextPlusServer::new(root_dir.clone(), config.clone());
 
-    // Pre-load memory graph + spawn debounce + tracker, just like the stdio path.
-    let root_str = root_dir.to_string_lossy().to_string();
-    if let Err(e) = server
-        .state
-        .memory_graph
-        .get_graph(&root_str, |_g| {})
-        .await
-    {
-        tracing::warn!("daemon: pre-load memory graph failed: {e}");
-    }
-    let _debounce = server.state.memory_graph.spawn_debounce_task();
-
     use crate::config::TrackerMode;
     if config.embed_tracker_mode == TrackerMode::Eager {
         server.ensure_tracker_started();
@@ -616,174 +580,8 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
         server.spawn_warmup_task();
     }
 
-    // HEAD watcher: track primary HEAD advances and trigger memory-graph
-    // merge for overlay refs whose HEAD has become an ancestor.
-    //
-    // ## U4 / U7 seam
-    //
-    // Today the registry holds only the primary ref (U3 scaffolding) so the
-    // merge loop is a no-op: there are no overlay graphs to fold in.  When
-    // U4 lands and multiple refs populate `server.state.refs`, this task
-    // will iterate over them and call `run_merge_ladder` for each that
-    // qualifies.
-    //
-    // The `_head_watcher_handle` binding keeps the watcher alive for the
-    // daemon's lifetime; dropping it shuts down the background thread.
-    let _head_watcher_handle = spawn_head_watcher_task(&server, root_dir.clone());
-
     run(server, listener, socket_path, pid_path, idle_secs, lock).await?;
     Ok(true)
-}
-
-/// Spawn the HEAD-watcher + merge-dispatch background task.
-///
-/// Returns the watcher handle (drop = shutdown).  If the gitdir cannot be
-/// found or the watcher fails to start, logs a warning and returns `None`
-/// so the rest of the daemon still operates.
-fn spawn_head_watcher_task(
-    server: &ContextPlusServer,
-    root_dir: PathBuf,
-) -> Option<crate::core::head_watcher::HeadWatcherHandle> {
-    // Locate the gitdir.  For a primary worktree `.git` is a directory; for
-    // a linked worktree `.git` is a file — `git_worktree::resolve_primary_worktree`
-    // already handles both, but here we need the gitdir itself, not just the
-    // primary root.  We shell out to `git rev-parse --git-dir` to cover both
-    // cases.
-    let gitdir_out = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(&root_dir)
-        .output();
-
-    let gitdir = match gitdir_out {
-        Ok(out) if out.status.success() => {
-            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if std::path::Path::new(&raw).is_absolute() {
-                std::path::PathBuf::from(raw)
-            } else {
-                root_dir.join(raw)
-            }
-        }
-        _ => {
-            tracing::warn!(
-                root = %root_dir.display(),
-                "head_watcher: could not resolve gitdir — HEAD-advance events disabled"
-            );
-            return None;
-        }
-    };
-
-    let (handle, mut event_rx) = match start_head_watcher(root_dir.clone(), gitdir) {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!("head_watcher: failed to start: {e} — merge events disabled");
-            return None;
-        }
-    };
-
-    // Capture what we need for the async task.
-    let state = Arc::clone(&server.state);
-    let root_str = root_dir.to_string_lossy().to_string();
-
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            let HeadEvent::Advanced {
-                old_sha: _,
-                new_sha,
-            } = event;
-
-            // Suppress merges during drain.
-            if state.draining.load(std::sync::atomic::Ordering::Acquire) {
-                tracing::info!(
-                    new_sha = %new_sha,
-                    "head_watcher: HEAD advance during drain — deferring merge"
-                );
-                continue;
-            }
-
-            // Iterate over all registered refs and check ancestry.
-            // U3: the registry has only one ref (primary); no overlay nodes to
-            // merge.  U4 will add secondary refs; this loop body will process
-            // them once they carry real overlay memory graphs.
-            let refs_snapshot: Vec<(crate::ref_index::RefId, Arc<crate::ref_index::RefIndex>)> = {
-                let reg = state.refs.read().await;
-                reg.iter().map(|(id, r)| (*id, Arc::clone(r))).collect()
-            };
-
-            for (ref_id, ref_index) in &refs_snapshot {
-                let ref_head = match &ref_index.head_sha {
-                    Some(h) => h.clone(),
-                    None => continue, // no HEAD recorded yet — skip
-                };
-
-                // Skip the primary ref itself.
-                if ref_index.parent_ref_id.is_none() {
-                    continue;
-                }
-
-                // Check ancestry.
-                let is_anc = crate::core::head_watcher::is_ancestor(&root_dir, &ref_head, &new_sha);
-                if is_anc != Some(true) {
-                    continue;
-                }
-
-                tracing::info!(
-                    ref_id = ?ref_id,
-                    ref_head = %ref_head,
-                    primary_head = %new_sha,
-                    "head_watcher: ref HEAD is ancestor of primary — entering merge ladder"
-                );
-
-                // U10 seam: use the ref's CoW memory-graph overlay when
-                // available.  If none is attached yet (U10 hasn't landed or
-                // this ref was registered before U10), log and skip so the
-                // rest of the merge loop is not blocked.
-                let overlay_arc = match &ref_index.memory_overlay {
-                    Some(a) => Arc::clone(a),
-                    None => {
-                        tracing::debug!(
-                            ref_id = ?ref_id,
-                            "head_watcher: no overlay attached — skipping merge for this ref"
-                        );
-                        continue;
-                    }
-                };
-
-                // Take a snapshot of the overlay graph under a read lock so
-                // we don't hold the lock across the async `get_graph` call.
-                let overlay_snapshot = {
-                    let overlay_read = overlay_arc.read().await;
-                    // Clone the node list out — MemoryGraph::new() + insert_node
-                    // is cheap for the typical small overlay.
-                    let mut snap = MemoryGraph::new();
-                    for node in overlay_read.all_nodes() {
-                        snap.insert_node(node);
-                    }
-                    snap
-                };
-
-                let draining_now = state.draining.load(std::sync::atomic::Ordering::Acquire);
-                let summary = state
-                    .memory_graph
-                    .get_graph(&root_str, |primary_graph| {
-                        run_merge_ladder(&overlay_snapshot, primary_graph, &[], draining_now)
-                    })
-                    .await
-                    .unwrap_or_default();
-
-                tracing::info!(
-                    ref_id = ?ref_id,
-                    published = summary.published,
-                    skipped_identical = summary.skipped_identical,
-                    smart_merged = summary.smart_merged,
-                    conflicts = summary.conflicts,
-                    "head_watcher: merge ladder complete"
-                );
-            }
-        }
-        tracing::debug!("head_watcher: event channel closed — merge task exiting");
-    });
-
-    Some(handle)
 }
 
 #[cfg(test)]
