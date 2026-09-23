@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
+use regex::Regex;
 use rmcp::RoleServer;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::*;
@@ -13,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock, Semaphore};
 
 use crate::cache::rkyv_store;
-use crate::config::{Config, RefWarmupMode, TrackerMode};
+use crate::config::{Config, EmbedDocShape, RefWarmupMode, TrackerMode};
 use crate::core::embedding_tracker::{
     EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
 };
@@ -373,10 +374,120 @@ pub fn sanitize_model_name(model: &str) -> String {
         .collect()
 }
 
-/// Build a model-qualified cache name to prevent cross-model cache poisoning.
-/// E.g., `cache_name("embeddings", "snowflake-arctic-embed2")` → `"embeddings-snowflake-arctic-embed2"`.
-pub fn cache_name(base: &str, model: &str) -> String {
-    format!("{}-{}", base, sanitize_model_name(model))
+/// Build a model- and document-settings-qualified cache name.
+pub fn cache_name(base: &str, config: &Config) -> String {
+    format!(
+        "{}-{}",
+        base,
+        sanitize_model_name(&config.document_cache_identity())
+    )
+}
+
+static TS_DECL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(\s*)(export\s+)?(default\s+)?(declare\s+)?(async\s+)?(abstract\s+)?(function\*?|class|interface|type|enum|const|let|var|namespace)\s+([A-Za-z_$][\w$]*)",
+    )
+    .expect("valid TypeScript declaration regex")
+});
+static TS_METHOD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(\s+)(async\s+)?((static|private|public|protected|readonly|get|set|override)\s+)*([A-Za-z_$][\w$]*)\??\s*(<[^>]*>)?\s*\(",
+    )
+    .expect("valid TypeScript method regex")
+});
+static TS_PROPFN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\s+)(readonly\s+)?([A-Za-z_$][\w$]*)\??\s*:\s*(async\s*)?\(")
+        .expect("valid TypeScript function-property regex")
+});
+static GO_DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(func|type)\s+").expect("valid Go declaration regex"));
+static GO_IFACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+([A-Z]\w*)\(").expect("valid Go interface regex"));
+static SQL_DECL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^\s*CREATE\s+(OR\s+REPLACE\s+)?(UNIQUE\s+)?(FUNCTION|TABLE|VIEW|MATERIALIZED VIEW|POLICY|TRIGGER|INDEX|TYPE)\b",
+    )
+    .expect("valid SQL declaration regex")
+});
+
+fn expanded_indent_width(indent: &str) -> usize {
+    indent.chars().fold(0, |width, ch| {
+        if ch == '\t' {
+            width + (4 - width % 4)
+        } else {
+            width + 1
+        }
+    })
+}
+
+fn embedding_outline(relative_path: &str, content: &str) -> String {
+    const TS_KEYWORDS: [&str; 20] = [
+        "if", "for", "while", "switch", "return", "catch", "function", "await", "new", "throw",
+        "else", "typeof", "super", "import", "export", "case", "do", "try", "void", "delete",
+    ];
+
+    let ext = relative_path
+        .rsplit_once('.')
+        .map_or(relative_path, |(_, ext)| ext);
+    content
+        .lines()
+        .filter_map(|line| {
+            let keep = match ext {
+                "ts" | "tsx" => {
+                    if let Some(captures) = TS_DECL.captures(line) {
+                        if line.trim_end().ends_with(',') {
+                            false
+                        } else {
+                            let indent = captures.get(1).map_or("", |m| m.as_str());
+                            let kind = captures.get(7).map_or("", |m| m.as_str());
+                            indent.is_empty()
+                                || !matches!(kind, "const" | "let" | "var")
+                                || line.contains("=>")
+                                || line.contains("function")
+                        }
+                    } else {
+                        let method = TS_METHOD
+                            .captures(line)
+                            .map(|captures| (captures, 5))
+                            .or_else(|| TS_PROPFN.captures(line).map(|captures| (captures, 3)));
+                        method.is_some_and(|(captures, name_group)| {
+                            let indent = captures.get(1).map_or("", |m| m.as_str());
+                            let name = captures.get(name_group).map_or("", |m| m.as_str());
+                            !TS_KEYWORDS.contains(&name)
+                                && expanded_indent_width(indent) <= 8
+                                && !line.trim_end().ends_with(");")
+                        })
+                    }
+                }
+                "go" => GO_DECL.is_match(line) || GO_IFACE.is_match(line),
+                "sql" => SQL_DECL.is_match(line),
+                _ => false,
+            };
+            keep.then(|| line.trim().chars().take(160).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(1500)
+        .collect()
+}
+
+/// Build the text embedded for a code file.
+pub fn build_embedding_document(
+    relative_path: &str,
+    content: &str,
+    shape: EmbedDocShape,
+) -> String {
+    let head = crate::core::parser::truncate_to_char_boundary(content, 500);
+    let header = crate::core::parser::extract_header(head);
+
+    match shape {
+        EmbedDocShape::Head => format!("{} {} {}", header, relative_path, head),
+        EmbedDocShape::Outline => {
+            let outline = embedding_outline(relative_path, content);
+            format!("{}\n{}\n{}\n{}", relative_path, header, outline, head)
+        }
+    }
 }
 
 impl ContextPlusServer {
@@ -389,7 +500,7 @@ impl ContextPlusServer {
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
             .with_semaphore(Arc::clone(&ollama_semaphore));
 
-        let embed_cache_name = cache_name("embeddings", &config.ollama_embed_model);
+        let embed_cache_name = cache_name("embeddings", &config);
 
         // Load embedding cache from disk if available (cross-restart persistence)
         let initial_cache = match rkyv_store::mmap_vector_store(&root_dir, &embed_cache_name) {
@@ -1193,7 +1304,7 @@ impl ContextPlusServer {
 
         // CAS setup for diff-only embedding via U6 content-addressed store.
         let mcp_data_dir = ref_index.root_dir.join(".mcp_data");
-        let cas = CasStore::new(mcp_data_dir, &self.state.config.ollama_embed_model);
+        let cas = CasStore::new(mcp_data_dir, self.state.config.document_cache_identity());
         let ref_id_hex = ref_index.cas_ref_id_hex.clone();
 
         let mut texts_to_embed: Vec<(String, String, String)> = Vec::new(); // (rel_path, hash, text)
@@ -1246,13 +1357,8 @@ impl ContextPlusServer {
                 }
             }
 
-            let truncated = if content.len() > 500 {
-                crate::core::parser::truncate_to_char_boundary(&content, 500).to_string()
-            } else {
-                content
-            };
-            let header = crate::core::parser::extract_header(&truncated);
-            let text = format!("{} {} {}", header, rel_path, truncated);
+            let text =
+                build_embedding_document(&rel_path, &content, self.state.config.embed_doc_shape);
 
             // CAS dedup: check if this chunk's BLAKE3 hash exists in the parent chain.
             // chunk_idx = 0 because we treat each file as a single chunk here.
@@ -1319,7 +1425,7 @@ impl ContextPlusServer {
         if !texts_to_embed.is_empty() {
             let embed_texts: Vec<String> =
                 texts_to_embed.iter().map(|(_, _, t)| t.clone()).collect();
-            match self.state.ollama.embed(&embed_texts).await {
+            match self.state.ollama.embed_documents(&embed_texts).await {
                 Ok(vectors) => {
                     let mut cache = ref_index.embedding_cache.write().await;
                     for (i, (rel_path, hash, text)) in texts_to_embed.iter().enumerate() {
@@ -1372,7 +1478,7 @@ impl ContextPlusServer {
                 store
             };
 
-            let embed_cache_name = cache_name("embeddings", &self.state.config.ollama_embed_model);
+            let embed_cache_name = cache_name("embeddings", &self.state.config);
             let root = ref_index.root_dir.clone();
             let deletions_owned = std::mem::take(&mut deletions);
             let result = tokio::task::spawn_blocking(move || {
@@ -1549,10 +1655,7 @@ impl ContextPlusServer {
         // and new vectors are merged into the primary's so every worktree of
         // the repo benefits. Without the fallback a worktree's first search
         // re-embedded the whole repo.
-        let id_cache_name = cache_name(
-            "identifier-embeddings",
-            &self.state.config.ollama_embed_model,
-        );
+        let id_cache_name = cache_name("identifier-embeddings", &self.state.config);
         let primary_root = self.state.root_dir.clone();
         let load_store = |root: &std::path::Path| match rkyv_store::load_cache(root, &id_cache_name)
         {
@@ -1602,7 +1705,7 @@ impl ContextPlusServer {
                 let chunk_end = (chunk_start + chunk_size).min(uncached_indices.len());
                 let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
-                let chunk_vectors = self.state.ollama.embed(chunk_texts).await?;
+                let chunk_vectors = self.state.ollama.embed_documents(chunk_texts).await?;
                 for (local_j, &idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
                     if local_j < chunk_vectors.len() {
                         result_vectors[idx] = Some(chunk_vectors[local_j].clone());
@@ -3085,7 +3188,7 @@ pub struct MissedChunk {
     pub rel_path: String,
     /// FNV hash of the raw content (used as the in-memory `CacheEntry.hash`).
     pub content_hash: String,
-    /// Text that was prepared for embedding (header + path + truncated content).
+    /// Text prepared for embedding using the configured document shape.
     pub embed_text: String,
 }
 
@@ -3129,9 +3232,10 @@ async fn import_baseline_for_ref(
 
     // CAS lives at the primary worktree's .mcp_data directory.
     let mcp_data_dir = state.root_dir.join(".mcp_data");
-    let cas = CasStore::new(mcp_data_dir, &state.config.ollama_embed_model);
+    let cas = CasStore::new(mcp_data_dir, state.config.document_cache_identity());
     let ref_id_hex = ref_index.cas_ref_id_hex.clone();
     let max_file_size = state.config.max_embed_file_size;
+    let embed_doc_shape = state.config.embed_doc_shape;
 
     // Collect per-file results on a blocking thread to avoid holding async locks
     // during synchronous I/O.
@@ -3148,13 +3252,7 @@ async fn import_baseline_for_ref(
                     continue;
                 }
                 let content_hash = crate::core::parser::hash_content(content);
-                let truncated = if content.len() > 500 {
-                    crate::core::parser::truncate_to_char_boundary(content, 500).to_string()
-                } else {
-                    content.as_str().to_string()
-                };
-                let header = crate::core::parser::extract_header(content);
-                let embed_text = format!("{} {} {}", header, rel_path, truncated);
+                let embed_text = build_embedding_document(rel_path, content, embed_doc_shape);
 
                 let chunk_hash = ChunkHash::of(&embed_text);
                 let key = ChunkKey::new(rel_path.clone(), 0);
@@ -3309,7 +3407,7 @@ async fn embed_diff_chunks(
 
     let embed_texts: Vec<String> = misses.iter().map(|m| m.embed_text.clone()).collect();
 
-    let vectors = match state.ollama.embed(&embed_texts).await {
+    let vectors = match state.ollama.embed_documents(&embed_texts).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -3323,7 +3421,7 @@ async fn embed_diff_chunks(
 
     // Write new blobs + update embedding_cache.
     let mcp_data_dir = state.root_dir.join(".mcp_data");
-    let cas = CasStore::new(mcp_data_dir, &state.config.ollama_embed_model);
+    let cas = CasStore::new(mcp_data_dir, state.config.document_cache_identity());
     let ref_id_hex = ref_index.cas_ref_id_hex.clone();
 
     let mut manifest_updates: Vec<(ChunkKey, ChunkHash)> = Vec::new();
@@ -3578,6 +3676,135 @@ mod tests {
         let root = std::env::temp_dir().join("contextplus-test");
         let _ = std::fs::create_dir_all(&root);
         ContextPlusServer::new(root, config)
+    }
+
+    #[test]
+    fn embedding_cache_names_include_prefix_and_shape_identity() {
+        let mut config = Config::from_env();
+        config.ollama_embed_model = "nomic-embed-text".to_string();
+        config.embed_query_prefix.clear();
+        config.embed_doc_prefix.clear();
+        config.embed_doc_shape = crate::config::EmbedDocShape::Head;
+
+        assert_eq!(
+            cache_name("embeddings", &config),
+            "embeddings-nomic-embed-text"
+        );
+        assert_eq!(
+            rkyv_store::query_cache_name(&config.query_cache_identity()),
+            "query-embeddings-nomic-embed-text"
+        );
+
+        let baseline_doc = cache_name("embeddings", &config);
+        config.embed_doc_prefix = "title: none | text: ".to_string();
+        assert_ne!(cache_name("embeddings", &config), baseline_doc);
+
+        config.embed_doc_prefix.clear();
+        config.embed_doc_shape = crate::config::EmbedDocShape::Outline;
+        assert_ne!(cache_name("embeddings", &config), baseline_doc);
+
+        let baseline_query = rkyv_store::query_cache_name("nomic-embed-text");
+        config.embed_query_prefix = "query: ".to_string();
+        assert_ne!(
+            rkyv_store::query_cache_name(&config.query_cache_identity()),
+            baseline_query
+        );
+
+        config.ollama_embed_model = "a".repeat(70);
+        config.embed_doc_shape = crate::config::EmbedDocShape::Outline;
+        config.embed_doc_prefix = "first: ".to_string();
+        let first = rkyv_store::model_slug(&config.document_cache_identity());
+        config.embed_doc_prefix = "second: ".to_string();
+        let second = rkyv_store::model_slug(&config.document_cache_identity());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn head_embedding_document_matches_legacy_format() {
+        let content = "// Authentication helpers\npub fn authenticate(token: &str) -> bool { !token.is_empty() }\n";
+        let legacy = "Authentication helpers | pub fn authenticate(token: &str) -> bool { !token.is_empty() } src/auth.rs // Authentication helpers\npub fn authenticate(token: &str) -> bool { !token.is_empty() }\n";
+
+        assert_eq!(
+            build_embedding_document("src/auth.rs", content, crate::config::EmbedDocShape::Head),
+            legacy
+        );
+    }
+
+    #[test]
+    fn outline_embedding_document_matches_run2_d1_golden_files() {
+        let fixtures = [
+            include_str!("../tests/fixtures/embed_outline/synthetic-worker.json"),
+            include_str!("../tests/fixtures/embed_outline/synthetic-worker.test.json"),
+            include_str!("../tests/fixtures/embed_outline/synthetic_worker.go.json"),
+        ];
+
+        for fixture in fixtures {
+            let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let path = fixture["path"].as_str().unwrap();
+            let content = fixture["content"].as_str().unwrap();
+            let expected = fixture["expected"].as_str().unwrap();
+            let actual =
+                build_embedding_document(path, content, crate::config::EmbedDocShape::Outline);
+            assert_eq!(actual.as_bytes(), expected.as_bytes(), "{path}");
+        }
+    }
+
+    #[test]
+    fn synthetic_outline_fixtures_cover_filters_and_caps() {
+        let typescript: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/embed_outline/synthetic-worker.json"
+        ))
+        .unwrap();
+        let outline = embedding_outline(
+            typescript["path"].as_str().unwrap(),
+            typescript["content"].as_str().unwrap(),
+        );
+        assert_eq!(outline.chars().count(), 1500);
+        assert!(outline.lines().all(|line| line.chars().count() <= 160));
+        assert!(outline.lines().any(|line| line.chars().count() == 160));
+        assert!(outline.contains("export class SyntheticWorker"));
+        assert!(outline.contains("async execute("));
+        assert!(outline.contains("static create("));
+        assert!(outline.contains("private reset("));
+        assert!(outline.contains("transform<TValue>("));
+        assert!(outline.contains("const arrowTask = (value: number) => value + x;"));
+        assert!(!outline.contains("type ExternalShape,"));
+        assert!(!outline.contains("const x = 1;"));
+
+        let test_file: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/embed_outline/synthetic-worker.test.json"
+        ))
+        .unwrap();
+        let test_outline = embedding_outline(
+            test_file["path"].as_str().unwrap(),
+            test_file["content"].as_str().unwrap(),
+        );
+        assert!(!test_outline.contains("describe('synthetic worker'"));
+        assert!(test_outline.contains("beforeEach(() => {"));
+        assert!(test_outline.contains("it('runs a task'"));
+        assert!(!test_outline.contains("registerHook(createHook());"));
+
+        let go: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/embed_outline/synthetic_worker.go.json"
+        ))
+        .unwrap();
+        let go_outline = embedding_outline(
+            go["path"].as_str().unwrap(),
+            go["content"].as_str().unwrap(),
+        );
+        assert!(go_outline.contains("type Runner interface"));
+        assert!(go_outline.contains("Start(context.Context) error"));
+        assert!(go_outline.contains("func NewRunner(config Config) Runner"));
+    }
+
+    #[test]
+    fn embedding_outline_matches_run2_sql_and_extension_rules() {
+        let sql = "create table lower_case (id int);\nCREATE OR REPLACE FUNCTION do_work() RETURNS void;\nCREATE UNIQUE INDEX idx ON t (id);\n";
+        assert_eq!(
+            embedding_outline("schema.sql", sql),
+            "create table lower_case (id int);\nCREATE OR REPLACE FUNCTION do_work() RETURNS void;\nCREATE UNIQUE INDEX idx ON t (id);"
+        );
+        assert_eq!(embedding_outline("src/lib.rs", "pub fn ignored() {}"), "");
     }
 
     #[test]
@@ -6963,13 +7190,8 @@ mod tests {
         // ── Pre-seed the primary's CAS manifest + blob. ─────────────────────
         // Compute the same embed-text format that import_baseline_for_ref uses.
         let content = "fn hello() {}";
-        let truncated = if content.len() > 500 {
-            crate::core::parser::truncate_to_char_boundary(content, 500).to_string()
-        } else {
-            content.to_string()
-        };
-        let header = crate::core::parser::extract_header(content);
-        let embed_text = format!("{} {} {}", header, "hello.rs", truncated);
+        let embed_text =
+            build_embedding_document("hello.rs", content, server.state.config.embed_doc_shape);
         let chunk_hash = ChunkHash::of(&embed_text);
         let chunk_key = ChunkKey::new("hello.rs".to_string(), 0);
 
@@ -6977,7 +7199,10 @@ mod tests {
         let synthetic_vec: Vec<f32> = (0..768).map(|i| i as f32 * 0.001).collect();
         let mcp_data = primary_path.join(".mcp_data");
         fs::create_dir_all(&mcp_data).unwrap();
-        let cas = CasStore::new(mcp_data.clone(), &server.state.config.ollama_embed_model);
+        let cas = CasStore::new(
+            mcp_data.clone(),
+            server.state.config.document_cache_identity(),
+        );
         cas.write_blob(&chunk_hash, &synthetic_vec).unwrap();
         cas.update_manifest(
             &primary_ref.cas_ref_id_hex,
@@ -7090,20 +7315,18 @@ mod tests {
 
         // Pre-seed the CAS for the shared file.
         let content = "fn shared() {}";
-        let truncated = if content.len() > 500 {
-            crate::core::parser::truncate_to_char_boundary(content, 500).to_string()
-        } else {
-            content.to_string()
-        };
-        let header = crate::core::parser::extract_header(content);
-        let embed_text = format!("{} {} {}", header, "shared.rs", truncated);
+        let embed_text =
+            build_embedding_document("shared.rs", content, server.state.config.embed_doc_shape);
         let chunk_hash = ChunkHash::of(&embed_text);
         let chunk_key = ChunkKey::new("shared.rs".to_string(), 0);
 
         let seeded_vec: Vec<f32> = (0..768).map(|i| (i as f32) * 0.002).collect();
         let mcp_data = primary_path.join(".mcp_data");
         fs::create_dir_all(&mcp_data).unwrap();
-        let cas = CasStore::new(mcp_data.clone(), &server.state.config.ollama_embed_model);
+        let cas = CasStore::new(
+            mcp_data.clone(),
+            server.state.config.document_cache_identity(),
+        );
         cas.write_blob(&chunk_hash, &seeded_vec).unwrap();
         cas.update_manifest(&primary_ref.cas_ref_id_hex, &[(chunk_key, chunk_hash)])
             .unwrap();

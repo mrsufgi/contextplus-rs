@@ -245,7 +245,7 @@ mod tests {
 
     // 11. Type-only cross-imports must NOT form a reported cycle.
     //
-    // Reproduces the berries subscription-domain false positive: three files
+    // Reproduces an application-domain false positive: three files
     // that mutually `import type` each other. At runtime the TypeScript
     // compiler erases every such edge, so there is no actual circular
     // dependency. The graph fed to Tarjan must not contain those edges.

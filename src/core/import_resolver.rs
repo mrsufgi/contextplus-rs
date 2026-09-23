@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn skip_scoped_package_import() {
-        let result = resolve_import("@berries/lib-context", Path::new("/workspace/src/app.ts"));
+        let result = resolve_import("@acme/lib-context", Path::new("/workspace/src/app.ts"));
         assert!(result.is_none());
     }
 
@@ -107,7 +107,7 @@ mod tests {
         let imports = vec![
             "./foo".to_string(),
             "stripe".to_string(),
-            "@berries/lib-context".to_string(),
+            "@acme/lib-context".to_string(),
         ];
 
         let pairs = resolve_file_imports(&main_file, &imports);

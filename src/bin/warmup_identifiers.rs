@@ -115,7 +115,7 @@ async fn main() {
     }
 
     // Step 2: Load existing identifier embedding cache
-    let id_cache_name = cache_name("identifier-embeddings", &config.ollama_embed_model);
+    let id_cache_name = cache_name("identifier-embeddings", &config);
     let id_cache = match rkyv_store::load_cache(root, &id_cache_name) {
         Ok(Some(data)) => {
             let store = data.to_store();
@@ -169,7 +169,7 @@ async fn main() {
             chunk_texts.len()
         );
 
-        match ollama.embed(chunk_texts).await {
+        match ollama.embed_documents(chunk_texts).await {
             Ok(vectors) => {
                 for (local_j, &idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
                     if local_j < vectors.len() {

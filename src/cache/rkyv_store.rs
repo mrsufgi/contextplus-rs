@@ -875,6 +875,15 @@ mod tests {
     }
 
     #[test]
+    fn query_cache_name_preserves_identity_for_long_models() {
+        let model = "a".repeat(70);
+        let first = query_cache_name(&format!("q1111111111111111-{model}"));
+        let second = query_cache_name(&format!("q2222222222222222-{model}"));
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn rkyv_round_trip() {
         let dir = TempDir::new().unwrap();
         let data = make_test_data();

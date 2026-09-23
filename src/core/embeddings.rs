@@ -153,7 +153,10 @@ pub struct OllamaClient {
     client: reqwest::Client,
     host: String,
     model: String,
+    query_cache_identity: String,
     chat_model: String,
+    query_prefix: String,
+    document_prefix: String,
     batch_size: usize,
     query_batch_size: usize,
     embed_options: Option<EmbedRuntimeOptions>,
@@ -265,7 +268,7 @@ impl OllamaClient {
 
         // Load persisted entries into the in-memory LRU.
         if let Some(ref dir) = root_dir {
-            match rkyv_store::load_query_cache(dir, &config.ollama_embed_model) {
+            match rkyv_store::load_query_cache(dir, &config.query_cache_identity()) {
                 Ok(entries) => {
                     let mut lru = cache.lock().unwrap();
                     for (k, v) in entries {
@@ -286,7 +289,7 @@ impl OllamaClient {
         let flush_tx_arc = if let Some(ref dir) = root_dir {
             let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let cache_clone = Arc::clone(&cache);
-            let model_clone = config.ollama_embed_model.clone();
+            let model_clone = config.query_cache_identity();
             let dir_clone = dir.clone();
             // `tokio::runtime::Handle::try_current()` returns Err when there is
             // no active runtime (sync test threads).  In that case we skip the
@@ -310,7 +313,10 @@ impl OllamaClient {
             client,
             host: config.ollama_host.clone(),
             model: config.ollama_embed_model.clone(),
+            query_cache_identity: config.query_cache_identity(),
             chat_model: config.ollama_chat_model.clone(),
+            query_prefix: config.embed_query_prefix.clone(),
+            document_prefix: config.embed_doc_prefix.clone(),
             batch_size: config.embed_batch_size,
             query_batch_size: config.query_batch_size,
             embed_options: EmbedRuntimeOptions::from_config(config),
@@ -338,7 +344,7 @@ impl OllamaClient {
             }
             lru.drain_to_vec()
         };
-        if let Err(e) = rkyv_store::save_query_cache(dir, &self.model, &entries) {
+        if let Err(e) = rkyv_store::save_query_cache(dir, &self.query_cache_identity, &entries) {
             tracing::warn!("Failed to flush query embedding cache on shutdown: {e}");
         }
     }
@@ -471,6 +477,45 @@ impl OllamaClient {
         // ----------------------------------------------------------------
         // Multi-text (batch / indexing) path — unchanged.
         // ----------------------------------------------------------------
+
+        self.embed_uncached(texts).await
+    }
+
+    /// Embed user queries with the configured model-specific query prefix.
+    pub async fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let inputs: Vec<String> = texts
+            .iter()
+            .map(|text| format!("{}{}", self.query_prefix, text))
+            .collect();
+        self.embed(&inputs).await
+    }
+
+    /// Embed one user query with the configured model-specific query prefix.
+    pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        self.embed_queries(&[query.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ContextPlusError::Ollama("empty embedding response".into()))
+    }
+
+    /// Embed index documents with the configured model-specific document prefix.
+    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if self.document_prefix.is_empty() {
+            return self.embed_uncached(texts).await;
+        }
+
+        let inputs: Vec<String> = texts
+            .iter()
+            .map(|text| format!("{}{}", self.document_prefix, text))
+            .collect();
+        self.embed_uncached(&inputs).await
+    }
+
+    async fn embed_uncached(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
 
         // Split each input into chunks; short inputs produce a single chunk.
         let chunked_inputs: Vec<Vec<&str>> = texts
@@ -2045,6 +2090,50 @@ mod tests {
     }
 
     // -- adaptive embed_single_adaptive with wiremock --
+
+    #[tokio::test]
+    async fn query_and_document_paths_apply_their_prefix_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = config_with_host(&server.uri());
+        config.embed_query_prefix = "task: code retrieval | query: ".to_string();
+        config.embed_doc_prefix = "title: none | text: ".to_string();
+        let client = OllamaClient::new(&config);
+
+        client.embed_query("find authentication").await.unwrap();
+        client
+            .embed_documents(&["src/auth.rs\nAuth module".to_string()])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let inputs: Vec<String> = requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["input"][0].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            [
+                "task: code retrieval | query: find authentication",
+                "title: none | text: src/auth.rs\nAuth module",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn embed_single_adaptive_shrinks_on_context_error() {
