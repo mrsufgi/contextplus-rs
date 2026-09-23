@@ -1531,19 +1531,36 @@ impl ContextPlusServer {
             "Embedding identifiers (using disk cache for warm hits)"
         );
 
-        // Load identifier-specific embedding cache
+        // Load identifier-specific embedding cache. Identifier texts are keyed
+        // by repo-relative path and signature, so a worktree shares them with
+        // the primary: its own cache is consulted first, then the primary's,
+        // and new vectors are merged into the primary's so every worktree of
+        // the repo benefits. Without the fallback a worktree's first search
+        // re-embedded the whole repo.
         let id_cache_name = cache_name(
             "identifier-embeddings",
             &self.state.config.ollama_embed_model,
         );
-        let id_cache = match rkyv_store::load_cache(&ref_index.root_dir, &id_cache_name) {
-            Ok(Some(data)) => {
-                let store = data.to_store();
-                tracing::info!(cached = store.count(), "Loaded identifier embedding cache");
-                Some(store)
-            }
+        let primary_root = self.state.root_dir.clone();
+        let load_store = |root: &std::path::Path| match rkyv_store::load_cache(root, &id_cache_name)
+        {
+            Ok(Some(data)) => Some(data.to_store()),
             _ => None,
         };
+        let mut id_caches: Vec<crate::core::embeddings::VectorStore> = Vec::new();
+        if let Some(own) = load_store(&ref_index.root_dir) {
+            id_caches.push(own);
+        }
+        if ref_index.root_dir != primary_root
+            && let Some(parent) = load_store(&primary_root)
+        {
+            id_caches.push(parent);
+        }
+        tracing::info!(
+            cached = id_caches.iter().map(|s| s.count()).sum::<usize>(),
+            stores = id_caches.len(),
+            "Loaded identifier embedding cache"
+        );
 
         // Partition: cached vs uncached identifiers (use &str slices for cache lookup)
         let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_identifiers);
@@ -1551,9 +1568,7 @@ impl ContextPlusServer {
         let mut uncached_texts: Vec<String> = Vec::new();
 
         for (i, doc) in identifier_docs.iter().enumerate() {
-            if let Some(ref store) = id_cache
-                && let Some(vec) = store.get_vector(&doc.text)
-            {
+            if let Some(vec) = id_caches.iter().find_map(|s| s.get_vector(&doc.text)) {
                 result_vectors.push(Some(vec.to_vec()));
                 continue;
             }
@@ -1595,7 +1610,7 @@ impl ContextPlusServer {
                         .collect();
                     let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
                     let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
-                    let root = ref_index.root_dir.clone();
+                    let root = primary_root.clone();
                     let cache_name_owned = id_cache_name.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         // Merge with disk under fd-lock so we preserve identifier
@@ -6804,6 +6819,73 @@ mod tests {
                 .await
                 .is_some_and(|r| !r.is_empty()),
             "Ollama must have been called"
+        );
+    }
+
+    /// A worktree's identifier texts are keyed by repo-relative path, so the
+    /// primary's identifier cache must serve it; otherwise the first identifier
+    /// search in every worktree re-embeds the whole repo.
+    #[tokio::test]
+    async fn worktree_identifier_index_reuses_primary_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|req: &Request| {
+                let body: serde_json::Value = req.body_json().unwrap_or_default();
+                let n = body["input"].as_array().map_or(1, |a| a.len());
+                let vecs: Vec<Vec<f32>> = (0..n).map(|_| vec![0.6, 0.8, 0.0]).collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "embeddings": vecs }))
+            })
+            .mount(&ollama)
+            .await;
+        let embed_calls = || async {
+            ollama.received_requests().await.map_or(0, |r| {
+                r.iter().filter(|q| q.url.path() == "/api/embed").count()
+            })
+        };
+
+        let primary = tempfile::tempdir().expect("tempdir");
+        let source = "fn hello() {}\nfn world() {}\n";
+        std::fs::write(primary.path().join("hello.rs"), source).unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+
+        let cache = server.ensure_project_cache().await.unwrap();
+        let idx = server.ensure_identifier_index(&cache).await.unwrap();
+        assert_eq!(idx.dims, 3);
+        let calls_after_primary = embed_calls().await;
+        assert!(calls_after_primary >= 1, "primary build must embed");
+
+        // A worktree with the same file at the same relative path.
+        let wt = tempfile::tempdir().expect("tempdir");
+        std::fs::write(wt.path().join("hello.rs"), source).unwrap();
+        let canonical_wt = wt.path().canonicalize().unwrap();
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical_wt.to_string_lossy().to_string()),
+        );
+        assert_eq!(
+            server.handle_attach_worktree(args).await.unwrap().is_error,
+            Some(false)
+        );
+        let wt_ref = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
+        let wt_server = server.with_session(wt_ref);
+
+        let wt_cache = wt_server.ensure_project_cache().await.unwrap();
+        let wt_idx = wt_server.ensure_identifier_index(&wt_cache).await.unwrap();
+        assert_eq!(wt_idx.dims, 3, "worktree index must carry vectors");
+        assert_eq!(wt_idx.docs.len(), idx.docs.len());
+        assert_eq!(
+            embed_calls().await,
+            calls_after_primary,
+            "worktree must reuse the primary's identifier cache, not re-embed"
         );
     }
 
