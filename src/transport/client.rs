@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::UnixStream;
 
 use crate::transport::{daemon, paths};
@@ -313,16 +313,32 @@ fn spawn_daemon(root_dir: &Path) -> Result<()> {
 
 /// Pump bytes between our stdio and the daemon socket. Returns when either
 /// half closes (EOF on stdin, or daemon disconnect).
+///
+/// Host → daemon traffic is forwarded line by line so every `tools/call`
+/// can carry the host's current working directory (see
+/// [`crate::core::client_cwd`]); the daemon uses it to run the call against
+/// the worktree the agent is in.
 pub async fn bridge(stream: UnixStream) -> Result<()> {
     let (mut sock_r, mut sock_w) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
 
     let to_daemon = async move {
-        let n = copy(&mut stdin, &mut sock_w).await?;
+        let mut total = 0u64;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if stdin.read_until(b'\n', &mut line).await? == 0 {
+                break;
+            }
+            let cwd = crate::core::client_cwd::parent_process_cwd();
+            let out = crate::core::client_cwd::inject_cwd(&line, cwd.as_deref());
+            sock_w.write_all(&out).await?;
+            total += out.len() as u64;
+        }
         // Half-close so the daemon sees EOF on its read side.
         let _ = sock_w.shutdown().await;
-        Ok::<u64, std::io::Error>(n)
+        Ok::<u64, std::io::Error>(total)
     };
 
     let to_stdout = async move {

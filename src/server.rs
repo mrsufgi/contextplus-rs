@@ -2938,7 +2938,10 @@ impl ServerHandler for ContextPlusServer {
         .with_instructions(
             "Context+ semantic code analysis server. Provides semantic search, \
              blast radius analysis, context trees, file skeletons, navigation, \
-             memory graph, and more.",
+             memory graph, and more. Calls run against the git worktree of this \
+             repo that your process is in, or that an absolute path argument \
+             points into (attached on first use, forked from the primary's \
+             cache); relative paths are resolved from that worktree's root.",
         )
     }
 
@@ -3008,7 +3011,18 @@ impl ServerHandler for ContextPlusServer {
             monitor.touch();
         }
         let name = request.name.to_string();
-        let args = request.arguments.unwrap_or_default();
+        let mut args = request.arguments.unwrap_or_default();
+        // Over stdio this process is the host's child, so its parent's cwd is
+        // the agent's; the daemon bridge injects the same argument itself.
+        if self.session_ref_id.is_none()
+            && !args.contains_key(crate::core::client_cwd::CWD_ARG)
+            && let Some(cwd) = crate::core::client_cwd::parent_process_cwd()
+        {
+            args.insert(
+                crate::core::client_cwd::CWD_ARG.to_string(),
+                Value::String(cwd.to_string_lossy().into_owned()),
+            );
+        }
 
         // Tool-call entry log — pairs with an exit log below. Lets daemon-log
         // operators correlate "Transport closed" / "completed without a
@@ -3021,6 +3035,41 @@ impl ServerHandler for ContextPlusServer {
             session_ref_id = self.session_ref_id.map(|r| r.0),
             "call_tool: entry"
         );
+
+        let result = Ok(self.call_tool_routed(&name, args).await);
+
+        let elapsed_ms = _call_started.elapsed().as_millis() as u64;
+        let content_count = result
+            .as_ref()
+            .ok()
+            .map(|r: &CallToolResult| r.content.len());
+        tracing::info!(
+            tool = %name,
+            session_ref_id = self.session_ref_id.map(|r| r.0),
+            elapsed_ms,
+            content_count = ?content_count,
+            "call_tool: exit"
+        );
+        result
+    }
+}
+
+impl ContextPlusServer {
+    /// Dispatch one tool call through the path-translation boundary. Entry
+    /// point shared by the MCP `call_tool` handler and tests.
+    pub async fn call_tool_routed(
+        &self,
+        name: &str,
+        args: serde_json::Map<String, Value>,
+    ) -> CallToolResult {
+        // A path inside another worktree of this repo runs the whole call as
+        // that worktree's session; routed paths come back relative, so the
+        // re-entry below does not route again.
+        let (routed, args) =
+            crate::transport::dispatch::route_to_worktree_ref(self, name, args).await;
+        if let Some(ref_id) = routed {
+            return Box::pin(self.with_session(ref_id).call_tool_routed(name, args)).await;
+        }
 
         // Route through U5's path-translation boundary.
         //
@@ -3039,44 +3088,32 @@ impl ServerHandler for ContextPlusServer {
         // (listing other refs' roots as `foreign_roots`) is reserved for U10+.
         let caller_root_opt =
             crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id);
-        let result = match caller_root_opt {
-            Some(caller_root) => Ok(crate::transport::dispatch::dispatch_with_translation(
-                self,
-                &name,
-                args,
-                &caller_root,
-                // U9 + U14 wiring: `self.session_ref_id` is set per-connection by
-                // `daemon::serve_connection` after `register_session`. Passing it
-                // to `dispatch_with_translation` lets `foreign_roots_for_session`
-                // exclude the caller's own ref from the foreign-roots list and
-                // include only OTHER attached refs — activating cross-ref
-                // leakage protection for multi-ref daemons.
-                self.session_ref_id,
-            )
-            .await),
+        match caller_root_opt {
+            Some(caller_root) => {
+                crate::transport::dispatch::dispatch_with_translation(
+                    self,
+                    name,
+                    args,
+                    &caller_root,
+                    // U9 + U14 wiring: `self.session_ref_id` is set per-connection by
+                    // `daemon::serve_connection` after `register_session`. Passing it
+                    // to `dispatch_with_translation` lets `foreign_roots_for_session`
+                    // exclude the caller's own ref from the foreign-roots list and
+                    // include only OTHER attached refs — activating cross-ref
+                    // leakage protection for multi-ref daemons.
+                    self.session_ref_id,
+                )
+                .await
+            }
             None => {
                 // Registry tampered with externally — fall back to direct
                 // dispatch so we don't lose the request entirely.
                 tracing::warn!(
                     "caller_root unavailable; bypassing path translation for tool {name}"
                 );
-                Ok(self.dispatch(&name, args).await)
+                self.dispatch(name, args).await
             }
-        };
-
-        let elapsed_ms = _call_started.elapsed().as_millis() as u64;
-        let content_count = result
-            .as_ref()
-            .ok()
-            .map(|r: &CallToolResult| r.content.len());
-        tracing::info!(
-            tool = %name,
-            session_ref_id = self.session_ref_id.map(|r| r.0),
-            elapsed_ms,
-            content_count = ?content_count,
-            "call_tool: exit"
-        );
-        result
+        }
     }
 }
 

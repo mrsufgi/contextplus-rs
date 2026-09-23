@@ -462,6 +462,160 @@ pub fn caller_root_for_session(
     }
 }
 
+/// Tool arguments that carry a filesystem path.
+const PATH_ARG_KEYS: &[&str] = &["file_path", "path", "root_dir", "target_path", "rootDir"];
+
+/// Tools that manage refs themselves and must never be re-routed.
+fn manages_worktrees(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "attach_worktree" | "detach_worktree" | "list_worktrees"
+    )
+}
+
+/// Canonicalize `p`, resolving symlinks through its deepest existing ancestor
+/// so a path to a file that does not exist yet still canonicalizes.
+fn canonicalize_lenient(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut existing = p;
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            return tail
+                .iter()
+                .rev()
+                .fold(canonical, |acc: PathBuf, seg| acc.join(seg));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Root of the linked git worktree containing `p`: the nearest ancestor whose
+/// `.git` is a file. `None` when the nearest `.git` is a directory (a primary
+/// checkout) or there is none.
+fn enclosing_linked_worktree(p: &Path) -> Option<PathBuf> {
+    for dir in p.ancestors() {
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(meta) if meta.is_dir() => return None,
+            Ok(_) => return Some(dir.to_path_buf()),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Longest registered ref whose canonical root contains `canonical_path`.
+async fn ref_containing(server: &ContextPlusServer, canonical_path: &Path) -> Option<RefId> {
+    let refs = server.state.refs.read().await;
+    refs.iter()
+        .filter(|(_, r)| canonical_path.starts_with(&r.canonical_root))
+        .max_by_key(|(_, r)| r.canonical_root.as_os_str().len())
+        .map(|(id, _)| *id)
+}
+
+/// Pick the ref a tool call runs against when one of its path arguments
+/// points outside the session's own root.
+///
+/// The call is routed by, in order: an absolute path argument outside the
+/// session's root, then the host's working directory (the `_cwd` argument
+/// the bridge adds) when no absolute path argument pins the call to the
+/// session's own root. A location under an attached worktree routes the
+/// call to that worktree; one under a linked git worktree of the same repo
+/// that is not attached yet attaches it first (forking the primary's cache
+/// the same way `attach_worktree` does). Routed path arguments are rewritten
+/// relative to the target root, which also covers paths reached through a
+/// symlink; relative arguments then resolve against the target root.
+/// Anything else is returned unchanged and left to the path-translation
+/// boundary to accept or reject. `_cwd` is always removed.
+pub async fn route_to_worktree_ref(
+    server: &ContextPlusServer,
+    tool_name: &str,
+    mut args: serde_json::Map<String, serde_json::Value>,
+) -> (Option<RefId>, serde_json::Map<String, serde_json::Value>) {
+    let cwd = args
+        .remove(crate::core::client_cwd::CWD_ARG)
+        .and_then(|v| v.as_str().map(|s| canonicalize_lenient(Path::new(s))));
+    if manages_worktrees(tool_name) {
+        return (None, args);
+    }
+    let session_root = server.current_ref().canonical_root.clone();
+    let absolute_args: Vec<PathBuf> = PATH_ARG_KEYS
+        .iter()
+        .filter_map(|key| {
+            let p = Path::new(args.get(*key)?.as_str()?);
+            p.is_absolute().then(|| canonicalize_lenient(p))
+        })
+        .collect();
+    let foreign = absolute_args
+        .iter()
+        .find(|p| !p.starts_with(&session_root))
+        .cloned()
+        .or_else(|| {
+            if !absolute_args.is_empty() {
+                return None;
+            }
+            cwd.filter(|c| !c.starts_with(&session_root))
+        });
+    let Some(foreign) = foreign else {
+        return (None, args);
+    };
+
+    let mut target = ref_containing(server, &foreign).await;
+    if target.is_none()
+        && let Some(worktree) = enclosing_linked_worktree(&foreign)
+        && let Some(primary) = server.state.default_ref()
+        && crate::core::git_worktree::resolve_primary_worktree(&worktree)
+            == crate::core::git_worktree::resolve_primary_worktree(&primary.canonical_root)
+    {
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".to_string(),
+            serde_json::Value::String(worktree.to_string_lossy().into_owned()),
+        );
+        server.dispatch("attach_worktree", attach).await;
+        target = ref_containing(server, &foreign).await;
+    }
+    let Some(target) = target else {
+        return (None, args);
+    };
+    if server.session_ref_id == Some(target) {
+        return (None, args);
+    }
+    let Some(target_root) = server
+        .state
+        .ref_index(target)
+        .map(|r| r.canonical_root.clone())
+    else {
+        return (None, args);
+    };
+
+    for key in PATH_ARG_KEYS {
+        let Some(raw) = args.get(*key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !Path::new(raw).is_absolute() {
+            continue;
+        }
+        if let Ok(rel) = canonicalize_lenient(Path::new(raw)).strip_prefix(&target_root) {
+            let rel = rel.to_string_lossy().into_owned();
+            let rel = if rel.is_empty() { ".".to_string() } else { rel };
+            args.insert(key.to_string(), serde_json::Value::String(rel));
+        }
+    }
+    tracing::debug!(
+        tool = tool_name,
+        ref_id = target.0,
+        root = %target_root.display(),
+        "routing tool call to worktree ref"
+    );
+    (Some(target), args)
+}
+
 /// Collect canonical worktree paths of all attached refs EXCEPT the caller's.
 ///
 /// Used to populate `foreign_roots` for path translation at the dispatch
@@ -841,6 +995,229 @@ mod tests {
         assert!(
             !text.contains("outside the caller's worktree root"),
             "in-tree absolute path should not trigger rejection, got: {text}"
+        );
+    }
+
+    // ── Worktree routing ──────────────────────────────────────────────────────
+
+    /// Lay out a primary repo with one linked worktree the way `git worktree
+    /// add` does, without shelling out to git. The worktree holds a file the
+    /// primary does not.
+    fn make_repo_with_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let primary = base.join("repo");
+        let wt = base.join("worktrees/feat");
+        let wt_gitdir = primary.join(".git/worktrees/feat");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(primary.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("src/only_in_worktree.rs"),
+            "pub fn worktree_only_fn() {}",
+        )
+        .unwrap();
+        (tmp, primary, wt)
+    }
+
+    fn file_path_args(p: &Path) -> serde_json::Map<String, serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "file_path".to_string(),
+            serde_json::Value::String(p.to_string_lossy().to_string()),
+        );
+        args
+    }
+
+    #[tokio::test]
+    async fn absolute_path_under_attached_worktree_runs_against_that_worktree() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".to_string(),
+            serde_json::Value::String(wt.to_string_lossy().to_string()),
+        );
+        server.call_tool_routed("attach_worktree", attach).await;
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                file_path_args(&wt.join("src/only_in_worktree.rs")),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("worktree_only_fn"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn absolute_path_under_unattached_linked_worktree_auto_attaches() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                file_path_args(&wt.join("src/only_in_worktree.rs")),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("worktree_only_fn"), "got: {text}");
+        let listed = server
+            .call_tool_routed("list_worktrees", serde_json::Map::new())
+            .await;
+        assert!(
+            first_text(&listed).contains(&*wt.to_string_lossy()),
+            "worktree should now be registered, got: {}",
+            first_text(&listed)
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_path_through_symlink_into_worktree_is_routed() {
+        let (tmp, primary, wt) = make_repo_with_linked_worktree();
+        let link = tmp.path().join("wt-link");
+        std::os::unix::fs::symlink(&wt, &link).unwrap();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                file_path_args(&link.join("src/only_in_worktree.rs")),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("worktree_only_fn"), "got: {text}");
+    }
+
+    fn with_cwd(
+        mut args: serde_json::Map<String, serde_json::Value>,
+        cwd: &Path,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        args.insert(
+            crate::core::client_cwd::CWD_ARG.to_string(),
+            serde_json::Value::String(cwd.to_string_lossy().to_string()),
+        );
+        args
+    }
+
+    #[tokio::test]
+    async fn cwd_inside_unattached_worktree_routes_relative_path_and_attaches() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                with_cwd(
+                    file_path_args(Path::new("src/only_in_worktree.rs")),
+                    &wt.join("src"),
+                ),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("worktree_only_fn"), "got: {text}");
+        let listed = server
+            .call_tool_routed("list_worktrees", serde_json::Map::new())
+            .await;
+        assert!(first_text(&listed).contains(&*wt.to_string_lossy()));
+    }
+
+    #[tokio::test]
+    async fn cwd_inside_primary_leaves_call_on_primary() {
+        let (_tmp, primary, _wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                with_cwd(
+                    file_path_args(Path::new("src/main.rs")),
+                    &primary.join("src"),
+                ),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("main"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn explicit_primary_path_wins_over_worktree_cwd() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                with_cwd(file_path_args(&primary.join("src/main.rs")), &wt),
+            )
+            .await;
+
+        let text = first_text(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("main"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn cwd_arg_never_reaches_the_tool() {
+        let (_tmp, primary, wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let (routed, args) = route_to_worktree_ref(
+            &server,
+            "get_file_skeleton",
+            with_cwd(file_path_args(Path::new("src/only_in_worktree.rs")), &wt),
+        )
+        .await;
+        assert!(routed.is_some());
+        assert!(!args.contains_key(crate::core::client_cwd::CWD_ARG));
+
+        let (routed, args) = route_to_worktree_ref(
+            &server,
+            "get_file_skeleton",
+            with_cwd(file_path_args(Path::new("src/main.rs")), &primary),
+        )
+        .await;
+        assert!(routed.is_none());
+        assert!(!args.contains_key(crate::core::client_cwd::CWD_ARG));
+    }
+
+    #[tokio::test]
+    async fn absolute_path_in_worktree_of_another_repo_is_still_rejected() {
+        let (_tmp, primary, _wt) = make_repo_with_linked_worktree();
+        let (_other_tmp, _other_primary, other_wt) = make_repo_with_linked_worktree();
+        let server = make_test_server(&primary);
+
+        let result = server
+            .call_tool_routed(
+                "get_file_skeleton",
+                file_path_args(&other_wt.join("src/only_in_worktree.rs")),
+            )
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            first_text(&result).contains("outside the caller's worktree root"),
+            "got: {}",
+            first_text(&result)
         );
     }
 
