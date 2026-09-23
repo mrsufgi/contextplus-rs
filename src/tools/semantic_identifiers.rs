@@ -71,9 +71,10 @@ pub struct IdentifierDoc {
     pub signature: String,
     pub parent_name: Option<String>,
     pub text: String,
-    /// Pre-computed token set over `name + signature + path + header`.
+    /// Pre-computed token set over `name + signature + path + header`, plus
+    /// the whole lowercased `name` (see `build_token_set`).
     ///
-    /// Built once at index time via `split_camel_case`; eliminates one
+    /// Built once at index time; eliminates one
     /// `format!` allocation and one re-tokenization per doc per query in
     /// the hot `score_identifiers` loop.
     pub token_set: HashSet<String>,
@@ -89,7 +90,9 @@ impl IdentifierDoc {
         header: &str,
     ) -> HashSet<String> {
         let combined = format!("{name} {signature} {path} {header}");
-        split_camel_case(&combined).into_iter().collect()
+        let mut tokens: HashSet<String> = split_camel_case(&combined).into_iter().collect();
+        tokens.extend(whole_identifiers(name));
+        tokens
     }
 }
 
@@ -249,13 +252,28 @@ pub fn escape_regex(s: &str) -> String {
 // Keyword coverage
 // ---------------------------------------------------------------------------
 
-/// Tokenize `input` with `split_camel_case` then delegate to
+/// Tokenize `input` with `identifier_terms` then delegate to
 /// `scoring::keyword_coverage`.  Identifier search always needs to tokenize
 /// the document string on the fly (unlike file-level search, which
 /// pre-computes token sets at index time).
 fn get_keyword_coverage(query_terms: &HashSet<String>, input: &str) -> f64 {
-    let doc_tokens: HashSet<String> = split_camel_case(input).into_iter().collect();
-    keyword_coverage(query_terms, &doc_tokens)
+    keyword_coverage(query_terms, &identifier_terms(input))
+}
+
+/// Whole lowercased identifiers in `text` (`selectableScopes` ->
+/// `selectablescopes`), the unsplit counterpart of `split_camel_case`.
+fn whole_identifiers(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| w.len() > 1)
+        .map(str::to_lowercase)
+}
+
+/// camelCase / snake_case parts plus each whole identifier, so a query naming
+/// `selectableScopes` only fully matches an identifier with that exact name.
+fn identifier_terms(text: &str) -> HashSet<String> {
+    let mut terms: HashSet<String> = split_camel_case(text).into_iter().collect();
+    terms.extend(whole_identifiers(text));
+    terms
 }
 
 fn format_line_range(line: usize, end_line: usize) -> String {
@@ -630,7 +648,7 @@ pub async fn semantic_identifier_search(
         .into_iter()
         .next()
         .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
-    let query_terms: HashSet<String> = split_camel_case(query.as_ref()).into_iter().collect();
+    let query_terms = identifier_terms(query.as_ref());
 
     // Score identifiers
     let top = score_identifiers(
@@ -777,6 +795,53 @@ mod tests {
     fn test_keyword_coverage_empty() {
         let query: HashSet<String> = HashSet::new();
         assert_eq!(get_keyword_coverage(&query, "anything"), 0.0);
+    }
+
+    #[test]
+    fn exact_identifier_name_outranks_shared_parts_under_keyword_weights() {
+        let path = "packages/platform/context/src/scope-authz-plugin.ts";
+        let make_doc = |name: &str, kind: &str, sig: &str, line: usize| IdentifierDoc {
+            id: format!("{path}:{name}:{line}"),
+            path: path.to_string(),
+            header: String::new(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            kind_lower: kind.to_lowercase(),
+            line,
+            end_line: line,
+            signature: sig.to_string(),
+            parent_name: None,
+            text: format!("{name} {kind} {sig} {path}"),
+            token_set: IdentifierDoc::build_token_set(name, sig, path, ""),
+        };
+        let docs = vec![
+            make_doc(
+                "mode",
+                "const",
+                "const mode = resolveScopeMode(request);",
+                670,
+            ),
+            make_doc(
+                "selectableScopes",
+                "function",
+                "function selectableScopes(raw: OrgScope | readonly OrgScope[]): Set<OrgScope>",
+                92,
+            ),
+        ];
+        let query_terms = identifier_terms("resolveScopeMode selectableScopes");
+        let results = score_identifiers(
+            &docs,
+            &[1.0, 0.0],
+            &query_terms,
+            &[1.0, 0.0, 1.0, 0.0],
+            2,
+            &None,
+            0.0,
+            1.0,
+            2,
+        );
+        assert_eq!(results[0].doc.name, "selectableScopes");
+        assert!(results[0].keyword_score > results[1].keyword_score);
     }
 
     // -- vector_norm tests --
@@ -1291,9 +1356,10 @@ mod tests {
         // Pre-computed path (new).
         let precomputed = IdentifierDoc::build_token_set(name, signature, path, header);
 
-        // Live path (old — what score_identifiers used to do on every query).
+        // Parts of all four fields plus the whole name.
         let keyword_input = format!("{name} {signature} {path} {header}");
-        let live: HashSet<String> = split_camel_case(&keyword_input).into_iter().collect();
+        let mut live: HashSet<String> = split_camel_case(&keyword_input).into_iter().collect();
+        live.insert("getuserbyid".to_string());
 
         assert_eq!(
             precomputed, live,
