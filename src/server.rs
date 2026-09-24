@@ -1390,6 +1390,11 @@ impl ContextPlusServer {
         }
 
         // Slow path: rebuild cache
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            root = %ref_index.root_dir.display(),
+            "walking project cache root"
+        );
         let root = ref_index.root_dir.clone();
         let config = self.state.config.clone();
 
@@ -1425,6 +1430,7 @@ impl ContextPlusServer {
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
             files = arc_cache.file_content.len(),
+            root = %ref_index.root_dir.display(),
             "ProjectCache replaced after rebuild"
         );
 
@@ -2346,7 +2352,7 @@ impl ContextPlusServer {
     /// Resolve which worktree a scope-limited read tool should scan.
     ///
     /// Default: the session's `current_ref()`. When `path` is provided it must
-    /// be an **already-attached** worktree (registered via `attach_worktree`);
+    /// be inside an **already-attached** worktree (registered via `attach_worktree`);
     /// otherwise we return an error result instead of silently scanning a
     /// different tree. That silent fallback is exactly what made `get_blast_radius`
     /// and `find_dead_code` report symbols defined on another branch as
@@ -2359,11 +2365,28 @@ impl ContextPlusServer {
         let Some(path) = Self::get_str(args, "path") else {
             return Ok(self.current_ref());
         };
-        let canonical = PathBuf::from(&path)
+        let current_ref = self.current_ref();
+        // Dispatch rewrites routed absolute paths relative to the selected ref.
+        let canonical = current_ref
+            .root_dir
+            .join(&path)
             .canonicalize()
             .map_err(|e| Self::err_text(format!("Cannot canonicalize path {path}: {e}")))?;
-        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical);
-        self.state.ref_index(ref_id).ok_or_else(|| {
+        let target = canonical.ancestors().find_map(|root| {
+            let ref_id = crate::ref_index::RefId::for_canonical_path(root);
+            self.state.ref_index(ref_id)
+        });
+        if let Some(ref target) = target {
+            tracing::debug!(
+                tool,
+                path,
+                resolved_path = %canonical.display(),
+                ref_id = %target.cas_ref_id_hex,
+                root = %target.root_dir.display(),
+                "resolved scan target"
+            );
+        }
+        target.ok_or_else(|| {
             Self::err_text(format!(
                 "Worktree not attached: {}\n\
                  Call `attach_worktree` with this path first, then retry `{tool}` with the same \
@@ -2944,7 +2967,7 @@ impl ContextPlusServer {
     fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
         let ref_index = self.current_ref();
         if let Some(requested) = Self::get_str(args, "rootDir") {
-            let requested_path = PathBuf::from(&requested);
+            let requested_path = ref_index.root_dir.join(&requested);
             // Use pre-canonicalized root (computed once at construction, not per-request).
             if let Ok(canonical_requested) = requested_path.canonicalize()
                 && canonical_requested.starts_with(&ref_index.canonical_root)

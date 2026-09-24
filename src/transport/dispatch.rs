@@ -1011,6 +1011,108 @@ mod tests {
         (tmp, primary, wt)
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to start: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn make_divergent_git_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let worktree = tmp.path().join("feature");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        git(&primary, &["init", "-b", "main"]);
+        std::fs::write(
+            primary.join("src/symbols.ts"),
+            "export function primaryOnlySymbol() {}\n\
+             primaryOnlySymbol();\n\
+             export function sharedBranchSymbol() {}\n\
+             sharedBranchSymbol();\n",
+        )
+        .unwrap();
+        git(&primary, &["add", "."]);
+        git(&primary, &["commit", "-m", "primary symbols"]);
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        std::fs::write(
+            worktree.join("src/symbols.ts"),
+            "const branchPaddingOne = true;\n\
+             const branchPaddingTwo = true;\n\
+             export function worktreeOnlySymbol() {}\n\
+             worktreeOnlySymbol();\n\
+             const branchPaddingThree = true;\n\
+             export function sharedBranchSymbol() {}\n\
+             sharedBranchSymbol();\n",
+        )
+        .unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "feature symbols"]);
+        (tmp, primary, worktree)
+    }
+
+    async fn primary_session_with_attached_worktree()
+    -> (tempfile::TempDir, PathBuf, PathBuf, ContextPlusServer) {
+        let (tmp, primary, worktree) = make_divergent_git_worktree();
+        let mut config = crate::config::Config::from_env();
+        config.embed_tracker_mode = crate::config::TrackerMode::Off;
+        config.ref_warmup_mode = crate::config::RefWarmupMode::Off;
+        config.warmup_on_start = false;
+        let server = ContextPlusServer::new(primary.clone(), config);
+        let primary_session = server.with_session(server.state.default_ref_id);
+
+        let mut attach = serde_json::Map::new();
+        attach.insert("action".to_string(), serde_json::json!("attach"));
+        attach.insert(
+            "path".to_string(),
+            serde_json::json!(worktree.to_string_lossy().to_string()),
+        );
+        let result = primary_session.call_tool_routed("worktrees", attach).await;
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "failed to attach test worktree: {}",
+            first_text(&result)
+        );
+
+        (tmp, primary, worktree, primary_session)
+    }
+
+    fn impact_args(
+        symbol: &str,
+        path: Option<&Path>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        args.insert("symbol".to_string(), serde_json::json!(symbol));
+        if let Some(path) = path {
+            args.insert(
+                "path".to_string(),
+                serde_json::json!(path.to_string_lossy().to_string()),
+            );
+        }
+        args
+    }
+
     fn file_path_args(p: &Path) -> serde_json::Map<String, serde_json::Value> {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -1140,6 +1242,104 @@ mod tests {
         let text = first_text(&result);
         assert_ne!(result.is_error, Some(true), "got: {text}");
         assert!(text.contains("main"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn impact_path_from_primary_session_finds_worktree_only_symbol() {
+        let (_tmp, _primary, worktree, server) = primary_session_with_attached_worktree().await;
+
+        let result = server
+            .call_tool_routed("impact", impact_args("worktreeOnlySymbol", Some(&worktree)))
+            .await;
+        let text = first_text(&result);
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "targeted impact must scan the attached worktree: {text}"
+        );
+        assert!(
+            text.contains("L3: export function worktreeOnlySymbol() {}")
+                && text.contains("L4: worktreeOnlySymbol();"),
+            "targeted impact must report worktree line numbers: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_path_from_primary_session_uses_worktree_line_for_shared_symbol() {
+        let (_tmp, _primary, worktree, server) = primary_session_with_attached_worktree().await;
+
+        let result = server
+            .call_tool_routed("impact", impact_args("sharedBranchSymbol", Some(&worktree)))
+            .await;
+        let text = first_text(&result);
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "targeted impact must scan the attached worktree: {text}"
+        );
+        assert!(
+            text.contains("L6: export function sharedBranchSymbol() {}")
+                && text.contains("L7: sharedBranchSymbol();")
+                && !text.contains("L3: export function sharedBranchSymbol() {}"),
+            "targeted impact reported the primary checkout's line numbers: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_path_zero_result_names_worktree_root_and_file_count() {
+        let (_tmp, _primary, worktree, server) = primary_session_with_attached_worktree().await;
+
+        let result = server
+            .call_tool_routed(
+                "impact",
+                impact_args("missingFromBothBranches", Some(&worktree)),
+            )
+            .await;
+        let text = first_text(&result);
+        let expected_scope = format!(
+            "no references in {} (1 files scanned)",
+            worktree.canonicalize().unwrap().display()
+        );
+        assert_eq!(
+            result.is_error,
+            Some(false),
+            "targeted impact must return a scoped zero result: {text}"
+        );
+        assert!(
+            text.contains(&expected_scope),
+            "zero result must describe the worktree actually scanned: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_without_path_from_primary_session_keeps_primary_content() {
+        let (_tmp, primary, _worktree, server) = primary_session_with_attached_worktree().await;
+
+        let shared = server
+            .call_tool_routed("impact", impact_args("sharedBranchSymbol", None))
+            .await;
+        let shared_text = first_text(&shared);
+        assert_eq!(shared.is_error, Some(false), "{shared_text}");
+        assert!(
+            shared_text.contains("L3: export function sharedBranchSymbol() {}")
+                && shared_text.contains("L4: sharedBranchSymbol();")
+                && !shared_text.contains("L6: export function sharedBranchSymbol() {}"),
+            "pathless impact must keep the primary checkout's line numbers: {shared_text}"
+        );
+
+        let worktree_only = server
+            .call_tool_routed("impact", impact_args("worktreeOnlySymbol", None))
+            .await;
+        let worktree_only_text = first_text(&worktree_only);
+        let expected_scope = format!(
+            "no references in {} (1 files scanned)",
+            primary.canonicalize().unwrap().display()
+        );
+        assert_eq!(worktree_only.is_error, Some(false), "{worktree_only_text}");
+        assert!(
+            worktree_only_text.contains(&expected_scope),
+            "pathless impact must describe the primary tree it scanned: {worktree_only_text}"
+        );
     }
 
     #[tokio::test]
