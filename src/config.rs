@@ -153,6 +153,8 @@ pub struct Config {
     pub embed_doc_prefix: String,
     pub embed_doc_shape: EmbedDocShape,
     pub embed_batch_size: usize,
+    pub embed_budget_ms: u64,
+    pub embed_fill_batch_timeout_ms: u64,
     pub embed_tracker_mode: TrackerMode,
     pub embed_tracker_debounce_ms: u64,
     pub embed_tracker_max_files: usize,
@@ -544,6 +546,11 @@ impl Config {
                 default_doc_shape,
             ),
             embed_batch_size: batch_size,
+            embed_budget_ms: env_parse("CONTEXTPLUS_EMBED_BUDGET_MS", 20_000),
+            embed_fill_batch_timeout_ms: env_parse(
+                "CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS",
+                120_000,
+            ),
             embed_tracker_mode: parse_tracker_mode(
                 env::var("CONTEXTPLUS_EMBED_TRACKER").ok().as_deref(),
             ),
@@ -1217,6 +1224,32 @@ mod tests {
             let c = Config::from_env();
             assert_eq!(c.query_batch_size, 4);
         });
+    }
+
+    #[test]
+    fn semantic_embed_time_budgets_default_and_read_from_env() {
+        with_cleared_env(
+            &[
+                "CONTEXTPLUS_EMBED_BUDGET_MS",
+                "CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS",
+            ],
+            || {
+                let c = Config::from_env();
+                assert_eq!(c.embed_budget_ms, 20_000);
+                assert_eq!(c.embed_fill_batch_timeout_ms, 120_000);
+            },
+        );
+        with_env(
+            &[
+                ("CONTEXTPLUS_EMBED_BUDGET_MS", "37"),
+                ("CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS", "91"),
+            ],
+            || {
+                let c = Config::from_env();
+                assert_eq!(c.embed_budget_ms, 37);
+                assert_eq!(c.embed_fill_batch_timeout_ms, 91);
+            },
+        );
     }
 
     #[test]

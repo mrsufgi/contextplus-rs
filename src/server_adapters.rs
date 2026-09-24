@@ -1,6 +1,8 @@
 // Adapter structs that bridge shared server state to tool function traits.
 // Extracted from server.rs (Round 11D) to reduce server.rs line count.
 
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,6 +17,137 @@ use crate::tools::semantic_search::{
     EmbedFn, SearchDocument, SymbolSearchEntry, WalkAndIndexFn, extract_plain_text_header,
     is_text_index_candidate, semantic_embedding_content,
 };
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+    pub(crate) struct AsyncPause {
+        entered: tokio::sync::Semaphore,
+        resume: tokio::sync::Semaphore,
+    }
+
+    impl AsyncPause {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Semaphore::new(0),
+                resume: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        pub(crate) async fn wait_until_entered(&self) {
+            self.entered.acquire().await.unwrap().forget();
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.add_permits(1);
+        }
+    }
+
+    struct FileSnapshotPause {
+        hash: String,
+        pause: Arc<AsyncPause>,
+    }
+
+    fn file_snapshot_slots() -> &'static Mutex<BTreeMap<PathBuf, FileSnapshotPause>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, FileSnapshotPause>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    fn cache_snapshot_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(crate) fn pause_after_file_snapshot(root: &Path, hash: String) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        file_snapshot_slots().lock().unwrap().insert(
+            root.to_path_buf(),
+            FileSnapshotPause {
+                hash,
+                pause: Arc::clone(&pause),
+            },
+        );
+        pause
+    }
+
+    pub(crate) fn pause_after_cache_snapshot(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        cache_snapshot_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_file_snapshot(root: &Path, hashes: &[(String, String)]) {
+        let pause = {
+            let mut slots = file_snapshot_slots().lock().unwrap();
+            let matches = slots
+                .get(root)
+                .is_some_and(|candidate| hashes.iter().any(|(_, hash)| hash == &candidate.hash));
+            matches.then(|| slots.remove(root).unwrap().pause)
+        };
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    pub(crate) async fn after_cache_snapshot(root: &Path) {
+        let pause = cache_snapshot_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    pub(crate) struct MetadataPause {
+        enumerated: Barrier,
+        resume: Barrier,
+    }
+
+    impl MetadataPause {
+        fn new() -> Self {
+            Self {
+                enumerated: Barrier::new(2),
+                resume: Barrier::new(2),
+            }
+        }
+
+        pub(crate) fn wait_until_enumerated(&self) {
+            self.enumerated.wait();
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.wait();
+        }
+    }
+
+    fn metadata_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<MetadataPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<MetadataPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(crate) fn pause_after_metadata_enumeration(root: &Path) -> Arc<MetadataPause> {
+        let pause = Arc::new(MetadataPause::new());
+        metadata_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) fn after_metadata_enumeration(root: &Path) {
+        let pause = metadata_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.enumerated.wait();
+            pause.resume.wait();
+        }
+    }
+}
 
 // --- OllamaEmbedder ---
 
@@ -43,6 +176,63 @@ pub struct CachedWalkerIndexer {
 }
 
 impl WalkAndIndexFn for CachedWalkerIndexer {
+    fn vector_generation(&self, root: &Path) -> u64 {
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        self.state
+            .refs
+            .try_read()
+            .ok()
+            .and_then(|refs| {
+                refs.values()
+                    .find(|r| r.canonical_root == canonical)
+                    .map(|r| {
+                        r.semantic_vector_generation
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    fn metadata_fingerprint(
+        &self,
+        root_dir: &Path,
+    ) -> crate::tools::semantic_search::MetadataFingerprintFuture<'_> {
+        let root = root_dir.to_path_buf();
+        let config = self.config.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut entries = walk_with_config(&root, &config);
+                entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+                #[cfg(test)]
+                test_seams::after_metadata_enumeration(&root);
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                std::fs::canonicalize(&root)
+                    .unwrap_or_else(|_| root.clone())
+                    .hash(&mut hash);
+                for entry in &entries {
+                    entry.relative_path.hash(&mut hash);
+                    let Ok(meta) = std::fs::metadata(root.join(&entry.relative_path)) else {
+                        return Ok(None);
+                    };
+                    let Ok(modified) = meta.modified() else {
+                        return Ok(None);
+                    };
+                    if meta.is_dir() != entry.is_directory || (!meta.is_file() && !meta.is_dir()) {
+                        return Ok(None);
+                    }
+                    meta.len().hash(&mut hash);
+                    modified.hash(&mut hash);
+                }
+                Ok(Some(crate::tools::semantic_search::MetadataFingerprint {
+                    n_entries: entries.len(),
+                    metadata_hash: hash.finish(),
+                }))
+            })
+            .await
+            .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?
+        })
+    }
+
     fn walk_and_index(
         &self,
         root_dir: &Path,
@@ -54,25 +244,72 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
         >,
     > {
         let root = root_dir.to_path_buf();
+        Box::pin(async move {
+            let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let ref_index = self
+                .state
+                .refs
+                .read()
+                .await
+                .values()
+                .filter(|r| canonical.starts_with(&r.canonical_root))
+                .max_by_key(|r| r.canonical_root.components().count())
+                .cloned()
+                .or_else(|| self.state.default_ref())
+                .expect("registered ref");
+            self.walk_for_ref(&root, ref_index).await
+        })
+    }
+}
+
+pub struct RefWalkerIndexer {
+    pub walker: CachedWalkerIndexer,
+    pub ref_index: Arc<crate::ref_index::RefIndex>,
+}
+
+impl WalkAndIndexFn for RefWalkerIndexer {
+    fn vector_generation(&self, _root: &Path) -> u64 {
+        self.ref_index
+            .semantic_vector_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn metadata_fingerprint(
+        &self,
+        root: &Path,
+    ) -> crate::tools::semantic_search::MetadataFingerprintFuture<'_> {
+        self.walker.metadata_fingerprint(root)
+    }
+
+    fn walk_and_index(
+        &self,
+        root_dir: &Path,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.walker.walk_for_ref(root_dir, self.ref_index.clone())
+    }
+}
+
+impl CachedWalkerIndexer {
+    fn walk_for_ref(
+        &self,
+        root_dir: &Path,
+        ref_index: Arc<crate::ref_index::RefIndex>,
+    ) -> crate::tools::semantic_search::WalkAndIndexFuture<'_> {
+        let root = root_dir.to_path_buf();
         let config = self.config.clone();
         let ollama = self.ollama.clone();
-        let state = self.state.clone();
         Box::pin(async move {
-            // `CachedWalkerIndexer` is constructed with an `Arc<SharedState>` and has
-            // no per-session `RefId`.  It always operates on the default ref.  This is
-            // correct for the warmup path and for single-ref stdio mode.  Per-session
-            // dispatch via `ContextPlusServer::handle_semantic_code_search` obtains the
-            // ref-appropriate `search_index_cache` before constructing this walker and
-            // passes it directly — so the embedding cache here only needs to be the
-            // default ref's cache for the file-embedding step.
-            let default_ref = state
-                .default_ref()
-                .expect("default_ref always present in CachedWalkerIndexer");
-            // Clone the Arcs so we can drop `default_ref` and avoid lifetime issues
-            // with borrowing into the async block.
-            let embedding_cache = Arc::clone(&default_ref.embedding_cache);
-            let store_root = default_ref.root_dir.clone();
-            drop(default_ref);
+            let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            let prefix = canonical
+                .strip_prefix(&ref_index.canonical_root)
+                .unwrap_or(Path::new(""));
+            let embedding_cache = Arc::clone(&ref_index.embedding_cache);
             let entries = walk_with_config(&root, &config);
 
             let max_file_size = config.max_embed_file_size as u64;
@@ -80,7 +317,10 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
             let mut join_set = tokio::task::JoinSet::new();
             for (i, entry) in entries.iter().enumerate() {
                 let full_path = root.join(&entry.relative_path);
-                let rel_path = entry.relative_path.clone();
+                let rel_path = prefix
+                    .join(&entry.relative_path)
+                    .to_string_lossy()
+                    .into_owned();
                 join_set.spawn(async move {
                     if let Ok(meta) = tokio::fs::metadata(&full_path).await
                         && meta.len() > max_file_size
@@ -92,7 +332,6 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 });
             }
 
-            // Collect results in order
             let mut file_contents: Vec<(usize, String, Option<String>)> =
                 Vec::with_capacity(entries.len());
             while let Some(result) = join_set.join_next().await {
@@ -112,7 +351,6 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     None => continue,
                 };
 
-                // Text/data file path: index raw content for semantic search
                 if is_text_index_candidate(rel_path) {
                     let truncated = semantic_embedding_content(rel_path, content);
                     let header = extract_plain_text_header(&truncated);
@@ -132,7 +370,6 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                     continue;
                 }
 
-                // Code file path: parse with tree-sitter
                 let ext = rel_path.rsplit('.').next().unwrap_or("");
                 let symbols = parse_with_tree_sitter(content, ext).unwrap_or_default();
                 let header = crate::core::parser::extract_header(content);
@@ -164,11 +401,21 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
                 ));
             }
 
+            for doc in &mut docs {
+                doc.path = Path::new(&doc.path)
+                    .strip_prefix(prefix)
+                    .unwrap_or(Path::new(&doc.path))
+                    .to_string_lossy()
+                    .into_owned();
+            }
+
+            #[cfg(test)]
+            test_seams::after_file_snapshot(&root, &content_hashes).await;
+
             if docs.is_empty() {
                 return Ok((docs, Vec::new()));
             }
 
-            // Resolve vectors from cache, embed only uncached/stale files
             let cache_read = embedding_cache.read().await;
             let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
             let mut uncached_indices: Vec<usize> = Vec::new();
@@ -187,218 +434,395 @@ impl WalkAndIndexFn for CachedWalkerIndexer {
             }
             drop(cache_read);
 
+            #[cfg(test)]
+            test_seams::after_cache_snapshot(&root).await;
+
             tracing::info!(
                 cached = docs.len() - uncached_indices.len(),
                 uncached = uncached_indices.len(),
                 "semantic_code_search embedding cache hit/miss"
             );
 
-            // Embed only uncached files — TIME-BOXED, PER-BATCH TIMEOUT,
-            // and CONCURRENT up to `ollama_max_concurrent`.
-            //
-            // Three failure modes this defends against:
-            //
-            // 1. Many uncached batches: embedding 3000+ files sequentially at
-            //    ~7s/batch on CPU Ollama can take 12-18 min. Codex's bridge
-            //    times out and closes the connection.
-            //
-            // 2. A single batch hangs: on a slow CPU Ollama, one batch can
-            //    take 60+ s. Without a per-batch timeout, a global "elapsed"
-            //    check between batches never fires while one batch is stuck.
-            //
-            // 3. Sequential under-utilization: with `ollama_max_concurrent=4`
-            //    the server can sustain 4 in-flight HTTP requests, but a
-            //    one-at-a-time loop only ever uses one. Within the same 20s
-            //    budget, parallel issue gets ~Nx more vectors filled before
-            //    we bail.
-            //
-            // The pipeline:
-            //   - Pre-build per-batch chunks.
-            //   - Issue up to `ollama_max_concurrent` in flight at once via
-            //     `JoinSet`, each wrapped in `tokio::time::timeout(remaining)`.
-            //   - On every completion: queue the next pending chunk if budget
-            //     remains; otherwise drain in-flight tasks (each bounded by
-            //     its own remaining budget) and exit.
-            //   - Reassemble results in order so `new_vectors` aligns with
-            //     `uncached_indices` exactly as before.
-            //
-            // OllamaClient already gates HTTP concurrency via its own
-            // semaphore (U17), so even if we somehow over-spawn, only
-            // `ollama_max_concurrent` requests reach the wire.
-            //
-            // Budget is deliberately tight (20 s).
-            const EMBED_BUDGET_MS: u128 = 20_000;
-            if !uncached_texts.is_empty() {
-                let embed_start = std::time::Instant::now();
-                let batch_size = config.embed_batch_size.max(1);
-                let max_concurrent = config.ollama_max_concurrent.max(1);
-
-                let chunks: Vec<Vec<String>> = uncached_texts
-                    .chunks(batch_size)
-                    .map(|c| c.to_vec())
-                    .collect();
-                let n_chunks = chunks.len();
-                let chunk_sizes: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
-                let mut per_chunk_results: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_chunks];
-
-                let mut budget_exceeded = false;
-                // (chunk_idx, outer = timeout result, inner = embed result)
-                type EmbedBatchOutcome = (
-                    usize,
-                    std::result::Result<Result<Vec<Vec<f32>>>, tokio::time::error::Elapsed>,
-                );
-                let mut join_set: tokio::task::JoinSet<EmbedBatchOutcome> =
-                    tokio::task::JoinSet::new();
-                let mut next_idx = 0usize;
-
-                // Spawn helper closure to keep the seed and drain loops in sync.
-                let spawn_one = |join_set: &mut tokio::task::JoinSet<_>,
-                                 idx: usize,
-                                 chunk: Vec<String>,
-                                 ollama: OllamaClient,
-                                 remaining: std::time::Duration| {
-                    join_set.spawn(async move {
-                        (
-                            idx,
-                            tokio::time::timeout(remaining, async move {
-                                ollama.embed_documents(&chunk).await
-                            })
-                            .await,
-                        )
-                    });
+            let mut current = Vec::with_capacity(content_hashes.len());
+            for (idx, (path, hash)) in content_hashes.iter().enumerate() {
+                let valid = if vectors[idx].is_none() {
+                    FillDocument {
+                        path: path.clone(),
+                        hash: hash.clone(),
+                        text: String::new(),
+                        owner: None,
+                    }
+                    .is_current(&ref_index.canonical_root, config.max_embed_file_size)
+                    .await
+                } else {
+                    true
                 };
-
-                // Seed: spawn up to max_concurrent batches.
-                while next_idx < n_chunks && join_set.len() < max_concurrent {
-                    let elapsed_ms = embed_start.elapsed().as_millis();
-                    if elapsed_ms >= EMBED_BUDGET_MS {
-                        budget_exceeded = true;
-                        break;
-                    }
-                    let remaining =
-                        std::time::Duration::from_millis((EMBED_BUDGET_MS - elapsed_ms) as u64);
-                    let chunk = chunks[next_idx].clone();
-                    spawn_one(&mut join_set, next_idx, chunk, ollama.clone(), remaining);
-                    next_idx += 1;
+                current.push(valid);
+            }
+            let owner = Arc::new(());
+            let mut fill = ref_index.semantic_fill.lock().await;
+            let cache = embedding_cache.read().await;
+            let mut pending = Vec::new();
+            for (idx, (path, hash)) in content_hashes.iter().enumerate() {
+                if !current[idx] {
+                    continue;
                 }
-
-                // Drain: collect each completion, queue the next chunk while
-                // budget remains, and let in-flight tasks finish under their
-                // own per-batch deadline once budget is exceeded.
-                while let Some(joined) = join_set.join_next().await {
-                    match joined {
-                        Ok((idx, Ok(Ok(embeddings)))) => {
-                            per_chunk_results[idx] = embeddings;
-                        }
-                        Ok((idx, Ok(Err(e)))) => {
-                            tracing::warn!(chunk_idx = idx, "Embedding batch failed: {e}");
-                        }
-                        Ok((idx, Err(_elapsed))) => {
-                            tracing::warn!(
-                                chunk_idx = idx,
-                                "Embedding batch timed out within budget"
+                if let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash) {
+                    vectors[idx] = Some(entry.vector.clone());
+                    fill.pending.remove(path);
+                    continue;
+                }
+                let mut doc = FillDocument {
+                    path: path.clone(),
+                    hash: hash.clone(),
+                    text: embedding_texts[idx].clone(),
+                    owner: Some(Arc::downgrade(&owner)),
+                };
+                if fill.failed(&doc) {
+                    fill.pending.remove(path);
+                    continue;
+                }
+                if let Some(current) = fill.pending.get(path) {
+                    if current.hash == *hash {
+                        continue;
+                    }
+                    doc.owner = None;
+                } else {
+                    pending.push((idx, doc.clone()));
+                }
+                fill.pending.insert(path.clone(), doc);
+            }
+            drop(cache);
+            if !fill.running && !fill.pending.is_empty() {
+                fill.running = true;
+                let ref_index = ref_index.clone();
+                let ollama = ollama.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    run_fill(ref_index, ollama, config).await;
+                });
+            }
+            drop(fill);
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(config.embed_budget_ms);
+            for chunk in pending.chunks(config.embed_batch_size.max(1)) {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let texts: Vec<_> = chunk.iter().map(|(_, d)| d.text.clone()).collect();
+                match tokio::time::timeout_at(deadline, ollama.embed_documents(&texts)).await {
+                    Ok(Ok(result)) if result.len() == chunk.len() => {
+                        let mut current = Vec::with_capacity(chunk.len());
+                        for (_, doc) in chunk {
+                            current.push(
+                                doc.is_current(
+                                    &ref_index.canonical_root,
+                                    config.max_embed_file_size,
+                                )
+                                .await,
                             );
-                            budget_exceeded = true;
                         }
-                        Err(join_err) => {
-                            tracing::warn!("Embedding task join failed: {join_err}");
-                        }
-                    }
-
-                    let elapsed_ms = embed_start.elapsed().as_millis();
-                    if elapsed_ms >= EMBED_BUDGET_MS {
-                        budget_exceeded = true;
-                    }
-                    if !budget_exceeded && next_idx < n_chunks {
-                        let remaining =
-                            std::time::Duration::from_millis((EMBED_BUDGET_MS - elapsed_ms) as u64);
-                        let chunk = chunks[next_idx].clone();
-                        spawn_one(&mut join_set, next_idx, chunk, ollama.clone(), remaining);
-                        next_idx += 1;
-                    }
-                }
-
-                // Flatten per-chunk results back to a flat `new_vectors`
-                // aligned with `uncached_indices`. Missing slots (failed
-                // batches, never scheduled, timed out) become empty vectors;
-                // the cache writer below skips them.
-                let mut new_vectors: Vec<Vec<f32>> = Vec::with_capacity(uncached_texts.len());
-                for (i, results) in per_chunk_results.iter_mut().enumerate() {
-                    let expected = chunk_sizes[i];
-                    if results.len() == expected {
-                        new_vectors.append(results);
-                    } else {
-                        for _ in 0..expected {
-                            new_vectors.push(Vec::new());
-                        }
-                    }
-                }
-
-                let chunks_skipped = next_idx < n_chunks;
-                if budget_exceeded || chunks_skipped {
-                    let still_uncached = new_vectors.iter().filter(|v| v.is_empty()).count();
-                    tracing::warn!(
-                        budget_ms = EMBED_BUDGET_MS as u64,
-                        elapsed_ms = embed_start.elapsed().as_millis() as u64,
-                        embedded = uncached_texts.len() - still_uncached,
-                        skipped = still_uncached,
-                        chunks_scheduled = next_idx,
-                        chunks_total = n_chunks,
-                        concurrency = max_concurrent,
-                        "semantic_code_search embed budget exceeded — returning partial results; tracker will fill remaining in background"
-                    );
-                }
-
-                // Store new vectors in cache and build the snapshot to persist.
-                // Critical: build the VectorStore inside the write-guard scope,
-                // then drop the guard BEFORE the disk save. The merging save
-                // takes a blocking fd-lock and does ~146 MB of sync I/O — if we
-                // held the in-memory write lock across that, every concurrent
-                // request waiting on `embedding_cache.read().await` would stall.
-                let store_to_save = {
-                    let mut cache_write = embedding_cache.write().await;
-                    for (j, &idx) in uncached_indices.iter().enumerate() {
-                        if j < new_vectors.len() && !new_vectors[j].is_empty() {
-                            let (rel_path, hash) = &content_hashes[idx];
-                            cache_write.insert(
-                                rel_path.clone(),
+                        let mut fill = ref_index.semantic_fill.lock().await;
+                        let mut cache = embedding_cache.write().await;
+                        for (((idx, doc), vector), current) in chunk.iter().zip(result).zip(current)
+                        {
+                            if !current {
+                                if fill
+                                    .pending
+                                    .get(&doc.path)
+                                    .is_some_and(|cur| cur.hash == doc.hash)
+                                {
+                                    fill.pending.remove(&doc.path);
+                                }
+                                continue;
+                            }
+                            if vector.is_empty()
+                                || !fill
+                                    .pending
+                                    .get(&doc.path)
+                                    .is_some_and(|cur| cur.hash == doc.hash)
+                            {
+                                continue;
+                            }
+                            cache.insert(
+                                doc.path.clone(),
                                 CacheEntry {
-                                    hash: hash.clone(),
-                                    vector: new_vectors[j].clone(),
+                                    hash: doc.hash.clone(),
+                                    vector: vector.clone(),
                                 },
                             );
-                            vectors[idx] = Some(new_vectors[j].clone());
+                            vectors[*idx] = Some(vector);
+                            if fill
+                                .pending
+                                .get(&doc.path)
+                                .is_some_and(|cur| cur.hash == doc.hash)
+                            {
+                                fill.pending.remove(&doc.path);
+                            }
                         }
                     }
-                    let store = crate::core::embeddings::VectorStore::from_cache(&cache_write);
-                    drop(cache_write);
-                    store
-                };
-
-                // Persist to disk off the Tokio worker via spawn_blocking — the
-                // merging save acquires a blocking fd-lock and does sync I/O.
-                // Merge with disk under fd-lock: this adapter's in-memory cache
-                // only covers keys touched in this session, so an overwrite would
-                // silently drop entries written by warmup_embeddings or a second
-                // MCP instance racing on the same cache file.
-                if let Some(store) = store_to_save {
-                    let code_cache_name = cache_name("embeddings", &config);
-                    let root = store_root.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        rkyv_store::save_vector_store_merged(&root, &code_cache_name, &store)
-                    })
-                    .await;
-                    match result {
-                        Ok(Err(e)) => tracing::warn!("Failed to save embedding cache: {e}"),
-                        Err(join_err) => tracing::warn!(
-                            "save_vector_store spawn_blocking join failed: {join_err}"
-                        ),
-                        Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        let mut fill = ref_index.semantic_fill.lock().await;
+                        for (_, doc) in chunk {
+                            if fill
+                                .pending
+                                .get(&doc.path)
+                                .is_some_and(|cur| cur.hash == doc.hash)
+                            {
+                                fill.record_error(doc);
+                            }
+                        }
                     }
+                    _ => {}
                 }
+            }
+            let mut fill = ref_index.semantic_fill.lock().await;
+            for (_, doc) in &pending {
+                if fill.failed(doc)
+                    && fill
+                        .pending
+                        .get(&doc.path)
+                        .is_some_and(|cur| cur.hash == doc.hash)
+                {
+                    fill.pending.remove(&doc.path);
+                }
+            }
+            let queued = pending
+                .iter()
+                .filter(|(idx, _)| vectors[*idx].is_none())
+                .count();
+            drop(owner);
+            drop(fill);
+            if queued > 0 {
+                tracing::warn!(
+                    queued,
+                    "semantic_code_search returning partial results; leftovers queued for background fill"
+                );
             }
 
             Ok((docs, vectors))
         })
+    }
+}
+
+#[derive(Clone)]
+struct FillDocument {
+    path: String,
+    hash: String,
+    text: String,
+    owner: Option<std::sync::Weak<()>>,
+}
+
+impl FillDocument {
+    async fn is_current(&self, root: &Path, max_size: usize) -> bool {
+        let path = root.join(&self.path);
+        let hash = self.hash.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Opening a replacement FIFO must not wait for a writer.
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let Ok(file) = options.open(path) else {
+                return false;
+            };
+            let Ok(metadata) = file.metadata() else {
+                return false;
+            };
+            if !metadata.is_file() || metadata.len() > max_size as u64 {
+                return false;
+            }
+            let mut content = String::new();
+            (&file)
+                .take(max_size as u64)
+                .read_to_string(&mut content)
+                .is_ok()
+                && file
+                    .metadata()
+                    .is_ok_and(|meta| meta.len() == content.len() as u64)
+                && content_hash(&content) == hash
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SemanticFill {
+    running: bool,
+    pending: BTreeMap<String, FillDocument>,
+    failures: BTreeMap<String, (String, u8)>,
+}
+
+impl SemanticFill {
+    fn failed(&self, doc: &FillDocument) -> bool {
+        self.failures
+            .get(&doc.path)
+            .is_some_and(|(hash, n)| hash == &doc.hash && *n >= 3)
+    }
+
+    fn record_error(&mut self, doc: &FillDocument) {
+        let entry = self
+            .failures
+            .entry(doc.path.clone())
+            .or_insert((doc.hash.clone(), 0));
+        if entry.0 != doc.hash {
+            *entry = (doc.hash.clone(), 0);
+        }
+        entry.1 += 1;
+        if entry.1 == 3 {
+            tracing::warn!(
+                path = doc.path,
+                hash = doc.hash,
+                "Embedding permanently failed after three errors; skipping until content changes"
+            );
+        }
+    }
+}
+
+async fn persist_fill(ref_index: &crate::ref_index::RefIndex, config: &Config) {
+    let store =
+        crate::core::embeddings::VectorStore::from_cache(&*ref_index.embedding_cache.read().await);
+    if let Some(store) = store {
+        let root = ref_index.root_dir.clone();
+        let name = cache_name("embeddings", config);
+        match tokio::task::spawn_blocking(move || {
+            rkyv_store::save_vector_store_merged(&root, &name, &store)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            result => tracing::warn!(?result, "Failed to persist background embeddings"),
+        }
+    }
+}
+
+async fn run_fill(
+    ref_index: Arc<crate::ref_index::RefIndex>,
+    ollama: OllamaClient,
+    config: Config,
+) {
+    let mut completed = 0usize;
+    loop {
+        let batch: Vec<_> = {
+            let fill = ref_index.semantic_fill.lock().await;
+            fill.pending
+                .values()
+                .filter(|doc| {
+                    doc.owner
+                        .as_ref()
+                        .is_none_or(|owner| owner.upgrade().is_none())
+                })
+                .take(8)
+                .cloned()
+                .collect()
+        };
+        if batch.is_empty() {
+            if !ref_index.semantic_fill.lock().await.pending.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+            persist_fill(&ref_index, &config).await;
+            ref_index
+                .semantic_vector_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            *ref_index.search_index_cache.write().await = None;
+            let mut fill = ref_index.semantic_fill.lock().await;
+            if fill.pending.is_empty() {
+                fill.running = false;
+                return;
+            }
+            continue;
+        }
+        let mut batches = vec![batch];
+        while let Some(batch) = batches.pop() {
+            let texts: Vec<_> = batch.iter().map(|d| d.text.clone()).collect();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_millis(config.embed_fill_batch_timeout_ms),
+                ollama.embed_documents(&texts),
+            )
+            .await;
+            if outcome.is_err() && batch.len() > 1 {
+                let mid = batch.len().div_ceil(2);
+                batches.push(batch[..mid].to_vec());
+                batches.push(batch[mid..].to_vec());
+                continue;
+            }
+            let mut current = Vec::with_capacity(batch.len());
+            if matches!(&outcome, Ok(Ok(vectors)) if vectors.len() == batch.len() && vectors.iter().all(|v| !v.is_empty()))
+            {
+                for doc in &batch {
+                    current.push(
+                        doc.is_current(&ref_index.canonical_root, config.max_embed_file_size)
+                            .await,
+                    );
+                }
+            }
+            let mut fill = ref_index.semantic_fill.lock().await;
+            match outcome {
+                Ok(Ok(vectors))
+                    if vectors.len() == batch.len() && vectors.iter().all(|v| !v.is_empty()) =>
+                {
+                    let mut cache = ref_index.embedding_cache.write().await;
+                    for ((doc, vector), current) in batch.iter().zip(vectors).zip(current) {
+                        let pending_matches = fill
+                            .pending
+                            .get(&doc.path)
+                            .is_some_and(|cur| cur.hash == doc.hash);
+                        if pending_matches {
+                            fill.pending.remove(&doc.path);
+                        }
+                        if current && pending_matches {
+                            cache.insert(
+                                doc.path.clone(),
+                                CacheEntry {
+                                    hash: doc.hash.clone(),
+                                    vector,
+                                },
+                            );
+                            completed += 1;
+                        }
+                    }
+                    ref_index
+                        .semantic_vector_generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                result => {
+                    for doc in &batch {
+                        if !fill
+                            .pending
+                            .get(&doc.path)
+                            .is_some_and(|cur| cur.hash == doc.hash)
+                        {
+                            continue;
+                        }
+                        if result.is_ok() {
+                            fill.record_error(doc);
+                        }
+                        if (result.is_err() || fill.failed(doc))
+                            && fill
+                                .pending
+                                .get(&doc.path)
+                                .is_some_and(|cur| cur.hash == doc.hash)
+                        {
+                            fill.pending.remove(&doc.path);
+                        }
+                    }
+                }
+            }
+            drop(fill);
+            if completed >= 64 {
+                ref_index
+                    .semantic_vector_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                *ref_index.search_index_cache.write().await = None;
+                persist_fill(&ref_index, &config).await;
+                completed = 0;
+            }
+        }
     }
 }
