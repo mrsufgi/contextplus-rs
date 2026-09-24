@@ -2613,7 +2613,7 @@ impl ContextPlusServer {
         // like `run_static_analysis`.
         {
             let mcp_data = self.state.root_dir.join(".mcp_data");
-            let model = self.state.config.ollama_embed_model.clone();
+            let model = self.state.config.document_cache_identity();
             let parent_ref_opt = parent_ref_id.and_then(|pid| self.state.ref_index(pid));
             if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
                 tracing::warn!(

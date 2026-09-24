@@ -507,7 +507,7 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     // manifest (U12 diff-only embedding).
     {
         let mcp_data = server.state.root_dir.join(paths::MCP_DATA_DIR);
-        let model = server.state.config.ollama_embed_model.clone();
+        let model = server.state.config.document_cache_identity();
         let parent_ref_opt = parent_ref_id.and_then(|pid| server.state.ref_index(pid));
         if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
             tracing::warn!(ref_id = ref_id.0, "CAS fork_from failed (non-fatal): {e}");
@@ -678,6 +678,37 @@ mod tests {
                 "warning omitted {field}: {warning}"
             );
         }
+    }
+
+    #[test]
+    fn search_config_comparison_includes_provider_identity_without_secrets() {
+        let mut daemon = Config::from_env();
+        daemon.embed_provider = crate::config::EmbedProvider::Ollama;
+        daemon.chat_provider = crate::config::ChatProvider::Ollama;
+        let mut bridge_config = daemon.clone();
+        bridge_config.embed_provider = crate::config::EmbedProvider::OpenAi;
+        bridge_config.chat_provider = crate::config::ChatProvider::Claude;
+        bridge_config.openai_embed_model = "bridge-embed".into();
+        bridge_config.openai_base_url = "https://embed.example/v1".into();
+        bridge_config.claude_model = "bridge-claude".into();
+        bridge_config.claude_path = "/opt/claude".into();
+        bridge_config.openai_api_key = Some("must-not-appear".into());
+
+        let bridge = crate::transport::client::SearchConfig::from(&bridge_config);
+        let differences = compare_search_config(&daemon, &bridge);
+        let names: Vec<_> = differences
+            .iter()
+            .map(|difference| difference.field)
+            .collect();
+        let rendered = format!("{bridge:?} {differences:?}");
+
+        assert!(names.contains(&"CONTEXTPLUS_EMBED_PROVIDER"));
+        assert!(names.contains(&"CONTEXTPLUS_CHAT_PROVIDER"));
+        assert!(names.contains(&"CONTEXTPLUS_OPENAI_EMBED_MODEL"));
+        assert!(names.contains(&"CONTEXTPLUS_OPENAI_BASE_URL"));
+        assert!(names.contains(&"CONTEXTPLUS_CLAUDE_MODEL"));
+        assert!(names.contains(&"CONTEXTPLUS_CLAUDE_PATH"));
+        assert!(!rendered.contains("must-not-appear"));
     }
 
     /// All env-driven cases live in a single test so they don't race against

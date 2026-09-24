@@ -70,9 +70,9 @@ cargo build --release
 
 The binary is at `target/release/contextplus-rs`.
 
-### Prerequisites
+### Default Ollama setup
 
-- [Ollama](https://ollama.com/) running locally with an embedding model:
+The default configuration uses [Ollama](https://ollama.com/) locally:
 
 ```bash
 ollama pull snowflake-arctic-embed2   # embeddings
@@ -80,6 +80,56 @@ ollama pull qwen3.5:9b                # chat (for cluster labeling)
 ```
 
 ## Configuration
+
+### Providers
+
+Ollama remains the default for both embeddings and cluster-label chat. The binary reads provider credentials only from its process environment; it does not fetch from or integrate with a secrets manager.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTEXTPLUS_EMBED_PROVIDER` | `ollama` | Embedding provider: `ollama` or `openai` |
+| `CONTEXTPLUS_CHAT_PROVIDER` | `ollama` | Cluster-label chat provider: `ollama`, `openai`, `claude`, or `anthropic` |
+| `CONTEXTPLUS_OPENAI_API_KEY` | _(none)_ | Bearer key for OpenAI-compatible embeddings and, unless overridden, OpenAI-compatible chat |
+| `CONTEXTPLUS_OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL for OpenAI-compatible embeddings and, unless overridden, chat |
+| `CONTEXTPLUS_OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI-compatible embedding model |
+| `CONTEXTPLUS_OPENAI_CHAT_MODEL` | `gpt-4o-mini` | OpenAI-compatible cluster-label model |
+| `CONTEXTPLUS_CHAT_BASE_URL` | _(uses OpenAI base URL)_ | Optional OpenAI-compatible chat-only base URL |
+| `CONTEXTPLUS_CHAT_API_KEY` | _(uses provider fallback)_ | Optional OpenAI-compatible chat-only bearer key; takes precedence over other keys |
+| `GROQ_API_KEY` | _(none)_ | Chat key fallback when the effective chat base URL host is `api.groq.com` |
+| `CONTEXTPLUS_CLAUDE_PATH` | `claude` | Claude Code executable for the `claude` chat provider |
+| `CONTEXTPLUS_CLAUDE_MODEL` | `claude-haiku-4-5` | Claude Code model for cluster labels |
+| `CLAUDE_CODE_OAUTH_TOKEN` | _(Claude Code login)_ | Passed through unchanged to Claude Code; contextplus does not read or log it |
+| `CONTEXTPLUS_ANTHROPIC_CHAT_MODEL` | `claude-haiku-4-5` | Messages API model for the `anthropic` chat provider |
+| `ANTHROPIC_API_KEY` | _(none)_ | Messages API `x-api-key`; takes precedence over `ANTHROPIC_AUTH_TOKEN`. Also inherited unchanged by the Claude CLI |
+| `ANTHROPIC_AUTH_TOKEN` | _(none)_ | Messages API bearer token used with the OAuth beta header when no API key is set |
+| `HOME` | _(inherited)_ | Claude Code's existing login/config location; not read or rewritten by the Claude subprocess adapter |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase equivalents) | _(inherited)_ | Proxy settings passed through unchanged to Claude Code; HTTP providers use reqwest's proxy support |
+
+OpenAI-compatible embeddings (including vLLM, LiteLLM, and compatible local/proxy servers):
+
+```bash
+export CONTEXTPLUS_EMBED_PROVIDER=openai
+export CONTEXTPLUS_OPENAI_BASE_URL=https://api.openai.com/v1
+export CONTEXTPLUS_OPENAI_API_KEY=your-key
+export CONTEXTPLUS_OPENAI_EMBED_MODEL=text-embedding-3-small
+contextplus-rs --root-dir /path/to/project
+```
+
+Groq chat with embeddings configured independently:
+
+```bash
+export CONTEXTPLUS_CHAT_PROVIDER=openai
+export CONTEXTPLUS_CHAT_BASE_URL=https://api.groq.com/openai/v1
+export GROQ_API_KEY=your-groq-key
+export CONTEXTPLUS_OPENAI_CHAT_MODEL=your-groq-model
+contextplus-rs --root-dir /path/to/project
+```
+
+`claude` runs one non-interactive Claude Code process per label prompt using the existing Claude Code login. `anthropic` calls the Messages API directly. All chat providers retain the 90-second timeout and fall back to non-LLM labels on errors.
+
+The Claude adapter uses print/JSON mode, safe mode, an empty strict MCP configuration, no tools or skills, empty settings sources, no session persistence or permission prompts, and a temporary working directory. The installed CLI must support these flags; unsupported flags produce a fallback label. Claude Code's admin-managed policies still apply. `--bare` is deliberately not used because it disables OAuth login. The child inherits the entire environment without credential inspection and is killed on timeout; its stderr is discarded.
+
+Embedding batching, adaptive context-length retries, chunk-and-merge, prefixes, cancellation, and query caching are shared by both providers. Existing Ollama cache names are unchanged. OpenAI cache names include the provider and a model/base-URL fingerprint so different endpoints or model aliases do not share vectors. Provider errors omit remote response bodies and request URLs to prevent credential disclosure.
 
 ### Ollama / embedding
 
@@ -90,7 +140,7 @@ ollama pull qwen3.5:9b                # chat (for cluster labeling)
 | `OLLAMA_CHAT_MODEL` | `llama3.2` | Chat model for cluster labels |
 | `OLLAMA_API_KEY` | _(none)_ | Optional API key |
 | `CONTEXTPLUS_EMBED_BATCH_SIZE` | `50` | Document embedding batch size (clamped 5–512) |
-| `CONTEXTPLUS_QUERY_BATCH_SIZE` | `1` | Query embedding batch size (number of query vectors sent per Ollama request) |
+| `CONTEXTPLUS_QUERY_BATCH_SIZE` | `1` | Query embedding batch size for live searches |
 | `CONTEXTPLUS_EMBED_QUERY_PREFIX` | Model-specific | Query prefix: `task: code retrieval \| query: ` for `embeddinggemma`, `query: ` for `snowflake-arctic-embed2`, empty otherwise. Set to an empty string to disable |
 | `CONTEXTPLUS_EMBED_DOC_PREFIX` | Model-specific | Document prefix: `title: none \| text: ` for `embeddinggemma`, empty otherwise. Set to an empty string to disable |
 | `CONTEXTPLUS_EMBED_DOC_SHAPE` | Model-specific | File document shape: `outline` for `embeddinggemma`, `head` otherwise |
