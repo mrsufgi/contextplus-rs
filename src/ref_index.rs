@@ -161,6 +161,8 @@ pub struct RefIndex {
 
     /// Cached HNSW search index with generation counter.
     /// Already `Arc<RwLock<…>>` so background rebuild tasks can hold a clone.
+    pub(crate) semantic_vector_generation: AtomicU64,
+    pub(crate) semantic_fill: tokio::sync::Mutex<crate::server_adapters::SemanticFill>,
     pub search_index_cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
 
     /// Monotonic counter incremented by the embedding tracker on each file-change
@@ -211,6 +213,8 @@ impl RefIndex {
             session_count: Arc::new(AtomicUsize::new(0)),
             embedding_cache: Arc::new(RwLock::new(HashMap::new())),
             identifier_index: Arc::new(RwLock::new(None)),
+            semantic_vector_generation: AtomicU64::new(0),
+            semantic_fill: tokio::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
@@ -240,6 +244,8 @@ impl RefIndex {
             session_count: Arc::new(AtomicUsize::new(0)),
             embedding_cache: Arc::new(RwLock::new(HashMap::new())),
             identifier_index: Arc::new(RwLock::new(None)),
+            semantic_vector_generation: AtomicU64::new(0),
+            semantic_fill: tokio::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
@@ -271,6 +277,8 @@ impl RefIndex {
             session_count: Arc::new(AtomicUsize::new(0)),
             embedding_cache: Arc::new(RwLock::new(initial_embedding_cache)),
             identifier_index: Arc::new(RwLock::new(None)),
+            semantic_vector_generation: AtomicU64::new(0),
+            semantic_fill: tokio::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),

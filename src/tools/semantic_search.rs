@@ -45,7 +45,7 @@ type EmbedFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
 
 /// Type alias for the boxed future returned by walk-and-index functions.
-type WalkAndIndexFuture<'a> = std::pin::Pin<
+pub(crate) type WalkAndIndexFuture<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>>
             + Send
@@ -793,7 +793,20 @@ impl IndexFingerprint {
 
 /// A `SearchIndex` paired with the fingerprint that was current when it was built.
 /// Stored in `SharedState` and reused across MCP requests when the fingerprint is unchanged.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MetadataFingerprint {
+    pub n_entries: usize,
+    pub metadata_hash: u64,
+}
+
+pub type MetadataFingerprintFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<MetadataFingerprint>>> + Send + 'a>,
+>;
+
 pub struct CachedSearchIndex {
+    search_root: std::path::PathBuf,
+    pub metadata: std::sync::RwLock<Option<MetadataFingerprint>>,
+    vector_generation: u64,
     pub index: SearchIndex,
     pub fingerprint: IndexFingerprint,
     /// Tracker generation counter value at the time this entry was built.
@@ -834,6 +847,9 @@ impl CachedSearchIndex {
         Self {
             index,
             fingerprint,
+            metadata: std::sync::RwLock::new(None),
+            vector_generation: 0,
+            search_root: std::path::PathBuf::new(),
             generation: std::sync::atomic::AtomicU64::new(generation),
             reuse_count: std::sync::atomic::AtomicU64::new(0),
             rebuild_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -1414,6 +1430,9 @@ pub async fn semantic_code_search(
         .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
 
     // Obtain the SearchIndex — from cache if available and still fresh, otherwise rebuild.
+    let search_root =
+        std::fs::canonicalize(&options.root_dir).unwrap_or_else(|_| options.root_dir.clone());
+    let vector_generation = walk_and_index_fn.vector_generation(&options.root_dir);
     let cached_arc: Arc<CachedSearchIndex> = match index_cache {
         None => {
             // No cache slot provided — always rebuild (unit-test / legacy path).
@@ -1450,6 +1469,8 @@ pub async fn semantic_code_search(
                 let guard = lock.read().await;
                 if let Some(ref cached) = *guard
                     && cached.generation.load(std::sync::atomic::Ordering::Acquire) == current_gen
+                    && cached.vector_generation == vector_generation
+                    && cached.search_root == search_root
                 {
                     let reuses = cached.record_reuse();
                     tracing::debug!(
@@ -1481,6 +1502,30 @@ pub async fn semantic_code_search(
                 // Generation mismatch (or no cache yet) — fall through to walk + fingerprint.
             }
 
+            let metadata = walk_and_index_fn
+                .metadata_fingerprint(&options.root_dir)
+                .await?;
+            {
+                let guard = lock.read().await;
+                if let Some(cached) = guard.as_ref()
+                    && cached.vector_generation == vector_generation
+                    && cached.search_root == search_root
+                    && metadata.is_some()
+                    && *cached.metadata.read().unwrap() == metadata
+                {
+                    cached.record_reuse();
+                    cached
+                        .generation
+                        .store(current_gen, std::sync::atomic::Ordering::Release);
+                    let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
+                    return Ok(format_search_results_with_freshness(
+                        query.as_ref(),
+                        &results,
+                        Some(cached.index.document_count()),
+                    ));
+                }
+            }
+
             // Walk the filesystem and compute fingerprint (tracker-off fallback or
             // generation mismatch meaning the tracker saw a change).
             let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
@@ -1490,7 +1535,10 @@ pub async fn semantic_code_search(
                 let guard = lock.read().await;
                 if let Some(ref cached) = *guard
                     && cached.fingerprint == fp
+                    && cached.vector_generation == vector_generation
+                    && cached.search_root == search_root
                 {
+                    *cached.metadata.write().unwrap() = metadata.clone();
                     let reuses = cached.record_reuse();
                     // Content unchanged even though tracker fired — update the cached
                     // generation so the next request takes the fast path without
@@ -1527,6 +1575,8 @@ pub async fn semantic_code_search(
             // Another task may have rebuilt while we waited for the write-lock.
             if let Some(ref cached) = *guard
                 && cached.fingerprint == fp
+                && cached.vector_generation == vector_generation
+                && cached.search_root == search_root
             {
                 let reuses = cached.record_reuse();
                 // Same fix as the read-lock path: bring the cached generation
@@ -1551,6 +1601,8 @@ pub async fn semantic_code_search(
             // (small-delta corpus change) and no rebuild is already in flight, serve
             // the stale index immediately and spawn a background task to rebuild.
             if let Some(ref stale) = *guard
+                && stale.search_root == search_root
+                && stale.vector_generation == vector_generation
                 && stale.qualifies_for_background_rebuild(&fp)
                 && stale
                     .rebuild_in_progress
@@ -1617,7 +1669,9 @@ pub async fn semantic_code_search(
                     // installed entry to carry a stale generation.
                     let mut wguard = lock_clone.write().await;
                     let should_install = match *wguard {
-                        Some(ref cur) => cur.fingerprint == stale_fp,
+                        Some(ref cur) => {
+                            cur.fingerprint == stale_fp && cur.search_root == search_root
+                        }
                         None => false,
                     };
                     if should_install {
@@ -1625,8 +1679,12 @@ pub async fn semantic_code_search(
                             .as_ref()
                             .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
                             .unwrap_or(0);
-                        let new_entry =
-                            Arc::new(CachedSearchIndex::new(new_idx, new_fp.clone(), install_gen));
+                        let mut entry =
+                            CachedSearchIndex::new(new_idx, new_fp.clone(), install_gen);
+                        entry.vector_generation = vector_generation;
+                        entry.search_root = search_root;
+                        let new_entry = Arc::new(entry);
+                        *new_entry.metadata.write().unwrap() = metadata;
                         *wguard = Some(new_entry);
                         tracing::info!(
                             n_docs = new_fp.n_docs,
@@ -1667,7 +1725,11 @@ pub async fn semantic_code_search(
                 vectors,
                 crate::core::embeddings::HnswTuning::global(),
             );
-            let arc = Arc::new(CachedSearchIndex::new(idx, fp, current_gen));
+            let mut entry = CachedSearchIndex::new(idx, fp, current_gen);
+            entry.vector_generation = vector_generation;
+            entry.search_root = search_root;
+            let arc = Arc::new(entry);
+            *arc.metadata.write().unwrap() = metadata;
             *guard = Some(Arc::clone(&arc));
             tracing::debug!(
                 generation = current_gen,
@@ -1699,6 +1761,12 @@ pub trait EmbedFn: Send + Sync {
 
 /// Trait for walking files and producing indexed documents with vectors.
 pub trait WalkAndIndexFn: Send + Sync {
+    fn vector_generation(&self, _root: &Path) -> u64 {
+        0
+    }
+    fn metadata_fingerprint(&self, _root_dir: &Path) -> MetadataFingerprintFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     fn walk_and_index(&self, root_dir: &Path) -> WalkAndIndexFuture<'_>;
 }
 
@@ -3650,6 +3718,175 @@ mod tests {
         assert_eq!(
             reuses, 1,
             "fingerprint backstop: index reused on second call"
+        );
+    }
+
+    struct MetadataCountingWalker {
+        metadata: Arc<std::sync::atomic::AtomicU64>,
+        metadata_count: Arc<std::sync::atomic::AtomicU32>,
+        walk_count: Arc<std::sync::atomic::AtomicU32>,
+        path: Arc<std::sync::Mutex<String>>,
+    }
+
+    impl WalkAndIndexFn for MetadataCountingWalker {
+        fn metadata_fingerprint(&self, _root: &Path) -> MetadataFingerprintFuture<'_> {
+            self.metadata_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let hash = self.metadata.load(std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(Some(MetadataFingerprint {
+                    n_entries: 1,
+                    metadata_hash: hash,
+                }))
+            })
+        }
+
+        fn walk_and_index(
+            &self,
+            _root: &Path,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.walk_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = self.path.lock().unwrap().clone();
+            Box::pin(async move {
+                Ok((
+                    vec![make_doc(&path, "metadata target")],
+                    vec![Some(vec![1.0_f32, 0.0])],
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_fingerprint_skips_walk_when_tracker_is_off_and_tree_is_unchanged() {
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let metadata = Arc::new(std::sync::atomic::AtomicU64::new(10));
+        let metadata_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let walker = MetadataCountingWalker {
+            metadata,
+            metadata_count: Arc::clone(&metadata_count),
+            walk_count: Arc::clone(&walk_count),
+            path: Arc::new(std::sync::Mutex::new("before.rs".to_string())),
+        };
+
+        semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+        semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            metadata_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the cheap metadata check runs on each tracker-off request"
+        );
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unchanged metadata fingerprint must skip the full walk"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_fingerprint_change_falls_through_to_walk_and_refreshes_results() {
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let metadata = Arc::new(std::sync::atomic::AtomicU64::new(10));
+        let walk_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let path = Arc::new(std::sync::Mutex::new("before.rs".to_string()));
+        let walker = MetadataCountingWalker {
+            metadata: Arc::clone(&metadata),
+            metadata_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            walk_count: Arc::clone(&walk_count),
+            path: Arc::clone(&path),
+        };
+
+        semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+        let stale_fingerprint = cache.read().await.as_ref().unwrap().fingerprint.clone();
+
+        metadata.store(11, std::sync::atomic::Ordering::Relaxed);
+        *path.lock().unwrap() = "after.rs".to_string();
+        let stale_result = semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a changed metadata fingerprint must perform the full walk"
+        );
+        assert!(
+            stale_result.contains("before.rs"),
+            "the existing small-delta path serves stale results while rebuilding: {stale_result}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let rebuild_finished = cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|cached| cached.fingerprint != stale_fingerprint);
+                if rebuild_finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background index replacement must finish");
+
+        let fresh_result = semantic_code_search(
+            gen_test_opts(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            fresh_result.contains("after.rs"),
+            "the replacement index must expose the changed walk result: {fresh_result}"
+        );
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the refreshed metadata fingerprint must avoid a third full walk"
         );
     }
 
