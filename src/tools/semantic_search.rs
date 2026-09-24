@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -528,6 +529,109 @@ pub(crate) fn snippet_for_doc(
     } else {
         Some(trimmed)
     }
+}
+
+pub(crate) trait SnippetFileOpener: Send + Sync {
+    fn open(&self, path: &Path) -> io::Result<Box<dyn BufRead>>;
+}
+
+struct DiskSnippetFileOpener;
+
+impl SnippetFileOpener for DiskSnippetFileOpener {
+    fn open(&self, path: &Path) -> io::Result<Box<dyn BufRead>> {
+        Ok(Box::new(BufReader::new(std::fs::File::open(path)?)))
+    }
+}
+
+pub(crate) fn fill_result_snippets(root_dir: &Path, results: &mut [SearchResult]) {
+    fill_result_snippets_with_opener(root_dir, results, &DiskSnippetFileOpener);
+}
+
+pub(crate) fn fill_result_snippets_with_opener(
+    root_dir: &Path,
+    results: &mut [SearchResult],
+    opener: &dyn SnippetFileOpener,
+) {
+    for result in results {
+        let snippet = opener
+            .open(&root_dir.join(&result.path))
+            .and_then(|reader| {
+                let location = result
+                    .matched_symbol_locations
+                    .first()
+                    .and_then(|loc| parse_location_string(loc))
+                    .filter(|(start, end)| *start > 0 && end.is_none_or(|end| end >= *start));
+                read_result_snippet(reader, location, Path::new(&result.path))
+            });
+        if let Ok(snippet) = snippet {
+            result.snippet = snippet;
+        }
+    }
+}
+
+fn read_result_snippet(
+    reader: Box<dyn BufRead>,
+    location: Option<(u32, Option<u32>)>,
+    path: &Path,
+) -> io::Result<Option<String>> {
+    let mut lines = reader.lines();
+    let mut content = Vec::new();
+    if let Some((start, end)) = location {
+        for _ in 1..start {
+            match lines.next().transpose()? {
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+        // One extra line lets extract_snippet preserve its truncation marker.
+        let limit = end
+            .map(|end| (end - start) as usize + 1)
+            .unwrap_or(SNIPPET_MAX_LINES + 1)
+            .min(SNIPPET_MAX_LINES + 1);
+        for line in lines.take(limit) {
+            content.push(line?);
+        }
+    } else {
+        let mut first = true;
+        let mut front_matter = false;
+        for line in lines {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if first {
+                first = false;
+                if trimmed == "---"
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ["md", "markdown", "mdx"]
+                                .iter()
+                                .any(|markdown| ext.eq_ignore_ascii_case(markdown))
+                        })
+                {
+                    front_matter = true;
+                    continue;
+                }
+            }
+            if front_matter {
+                if matches!(trimmed, "---" | "...") {
+                    front_matter = false;
+                }
+                continue;
+            }
+            if matches!(trimmed, "{" | "[" | "---" | "/**" | "/*" | "//") {
+                continue;
+            }
+            content.push(line);
+            if content.len() == SNIPPET_MAX_LINES {
+                break;
+            }
+        }
+    }
+    Ok(extract_snippet(&content.join("\n"), 1, None))
 }
 
 /// Cosine similarity between two f32 vectors.
@@ -1436,7 +1540,7 @@ pub async fn semantic_code_search(
             );
             Arc::new(CachedSearchIndex::new(idx, fp, current_gen))
         }
-        Some(lock) => {
+        Some(lock) => 'cache: {
             // Snapshot the current tracker generation before any locking.
             let current_gen = cache_generation
                 .as_ref()
@@ -1457,12 +1561,7 @@ pub async fn semantic_code_search(
                         generation = current_gen,
                         "SearchIndex generation hit — skipping walk"
                     );
-                    let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
-                    return Ok(format_search_results_with_freshness(
-                        query.as_ref(),
-                        &results,
-                        Some(cached.index.document_count()),
-                    ));
+                    break 'cache Arc::clone(cached);
                 }
                 match guard.as_ref() {
                     Some(cached) => tracing::debug!(
@@ -1506,12 +1605,7 @@ pub async fn semantic_code_search(
                         generation = current_gen,
                         "SearchIndex fingerprint hit — reusing index, updated generation"
                     );
-                    let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
-                    return Ok(format_search_results_with_freshness(
-                        query.as_ref(),
-                        &results,
-                        Some(cached.index.document_count()),
-                    ));
+                    break 'cache Arc::clone(cached);
                 }
             }
 
@@ -1539,12 +1633,7 @@ pub async fn semantic_code_search(
                     generation = current_gen,
                     "SearchIndex cache hit (post-write-lock) — reusing index, updated generation"
                 );
-                let results = cached.index.search(query.as_ref(), &query_vec, &resolved);
-                return Ok(format_search_results_with_freshness(
-                    query.as_ref(),
-                    &results,
-                    Some(cached.index.document_count()),
-                ));
+                break 'cache Arc::clone(cached);
             }
 
             // Background-rebuild fast-return: if the existing stale entry qualifies
@@ -1642,15 +1731,7 @@ pub async fn semantic_code_search(
                     let _ = root_dir_clone; // ensure the clone is owned by the task
                 });
 
-                // Return stale results immediately (zero latency).
-                let results = stale_arc
-                    .index
-                    .search(query.as_ref(), &query_vec, &resolved);
-                return Ok(format_search_results_with_freshness(
-                    query.as_ref(),
-                    &results,
-                    Some(stale_arc.index.document_count()),
-                ));
+                break 'cache stale_arc;
             }
 
             // No stale entry, large-delta change, or another rebuild already in
@@ -1678,9 +1759,16 @@ pub async fn semantic_code_search(
         }
     };
 
-    let results = cached_arc
+    let mut results = cached_arc
         .index
         .search(query.as_ref(), &query_vec, &resolved);
+    let root_dir = options.root_dir.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        fill_result_snippets(&root_dir, &mut results);
+        results
+    })
+    .await
+    .map_err(|err| crate::error::ContextPlusError::Other(format!("Snippet task failed: {err}")))?;
     Ok(format_search_results_with_freshness(
         query.as_ref(),
         &results,
@@ -2657,6 +2745,271 @@ mod tests {
         assert!(snippet_for_doc(&doc, &[]).is_none());
     }
 
+    fn ranked_result(
+        path: &str,
+        matched_symbol_locations: Vec<&str>,
+        fallback_snippet: &str,
+    ) -> SearchResult {
+        SearchResult {
+            path: path.to_string(),
+            score: 100.0,
+            semantic_score: 100.0,
+            keyword_score: 100.0,
+            header: String::new(),
+            matched_symbols: vec![],
+            matched_symbol_locations: matched_symbol_locations
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            snippet: Some(fallback_snippet.to_string()),
+        }
+    }
+
+    #[test]
+    fn ranked_code_snippet_reads_matched_symbol_at_line_40_from_real_file() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "src/stripe_webhook.ts";
+        let absolute_path = root.path().join(relative_path);
+        std::fs::create_dir_all(absolute_path.parent().unwrap()).unwrap();
+
+        let mut lines: Vec<String> = (1..40)
+            .map(|line| format!("// filler line {line}"))
+            .collect();
+        lines.extend([
+            "export function reconcileInvoicePayment(event: Stripe.Event) {".to_string(),
+            "  const invoice = event.data.object;".to_string(),
+            "  return markInvoicePaid(invoice.id);".to_string(),
+            "}".to_string(),
+        ]);
+        std::fs::write(&absolute_path, lines.join("\n")).unwrap();
+
+        let mut results = vec![ranked_result(
+            relative_path,
+            vec!["reconcileInvoicePayment@L40-L43"],
+            "typescript /**",
+        )];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert!(
+            snippet.starts_with("export function reconcileInvoicePayment"),
+            "expected snippet to start at real-file line 40, got: {snippet:?}"
+        );
+        assert!(!snippet.starts_with("typescript "));
+    }
+
+    #[test]
+    fn ranked_json_snippet_skips_lone_structural_opener() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "fixtures/invoice-payment-succeeded.json";
+        let absolute_path = root.path().join(relative_path);
+        std::fs::create_dir_all(absolute_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &absolute_path,
+            "\n{\n  \"type\": \"invoice.payment_succeeded\",\n  \"livemode\": false\n}\n",
+        )
+        .unwrap();
+
+        let mut results = vec![ranked_result(relative_path, vec![], "{")];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert!(
+            snippet.starts_with("  \"type\": \"invoice.payment_succeeded\""),
+            "expected first JSON key instead of structural opener, got: {snippet:?}"
+        );
+    }
+
+    #[test]
+    fn ranked_markdown_snippet_skips_front_matter_block() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "todos/reconcile-invoice-payment.md";
+        let absolute_path = root.path().join(relative_path);
+        std::fs::create_dir_all(absolute_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &absolute_path,
+            "---\ntitle: Reconcile invoice payment\nstatus: open\n---\n\n# Reconcile Stripe invoices\n\nUpdate payment status from the webhook event.\n",
+        )
+        .unwrap();
+
+        let mut results = vec![ranked_result(relative_path, vec![], "---")];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert!(
+            snippet.starts_with("# Reconcile Stripe invoices"),
+            "expected heading after front matter, got: {snippet:?}"
+        );
+        assert!(!snippet.contains("title: Reconcile invoice payment"));
+    }
+
+    #[test]
+    fn ranked_yaml_snippet_keeps_first_document_keys_without_terminator() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "config.yaml";
+        std::fs::write(
+            root.path().join(relative_path),
+            "---\nservice: billing\nport: 8080\n",
+        )
+        .unwrap();
+
+        let mut results = vec![ranked_result(relative_path, vec![], "---")];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        let snippet = results[0]
+            .snippet
+            .as_deref()
+            .expect("YAML keys after an opening document marker must produce a snippet");
+        assert!(
+            snippet.starts_with("service: billing"),
+            "expected the first YAML key after the document marker, got: {snippet:?}"
+        );
+    }
+
+    #[test]
+    fn ranked_yaml_snippet_keeps_first_document_keys_with_terminator() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "config.yaml";
+        std::fs::write(
+            root.path().join(relative_path),
+            "---\nservice: billing\nport: 8080\n...\n",
+        )
+        .unwrap();
+
+        let mut results = vec![ranked_result(relative_path, vec![], "---")];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        let snippet = results[0]
+            .snippet
+            .as_deref()
+            .expect("YAML keys before a document terminator must produce a snippet");
+        assert!(
+            snippet.starts_with("service: billing"),
+            "expected the first YAML key before the document terminator, got: {snippet:?}"
+        );
+    }
+
+    #[test]
+    fn ranked_code_without_symbol_skips_language_prefix_and_bare_comment_opener() {
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "src/invoice_status.ts";
+        let absolute_path = root.path().join(relative_path);
+        std::fs::create_dir_all(absolute_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &absolute_path,
+            "/**\n * Reconciles invoice payment status from Stripe.\n */\nexport const reconcileInvoiceStatus = () => {};\n",
+        )
+        .unwrap();
+
+        let mut results = vec![ranked_result(relative_path, vec![], "typescript /**")];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        let snippet = results[0].snippet.as_deref().unwrap();
+        assert_ne!(snippet, "typescript /**");
+        assert_ne!(snippet.trim(), "/**");
+        assert!(!snippet.starts_with("typescript "));
+    }
+
+    #[test]
+    fn ranked_snippet_missing_file_keeps_indexed_fallback_without_error() {
+        let root = tempfile::tempdir().unwrap();
+        let mut results = vec![ranked_result(
+            "src/deleted_since_indexing.ts",
+            vec!["reconcileInvoicePayment@L40-L43"],
+            "typescript /**",
+        )];
+
+        fill_result_snippets(root.path(), &mut results);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].snippet.as_deref(), Some("typescript /**"));
+    }
+
+    #[test]
+    fn ranked_snippets_only_open_files_in_final_top_k() {
+        use std::collections::HashMap;
+        use std::io::{self, BufRead, Cursor};
+        use std::sync::Mutex;
+
+        struct RecordingOpener {
+            files: HashMap<PathBuf, String>,
+            opened: Mutex<Vec<PathBuf>>,
+        }
+
+        impl SnippetFileOpener for RecordingOpener {
+            fn open(&self, path: &Path) -> io::Result<Box<dyn BufRead>> {
+                self.opened.lock().unwrap().push(path.to_path_buf());
+                let content =
+                    self.files.get(path).cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "fixture not found")
+                    })?;
+                Ok(Box::new(Cursor::new(content)))
+            }
+        }
+
+        let root = PathBuf::from("/repo");
+        let query_vec = vec![1.0_f32, 0.0];
+        let docs: Vec<SearchDocument> = (0..100)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/file_{i}.ts"),
+                    format!("file {i}"),
+                    vec![],
+                    vec![],
+                    format!("typescript indexed content {i}"),
+                )
+            })
+            .collect();
+        let vectors: Vec<Option<Vec<f32>>> = (0..100)
+            .map(|i| {
+                let x = 1.0 - i as f32 * 0.009;
+                let y = (1.0_f32 - x * x).sqrt();
+                Some(vec![x, y])
+            })
+            .collect();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let opts = ResolvedSearchOptions {
+            top_k: 3,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_combined_score: 0.0,
+            root_dir: root.clone(),
+            ..Default::default()
+        };
+        let mut results = index.search("unmatched query", &query_vec, &opts);
+        assert_eq!(results.len(), 3);
+
+        let files = (0..100)
+            .map(|i| {
+                (
+                    root.join(format!("src/file_{i}.ts")),
+                    format!("export const file{i} = {i};\n"),
+                )
+            })
+            .collect();
+        let opener = RecordingOpener {
+            files,
+            opened: Mutex::new(Vec::new()),
+        };
+
+        fill_result_snippets_with_opener(&root, &mut results, &opener);
+
+        let opened: HashSet<PathBuf> = opener.opened.lock().unwrap().iter().cloned().collect();
+        let expected: HashSet<PathBuf> = results
+            .iter()
+            .map(|result| root.join(&result.path))
+            .collect();
+        assert_eq!(opened, expected);
+        assert_eq!(opened.len(), 3, "only final top-k files may be opened");
+    }
+
     // -- format_search_results_with_freshness tests --
 
     #[test]
@@ -3557,6 +3910,86 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
         };
         assert_eq!(reuses, 1, "cache must have been reused exactly once");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_generation_cache_hit_releases_lock_while_snippet_io_is_pending() {
+        use std::io::Write;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let relative_path = "config.yaml";
+        let fifo_path = root.path().join(relative_path);
+        let status = Command::new("mkfifo").arg(&fifo_path).status().unwrap();
+        assert!(status.success(), "mkfifo failed with {status}");
+
+        let docs = vec![make_doc(relative_path, "service billing")];
+        let fingerprint = IndexFingerprint::from_docs(&docs);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vec![Some(vec![1.0_f32, 0.0])]);
+        let cached = Arc::new(CachedSearchIndex::new(index, fingerprint, 7));
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> =
+            Arc::new(RwLock::new(Some(cached)));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
+
+        let (reader_pending_tx, reader_pending_rx) = tokio::sync::oneshot::channel();
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+        let fifo_for_writer = fifo_path.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(fifo_for_writer)
+                .unwrap();
+            reader_pending_tx.send(()).unwrap();
+            release_writer_rx.recv().unwrap();
+            fifo.write_all(b"service: billing\nport: 8080\n").unwrap();
+        });
+
+        let mut opts = gen_test_opts();
+        opts.root_dir = root.path().to_path_buf();
+        opts.query = "billing".to_string();
+        let cache_for_search = Arc::clone(&cache);
+        let generation_for_search = Arc::clone(&generation);
+        let search = tokio::spawn(async move {
+            let walker = CountWalker(Arc::new(std::sync::atomic::AtomicU32::new(0)));
+            semantic_code_search(
+                opts,
+                &FixedEmbedder2,
+                &walker,
+                Some(cache_for_search),
+                Some(generation_for_search),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), reader_pending_rx)
+            .await
+            .expect("snippet reader did not reach the FIFO")
+            .unwrap();
+
+        let cache_for_writer = Arc::clone(&cache);
+        let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
+        let lock_writer = tokio::spawn(async move {
+            let guard = cache_for_writer.write().await;
+            let _ = lock_acquired_tx.send(());
+            drop(guard);
+        });
+        let acquired_while_pending =
+            tokio::time::timeout(Duration::from_millis(250), lock_acquired_rx)
+                .await
+                .is_ok();
+
+        release_writer_tx.send(()).unwrap();
+        writer.await.unwrap();
+        search.await.unwrap().unwrap();
+        lock_writer.await.unwrap();
+
+        assert!(
+            acquired_while_pending,
+            "cache writer could not acquire the lock while snippet I/O was pending"
+        );
     }
 
     /// File-change event (generation bump) forces a walk + rebuild on next request.
