@@ -3997,7 +3997,9 @@ mod tests {
         let fingerprint = IndexFingerprint::from_docs(&docs);
         let mut index = SearchIndex::new();
         index.index_with_vectors(docs, vec![Some(vec![1.0_f32, 0.0])]);
-        let cached = Arc::new(CachedSearchIndex::new(index, fingerprint, 7));
+        let mut cached = CachedSearchIndex::new(index, fingerprint, 7);
+        cached.search_root = std::fs::canonicalize(root.path()).unwrap();
+        let cached = Arc::new(cached);
         let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> =
             Arc::new(RwLock::new(Some(cached)));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
