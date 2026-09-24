@@ -686,6 +686,9 @@ impl ContextPlusServer {
                     mode = %self.state.config.embed_tracker_mode,
                     "Embedding tracker started"
                 );
+                ref_index
+                    .cache_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
                 *guard = Some(handle);
             }
             Err(e) => {
@@ -812,6 +815,9 @@ impl ContextPlusServer {
             tracing::info!(ref_id = ref_id.0, root = %root.display(), "ref_warmup shallow: starting walk");
 
             // --- Walk + read files (blocking I/O) ---
+            let build_generation = ref_index
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire);
             let new_cache = tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
                 let entries = walk_with_config(&root, &config);
@@ -845,13 +851,17 @@ impl ContextPlusServer {
             let cache_installed = {
                 let mut guard = ref_index.project_cache.write().await;
                 // First-writer-wins: only update if still unpopulated (or stale).
-                let needs_update = match &*guard {
-                    None => true,
-                    Some(c) => {
-                        !ContextPlusServer::tracker_is_running(&ref_index)
-                            && c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs
-                    }
-                };
+                let needs_update = ref_index
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == build_generation
+                    && match &*guard {
+                        None => true,
+                        Some(c) => {
+                            !ContextPlusServer::tracker_is_running(&ref_index)
+                                && c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs
+                        }
+                    };
                 if needs_update {
                     *guard = Some(Arc::clone(&new_cache));
                     tracing::debug!(
@@ -942,10 +952,14 @@ impl ContextPlusServer {
                 .count();
             {
                 let mut guard = ref_index.identifier_index.write().await;
-                let needs_update = match &*guard {
-                    None => true,
-                    Some(idx) => idx.file_count != file_count,
-                };
+                let needs_update = ref_index
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == build_generation
+                    && match &*guard {
+                        None => true,
+                        Some(idx) => idx.file_count != file_count,
+                    };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
                         docs: doc_list,
@@ -1042,6 +1056,9 @@ impl ContextPlusServer {
             // --- Phase 1: walk + read files ---
             let root = ref_index.root_dir.clone();
             let config = state.config.clone();
+            let build_generation = ref_index
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire);
             let new_cache = tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
                 let entries = walk_with_config(&root, &config);
@@ -1074,13 +1091,17 @@ impl ContextPlusServer {
             // --- Populate project_cache ---
             let cache_installed = {
                 let mut guard = ref_index.project_cache.write().await;
-                let needs_update = match &*guard {
-                    None => true,
-                    Some(c) => {
-                        !ContextPlusServer::tracker_is_running(&ref_index)
-                            && c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs
-                    }
-                };
+                let needs_update = ref_index
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == build_generation
+                    && match &*guard {
+                        None => true,
+                        Some(c) => {
+                            !ContextPlusServer::tracker_is_running(&ref_index)
+                                && c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs
+                        }
+                    };
                 if needs_update {
                     *guard = Some(Arc::clone(&new_cache));
                     tracing::debug!(
@@ -1168,10 +1189,14 @@ impl ContextPlusServer {
                 .count();
             {
                 let mut guard = ref_index.identifier_index.write().await;
-                let needs_update = match &*guard {
-                    None => true,
-                    Some(idx) => idx.file_count != file_count,
-                };
+                let needs_update = ref_index
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == build_generation
+                    && match &*guard {
+                        None => true,
+                        Some(idx) => idx.file_count != file_count,
+                    };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
                         docs: doc_list,
@@ -1301,7 +1326,8 @@ impl ContextPlusServer {
             .tracker_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
+            .as_ref()
+            .is_some_and(|handle| handle.is_healthy())
     }
 
     /// Build-or-reuse the walked file cache for a **specific** ref, rather than
@@ -1313,6 +1339,22 @@ impl ContextPlusServer {
         &self,
         ref_index: &Arc<crate::ref_index::RefIndex>,
     ) -> Result<Arc<ProjectCache>> {
+        // Serialize rebuilds with invalidation so an older walk cannot overwrite it.
+        let mut project_guard = ref_index.project_cache.write().await;
+        let dirty = ref_index
+            .tracker_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|handle| handle.take_source_dirty());
+        if dirty {
+            *project_guard = None;
+            *ref_index.identifier_index.write().await = None;
+            *ref_index.lexical_search_cache.write().await = None;
+            ref_index
+                .cache_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         let ttl_secs = self.state.config.cache_ttl_secs;
         let tracker_running = Self::tracker_is_running(ref_index);
 
@@ -1320,8 +1362,7 @@ impl ContextPlusServer {
         // real file change invalidates it. Without a tracker, retain the TTL
         // fallback so external edits are eventually observed.
         {
-            let guard = ref_index.project_cache.read().await;
-            if let Some(ref cache) = *guard {
+            if let Some(ref cache) = *project_guard {
                 let age_secs = cache.last_refresh.elapsed().as_secs();
                 if tracker_running || age_secs < ttl_secs {
                     tracing::debug!(
@@ -1378,10 +1419,9 @@ impl ContextPlusServer {
         let arc_cache = Arc::new(new_cache);
 
         // Store the Arc in per-ref state (cheap clone of the Arc pointer)
-        {
-            let mut guard = ref_index.project_cache.write().await;
-            *guard = Some(Arc::clone(&arc_cache));
-        }
+        *project_guard = Some(Arc::clone(&arc_cache));
+        *ref_index.identifier_index.write().await = None;
+        *ref_index.lexical_search_cache.write().await = None;
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
             files = arc_cache.file_content.len(),
@@ -1553,6 +1593,12 @@ impl ContextPlusServer {
             }
         }
 
+        // Source freshness must not wait for the embedding provider.
+        if content_changed {
+            self.invalidate_project_cache_with_reason("tracker inspected changed content")
+                .await;
+        }
+
         // Apply CAS hit entries to the in-memory embedding cache.
         if !cas_hit_entries.is_empty() {
             let mut cache = ref_index.embedding_cache.write().await;
@@ -1577,12 +1623,6 @@ impl ContextPlusServer {
                 tracing::warn!("CAS manifest update failed (non-fatal): {e}");
             }
             if cas_hit_entries.is_empty() {
-                if content_changed {
-                    self.invalidate_project_cache_with_reason(
-                        "tracker processed changed content without embedding",
-                    )
-                    .await;
-                }
                 return IncrementalReembedOutcome {
                     updated,
                     skipped,
@@ -1695,13 +1735,6 @@ impl ContextPlusServer {
                 }
                 Ok(Ok(())) => {}
             }
-        }
-
-        if content_changed {
-            self.invalidate_project_cache_with_reason(
-                "incremental re-embed processed changed content",
-            )
-            .await;
         }
 
         IncrementalReembedOutcome {
@@ -4804,6 +4837,486 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&expired, &actual),
             "tracker-off mode should retain TTL fallback invalidation"
+        );
+    }
+
+    async fn attached_ref_with_slow_embedder(
+        tracker_mode: TrackerMode,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        crate::ref_index::RefId,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap_or_default();
+                let count = body["input"].as_array().map_or(1, Vec::len);
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({
+                        "embeddings": vec![vec![0.6, 0.8]; count]
+                    }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().expect("failed to create primary temp dir");
+        let attached = tempfile::tempdir().expect("failed to create attached temp dir");
+        std::fs::write(attached.path().join("base.rs"), "fn baseline() {}\n").unwrap();
+
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.cache_ttl_secs = 0;
+        config.embed_tracker_mode = tracker_mode;
+        config.embed_tracker_debounce_ms = 60_000;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+
+        let canonical = attached.path().canonicalize().unwrap();
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        let result = server.handle_attach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        (primary, attached, ollama, server, ref_id)
+    }
+
+    async fn attached_impact(
+        server: &ContextPlusServer,
+        attached: &std::path::Path,
+        symbol: &str,
+    ) -> String {
+        let mut args = serde_json::Map::new();
+        args.insert("symbol_name".to_string(), json!(symbol));
+        args.insert(
+            "path".to_string(),
+            json!(attached.to_string_lossy().to_string()),
+        );
+        text_of(&server.handle_blast_radius(args).await.unwrap())
+    }
+
+    async fn wait_for_embed_request_count(ollama: &wiremock::MockServer, expected: usize) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let actual = ollama.received_requests().await.unwrap_or_default().len();
+            if actual >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tracker callback never reached embedding request {expected}; observed {actual}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn held_embedding_endpoint() -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind held embedding endpoint");
+        let address = listener.local_addr().expect("held endpoint address");
+        let (request_started_tx, request_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept embedding request");
+            let mut request = Vec::new();
+            let mut content_length = None;
+            let mut header_end = None;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read embedding request");
+                assert!(read > 0, "embedding request closed before its body arrived");
+                request.extend_from_slice(&buffer[..read]);
+
+                if header_end.is_none()
+                    && let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                {
+                    header_end = Some(end + 4);
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    content_length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
+                }
+
+                if let Some(end) = header_end
+                    && request.len() >= end + content_length.unwrap_or(0)
+                {
+                    break;
+                }
+            }
+
+            request_started_tx
+                .send(())
+                .expect("embedding request observer dropped");
+            release_rx.await.expect("embedding release sender dropped");
+
+            let body = r#"{"embeddings":[[0.6,0.8]]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write embedding response");
+        });
+
+        (
+            format!("http://{address}"),
+            request_started_rx,
+            release_tx,
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn attached_tracker_keeps_impact_fresh_for_create_edit_rename_and_delete() {
+        let (_primary, attached, ollama, server, ref_id) =
+            attached_ref_with_slow_embedder(TrackerMode::Eager).await;
+        let canonical = attached.path().canonicalize().unwrap();
+        let ref_index = server
+            .state
+            .ref_index(ref_id)
+            .expect("attached ref present");
+        assert!(
+            ref_index.tracker_handle.lock().unwrap().is_some(),
+            "attached eager ref must have a running tracker"
+        );
+
+        let symbol = "trackerFreshUniqueSymbol42";
+        let initial = attached_impact(&server, &canonical, symbol).await;
+        assert!(initial.contains("has no references"), "{initial}");
+
+        let created = canonical.join("created.rs");
+        std::fs::write(&created, format!("fn {symbol}() {{}}\n")).unwrap();
+        let callback = server.with_session(ref_id).build_tracker_callback();
+        let create_refresh = callback(canonical.clone(), vec!["created.rs".to_string()]);
+        wait_for_embed_request_count(&ollama, 1).await;
+        let created_impact = attached_impact(&server, &canonical, symbol).await;
+        create_refresh.abort();
+        assert!(
+            created_impact.contains("created.rs"),
+            "impact stayed on the pre-create project cache while embedding was in flight:\n{created_impact}"
+        );
+
+        std::fs::write(
+            &created,
+            format!("fn {symbol}() {{}}\nfn caller() {{ {symbol}(); }} // edit-visible\n"),
+        )
+        .unwrap();
+        let edit_refresh = callback(canonical.clone(), vec!["created.rs".to_string()]);
+        wait_for_embed_request_count(&ollama, 2).await;
+        let edited_impact = attached_impact(&server, &canonical, symbol).await;
+        edit_refresh.abort();
+        assert!(
+            edited_impact.contains("edit-visible"),
+            "impact stayed on the pre-edit project cache while embedding was in flight:\n{edited_impact}"
+        );
+
+        let renamed = canonical.join("renamed.rs");
+        std::fs::rename(&created, &renamed).unwrap();
+        let rename_refresh = callback(
+            canonical.clone(),
+            vec!["created.rs".to_string(), "renamed.rs".to_string()],
+        );
+        wait_for_embed_request_count(&ollama, 3).await;
+        let renamed_impact = attached_impact(&server, &canonical, symbol).await;
+        rename_refresh.abort();
+        assert!(
+            renamed_impact.contains("renamed.rs") && !renamed_impact.contains("  created.rs:"),
+            "impact did not reflect the rename while embedding was in flight:\n{renamed_impact}"
+        );
+
+        std::fs::remove_file(&renamed).unwrap();
+        callback(canonical.clone(), vec!["renamed.rs".to_string()])
+            .await
+            .unwrap();
+        let deleted_impact = attached_impact(&server, &canonical, symbol).await;
+        assert!(
+            deleted_impact.contains("has no references"),
+            "impact retained a deleted file:\n{deleted_impact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_tracker_bulk_replacement_is_visible_before_embedding_finishes() {
+        let (_primary, attached, ollama, server, ref_id) =
+            attached_ref_with_slow_embedder(TrackerMode::Eager).await;
+        let canonical = attached.path().canonicalize().unwrap();
+        let symbol = "bulkCheckoutUniqueSymbol73";
+
+        let mut old_paths = Vec::new();
+        for index in 0..32 {
+            let relative = format!("old_{index:02}.rs");
+            std::fs::write(
+                canonical.join(&relative),
+                format!("fn old_{index:02}() {{}}\n"),
+            )
+            .unwrap();
+            old_paths.push(relative);
+        }
+        let initial = attached_impact(&server, &canonical, symbol).await;
+        assert!(initial.contains("has no references"), "{initial}");
+
+        for relative in &old_paths {
+            std::fs::remove_file(canonical.join(relative)).unwrap();
+        }
+        let mut changed_paths = old_paths;
+        for index in 0..32 {
+            let relative = format!("new_{index:02}.rs");
+            std::fs::write(
+                canonical.join(&relative),
+                format!("fn checkout_{index:02}() {{ {symbol}(); }}\n"),
+            )
+            .unwrap();
+            changed_paths.push(relative);
+        }
+
+        let callback = server.with_session(ref_id).build_tracker_callback();
+        let refresh = callback(canonical.clone(), changed_paths);
+        wait_for_embed_request_count(&ollama, 1).await;
+        let impact = attached_impact(&server, &canonical, symbol).await;
+        refresh.abort();
+
+        assert!(
+            impact.contains("new_00.rs") && impact.contains("new_31.rs"),
+            "impact served the pre-checkout project cache while bulk embedding was in flight:\n{impact}"
+        );
+        assert!(
+            !impact.contains("  old_00.rs:"),
+            "impact retained files removed by the bulk replacement:\n{impact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_ref_ttl_fallback_and_unchanged_reuse_survive_tracker_start() {
+        let (_primary, attached, ollama, server, ref_id) =
+            attached_ref_with_slow_embedder(TrackerMode::Lazy).await;
+        let canonical = attached.path().canonicalize().unwrap();
+        let ref_index = server
+            .state
+            .ref_index(ref_id)
+            .expect("attached ref present");
+        assert!(ref_index.tracker_handle.lock().unwrap().is_none());
+
+        let initial = attached_impact(&server, &canonical, "ttlFallbackSymbol").await;
+        assert!(initial.contains("has no references"), "{initial}");
+        std::fs::write(
+            canonical.join("base.rs"),
+            "fn baseline() {}\nfn ttlFallbackSymbol() {}\n",
+        )
+        .unwrap();
+        let refreshed = attached_impact(&server, &canonical, "ttlFallbackSymbol").await;
+        assert!(
+            refreshed.contains("base.rs"),
+            "an attached ref without a tracker must refresh through its TTL fallback:\n{refreshed}"
+        );
+
+        server.ensure_tracker_started_for(ref_id);
+        assert!(ref_index.tracker_handle.lock().unwrap().is_some());
+        let first = server.ensure_project_cache_for(&ref_index).await.unwrap();
+        let second = server.ensure_project_cache_for(&ref_index).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged tree with a healthy tracker must reuse its project cache"
+        );
+
+        std::fs::write(
+            canonical.join("base.rs"),
+            "fn baseline() {}\nfn ttlFallbackSymbol() {}\nfn afterTrackerStart() {}\n",
+        )
+        .unwrap();
+        let callback = server.with_session(ref_id).build_tracker_callback();
+        let refresh = callback(canonical.clone(), vec!["base.rs".to_string()]);
+        wait_for_embed_request_count(&ollama, 1).await;
+        let impact = attached_impact(&server, &canonical, "afterTrackerStart").await;
+        refresh.abort();
+        assert!(
+            impact.contains("base.rs"),
+            "tracker TTL bypass served stale content while embedding was in flight:\n{impact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_tracker_start_refreshes_cache_built_before_tracking() {
+        let (_primary, attached, _ollama, server, ref_id) =
+            attached_ref_with_slow_embedder(TrackerMode::Lazy).await;
+        let canonical = attached.path().canonicalize().unwrap();
+        let ref_index = server
+            .state
+            .ref_index(ref_id)
+            .expect("attached ref present");
+        assert!(ref_index.tracker_handle.lock().unwrap().is_none());
+
+        let stale = server.ensure_project_cache_for(&ref_index).await.unwrap();
+        assert_eq!(stale.file_content["base.rs"].as_str(), "fn baseline() {}\n");
+
+        std::fs::write(
+            canonical.join("base.rs"),
+            "fn baseline() {}\n// pretrackeruniquetoken\n",
+        )
+        .unwrap();
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), json!("pretrackeruniquetoken"));
+        let search = server
+            .with_session(ref_id)
+            .handle_lexical_search(args)
+            .await
+            .unwrap();
+        let search_text = text_of(&search);
+        assert!(
+            search_text.contains("base.rs"),
+            "the tool that started the attached tracker searched the pre-tracker snapshot:\n{search_text}"
+        );
+
+        let refreshed = ref_index
+            .project_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("lexical search should populate the attached project cache");
+        assert!(
+            refreshed.file_content["base.rs"].contains("pretrackeruniquetoken"),
+            "the first cache access after tracker startup reused the pre-tracker snapshot"
+        );
+        assert!(
+            !Arc::ptr_eq(&stale, &refreshed),
+            "tracker startup must replace a cache it did not observe being built"
+        );
+
+        let unchanged = server.ensure_project_cache_for(&ref_index).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&refreshed, &unchanged),
+            "the refreshed snapshot should remain authoritative when the tree is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_real_watcher_covers_new_directory_while_embedding_is_in_flight() {
+        let (ollama_host, request_started, release_embedding, embedding_server) =
+            held_embedding_endpoint().await;
+        let primary = tempfile::tempdir().expect("failed to create primary temp dir");
+        let attached = tempfile::tempdir().expect("failed to create attached temp dir");
+        std::fs::write(attached.path().join("base.rs"), "fn baseline() {}\n").unwrap();
+
+        let mut config = Config::from_env();
+        config.ollama_host = ollama_host;
+        config.cache_ttl_secs = 0;
+        config.embed_tracker_mode = TrackerMode::Eager;
+        config.embed_tracker_debounce_ms = 100;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = attached.path().canonicalize().unwrap();
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".to_string(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        let attached_result = server.handle_attach_worktree(attach_args).await.unwrap();
+        assert_eq!(
+            attached_result.is_error,
+            Some(false),
+            "{}",
+            text_of(&attached_result)
+        );
+
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        let ref_index = server
+            .state
+            .ref_index(ref_id)
+            .expect("attached ref present");
+        let initial = server.ensure_project_cache_for(&ref_index).await.unwrap();
+
+        std::fs::write(
+            canonical.join("base.rs"),
+            "fn baseline() {}\nfn starts_slow_embedding() {}\n",
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), request_started)
+            .await
+            .expect("real watcher did not start embedding within the debounce bound")
+            .expect("held embedding endpoint stopped before receiving a request");
+
+        let new_dir = canonical.join("new_module");
+        std::fs::create_dir(&new_dir).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let directory_refresh = attached_impact(&server, &canonical, "directory_probe").await;
+        assert!(
+            directory_refresh.contains("has no references"),
+            "unexpected probe result: {directory_refresh}"
+        );
+        let after_directory = ref_index
+            .project_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("directory query should rebuild the project cache");
+        assert!(
+            !Arc::ptr_eq(&initial, &after_directory),
+            "directory event was not consumed before writing inside the new directory"
+        );
+
+        let symbol = "unwatched_directory_symbol_91";
+        std::fs::write(
+            new_dir.join("late.rs"),
+            format!("fn {symbol}() {{}}\nfn caller() {{ {symbol}(); }}\n"),
+        )
+        .unwrap();
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let impact = attached_impact(&server, &canonical, symbol).await;
+                if impact.contains("new_module/late.rs") {
+                    break impact;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+
+        release_embedding
+            .send(())
+            .expect("embedding request finished before the test released it");
+        tokio::time::timeout(std::time::Duration::from_secs(1), embedding_server)
+            .await
+            .expect("held embedding endpoint did not shut down")
+            .expect("held embedding endpoint task panicked");
+
+        let impact = observed.expect(
+            "impact did not find the file in the new directory within the debounce bound while embedding remained in flight",
+        );
+        assert!(
+            impact.contains(symbol),
+            "unexpected impact output: {impact}"
         );
     }
 

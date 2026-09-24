@@ -7,6 +7,7 @@ use notify_debouncer_full::notify::{Config as NotifyConfig, RecommendedWatcher, 
 use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
@@ -94,7 +95,10 @@ const MAX_PENDING_FILES: usize = 5_000;
 /// walk performs arrives here as an `Access` event for the file or directory;
 /// those must never count as changes, or the tracker feeds on its own walks.
 fn is_change_event(kind: &EventKind) -> bool {
-    !matches!(kind, EventKind::Access(_))
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
 }
 
 /// Whether a directory event means a directory appeared (created or moved
@@ -207,6 +211,7 @@ fn install_dir_watches(
     ignore_dirs: &HashSet<String>,
     watched_dirs: &mut usize,
     collect_files: bool,
+    healthy: &AtomicBool,
 ) -> Vec<String> {
     let mut files = Vec::new();
     let mut builder = WalkBuilder::new(start_dir);
@@ -216,7 +221,14 @@ fn install_dir_watches(
         .git_global(false)
         .git_exclude(true)
         .follow_links(true);
-    for entry in builder.build().flatten() {
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                healthy.store(false, Ordering::Release);
+                continue;
+            }
+        };
         let path = entry.path();
         let relative = match path.strip_prefix(root_dir) {
             Ok(r) => r,
@@ -243,15 +255,19 @@ fn install_dir_watches(
                 MAX_WATCHED_DIRS,
                 path.display()
             );
+            healthy.store(false, Ordering::Release);
             return files;
         }
         match debouncer.watch(path, RecursiveMode::NonRecursive) {
             Ok(()) => *watched_dirs += 1,
-            Err(e) => debug!(
-                "Embedding tracker could not watch {}: {}",
-                path.display(),
-                e
-            ),
+            Err(e) => {
+                healthy.store(false, Ordering::Release);
+                debug!(
+                    "Embedding tracker could not watch {}: {}",
+                    path.display(),
+                    e
+                );
+            }
         }
     }
     files
@@ -261,9 +277,24 @@ fn install_dir_watches(
 /// Dropping this handle will stop the tracker.
 pub struct EmbeddingTrackerHandle {
     shutdown_tx: Option<mpsc::Sender<()>>,
+    watch_task: tokio::task::JoinHandle<()>,
+    pending_watches: Arc<AtomicUsize>,
+    // Set by notify before the embedding queue can block or drop a batch.
+    source_dirty: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
 }
 
 impl EmbeddingTrackerHandle {
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+            && self.pending_watches.load(Ordering::Acquire) == 0
+            && self.shutdown_tx.as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+
+    pub(crate) fn take_source_dirty(&self) -> bool {
+        self.source_dirty.swap(false, Ordering::AcqRel)
+    }
+
     /// Gracefully stops the embedding tracker.
     pub async fn stop(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
@@ -274,6 +305,7 @@ impl EmbeddingTrackerHandle {
 
 impl Drop for EmbeddingTrackerHandle {
     fn drop(&mut self) {
+        self.watch_task.abort();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.try_send(());
         }
@@ -298,6 +330,12 @@ pub fn start_tracker(
     config: EmbeddingTrackerConfig,
     refresh_callback: RefreshCallback,
 ) -> Result<EmbeddingTrackerHandle, notify_debouncer_full::notify::Error> {
+    let source_dirty = Arc::new(AtomicBool::new(true));
+    let pending_watches = Arc::new(AtomicUsize::new(0));
+    let handler_pending_watches = pending_watches.clone();
+    let healthy = Arc::new(AtomicBool::new(true));
+    let handler_dirty = source_dirty.clone();
+    let handler_healthy = healthy.clone();
     let debounce_ms = config.clamped_debounce_ms();
     let max_files = config.clamped_max_files();
     let ignore_dirs = config.ignore_dirs.clone();
@@ -316,7 +354,7 @@ pub fn start_tracker(
 
     // Directories that appear after startup (created, renamed in, or
     // symlinked in) need their own watches. The notify handler pushes them
-    // here; the consumer task, which owns the debouncer, installs the
+    // here; a dedicated task, which owns the debouncer, installs the
     // watches and heals over any files that landed before the watch existed.
     let (watch_tx, mut watch_rx) = mpsc::channel::<PathBuf>(64);
 
@@ -367,6 +405,10 @@ pub fn start_tracker(
                 if !is_change_event(&event.kind) {
                     continue;
                 }
+                if event.need_rescan() {
+                    handler_dirty.store(true, Ordering::Release);
+                    handler_healthy.store(false, Ordering::Release);
+                }
                 for path in &event.paths {
                     // Detect sentinel events first. A sentinel touch represents
                     // a git event (commit/merge/checkout), not a file edit —
@@ -381,14 +423,20 @@ pub fn start_tracker(
                         // sentinel and we'll catch up then. Losing a single
                         // signal here is preferable to blocking the notify
                         // thread on a full channel.
-                        let _ = handler_hook_tx.try_send(name.to_string());
+                        handler_dirty.store(true, Ordering::Release);
+                        if handler_hook_tx.try_send(name.to_string()).is_err() {
+                            handler_healthy.store(false, Ordering::Release);
+                        }
                         continue;
                     }
 
                     if let Some(dirs) = &handler_git_dirs
                         && dirs.is_ref_update(path)
                     {
-                        let _ = handler_hook_tx.try_send(HEAD_SIGNAL.to_string());
+                        handler_dirty.store(true, Ordering::Release);
+                        if handler_hook_tx.try_send(HEAD_SIGNAL.to_string()).is_err() {
+                            handler_healthy.store(false, Ordering::Release);
+                        }
                         continue;
                     }
 
@@ -406,7 +454,10 @@ pub fn start_tracker(
                         if !is_new_dir_event(&event.kind) {
                             continue;
                         }
+                        handler_pending_watches.fetch_add(1, Ordering::AcqRel);
+                        handler_dirty.store(true, Ordering::Release);
                         if let Err(e) = handler_watch_tx.try_send(path.clone()) {
+                            handler_healthy.store(false, Ordering::Release);
                             debug!(
                                 "Embedding tracker watch queue full, dropping {}: {}",
                                 path.display(),
@@ -426,12 +477,14 @@ pub fn start_tracker(
                         );
                         continue;
                     }
+                    handler_dirty.store(true, Ordering::Release);
                     new_files.push(normalized);
                 }
             }
             if !new_files.is_empty()
                 && let Err(e) = event_tx.try_send(new_files.clone())
             {
+                handler_healthy.store(false, Ordering::Release);
                 // The receiving task is gone or the channel is full.
                 // metadata_unchanged() already recorded these paths as
                 // "seen", so a silent drop would mean the next identical
@@ -451,6 +504,8 @@ pub fn start_tracker(
             }
         }
         Err(errors) => {
+            handler_dirty.store(true, Ordering::Release);
+            handler_healthy.store(false, Ordering::Release);
             for e in errors {
                 error!("Embedding tracker watcher error: {}", e);
             }
@@ -484,6 +539,7 @@ pub fn start_tracker(
         &walk_ignore_dirs,
         &mut watched_dirs,
         false,
+        &healthy,
     );
     info!("Embedding tracker watching {} directories", watched_dirs);
 
@@ -591,12 +647,40 @@ pub fn start_tracker(
     // Spawn async task to process batched events
     let root_for_task = root_dir.clone();
     let consumer_meta_cache = metadata_cache.clone();
-    let consumer_ignore_dirs = config.ignore_dirs.clone();
-    tokio::spawn(async move {
-        // The consumer owns the debouncer: keeps it alive and is the only
-        // place watches are added after startup.
+    let watch_ignore_dirs = config.ignore_dirs.clone();
+    let watch_root = root_dir.clone();
+    let watch_healthy = healthy.clone();
+    let watch_dirty = source_dirty.clone();
+    let watch_pending = pending_watches.clone();
+    let watch_task = tokio::spawn(async move {
         let mut debouncer = debouncer;
         let mut watched_dirs = watched_dirs;
+        while let Some(new_dir) = watch_rx.recv().await {
+            let fresh = install_dir_watches(
+                &mut debouncer,
+                &watch_root,
+                &new_dir,
+                &watch_ignore_dirs,
+                &mut watched_dirs,
+                true,
+                &watch_healthy,
+            );
+            // Files written into the directory before its watch
+            // existed never produced an event — re-inject them
+            // through the normal event path.
+            if !fresh.is_empty()
+                && let Err(e) = consumer_event_tx.try_send(fresh)
+            {
+                watch_healthy.store(false, Ordering::Release);
+                warn!("Embedding tracker watch heal send failed: {}", e);
+            }
+            // Publish invalidation before restoring coverage authority.
+            watch_dirty.store(true, Ordering::Release);
+            watch_pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    });
+    let consumer_healthy = healthy.clone();
+    tokio::spawn(async move {
         let mut pending_set: HashSet<String> = HashSet::new();
 
         loop {
@@ -605,24 +689,6 @@ pub fn start_tracker(
                 _ = shutdown_rx.recv() => {
                     debug!("Embedding tracker shutting down");
                     break;
-                }
-                Some(new_dir) = watch_rx.recv() => {
-                    let fresh = install_dir_watches(
-                        &mut debouncer,
-                        &root_for_task,
-                        &new_dir,
-                        &consumer_ignore_dirs,
-                        &mut watched_dirs,
-                        true,
-                    );
-                    // Files written into the directory before its watch
-                    // existed never produced an event — re-inject them
-                    // through the normal event path.
-                    if !fresh.is_empty()
-                        && let Err(e) = consumer_event_tx.try_send(fresh)
-                    {
-                        warn!("Embedding tracker watch heal send failed: {}", e);
-                    }
                 }
                 Some(files) = event_rx.recv() => {
                     let mut dropped: Vec<String> = Vec::new();
@@ -654,6 +720,7 @@ pub fn start_tracker(
                     }
 
                     if !dropped.is_empty() {
+                        consumer_healthy.store(false, Ordering::Release);
                         invalidate_metadata_entries(&dropped, &consumer_meta_cache);
                     }
 
@@ -699,6 +766,10 @@ pub fn start_tracker(
 
     Ok(EmbeddingTrackerHandle {
         shutdown_tx: Some(shutdown_tx),
+        watch_task,
+        pending_watches,
+        source_dirty,
+        healthy,
     })
 }
 
