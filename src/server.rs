@@ -3234,7 +3234,7 @@ impl ServerHandler for ContextPlusServer {
             env!("CARGO_PKG_VERSION"),
         ))
         .with_instructions(
-            "Code intelligence for this repository, six tools: explore (find code by \
+            "Code intelligence for this repository, five tools: explore (find code by \
              what it does; start here), outline (a file's signatures or a directory's \
              tree; call before reading a file), impact (who uses a symbol; call before \
              changing one; give it a diff to rank a whole change), check (the \
