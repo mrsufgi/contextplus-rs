@@ -30,6 +30,80 @@ const STOPWORDS: &[&str] = &[
     "be",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PathPriorClassification {
+    pub(crate) is_test_like: bool,
+    pub(crate) is_generated: bool,
+    pub(crate) is_planning_prose: bool,
+    pub(crate) is_lockfile: bool,
+}
+
+pub(crate) fn classify_path_prior(path: &str) -> PathPriorClassification {
+    // A leading slash also recognizes directory priors at the repository root.
+    let path = format!("/{}", path.replace('\\', "/").to_lowercase());
+    PathPriorClassification {
+        is_test_like: [
+            ".test.",
+            ".spec.",
+            "/test/",
+            "/tests/",
+            "__tests__/",
+            "/__fixtures__/",
+            "/fixtures/",
+            "/__mocks__/",
+            "/testdata/",
+            "/test-data/",
+            ".fixture.",
+        ]
+        .iter()
+        .any(|pattern| path.contains(pattern))
+            || path.ends_with(".snap"),
+        is_generated: ["/generated/", ".generated.", "_pb.", ".pb."]
+            .iter()
+            .any(|pattern| path.contains(pattern)),
+        is_planning_prose: [
+            "/agent-os/specs/",
+            "/docs/plans/",
+            "/docs/brainstorms/",
+            "/todos/",
+        ]
+        .iter()
+        .any(|pattern| path.contains(pattern)),
+        is_lockfile: path.ends_with(".lock") || path.ends_with("/package-lock.json"),
+    }
+}
+
+impl PathPriorClassification {
+    fn non_test_multiplier(self) -> f64 {
+        let mut prior = 1.0;
+        if self.is_generated {
+            prior *= GENERATED_PRIOR;
+        }
+        if self.is_planning_prose {
+            prior *= PROSE_PRIOR;
+        }
+        if self.is_lockfile {
+            prior *= LOCK_PRIOR;
+        }
+        prior
+    }
+
+    pub(crate) fn meaning_multiplier(self, wants_tests: bool) -> f64 {
+        let test_prior = if self.is_test_like && !wants_tests {
+            TEST_PRIOR
+        } else {
+            1.0
+        };
+        // Square-root strength keeps semantic priors milder than lexical priors,
+        // allowing strong test matches to surface while breaking near ties for source.
+        (self.non_test_multiplier() * test_prior).sqrt()
+    }
+}
+
+pub(crate) fn is_test_intent_token(token: &str) -> bool {
+    matches!(token, "test" | "spec" | "fixture")
+}
+
 /// In-process inverted index over a [`SearchDocument`] slice.
 pub struct LexicalIndex {
     posting: HashMap<String, Vec<(usize, [u32; 4])>>,
@@ -92,32 +166,9 @@ impl LexicalIndex {
             for (token, counts) in terms {
                 posting.entry(token).or_default().push((idx, counts));
             }
-            // A leading slash also recognizes directory priors at the repository root.
-            let path = format!("/{}", doc.path.replace('\\', "/").to_lowercase());
-            let is_test = [".test.", ".spec.", "/test/", "/tests/", "__tests__/"]
-                .iter()
-                .any(|pattern| path.contains(pattern));
-            let mut prior = 1.0;
-            if ["/generated/", ".generated.", "_pb.", ".pb."]
-                .iter()
-                .any(|pattern| path.contains(pattern))
-            {
-                prior *= GENERATED_PRIOR;
-            }
-            if [
-                "/agent-os/specs/",
-                "/docs/plans/",
-                "/docs/brainstorms/",
-                "/todos/",
-            ]
-            .iter()
-            .any(|pattern| path.contains(pattern))
-            {
-                prior *= PROSE_PRIOR;
-            }
-            if path.ends_with(".lock") || path.ends_with("/package-lock.json") {
-                prior *= LOCK_PRIOR;
-            }
+            let classification = classify_path_prior(&doc.path);
+            let is_test = classification.is_test_like;
+            let prior = classification.non_test_multiplier();
             documents.push(DocumentFields {
                 lengths,
                 prior,
@@ -158,9 +209,7 @@ impl LexicalIndex {
             .filter(|token| !STOPWORDS.contains(&token.as_str()))
             .collect();
         tokens.sort_unstable();
-        let wants_tests = tokens
-            .iter()
-            .any(|token| token == "test" || token == "spec");
+        let wants_tests = tokens.iter().any(|token| is_test_intent_token(token));
         let mut scores: HashMap<usize, (f64, usize)> = HashMap::new();
         for token in &tokens {
             if let Some(postings) = self.posting.get(token) {
@@ -447,6 +496,39 @@ mod tests {
             test_results[0].0, 1,
             "test prior should be skipped for a test query: {test_results:?}"
         );
+    }
+
+    #[test]
+    fn fixture_paths_are_test_paths_and_fixture_query_skips_prior() {
+        for fixture_path in [
+            "src/__fixtures__/event.json",
+            "src/fixtures/event.json",
+            "src/__mocks__/event.ts",
+            "src/testdata/event.json",
+            "src/test-data/event.json",
+            "src/event.fixture.json",
+            "src/event.snap",
+        ] {
+            let docs = vec![
+                make_doc(fixture_path, "", &[], "hydrate fixture payload"),
+                make_doc("src/event.rs", "", &[], "hydrate fixture payload"),
+            ];
+            let idx = LexicalIndex::build(&docs);
+
+            let ordinary_results = idx.search("hydrate payload", 2);
+            assert_eq!(
+                ordinary_results[0].0, 1,
+                "fixture path should be demoted for an ordinary query: path={fixture_path}, results={ordinary_results:?}"
+            );
+
+            for query in ["hydrate fixture payload", "hydrate test payload"] {
+                let intent_results = idx.search(query, 2);
+                assert_eq!(
+                    intent_results[0].0, 0,
+                    "fixture prior should be skipped for explicit test intent: path={fixture_path}, query={query}, results={intent_results:?}"
+                );
+            }
+        }
     }
 
     #[test]

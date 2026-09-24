@@ -1367,6 +1367,15 @@ impl SearchIndex {
             .collect();
 
         scored.extend(keyword_only);
+        let wants_tests = query_terms
+            .iter()
+            .any(|token| super::lexical_search::is_test_intent_token(token));
+        for (i, combined_score, ..) in &mut scored {
+            *combined_score *= super::lexical_search::classify_path_prior(&self.documents[*i].path)
+                .meaning_multiplier(wants_tests);
+        }
+
+        scored.retain(|(_, combined_score, ..)| *combined_score >= opts.min_combined_score);
 
         // Partial sort: O(N) partition to top_k, then sort only the small slice.
         let k = opts.top_k.min(scored.len());
@@ -2111,6 +2120,209 @@ mod tests {
         let results = index.search("auth", &query_vec, &opts);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].path, "src/auth.ts");
+    }
+
+    fn semantic_only_options(top_k: usize) -> ResolvedSearchOptions {
+        ResolvedSearchOptions {
+            top_k,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        }
+    }
+
+    fn unit_vector_with_x(x: f32) -> Vec<f32> {
+        vec![x, (1.0 - x * x).sqrt()]
+    }
+
+    #[test]
+    fn meaning_mode_fixture_prior_applies_only_without_test_intent() {
+        let docs = vec![
+            SearchDocument::new(
+                "packages/billing/__fixtures__/invoice-payment-succeeded.json".to_string(),
+                "invoice payment succeeded event".to_string(),
+                vec![],
+                vec![],
+                "reconciles invoice payment status from webhook".to_string(),
+            ),
+            SearchDocument::new(
+                "packages/billing/routes/stripe-webhook.ts".to_string(),
+                "Stripe webhook route".to_string(),
+                vec![],
+                vec![],
+                "reconciles invoice payment status from webhook".to_string(),
+            ),
+        ];
+        let vectors = vec![
+            Some(unit_vector_with_x(0.81)),
+            Some(unit_vector_with_x(0.80)),
+        ];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let opts = semantic_only_options(1);
+        let query_vec = [1.0, 0.0];
+
+        let ordinary = index.search("invoice payment status", &query_vec, &opts);
+        assert_eq!(
+            ordinary[0].path, "packages/billing/routes/stripe-webhook.ts",
+            "fixture with a slightly higher raw score should be demoted before top_k truncation: {ordinary:?}"
+        );
+
+        for query in ["invoice payment fixture", "invoice payment test"] {
+            let explicit_test_intent = index.search(query, &query_vec, &opts);
+            assert_eq!(
+                explicit_test_intent[0].path,
+                "packages/billing/__fixtures__/invoice-payment-succeeded.json",
+                "fixture should retain its higher raw score when the query requests tests or fixtures: query={query}, results={explicit_test_intent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn meaning_mode_enforces_combined_minimum_after_fixture_prior_for_embedded_candidate() {
+        let docs = vec![SearchDocument::new(
+            "packages/billing/__fixtures__/invoice-payment-succeeded.json".to_string(),
+            String::new(),
+            vec![],
+            vec![],
+            "invoice payment status fixture".to_string(),
+        )];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vec![Some(unit_vector_with_x(0.81))]);
+        let opts = ResolvedSearchOptions {
+            min_combined_score: 0.70,
+            ..semantic_only_options(5)
+        };
+        let query_vec = [1.0, 0.0];
+
+        let explicit_fixture_intent = index.search("invoice payment fixture", &query_vec, &opts);
+        assert_eq!(
+            explicit_fixture_intent.len(),
+            1,
+            "explicit fixture intent should preserve a candidate above the minimum: {explicit_fixture_intent:?}"
+        );
+
+        let ordinary = index.search("invoice payment status", &query_vec, &opts);
+        assert!(
+            ordinary.is_empty(),
+            "fixture demoted below the combined minimum should be excluded: {ordinary:?}"
+        );
+    }
+
+    #[test]
+    fn meaning_mode_enforces_combined_minimum_after_fixture_prior_for_no_vector_candidate() {
+        let docs = vec![SearchDocument::new(
+            "packages/billing/__fixtures__/invoice-payment-succeeded.json".to_string(),
+            String::new(),
+            vec![],
+            vec![],
+            "invoice payment status fixture".to_string(),
+        )];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vec![None]);
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 0.0,
+            keyword_weight: 1.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.70,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+
+        let explicit_fixture_intent = index.search("invoice payment status fixture", &[], &opts);
+        assert_eq!(
+            explicit_fixture_intent.len(),
+            1,
+            "explicit fixture intent should preserve a no-vector candidate above the minimum: {explicit_fixture_intent:?}"
+        );
+
+        let ordinary = index.search("invoice payment status", &[], &opts);
+        assert!(
+            ordinary.is_empty(),
+            "no-vector fixture demoted below the combined minimum should be excluded: {ordinary:?}"
+        );
+    }
+
+    #[test]
+    fn meaning_mode_demotes_generated_code_before_top_k() {
+        let docs = vec![
+            SearchDocument::new(
+                "src/generated/account_client.rs".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "hydrate account record".to_string(),
+            ),
+            SearchDocument::new(
+                "src/account_client.rs".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "hydrate account record".to_string(),
+            ),
+        ];
+        let vectors = vec![
+            Some(unit_vector_with_x(0.81)),
+            Some(unit_vector_with_x(0.80)),
+        ];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let results = index.search(
+            "hydrate account record",
+            &[1.0, 0.0],
+            &semantic_only_options(1),
+        );
+
+        assert_eq!(
+            results[0].path, "src/account_client.rs",
+            "generated code should be demoted before top_k truncation: {results:?}"
+        );
+    }
+
+    #[test]
+    fn meaning_mode_demotes_planning_prose_before_top_k() {
+        let docs = vec![
+            SearchDocument::new(
+                "docs/plans/account-hydration.md".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "hydrate account record".to_string(),
+            ),
+            SearchDocument::new(
+                "src/account_client.rs".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "hydrate account record".to_string(),
+            ),
+        ];
+        let vectors = vec![
+            Some(unit_vector_with_x(0.81)),
+            Some(unit_vector_with_x(0.80)),
+        ];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let results = index.search(
+            "hydrate account record",
+            &[1.0, 0.0],
+            &semantic_only_options(1),
+        );
+
+        assert_eq!(
+            results[0].path, "src/account_client.rs",
+            "planning prose should be demoted before top_k truncation: {results:?}"
+        );
     }
 
     #[test]
