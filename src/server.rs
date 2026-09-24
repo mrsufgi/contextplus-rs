@@ -5841,7 +5841,10 @@ mod tests {
         args.insert("rootDir".to_string(), json!(""));
         let root = server.resolve_root(&args);
         // Empty string can't be canonicalized to a path inside root
-        assert_eq!(root, server.state.root_dir);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            server.state.root_dir.canonicalize().unwrap()
+        );
     }
 
     #[test]

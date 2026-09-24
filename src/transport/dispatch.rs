@@ -874,6 +874,21 @@ mod tests {
         }
     }
 
+    fn assert_zero_result_scope(text: &str, expected_root: &Path) {
+        let (_, scope) = text
+            .split_once("no references in ")
+            .unwrap_or_else(|| panic!("zero result did not name its scan root: {text}"));
+        let (actual_root, _) = scope
+            .split_once(" (1 files scanned)")
+            .unwrap_or_else(|| panic!("zero result did not report one scanned file: {text}"));
+
+        assert_eq!(
+            std::fs::canonicalize(actual_root).unwrap(),
+            expected_root.canonicalize().unwrap(),
+            "zero result named the wrong scan root: {text}"
+        );
+    }
+
     /// Recursively scan a serde_json::Value for a needle string.
     fn json_has(v: &serde_json::Value, needle: &str) -> bool {
         crate::core::path_translation::json_contains_string(v, needle)
@@ -1296,19 +1311,12 @@ mod tests {
             )
             .await;
         let text = first_text(&result);
-        let expected_scope = format!(
-            "no references in {} (1 files scanned)",
-            worktree.canonicalize().unwrap().display()
-        );
         assert_eq!(
             result.is_error,
             Some(false),
             "targeted impact must return a scoped zero result: {text}"
         );
-        assert!(
-            text.contains(&expected_scope),
-            "zero result must describe the worktree actually scanned: {text}"
-        );
+        assert_zero_result_scope(text, &worktree);
     }
 
     #[tokio::test]
@@ -1331,15 +1339,8 @@ mod tests {
             .call_tool_routed("impact", impact_args("worktreeOnlySymbol", None))
             .await;
         let worktree_only_text = first_text(&worktree_only);
-        let expected_scope = format!(
-            "no references in {} (1 files scanned)",
-            primary.canonicalize().unwrap().display()
-        );
         assert_eq!(worktree_only.is_error, Some(false), "{worktree_only_text}");
-        assert!(
-            worktree_only_text.contains(&expected_scope),
-            "pathless impact must describe the primary tree it scanned: {worktree_only_text}"
-        );
+        assert_zero_result_scope(worktree_only_text, &primary);
     }
 
     #[tokio::test]
