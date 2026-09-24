@@ -26,7 +26,8 @@ use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
 pub use crate::server_definitions::{make_tool, tool_definitions};
 
 /// Cached project state: walked file entries and their raw file contents.
-/// Built lazily on first tool call, invalidated by file watcher or TTL expiry.
+/// Built lazily on first tool call. A running tracker invalidates it on file
+/// changes; the TTL is a fallback only when no tracker is running for the ref.
 /// Content is stored as `Arc<String>` so call-sites can clone the pointer
 /// (cheap) and use `content.lines()` when line iteration is needed, avoiding
 /// the `Vec<String>` split + `join("\n")` round-trip on every access.
@@ -38,14 +39,29 @@ pub struct ProjectCache {
     pub last_refresh: Instant,
 }
 
+/// Cached lexical index and the document paths used to format its results.
+pub(crate) struct CachedLexicalIndex {
+    pub index: crate::tools::lexical_search::LexicalIndex,
+    pub document_paths: Vec<String>,
+    pub project_cache: Arc<ProjectCache>,
+    pub generation: u64,
+}
+
 /// Cached identifier index: parsed symbols + their embedding vectors.
-/// Rebuilt when file count changes or TTL (300s) expires.
+/// Rebuilt when file count changes. The 300-second TTL is a fallback only when
+/// no tracker is running for the ref.
 pub struct IdentifierIndex {
     pub docs: Vec<crate::tools::semantic_identifiers::IdentifierDoc>,
     pub vector_buffer: Vec<f32>,
     pub dims: usize,
     pub file_count: usize,
     pub built_at: Instant,
+}
+
+struct IncrementalReembedOutcome {
+    updated: usize,
+    skipped: usize,
+    content_changed: bool,
 }
 
 const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
@@ -583,26 +599,48 @@ impl ContextPlusServer {
             let root = root.clone();
             let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
             tokio::spawn(async move {
-                let (updated, skipped) = srv.incremental_reembed(&changed_files).await;
+                tracing::debug!(
+                    ref_id = %srv.current_ref().cas_ref_id_hex,
+                    paths = ?files,
+                    "Embedding tracker refresh batch started"
+                );
+                let outcome = srv.incremental_reembed_detailed(&changed_files).await;
+                let updated = outcome.updated;
+                let skipped = outcome.skipped;
                 tracing::debug!(
                     updated,
                     skipped,
                     "Incremental re-embedding for {} changed files",
                     changed_files.len()
                 );
-                // Invalidate the search-index cache by bumping the generation counter.
-                // Any in-flight or subsequent `semantic_code_search` request will see a
-                // generation mismatch and re-walk + rebuild instead of reusing the stale
-                // cached index.
-                let new_gen = srv
-                    .current_ref()
-                    .cache_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::Release)
-                    + 1;
-                tracing::debug!(
-                    generation = new_gen,
-                    "cache_generation bumped after tracker event"
-                );
+                // Watchers can emit batches for metadata/read activity. Only
+                // invalidate when inspecting the source found a content change.
+                if outcome.content_changed {
+                    let new_gen = srv
+                        .current_ref()
+                        .cache_generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Release)
+                        + 1;
+                    tracing::debug!(
+                        generation = new_gen,
+                        updated,
+                        skipped,
+                        paths = ?files,
+                        reason = "tracker batch contained changed content",
+                        "cache_generation bumped after tracker event"
+                    );
+                } else {
+                    tracing::debug!(
+                        generation = srv
+                            .current_ref()
+                            .cache_generation
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        skipped,
+                        paths = ?files,
+                        reason = "all tracker paths were content-identical",
+                        "cache_generation unchanged after tracker event"
+                    );
+                }
                 (updated, skipped)
             })
         })
@@ -756,7 +794,9 @@ impl ContextPlusServer {
                 let guard = ref_index.project_cache.read().await;
                 if let Some(ref cache) = *guard {
                     let ttl = state.config.cache_ttl_secs;
-                    if cache.last_refresh.elapsed().as_secs() < ttl {
+                    if ContextPlusServer::tracker_is_running(&ref_index)
+                        || cache.last_refresh.elapsed().as_secs() < ttl
+                    {
                         tracing::debug!(
                             ref_id = ref_id.0,
                             "ref_warmup shallow: project_cache already populated, skipping"
@@ -802,16 +842,33 @@ impl ContextPlusServer {
             };
 
             // --- Populate project_cache ---
-            {
+            let cache_installed = {
                 let mut guard = ref_index.project_cache.write().await;
                 // First-writer-wins: only update if still unpopulated (or stale).
                 let needs_update = match &*guard {
                     None => true,
-                    Some(c) => c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs,
+                    Some(c) => {
+                        !ContextPlusServer::tracker_is_running(&ref_index)
+                            && c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs
+                    }
                 };
                 if needs_update {
                     *guard = Some(Arc::clone(&new_cache));
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        reason = "shallow ref warmup",
+                        "ProjectCache replaced"
+                    );
                 }
+                needs_update
+            };
+            if !cache_installed {
+                tracing::debug!(
+                    ref_id = ref_id.0,
+                    reason = "another authoritative cache won during shallow warmup",
+                    "ref_warmup shallow: discarding build"
+                );
+                return;
             }
 
             // --- Parse tree-sitter symbols into identifier_index.docs ---
@@ -900,6 +957,11 @@ impl ContextPlusServer {
                         file_count,
                         built_at: std::time::Instant::now(),
                     }));
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        reason = "shallow ref warmup",
+                        "IdentifierIndex replaced"
+                    );
                 }
             }
 
@@ -963,7 +1025,8 @@ impl ContextPlusServer {
             {
                 let guard = ref_index.project_cache.read().await;
                 if let Some(ref cache) = *guard
-                    && cache.last_refresh.elapsed().as_secs() < state.config.cache_ttl_secs
+                    && (ContextPlusServer::tracker_is_running(&ref_index)
+                        || cache.last_refresh.elapsed().as_secs() < state.config.cache_ttl_secs)
                 {
                     tracing::debug!(
                         ref_id = ref_id.0,
@@ -1009,15 +1072,32 @@ impl ContextPlusServer {
             };
 
             // --- Populate project_cache ---
-            {
+            let cache_installed = {
                 let mut guard = ref_index.project_cache.write().await;
                 let needs_update = match &*guard {
                     None => true,
-                    Some(c) => c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs,
+                    Some(c) => {
+                        !ContextPlusServer::tracker_is_running(&ref_index)
+                            && c.last_refresh.elapsed().as_secs() >= state.config.cache_ttl_secs
+                    }
                 };
                 if needs_update {
                     *guard = Some(Arc::clone(&new_cache));
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        reason = "full ref warmup",
+                        "ProjectCache replaced"
+                    );
                 }
+                needs_update
+            };
+            if !cache_installed {
+                tracing::debug!(
+                    ref_id = ref_id.0,
+                    reason = "another authoritative cache won during full warmup",
+                    "ref_warmup full: discarding build"
+                );
+                return;
             }
 
             // --- Phase 2: tree-sitter parse ---
@@ -1100,6 +1180,11 @@ impl ContextPlusServer {
                         file_count,
                         built_at: std::time::Instant::now(),
                     }));
+                    tracing::debug!(
+                        ref_id = ref_id.0,
+                        reason = "full ref warmup",
+                        "IdentifierIndex replaced"
+                    );
                 }
             }
 
@@ -1211,6 +1296,14 @@ impl ContextPlusServer {
         self.ensure_project_cache_for(&ref_index).await
     }
 
+    fn tracker_is_running(ref_index: &crate::ref_index::RefIndex) -> bool {
+        ref_index
+            .tracker_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
     /// Build-or-reuse the walked file cache for a **specific** ref, rather than
     /// the session's `current_ref()`. Used by tools that can be directed at an
     /// attached worktree (e.g. `get_blast_radius` with a `path` arg) so the scan
@@ -1221,14 +1314,37 @@ impl ContextPlusServer {
         ref_index: &Arc<crate::ref_index::RefIndex>,
     ) -> Result<Arc<ProjectCache>> {
         let ttl_secs = self.state.config.cache_ttl_secs;
+        let tracker_running = Self::tracker_is_running(ref_index);
 
-        // Fast path: cache exists and is fresh — just clone the Arc (cheap)
+        // Fast path: a running tracker makes this cache authoritative until a
+        // real file change invalidates it. Without a tracker, retain the TTL
+        // fallback so external edits are eventually observed.
         {
             let guard = ref_index.project_cache.read().await;
-            if let Some(ref cache) = *guard
-                && cache.last_refresh.elapsed().as_secs() < ttl_secs
-            {
-                return Ok(Arc::clone(cache));
+            if let Some(ref cache) = *guard {
+                let age_secs = cache.last_refresh.elapsed().as_secs();
+                if tracker_running || age_secs < ttl_secs {
+                    tracing::debug!(
+                        ref_id = %ref_index.cas_ref_id_hex,
+                        tracker_running,
+                        age_secs,
+                        ttl_secs,
+                        "ProjectCache hit"
+                    );
+                    return Ok(Arc::clone(cache));
+                }
+                tracing::debug!(
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    age_secs,
+                    ttl_secs,
+                    "Rebuilding ProjectCache: tracker absent and TTL expired"
+                );
+            } else {
+                tracing::debug!(
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    tracker_running,
+                    "Rebuilding ProjectCache: cache empty"
+                );
             }
         }
 
@@ -1266,6 +1382,11 @@ impl ContextPlusServer {
             let mut guard = ref_index.project_cache.write().await;
             *guard = Some(Arc::clone(&arc_cache));
         }
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            files = arc_cache.file_content.len(),
+            "ProjectCache replaced after rebuild"
+        );
 
         Ok(arc_cache)
     }
@@ -1276,12 +1397,31 @@ impl ContextPlusServer {
     /// `project_cache` and `identifier_index` so they rebuild with fresh data
     /// on the next tool call.
     pub async fn invalidate_project_cache(&self) {
+        self.invalidate_project_cache_with_reason("explicit invalidation")
+            .await;
+    }
+
+    async fn invalidate_project_cache_with_reason(&self, reason: &'static str) {
         let ref_index = self.current_ref();
         let mut guard = ref_index.project_cache.write().await;
+        let project_cache_was_populated = guard.is_some();
         *guard = None;
         drop(guard);
         let mut idx_guard = ref_index.identifier_index.write().await;
+        let identifier_index_was_populated = idx_guard.is_some();
         *idx_guard = None;
+        drop(idx_guard);
+        let mut lexical_guard = ref_index.lexical_search_cache.write().await;
+        let lexical_index_was_populated = lexical_guard.is_some();
+        *lexical_guard = None;
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            project_cache_was_populated,
+            identifier_index_was_populated,
+            lexical_index_was_populated,
+            reason,
+            "ProjectCache, IdentifierIndex, and LexicalIndex invalidated"
+        );
     }
 
     /// Incrementally re-embed specific changed files without invalidating the entire cache.
@@ -1294,13 +1434,23 @@ impl ContextPlusServer {
     ///
     /// Returns (updated_count, skipped_count).
     pub async fn incremental_reembed(&self, files: &[std::path::PathBuf]) -> (usize, usize) {
+        let outcome = self.incremental_reembed_detailed(files).await;
+        (outcome.updated, outcome.skipped)
+    }
+
+    async fn incremental_reembed_detailed(
+        &self,
+        files: &[std::path::PathBuf],
+    ) -> IncrementalReembedOutcome {
         use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
 
         let mut updated = 0usize;
         let mut skipped = 0usize;
+        let mut content_changed = false;
 
         let max_file_size = self.state.config.max_embed_file_size as u64;
         let ref_index = self.current_ref();
+        let project_cache = ref_index.project_cache.read().await.as_ref().cloned();
 
         // CAS setup for diff-only embedding via U6 content-addressed store.
         let mcp_data_dir = ref_index.root_dir.join(".mcp_data");
@@ -1324,12 +1474,9 @@ impl ContextPlusServer {
                 },
             };
 
-            if let Ok(meta) = tokio::fs::metadata(file_path).await
-                && meta.len() > max_file_size
-            {
-                skipped += 1;
-                continue;
-            }
+            let oversized = tokio::fs::metadata(file_path)
+                .await
+                .is_ok_and(|meta| meta.len() > max_file_size);
 
             let content = match tokio::fs::read_to_string(file_path).await {
                 Ok(c) => c,
@@ -1340,21 +1487,36 @@ impl ContextPlusServer {
                     cache.remove(&rel_path);
                     deletions.push(rel_path.clone());
                     updated += 1;
+                    content_changed = true;
                     continue;
                 }
             };
 
             let hash = crate::core::parser::hash_content(&content);
 
+            let project_content_matches = project_cache.as_ref().map(|cache| {
+                cache
+                    .file_content
+                    .get(&rel_path)
+                    .is_some_and(|cached| cached.as_str() == content)
+            });
+
             // Check if content actually changed (in-memory cache hit)
-            {
+            let embedding_cache_matches = {
                 let cache = ref_index.embedding_cache.read().await;
-                if let Some(entry) = cache.get(&rel_path)
-                    && entry.hash == hash
-                {
-                    skipped += 1;
-                    continue;
-                }
+                cache.get(&rel_path).is_some_and(|entry| entry.hash == hash)
+            };
+            if project_content_matches == Some(true)
+                || (project_content_matches.is_none() && embedding_cache_matches)
+            {
+                skipped += 1;
+                continue;
+            }
+
+            content_changed = true;
+            if oversized || embedding_cache_matches {
+                skipped += 1;
+                continue;
             }
 
             let text =
@@ -1415,7 +1577,17 @@ impl ContextPlusServer {
                 tracing::warn!("CAS manifest update failed (non-fatal): {e}");
             }
             if cas_hit_entries.is_empty() {
-                return (updated, skipped);
+                if content_changed {
+                    self.invalidate_project_cache_with_reason(
+                        "tracker processed changed content without embedding",
+                    )
+                    .await;
+                }
+                return IncrementalReembedOutcome {
+                    updated,
+                    skipped,
+                    content_changed,
+                };
             }
             // Fall through to persist the updated in-memory cache to disk.
         }
@@ -1525,15 +1697,47 @@ impl ContextPlusServer {
             }
         }
 
-        // Invalidate project cache + identifier index so they rebuild with fresh data
-        self.invalidate_project_cache().await;
+        if content_changed {
+            self.invalidate_project_cache_with_reason(
+                "incremental re-embed processed changed content",
+            )
+            .await;
+        }
 
-        (updated, skipped)
+        IncrementalReembedOutcome {
+            updated,
+            skipped,
+            content_changed,
+        }
     }
 
     /// Ensure the identifier index is built and cached.
     /// Returns cached index if TTL hasn't expired and file count is unchanged.
     /// Otherwise rebuilds: parses all symbols, embeds them, caches the result.
+    async fn install_identifier_index_if_current(
+        &self,
+        source_cache: &Arc<ProjectCache>,
+        build_generation: u64,
+        index: &Arc<IdentifierIndex>,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+
+        let ref_index = self.current_ref();
+        let project_guard = ref_index.project_cache.read().await;
+        let mut identifier_guard = ref_index.identifier_index.write().await;
+        let source_is_current = project_guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, source_cache));
+        let generation_is_current =
+            ref_index.cache_generation.load(Ordering::Acquire) == build_generation;
+        if !source_is_current || !generation_is_current {
+            return false;
+        }
+
+        *identifier_guard = Some(Arc::clone(index));
+        true
+    }
+
     async fn ensure_identifier_index(
         &self,
         cache: &Arc<ProjectCache>,
@@ -1544,8 +1748,10 @@ impl ContextPlusServer {
             .filter(|e| !e.is_directory)
             .count();
         let ref_index = self.current_ref();
+        let tracker_running = Self::tracker_is_running(&ref_index);
 
-        // Fast path: index exists, TTL valid, file count unchanged — clone Arc (cheap).
+        // Fast path: index exists, file count is unchanged, and either the
+        // tracker is authoritative or the tracker-off TTL remains valid.
         // A warmup-built index carries docs but no vectors (dims == 0); serving
         // it would score every identifier at zero similarity, so it does not
         // count as built.
@@ -1553,11 +1759,31 @@ impl ContextPlusServer {
             let guard = ref_index.identifier_index.read().await;
             if let Some(ref idx) = *guard
                 && idx.file_count == file_count
-                && idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS
+                && (tracker_running || idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS)
                 && (idx.dims > 0 || idx.docs.is_empty())
             {
+                tracing::debug!(
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    tracker_running,
+                    age_secs = idx.built_at.elapsed().as_secs(),
+                    "IdentifierIndex hit"
+                );
                 return Ok(Arc::clone(idx));
             }
+
+            let reason = match guard.as_ref() {
+                None => "cache empty",
+                Some(idx) if idx.file_count != file_count => "project file count changed",
+                Some(idx) if idx.dims == 0 && !idx.docs.is_empty() => "warmup index has no vectors",
+                Some(_) => "tracker absent and TTL expired",
+            };
+            tracing::debug!(
+                ref_id = %ref_index.cas_ref_id_hex,
+                tracker_running,
+                file_count,
+                reason,
+                "Rebuilding IdentifierIndex"
+            );
         }
 
         // Slow path: rebuild identifier index
@@ -1565,6 +1791,9 @@ impl ContextPlusServer {
             file_count,
             "Building identifier index (parsing + embedding)"
         );
+        let build_generation = ref_index
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let cache_clone = cache.clone();
 
         // Step 1: Parse symbols (CPU-bound)
@@ -1637,8 +1866,24 @@ impl ContextPlusServer {
                 file_count,
                 built_at: Instant::now(),
             });
-            let mut guard = ref_index.identifier_index.write().await;
-            *guard = Some(Arc::clone(&idx));
+            if !self
+                .install_identifier_index_if_current(cache, build_generation, &idx)
+                .await
+            {
+                tracing::debug!(
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    build_generation,
+                    reason = "project cache or generation changed during build",
+                    "IdentifierIndex build discarded"
+                );
+                let fresh_cache = self.ensure_project_cache().await?;
+                return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
+            }
+            tracing::debug!(
+                ref_id = %ref_index.cas_ref_id_hex,
+                reason = "parsed corpus contains no identifiers",
+                "IdentifierIndex replaced after rebuild"
+            );
             return Ok(idx);
         }
 
@@ -1764,13 +2009,117 @@ impl ContextPlusServer {
             built_at: Instant::now(),
         });
 
-        // Store Arc in per-ref state (cheap pointer clone, no data copy)
+        if !self
+            .install_identifier_index_if_current(cache, build_generation, &idx)
+            .await
         {
-            let mut guard = ref_index.identifier_index.write().await;
-            *guard = Some(Arc::clone(&idx));
+            tracing::debug!(
+                ref_id = %ref_index.cas_ref_id_hex,
+                build_generation,
+                reason = "project cache or generation changed during build",
+                "IdentifierIndex build discarded"
+            );
+            let fresh_cache = self.ensure_project_cache().await?;
+            return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
         }
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            identifiers = idx.docs.len(),
+            dims = idx.dims,
+            "IdentifierIndex replaced after rebuild"
+        );
 
         Ok(idx)
+    }
+
+    /// Build or reuse the lexical index for the current ref.
+    ///
+    /// Project-cache identity catches TTL/manual replacements while generation
+    /// catches tracker invalidations before another caller has rebuilt the
+    /// project cache. The write lock makes concurrent cold callers single-flight.
+    async fn ensure_lexical_index(
+        &self,
+        project_cache: &Arc<ProjectCache>,
+    ) -> Result<Arc<CachedLexicalIndex>> {
+        use crate::tools::lexical_search::LexicalIndex;
+        use crate::tools::semantic_search::SearchDocument;
+        use std::sync::atomic::Ordering;
+
+        let ref_index = self.current_ref();
+        let generation = ref_index.cache_generation.load(Ordering::Acquire);
+
+        {
+            let guard = ref_index.lexical_search_cache.read().await;
+            if let Some(cached) = guard.as_ref()
+                && cached.generation == generation
+                && Arc::ptr_eq(&cached.project_cache, project_cache)
+            {
+                tracing::debug!(generation, "LexicalIndex cache hit");
+                return Ok(Arc::clone(cached));
+            }
+        }
+
+        let mut guard = ref_index.lexical_search_cache.write().await;
+        if let Some(cached) = guard.as_ref()
+            && cached.generation == generation
+            && Arc::ptr_eq(&cached.project_cache, project_cache)
+        {
+            tracing::debug!(generation, "LexicalIndex cache hit after write lock");
+            return Ok(Arc::clone(cached));
+        }
+
+        let reason = match guard.as_ref() {
+            None => "empty",
+            Some(cached) if cached.generation != generation => "generation changed",
+            Some(_) => "project cache replaced",
+        };
+        tracing::debug!(generation, reason, "Rebuilding LexicalIndex");
+
+        let cache_for_build = Arc::clone(project_cache);
+        let (index, document_paths) = tokio::task::spawn_blocking(move || {
+            let docs: Vec<SearchDocument> = cache_for_build
+                .file_entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .map(|e| {
+                    let content: String = cache_for_build
+                        .file_content
+                        .get(&e.relative_path)
+                        .map(|arc| arc.as_str().to_owned())
+                        .unwrap_or_default();
+                    let ext = e.relative_path.rsplit('.').next().unwrap_or("");
+                    let symbols: Vec<String> = parse_with_tree_sitter(&content, ext)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect();
+                    let header = crate::core::parser::extract_header(&content);
+                    SearchDocument::new(e.relative_path.clone(), header, symbols, vec![], content)
+                })
+                .collect();
+            let index = LexicalIndex::build(&docs);
+            let document_paths = docs.into_iter().map(|doc| doc.path).collect();
+            (index, document_paths)
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!("lexical index spawn_blocking failed: {e}"))
+        })?;
+
+        let cached = Arc::new(CachedLexicalIndex {
+            index,
+            document_paths,
+            project_cache: Arc::clone(project_cache),
+            generation,
+        });
+        *guard = Some(Arc::clone(&cached));
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            generation,
+            documents = cached.document_paths.len(),
+            "LexicalIndex replaced after rebuild"
+        );
+        Ok(cached)
     }
 
     // --- Tool dispatch ---
@@ -2825,9 +3174,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        use crate::tools::lexical_search::LexicalIndex;
-        use crate::tools::semantic_search::SearchDocument;
-
+        self.ensure_tracker_started();
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         // top_k=0 would silently return zero hits (LexicalIndex::search short-
@@ -2838,35 +3185,14 @@ impl ContextPlusServer {
             .unwrap_or(10);
 
         let cache = self.ensure_project_cache().await?;
+        let cached = self.ensure_lexical_index(&cache).await?;
 
         let formatted = tokio::task::spawn_blocking(move || {
-            let docs: Vec<SearchDocument> = cache
-                .file_entries
-                .iter()
-                .filter(|e| !e.is_directory)
-                .map(|e| {
-                    let content: String = cache
-                        .file_content
-                        .get(&e.relative_path)
-                        .map(|arc| arc.as_str().to_owned())
-                        .unwrap_or_default();
-                    let ext = e.relative_path.rsplit('.').next().unwrap_or("");
-                    let symbols: Vec<String> = parse_with_tree_sitter(&content, ext)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|s| s.name)
-                        .collect();
-                    let header = crate::core::parser::extract_header(&content);
-                    SearchDocument::new(e.relative_path.clone(), header, symbols, vec![], content)
-                })
-                .collect();
-
-            if docs.is_empty() {
+            if cached.document_paths.is_empty() {
                 return "No files indexed. Ensure the project cache is populated.".to_string();
             }
 
-            let index = LexicalIndex::build(&docs);
-            let hits = index.search(&query, top_k);
+            let hits = cached.index.search(&query, top_k);
 
             if hits.is_empty() {
                 return format!("No lexical matches found for: {query}");
@@ -2878,13 +3204,8 @@ impl ContextPlusServer {
             )];
             lines.push(String::new());
             for (rank, (doc_idx, score)) in hits.iter().enumerate() {
-                if *doc_idx < docs.len() {
-                    lines.push(format!(
-                        "{}. {} (score: {:.3})",
-                        rank + 1,
-                        docs[*doc_idx].path,
-                        score
-                    ));
+                if let Some(path) = cached.document_paths.get(*doc_idx) {
+                    lines.push(format!("{}. {} (score: {:.3})", rank + 1, path, score));
                 }
             }
             lines.join("\n")
@@ -4155,6 +4476,7 @@ mod tests {
     fn server_with_root_and_ttl(root: PathBuf, cache_ttl_secs: u64) -> ContextPlusServer {
         let mut config = Config::from_env();
         config.cache_ttl_secs = cache_ttl_secs;
+        config.embed_tracker_mode = TrackerMode::Off;
         ContextPlusServer::new(root, config)
     }
 
@@ -4270,6 +4592,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_project_cache_ignores_ttl_while_tracker_is_running() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(tmp.path().join("hello.txt"), "hello\n").unwrap();
+        let mut config = Config::from_env();
+        config.cache_ttl_secs = 0;
+        config.embed_tracker_mode = TrackerMode::Lazy;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        server.ensure_tracker_started();
+        assert!(
+            server
+                .current_ref()
+                .tracker_handle
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+
+        let first = server.ensure_project_cache().await.unwrap();
+        let second = server.ensure_project_cache().await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a running tracker should keep the project cache authoritative past its TTL"
+        );
+    }
+
+    #[tokio::test]
     async fn invalidate_project_cache_sets_cache_to_none() {
         let (_tmp, server) = setup_cache_test(300);
 
@@ -4321,6 +4671,364 @@ mod tests {
             cache2.file_content.contains_key("world.rs"),
             "rebuilt cache should contain world.rs"
         );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_reuses_cache_until_generation_or_project_cache_changes() {
+        let (_tmp, server) = setup_cache_test(300);
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), json!("hello"));
+
+        server.handle_lexical_search(args.clone()).await.unwrap();
+        let ref_index = server.current_ref();
+        let first = ref_index
+            .lexical_search_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("first lexical search should populate the per-ref cache");
+
+        server.handle_lexical_search(args.clone()).await.unwrap();
+        let second = ref_index
+            .lexical_search_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        ref_index
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        server.handle_lexical_search(args.clone()).await.unwrap();
+        let after_generation = ref_index
+            .lexical_search_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&second, &after_generation));
+        server.handle_lexical_search(args.clone()).await.unwrap();
+        let after_generation_reuse = ref_index
+            .lexical_search_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&after_generation, &after_generation_reuse));
+
+        server.invalidate_project_cache().await;
+        server.handle_lexical_search(args.clone()).await.unwrap();
+        let after_project_cache = ref_index
+            .lexical_search_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&after_generation_reuse, &after_project_cache));
+        server.handle_lexical_search(args).await.unwrap();
+        let after_project_cache_reuse = ref_index
+            .lexical_search_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &after_project_cache,
+            &after_project_cache_reuse
+        ));
+    }
+
+    fn expired_empty_identifier_index(file_count: usize) -> Arc<IdentifierIndex> {
+        Arc::new(IdentifierIndex {
+            docs: Vec::new(),
+            vector_buffer: Vec::new(),
+            dims: 0,
+            file_count,
+            built_at: Instant::now()
+                - std::time::Duration::from_secs(IDENTIFIER_INDEX_TTL_SECS + 1),
+        })
+    }
+
+    #[tokio::test]
+    async fn ensure_identifier_index_ignores_ttl_while_tracker_is_running() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(tmp.path().join("notes.txt"), "hello\n").unwrap();
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Lazy;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        server.ensure_tracker_started();
+        let cache = server.ensure_project_cache().await.unwrap();
+        let file_count = cache
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .count();
+        let expired = expired_empty_identifier_index(file_count);
+        *server.current_ref().identifier_index.write().await = Some(Arc::clone(&expired));
+
+        let actual = server.ensure_identifier_index(&cache).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&expired, &actual),
+            "a running tracker should keep the identifier index authoritative past its TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_identifier_index_uses_ttl_when_tracker_is_off() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(tmp.path().join("notes.txt"), "hello\n").unwrap();
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        let cache = server.ensure_project_cache().await.unwrap();
+        let file_count = cache
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .count();
+        let expired = expired_empty_identifier_index(file_count);
+        *server.current_ref().identifier_index.write().await = Some(Arc::clone(&expired));
+
+        let actual = server.ensure_identifier_index(&cache).await.unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&expired, &actual),
+            "tracker-off mode should retain TTL fallback invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracker_callback_does_not_bump_generation_for_unchanged_content() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let content = "fn unchanged() {}\n";
+        std::fs::write(tmp.path().join("unchanged.rs"), content).unwrap();
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        server.current_ref().embedding_cache.write().await.insert(
+            "unchanged.rs".to_string(),
+            CacheEntry {
+                hash: crate::core::parser::hash_content(content),
+                vector: vec![1.0, 0.0],
+            },
+        );
+        let generation = Arc::clone(&server.current_ref().cache_generation);
+        let callback = server.build_tracker_callback();
+
+        let result = callback(tmp.path().to_path_buf(), vec!["unchanged.rs".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result, (0, 1));
+        assert_eq!(
+            generation.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "unchanged tracker events must not invalidate search caches"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_oversized_tracker_event_invalidates_source_caches() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let path = tmp.path().join("large.rs");
+        std::fs::write(&path, "fn before() { let value = 12345; }\n").unwrap();
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        config.max_embed_file_size = 8;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        server.ensure_project_cache().await.unwrap();
+
+        std::fs::write(&path, "fn after() { let value = 67890; }\n").unwrap();
+        let generation = Arc::clone(&server.current_ref().cache_generation);
+        let result =
+            server.build_tracker_callback()(tmp.path().to_path_buf(), vec!["large.rs".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(result, (0, 1));
+        assert_eq!(
+            generation.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a changed oversized source file must invalidate search caches"
+        );
+        assert!(
+            server.current_ref().project_cache.read().await.is_none(),
+            "a changed oversized source file must invalidate the project cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_semantic_cache_hash_matches_unchanged_tracker_content() {
+        use crate::tools::semantic_search::WalkAndIndexFn;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|req: &Request| {
+                let body: serde_json::Value = req.body_json().unwrap_or_default();
+                let n = body["input"].as_array().map_or(1, |a| a.len());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![0.6, 0.8]; n]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let content = "fn unchanged() { println!(\"still here\"); }\n";
+        std::fs::write(tmp.path().join("unchanged.rs"), content).unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        let walker = CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        };
+        walker.walk_and_index(tmp.path()).await.unwrap();
+        let requests_before = ollama.received_requests().await.unwrap_or_default().len();
+
+        let generation = Arc::clone(&server.current_ref().cache_generation);
+        let result = server.build_tracker_callback()(
+            tmp.path().to_path_buf(),
+            vec!["unchanged.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, (0, 1));
+        assert_eq!(
+            generation.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "semantic-produced cache entries must recognize unchanged source"
+        );
+        assert_eq!(
+            ollama.received_requests().await.unwrap_or_default().len(),
+            requests_before,
+            "an unchanged tracker event must not embed again"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_identifier_build_cannot_restore_invalidated_snapshot() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|req: &Request| {
+                let body: serde_json::Value = req.body_json().unwrap_or_default();
+                let n = body["input"].as_array().map_or(1, |a| a.len());
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .set_body_json(serde_json::json!({
+                        "embeddings": vec![vec![0.6, 0.8]; n]
+                    }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let path = tmp.path().join("changing.rs");
+        std::fs::write(&path, "fn before_change() {}\n").unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        let old_cache = server.ensure_project_cache().await.unwrap();
+
+        let builder = {
+            let server = server.clone();
+            let old_cache = Arc::clone(&old_cache);
+            tokio::spawn(async move { server.ensure_identifier_index(&old_cache).await.unwrap() })
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while ollama
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "identifier build never reached embedding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        std::fs::write(&path, "fn after_change() {}\n").unwrap();
+        server
+            .current_ref()
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        server
+            .invalidate_project_cache_with_reason("test invalidation during identifier build")
+            .await;
+
+        let index = builder.await.unwrap();
+        assert!(
+            index.docs.iter().any(|doc| doc.name == "after_change"),
+            "the request must retry against the fresh project cache"
+        );
+        assert!(
+            index.docs.iter().all(|doc| doc.name != "before_change"),
+            "the stale identifier snapshot must not be restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_warmup_keeps_expired_cache_with_live_tracker() {
+        for mode in [RefWarmupMode::Shallow, RefWarmupMode::Full] {
+            let tmp = tempfile::tempdir().expect("failed to create temp dir");
+            std::fs::write(tmp.path().join("warm.rs"), "fn warm() {}\n").unwrap();
+            let mut config = Config::from_env();
+            config.embed_tracker_mode = TrackerMode::Lazy;
+            config.ref_warmup_mode = mode;
+            config.cache_ttl_secs = 1;
+            let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+            let current = server.ensure_project_cache().await.unwrap();
+            let expired = Arc::new(ProjectCache {
+                file_entries: current.file_entries.clone(),
+                file_content: current.file_content.clone(),
+                last_refresh: Instant::now() - std::time::Duration::from_secs(2),
+            });
+            *server.current_ref().project_cache.write().await = Some(Arc::clone(&expired));
+            server.ensure_tracker_started();
+
+            server.spawn_ref_warmup(server.state.default_ref_id);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let actual = server
+                .current_ref()
+                .project_cache
+                .read()
+                .await
+                .as_ref()
+                .cloned()
+                .expect("warm cache should remain present");
+            assert!(
+                Arc::ptr_eq(&expired, &actual),
+                "{mode:?} warmup must not replace a tracker-owned cache after TTL"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

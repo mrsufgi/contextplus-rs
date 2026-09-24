@@ -17,8 +17,8 @@
 //!   canonical worktree path so the same physical worktree always hashes
 //!   to the same id, regardless of which session initiated registration.
 //! * [`RefIndex`] — per-ref identity metadata (root, parent, head) **plus
-//!   per-ref heavy state** (embedding cache, identifier index, search index
-//!   cache, embedding tracker, project cache).  Heavy state was migrated into
+//!   per-ref heavy state** (embedding cache, identifier index, semantic and
+//!   lexical search caches, embedding tracker, project cache). Heavy state was migrated into
 //!   `RefIndex` in U10; `SharedState` now holds `Arc` clones of the default
 //!   ref's fields for backward compatibility during the U11 migration period.
 //! * [`RefRegistry`] — the daemon's `HashMap<RefId, Arc<RefIndex>>`,
@@ -41,6 +41,7 @@
 //! - `tracker_handle` — per-ref notify-rs embedding tracker.
 //! - `cache_generation` — monotonic counter bumped by the tracker on file events.
 //! - `project_cache` — walked file entries and raw content for this ref.
+//! - `lexical_search_cache` — parsed lexical index and result paths for this ref.
 //!
 //! For the **default ref**, these fields are initialized from disk (embedding
 //! cache) or empty (everything else) at daemon start, matching the prior
@@ -60,7 +61,7 @@ use tokio::sync::RwLock;
 
 use crate::core::embedding_tracker::EmbeddingTrackerHandle;
 use crate::core::embeddings::CacheEntry;
-use crate::server::{IdentifierIndex, ProjectCache};
+use crate::server::{CachedLexicalIndex, IdentifierIndex, ProjectCache};
 use crate::tools::semantic_search::CachedSearchIndex;
 
 /// Stable identifier for a ref (worktree + HEAD).
@@ -187,6 +188,9 @@ pub struct RefIndex {
     /// Cached project state (walked file entries + raw content).
     /// `Arc`-wrapped for the backward-compat shim.
     pub project_cache: Arc<RwLock<Option<Arc<ProjectCache>>>>,
+
+    /// Cached lexical index and result-formatting metadata for this ref.
+    pub(crate) lexical_search_cache: Arc<RwLock<Option<Arc<CachedLexicalIndex>>>>,
 }
 
 impl RefIndex {
@@ -211,6 +215,7 @@ impl RefIndex {
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
+            lexical_search_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -239,6 +244,7 @@ impl RefIndex {
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
+            lexical_search_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -269,6 +275,7 @@ impl RefIndex {
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
+            lexical_search_cache: Arc::new(RwLock::new(None)),
         }
     }
 

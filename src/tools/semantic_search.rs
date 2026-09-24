@@ -88,6 +88,19 @@ pub fn is_text_index_candidate(file_path: &str) -> bool {
     TEXT_INDEX_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
+/// Return the exact text sent to the semantic embedder for one source file.
+pub fn semantic_embedding_content(file_path: &str, content: &str) -> String {
+    if is_text_index_candidate(file_path) {
+        content.chars().take(MAX_TEXT_DOC_CHARS).collect()
+    } else {
+        format!(
+            "{} {}",
+            crate::core::parser::detect_language(file_path).unwrap_or("unknown"),
+            content.chars().take(500).collect::<String>()
+        )
+    }
+}
+
 /// Extract a plain-text header from content: up to 2 non-empty lines, each capped at 120 chars.
 pub fn extract_plain_text_header(content: &str) -> String {
     let mut header_lines: Vec<&str> = Vec::new();
@@ -1408,6 +1421,11 @@ pub async fn semantic_code_search(
                 .as_ref()
                 .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(0);
+            tracing::debug!(
+                generation = current_gen,
+                reason = "no cache slot",
+                "Rebuilding SearchIndex"
+            );
             let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
             let fp = IndexFingerprint::from_docs(&docs);
             let mut idx = SearchIndex::new();
@@ -1446,6 +1464,20 @@ pub async fn semantic_code_search(
                         Some(cached.index.document_count()),
                     ));
                 }
+                match guard.as_ref() {
+                    Some(cached) => tracing::debug!(
+                        cached_generation =
+                            cached.generation.load(std::sync::atomic::Ordering::Acquire),
+                        current_generation = current_gen,
+                        reason = "tracker generation mismatch",
+                        "SearchIndex fast-path miss"
+                    ),
+                    None => tracing::debug!(
+                        current_generation = current_gen,
+                        reason = "cache empty",
+                        "SearchIndex fast-path miss"
+                    ),
+                }
                 // Generation mismatch (or no cache yet) — fall through to walk + fingerprint.
             }
 
@@ -1482,6 +1514,13 @@ pub async fn semantic_code_search(
                     ));
                 }
             }
+
+            tracing::debug!(
+                current_generation = current_gen,
+                new_n_docs = fp.n_docs,
+                reason = "content fingerprint changed or cache empty",
+                "SearchIndex fingerprint miss"
+            );
 
             // Slow path: acquire write-lock, double-check, then rebuild.
             let mut guard = lock.write().await;
@@ -1618,6 +1657,8 @@ pub async fn semantic_code_search(
             // flight — synchronous rebuild (same as before).
             tracing::info!(
                 n_docs = fp.n_docs,
+                generation = current_gen,
+                reason = "cache miss after double-check",
                 "SearchIndex cache miss — rebuilding index"
             );
             let mut idx = SearchIndex::new();
@@ -1628,6 +1669,11 @@ pub async fn semantic_code_search(
             );
             let arc = Arc::new(CachedSearchIndex::new(idx, fp, current_gen));
             *guard = Some(Arc::clone(&arc));
+            tracing::debug!(
+                generation = current_gen,
+                documents = arc.index.document_count(),
+                "SearchIndex replaced after rebuild"
+            );
             arc
         }
     };

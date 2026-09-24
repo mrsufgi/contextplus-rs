@@ -81,8 +81,8 @@ async fn main() -> anyhow::Result<()> {
     // instead of stderr. The bridge that spawns the daemon redirects stderr to
     // /dev/null, which has historically made "Transport closed" panics
     // unobservable. Pointing this at a file recovers full backtraces.
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("contextplus_rs=info".parse()?);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("contextplus_rs=info"));
     match std::env::var("CONTEXTPLUS_DAEMON_LOG").ok() {
         Some(path) if !path.trim().is_empty() => {
             let file = std::fs::OpenOptions::new()
