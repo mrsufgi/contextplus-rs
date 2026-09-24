@@ -2462,10 +2462,13 @@ impl ContextPlusServer {
         };
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());
-        let walker = CachedWalkerIndexer {
-            config: self.state.config.clone(),
-            ollama: self.state.ollama.clone(),
-            state: self.state.clone(),
+        let walker = crate::server_adapters::RefWalkerIndexer {
+            ref_index: self.current_ref(),
+            walker: CachedWalkerIndexer {
+                config: self.state.config.clone(),
+                ollama: self.state.ollama.clone(),
+                state: self.state.clone(),
+            },
         };
 
         // Pass the generation counter when the tracker is active so
@@ -4045,6 +4048,7 @@ pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::semantic_search::WalkAndIndexFn;
     use rmcp::model::RawContent;
     use serde_json::json;
 
@@ -5407,7 +5411,6 @@ mod tests {
 
     #[tokio::test]
     async fn review_regression_semantic_cache_hash_matches_unchanged_tracker_content() {
-        use crate::tools::semantic_search::WalkAndIndexFn;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -8660,5 +8663,1489 @@ mod tests {
                 "search_index_cache must be populated from baseline import"
             );
         }
+    }
+
+    fn semantic_fill_config(ollama_uri: &str, budget_ms: u64, fill_timeout_ms: u64) -> Config {
+        let mut config = Config::from_env();
+        config.ollama_host = ollama_uri.to_string();
+        config.ollama_embed_model = "semantic-fill-test".to_string();
+        config.embed_query_prefix.clear();
+        config.embed_doc_prefix.clear();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        config.embed_batch_size = 32;
+        config.ollama_max_concurrent = 1;
+        config.embed_budget_ms = budget_ms;
+        config.embed_fill_batch_timeout_ms = fill_timeout_ms;
+        config
+    }
+
+    fn semantic_args(query: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!(query));
+        args.insert("top_k".into(), json!(5));
+        args.insert("semantic_weight".into(), json!(1.0));
+        args.insert("keyword_weight".into(), json!(0.0));
+        args.insert("require_semantic_match".into(), json!(true));
+        args
+    }
+
+    fn embed_request_inputs(request: &wiremock::Request) -> Vec<String> {
+        request
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|body| body["input"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|input| input.as_str().map(str::to_string))
+            .collect()
+    }
+
+    async fn matching_embed_request_batches(
+        ollama: &wiremock::MockServer,
+        marker: &str,
+    ) -> Vec<usize> {
+        ollama
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(embed_request_inputs)
+            .filter(|inputs| inputs.iter().any(|input| input.contains(marker)))
+            .map(|inputs| inputs.len())
+            .collect()
+    }
+
+    struct GatedOllama {
+        uri: String,
+        fill_started: Arc<tokio::sync::Semaphore>,
+        release_fill: Arc<tokio::sync::Semaphore>,
+        slow_query_started: Arc<tokio::sync::Semaphore>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl GatedOllama {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let fill_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fill_started = Arc::new(tokio::sync::Semaphore::new(0));
+            let release_fill = Arc::new(tokio::sync::Semaphore::new(0));
+            let slow_query_started = Arc::new(tokio::sync::Semaphore::new(0));
+            let task_fill_calls = Arc::clone(&fill_calls);
+            let task_fill_started = Arc::clone(&fill_started);
+            let task_release_fill = Arc::clone(&release_fill);
+            let task_slow_started = Arc::clone(&slow_query_started);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let fill_calls = Arc::clone(&task_fill_calls);
+                    let fill_started = Arc::clone(&task_fill_started);
+                    let release_fill = Arc::clone(&task_release_fill);
+                    let slow_started = Arc::clone(&task_slow_started);
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let content_length = loop {
+                            let mut chunk = [0_u8; 4096];
+                            let Ok(read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if read == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            let Some(headers_end) =
+                                request.windows(4).position(|window| window == b"\r\n\r\n")
+                            else {
+                                continue;
+                            };
+                            let headers = String::from_utf8_lossy(&request[..headers_end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= headers_end + 4 + length {
+                                break length;
+                            }
+                        };
+                        let headers_end = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .unwrap();
+                        while request.len() < headers_end + 4 + content_length {
+                            let mut chunk = [0_u8; 4096];
+                            let Ok(read) = stream.read(&mut chunk).await else {
+                                return;
+                            };
+                            if read == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                        }
+                        let body: serde_json::Value = serde_json::from_slice(
+                            &request[headers_end + 4..headers_end + 4 + content_length],
+                        )
+                        .unwrap();
+                        let inputs: Vec<_> = body["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|input| input.as_str())
+                            .collect();
+                        if inputs.iter().any(|input| input.contains("FILL_COMPLETES")) {
+                            if fill_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                                std::future::pending::<()>().await;
+                            }
+                            fill_started.add_permits(1);
+                            release_fill.acquire().await.unwrap().forget();
+                        } else if inputs
+                            .iter()
+                            .any(|input| input.contains("SLOW_FRESH_DELTA"))
+                        {
+                            slow_started.add_permits(1);
+                            std::future::pending::<()>().await;
+                        }
+                        let body = serde_json::json!({
+                            "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            Self {
+                uri: format!("http://{address}"),
+                fill_started,
+                release_fill,
+                slow_query_started,
+                task,
+            }
+        }
+    }
+
+    impl Drop for GatedOllama {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_background_fill_breaks_query_budget_livelock() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let is_document = inputs.iter().any(|input| input.contains("FILL_DOC"));
+                let vectors: Vec<Vec<f32>> = inputs
+                    .iter()
+                    .map(|input| {
+                        if input.contains("target.rs") || input == "needle" {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }));
+                if is_document {
+                    response.set_delay(std::time::Duration::from_millis(120))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("target.rs"), "fn FILL_DOC_target() {}\n").unwrap();
+        std::fs::write(root.path().join("other.rs"), "fn FILL_DOC_other() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 20, 500),
+        );
+
+        let first = server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        assert_eq!(first.is_error, Some(false), "{}", text_of(&first));
+
+        while server.current_ref().embedding_cache.read().await.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+
+        let document_requests_before = matching_embed_request_batches(&ollama, "FILL_DOC").await;
+        let second = server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_embed_request_batches(&ollama, "FILL_DOC").await,
+            document_requests_before,
+            "a later query must not resubmit filled documents"
+        );
+        assert!(
+            text_of(&second).contains("1. target.rs"),
+            "the filled vector must rank the target: {}",
+            text_of(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_queries_do_not_resubmit_documents_while_fill_is_running() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }));
+                if inputs.iter().any(|input| input.contains("QUEUED_DOC")) {
+                    response.set_delay(std::time::Duration::from_millis(300))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("queued.rs"), "fn QUEUED_DOC() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 20, 1_000),
+        );
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if matching_embed_request_batches(&ollama, "QUEUED_DOC")
+                .await
+                .len()
+                >= 2
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "background fill never started");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let requests_while_running = matching_embed_request_batches(&ollama, "QUEUED_DOC").await;
+
+        for _ in 0..3 {
+            server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            matching_embed_request_batches(&ollama, "QUEUED_DOC").await,
+            requests_while_running,
+            "queries must answer from the current index while the queued document is filling"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_background_fill_splits_timed_out_batches() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }));
+                if inputs.iter().any(|input| input.contains("SPLIT_SLOW")) {
+                    response.set_delay(std::time::Duration::from_millis(150))
+                } else if inputs.iter().any(|input| input.contains("SPLIT_DOC")) {
+                    response.set_delay(std::time::Duration::from_millis(30))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn SPLIT_DOC_a() {}\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn SPLIT_DOC_b() {}\n").unwrap();
+        std::fs::write(root.path().join("z.rs"), "fn SPLIT_DOC_SPLIT_SLOW() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 10, 60),
+        );
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let current_ref = server.current_ref();
+            let cache = current_ref.embedding_cache.read().await;
+            if cache.contains_key("a.rs") && cache.contains_key("b.rs") {
+                assert!(
+                    !cache.contains_key("z.rs"),
+                    "the timed-out singleton must not block or masquerade as a success"
+                );
+                break;
+            }
+            drop(cache);
+            assert!(
+                Instant::now() < deadline,
+                "fast split halves were not cached"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let batches = matching_embed_request_batches(&ollama, "SPLIT_DOC").await;
+        assert!(
+            batches.iter().filter(|&&size| size == 3).count() >= 2,
+            "expected the query attempt and filler attempt for the full batch: {batches:?}"
+        );
+        assert!(
+            batches.contains(&2) && batches.contains(&1),
+            "a timed-out batch must be retried in halves down to a singleton: {batches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_permanent_failure_is_suppressed_until_content_hash_changes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                if inputs
+                    .iter()
+                    .any(|input| input.contains("PERMANENT_FAIL_v1"))
+                {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                    }))
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("failure.rs");
+        std::fs::write(&file, "fn PERMANENT_FAIL_v1() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 30, 200),
+        );
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let attempts = matching_embed_request_batches(&ollama, "PERMANENT_FAIL_v1")
+                .await
+                .len();
+            if attempts == 3 {
+                break;
+            }
+            assert!(attempts < 3, "failure threshold was exceeded: {attempts}");
+            assert!(
+                Instant::now() < deadline,
+                "failure did not reach three attempts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        for _ in 0..3 {
+            server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            matching_embed_request_batches(&ollama, "PERMANENT_FAIL_v1")
+                .await
+                .len(),
+            3,
+            "the query path and filler must both suppress a permanently failed content hash"
+        );
+
+        let changed = "fn RECOVERED_v2_with_different_size() {}\n";
+        std::fs::write(&file, changed).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let current_ref = server.current_ref();
+            let cache = current_ref.embedding_cache.read().await;
+            if cache
+                .get("failure.rs")
+                .is_some_and(|entry| entry.hash == crate::core::embeddings::content_hash(changed))
+            {
+                break;
+            }
+            drop(cache);
+            assert!(
+                Instant::now() < deadline,
+                "changed content was not embedded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !matching_embed_request_batches(&ollama, "RECOVERED_v2")
+                .await
+                .is_empty(),
+            "a new content hash must clear permanent-failure suppression"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_background_fill_invalidates_vectorless_search_index() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let vectors: Vec<Vec<f32>> = inputs
+                    .iter()
+                    .map(|input| {
+                        if input == "needle" || input.contains("VECTOR_TARGET") {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }));
+                if inputs.iter().any(|input| input.contains("VECTOR_TARGET")) {
+                    response.set_delay(std::time::Duration::from_millis(100))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let target_content = "fn VECTOR_TARGET() {}\n";
+        let decoy_content = "fn unrelated_decoy() {}\n";
+        std::fs::write(root.path().join("target.rs"), target_content).unwrap();
+        std::fs::write(root.path().join("decoy.rs"), decoy_content).unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 20, 500),
+        );
+        server.current_ref().embedding_cache.write().await.insert(
+            "decoy.rs".to_string(),
+            CacheEntry {
+                hash: crate::core::embeddings::content_hash(decoy_content),
+                vector: vec![0.0, 1.0],
+            },
+        );
+
+        let before = server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        assert!(
+            !text_of(&before).contains("target.rs"),
+            "a vectorless target must not satisfy a semantic-only query"
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let vector_ready = server
+                .current_ref()
+                .embedding_cache
+                .read()
+                .await
+                .contains_key("target.rs");
+            let index_invalidated = server
+                .current_ref()
+                .search_index_cache
+                .read()
+                .await
+                .is_none();
+            if vector_ready && index_invalidated {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fill did not cache the vector and invalidate the SearchIndex"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let after = server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&after).contains("1. target.rs"),
+            "the rebuilt index must rank the newly filled vector: {}",
+            text_of(&after)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_filler_rejects_non_regular_replacement() {
+        let ollama = GatedOllama::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fill.rs");
+        std::fs::write(&file, "fn FILL_COMPLETES_h1() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri, 20, 5_000),
+        );
+        let walker = CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        };
+        walker.walk_and_index(root.path()).await.unwrap();
+        ollama.fill_started.acquire().await.unwrap().forget();
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("fresh.rs"), "fn fresh() {}\n").unwrap();
+        ollama.release_fill.add_permits(1);
+        let ref_index = server.current_ref();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ref_index
+                .semantic_vector_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+            walker.walk_and_index(&unrelated).await.unwrap();
+            let cache = ref_index.embedding_cache.read().await;
+            assert!(
+                !cache.contains_key("fill.rs"),
+                "invalid filler vector was installed"
+            );
+        })
+        .await
+        .expect("filler validation must leave cache reads and admission available");
+    }
+
+    #[tokio::test]
+    async fn semantic_filler_rejects_stale_completion() {
+        let ollama = GatedOllama::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fill.rs");
+        std::fs::write(&file, "fn FILL_COMPLETES_h1() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri, 20, 5_000),
+        );
+        let walker = CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        };
+        walker.walk_and_index(root.path()).await.unwrap();
+        ollama.fill_started.acquire().await.unwrap().forget();
+        std::fs::write(&file, "fn changed_to_h2() {}\n").unwrap();
+        ollama.release_fill.add_permits(1);
+        let ref_index = server.current_ref();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ref_index
+                .semantic_vector_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+            let _admission = ref_index.semantic_fill.lock().await;
+            let cache = ref_index.embedding_cache.read().await;
+            assert!(
+                !cache.contains_key("fill.rs"),
+                "invalid filler vector was installed"
+            );
+        })
+        .await
+        .expect("filler validation must leave cache reads and admission available");
+    }
+
+    #[tokio::test]
+    async fn semantic_fill_installs_completed_batch_while_fresh_delta_query_is_slow() {
+        let ollama = GatedOllama::start().await;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("fill.rs"),
+            "fn FILL_COMPLETES_in_background() {}\n",
+        )
+        .unwrap();
+        let mut config = semantic_fill_config(&ollama.uri, 1_200, 2_000);
+        config.ollama_max_concurrent = 2;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let mut first_config = server.state.config.clone();
+        first_config.embed_budget_ms = 20;
+        let first_walker = CachedWalkerIndexer {
+            config: first_config,
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        };
+        first_walker.walk_and_index(root.path()).await.unwrap();
+
+        ollama.fill_started.acquire().await.unwrap().forget();
+
+        std::fs::write(
+            root.path().join("fresh.rs"),
+            "fn SLOW_FRESH_DELTA_blocks_query() {}\n",
+        )
+        .unwrap();
+        let slow_server = server.clone();
+        let slow_query = tokio::spawn(async move {
+            slow_server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+        });
+
+        ollama.slow_query_started.acquire().await.unwrap().forget();
+        ollama.release_fill.add_permits(1);
+
+        tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            loop {
+                if server
+                    .current_ref()
+                    .embedding_cache
+                    .read()
+                    .await
+                    .contains_key("fill.rs")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a released filler response must install while the fresh query is embedding");
+
+        slow_query.abort();
+    }
+
+    #[tokio::test]
+    async fn semantic_aborted_query_releases_reservations_to_background_fill() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let document_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&document_calls);
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }));
+                if inputs
+                    .iter()
+                    .any(|input| input.contains("ABORTED_RESERVATION"))
+                    && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    response.set_delay(std::time::Duration::from_millis(300))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("reserved.rs"),
+            "fn ABORTED_RESERVATION() {}\n",
+        )
+        .unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 3_000),
+        );
+        let query_server = server.clone();
+        let query = tokio::spawn(async move {
+            query_server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if document_calls.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "query never acquired the document reservation"
+            );
+            tokio::task::yield_now().await;
+        }
+        query.abort();
+        query.await.expect_err("query task must be cancelled");
+
+        tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            loop {
+                if server
+                    .current_ref()
+                    .embedding_cache
+                    .read()
+                    .await
+                    .contains_key("reserved.rs")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background fill must claim and install an aborted query's reservation");
+        assert!(
+            document_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the background filler must make its own request after the query is aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_admission_rechecks_vector_filled_after_walk_snapshot() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let content = "fn FILLED_BETWEEN_SNAPSHOT_AND_ADMISSION() {}\n";
+        std::fs::write(root.path().join("filled.rs"), content).unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 300, 1_000),
+        );
+        let ref_index = server.current_ref();
+        let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(root.path());
+
+        let query_server = server.clone();
+        let query = tokio::spawn(async move {
+            query_server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+        });
+
+        pause.wait_until_entered().await;
+        let mut cache = ref_index.embedding_cache.write().await;
+        cache.insert(
+            "filled.rs".to_string(),
+            CacheEntry {
+                hash: crate::core::embeddings::content_hash(content),
+                vector: vec![1.0, 0.0],
+            },
+        );
+        drop(cache);
+        pause.resume();
+
+        query.await.unwrap().unwrap();
+        assert!(
+            matching_embed_request_batches(&ollama, "FILLED_BETWEEN_SNAPSHOT_AND_ADMISSION")
+                .await
+                .is_empty(),
+            "admission must use the newly filled cache entry instead of embedding it again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_older_observation_cannot_replace_newer_hash_in_flight() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }));
+                if inputs.iter().any(|input| input.contains("NEWER_HASH_v2")) {
+                    response.set_delay(std::time::Duration::from_millis(150))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("versioned.rs");
+        let old_content = "fn OLDER_HASH_v1() {}\n";
+        let new_content = "fn NEWER_HASH_v2() {}\n";
+        std::fs::write(&source, old_content).unwrap();
+
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        let pause = crate::server_adapters::test_seams::pause_after_file_snapshot(
+            root.path(),
+            crate::core::embeddings::content_hash(old_content),
+        );
+        let old_root = root.path().to_path_buf();
+        let old_state = Arc::clone(&server.state);
+        let old_walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: old_state.config.clone(),
+                ollama: old_state.ollama.clone(),
+                state: old_state,
+            }
+            .walk_and_index(&old_root)
+            .await
+        });
+
+        pause.wait_until_entered().await;
+        std::fs::write(&source, new_content).unwrap();
+
+        let new_root = root.path().to_path_buf();
+        let new_state = Arc::clone(&server.state);
+        let new_walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: new_state.config.clone(),
+                ollama: new_state.ollama.clone(),
+                state: new_state,
+            }
+            .walk_and_index(&new_root)
+            .await
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if !matching_embed_request_batches(&ollama, "NEWER_HASH_v2")
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "newer hash embedding never entered flight"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        pause.resume();
+
+        new_walk.await.unwrap().unwrap();
+        old_walk.await.unwrap().unwrap();
+
+        let cached = server
+            .current_ref()
+            .embedding_cache
+            .read()
+            .await
+            .get("versioned.rs")
+            .cloned()
+            .expect("versioned document must be cached");
+        assert_eq!(
+            cached.hash,
+            crate::core::embeddings::content_hash(new_content),
+            "an older observation admitted later must not replace the newer hash"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_inverse_read_order_installs_only_current_content_vector() {
+        use std::io::Write;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("versioned.rs");
+        let older_content = "fn INVERSE_OLDER_H1() {}\n";
+        let newer_content = "fn INVERSE_NEWER_H2() {}\n";
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+
+        let first_root = root.path().to_path_buf();
+        let first_state = Arc::clone(&server.state);
+        let first_walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: first_state.config.clone(),
+                ollama: first_state.ollama.clone(),
+                state: first_state,
+            }
+            .walk_and_index(&first_root)
+            .await
+        });
+        let writer_path = source.clone();
+        let mut first_writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new().write(true).open(writer_path)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, older_content).unwrap();
+        let older_pause = crate::server_adapters::test_seams::pause_after_file_snapshot(
+            root.path(),
+            crate::core::embeddings::content_hash(older_content),
+        );
+        let second_root = root.path().to_path_buf();
+        let second_state = Arc::clone(&server.state);
+        let second_walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: second_state.config.clone(),
+                ollama: second_state.ollama.clone(),
+                state: second_state,
+            }
+            .walk_and_index(&second_root)
+            .await
+        });
+        older_pause.wait_until_entered().await;
+
+        std::fs::write(&source, newer_content).unwrap();
+        first_writer.write_all(newer_content.as_bytes()).unwrap();
+        drop(first_writer);
+        first_walk.await.unwrap().unwrap();
+        let current_hash = crate::core::embeddings::content_hash(newer_content);
+        assert_eq!(
+            server
+                .current_ref()
+                .embedding_cache
+                .read()
+                .await
+                .get("versioned.rs")
+                .map(|entry| entry.hash.as_str()),
+            Some(current_hash.as_str()),
+            "precondition: the first-started walk must install its newer observation"
+        );
+
+        older_pause.resume();
+        second_walk.await.unwrap().unwrap();
+
+        let cached = server
+            .current_ref()
+            .embedding_cache
+            .read()
+            .await
+            .get("versioned.rs")
+            .cloned()
+            .expect("the current document must retain a vector");
+        assert_eq!(
+            cached.hash, current_hash,
+            "a later admission of an older read must not install stale content"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_failed_current_hash_supersedes_different_hash_in_flight() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                if inputs
+                    .iter()
+                    .any(|input| input.contains("FAILED_CURRENT_HBAD"))
+                {
+                    ResponseTemplate::new(500)
+                } else {
+                    let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                    }));
+                    if inputs.iter().any(|input| input.contains("IN_FLIGHT_HGOOD")) {
+                        response.set_delay(std::time::Duration::from_millis(300))
+                    } else {
+                        response
+                    }
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("versioned.rs");
+        let failed_content = "fn FAILED_CURRENT_HBAD() {}\n";
+        let good_content = "fn IN_FLIGHT_HGOOD() {}\n";
+        std::fs::write(&source, failed_content).unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let attempts = matching_embed_request_batches(&ollama, "FAILED_CURRENT_HBAD")
+                .await
+                .len();
+            if attempts == 3 {
+                break;
+            }
+            assert!(attempts < 3, "failure threshold was exceeded: {attempts}");
+            assert!(
+                Instant::now() < deadline,
+                "failed hash did not reach permanent suppression"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        std::fs::write(&source, good_content).unwrap();
+        let good_root = root.path().to_path_buf();
+        let good_state = Arc::clone(&server.state);
+        let good_walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: good_state.config.clone(),
+                ollama: good_state.ollama.clone(),
+                state: good_state,
+            }
+            .walk_and_index(&good_root)
+            .await
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if !matching_embed_request_batches(&ollama, "IN_FLIGHT_HGOOD")
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "changed hash never entered flight"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        std::fs::write(&source, failed_content).unwrap();
+        CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        }
+        .walk_and_index(root.path())
+        .await
+        .unwrap();
+        good_walk.await.unwrap().unwrap();
+
+        let stale_hash = crate::core::embeddings::content_hash(good_content);
+        assert!(
+            !server
+                .current_ref()
+                .embedding_cache
+                .read()
+                .await
+                .get("versioned.rs")
+                .is_some_and(|entry| entry.hash == stale_hash),
+            "completion for superseded Hgood must not install after Hbad is current again"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_subdirectory_search_fills_and_invalidates_non_default_ref() {
+        use crate::ref_index::{RefId, RefIndex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let vectors: Vec<Vec<f32>> = inputs
+                    .iter()
+                    .map(|input| {
+                        if input == "needle" || input.contains("SUBDIR_VECTOR_TARGET") {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }));
+                if inputs.iter().any(|input| input.contains("SUBDIR_")) {
+                    response.set_delay(std::time::Duration::from_millis(100))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let canonical_worktree = worktree.path().canonicalize().unwrap();
+        let scope = canonical_worktree.join("scope");
+        std::fs::create_dir(&scope).unwrap();
+        std::fs::write(scope.join("target.rs"), "fn SUBDIR_VECTOR_TARGET() {}\n").unwrap();
+        std::fs::write(scope.join("decoy.rs"), "fn SUBDIR_VECTOR_DECOY() {}\n").unwrap();
+
+        let server = ContextPlusServer::new(
+            primary.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 20, 1_000),
+        );
+        let ref_id = RefId::for_canonical_path(&canonical_worktree);
+        let worktree_ref = server
+            .state
+            .attach_ref(ref_id, || {
+                Arc::new(RefIndex::new(
+                    canonical_worktree.clone(),
+                    canonical_worktree.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let session = server.with_session(ref_id);
+        let mut args = semantic_args("needle");
+        args.insert(
+            "rootDir".into(),
+            json!(scope.to_string_lossy().into_owned()),
+        );
+
+        session
+            .handle_semantic_code_search(args.clone())
+            .await
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let worktree_count = worktree_ref.embedding_cache.read().await.len();
+            let default_count = server.current_ref().embedding_cache.read().await.len();
+            if worktree_count + default_count >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "subdirectory background fill did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let after = session.handle_semantic_code_search(args).await.unwrap();
+        let after_text = text_of(&after);
+        let worktree_has_target = worktree_ref
+            .embedding_cache
+            .read()
+            .await
+            .contains_key("scope/target.rs");
+        let default_has_target = server
+            .current_ref()
+            .embedding_cache
+            .read()
+            .await
+            .contains_key("target.rs");
+        assert!(
+            worktree_has_target && !default_has_target && after_text.contains("1. target.rs"),
+            "subdirectory fill must stay on the session ref and refresh its ranking: \
+             worktree_has_target={worktree_has_target}, \
+             default_has_target={default_has_target}, result={after_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_metadata_cache_is_scoped_to_canonical_search_root() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let scope_a = root.path().join("a");
+        let scope_b = root.path().join("b");
+        std::fs::create_dir_all(&scope_a).unwrap();
+        std::fs::create_dir_all(&scope_b).unwrap();
+        let item_a = scope_a.join("item.rs");
+        let item_b = scope_b.join("item.rs");
+        std::fs::write(&item_a, "fn SCOPE_A_ONLY() {}\n").unwrap();
+        std::fs::write(&item_b, "fn SCOPE_B_ONLY() {}\n").unwrap();
+        let modified = std::fs::metadata(&item_a).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&item_b)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let metadata_a = std::fs::metadata(&item_a).unwrap();
+        let metadata_b = std::fs::metadata(&item_b).unwrap();
+        assert_eq!(metadata_a.len(), metadata_b.len());
+        assert_eq!(
+            metadata_a.modified().unwrap(),
+            metadata_b.modified().unwrap()
+        );
+
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        let mut first_args = semantic_args("needle");
+        first_args.insert(
+            "rootDir".into(),
+            json!(scope_a.to_string_lossy().into_owned()),
+        );
+        let first = server
+            .handle_semantic_code_search(first_args)
+            .await
+            .unwrap();
+        assert!(
+            text_of(&first).contains("SCOPE_A_ONLY"),
+            "precondition: first scope must build A's index: {}",
+            text_of(&first)
+        );
+
+        let mut second_args = semantic_args("needle");
+        second_args.insert(
+            "rootDir".into(),
+            json!(scope_b.to_string_lossy().into_owned()),
+        );
+        let second = server
+            .handle_semantic_code_search(second_args)
+            .await
+            .unwrap();
+        assert!(
+            text_of(&second).contains("SCOPE_B_ONLY") && !text_of(&second).contains("SCOPE_A_ONLY"),
+            "identical relative metadata in another root must not reuse A's index: {}",
+            text_of(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_metadata_fingerprint_detects_edit_add_remove_and_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.rs");
+        std::fs::write(&original, "fn original() {}\n").unwrap();
+        let config = semantic_fill_config("http://127.0.0.1:1", 20, 120_000);
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let walker = CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        };
+
+        let initial = walker
+            .metadata_fingerprint(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            walker.metadata_fingerprint(root.path()).await.unwrap(),
+            Some(initial.clone()),
+            "an unchanged tree must have the same metadata fingerprint"
+        );
+
+        std::fs::write(
+            &original,
+            "fn original_with_a_larger_body() { let x = 1; }\n",
+        )
+        .unwrap();
+        let edited = walker
+            .metadata_fingerprint(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(edited, initial, "a size-changing edit must be detected");
+
+        let added_path = root.path().join("added.rs");
+        std::fs::write(&added_path, "fn added() {}\n").unwrap();
+        let added = walker
+            .metadata_fingerprint(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(added, edited, "an added path must be detected");
+
+        std::fs::remove_file(&added_path).unwrap();
+        let removed = walker
+            .metadata_fingerprint(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(removed, added, "a removed path must be detected");
+
+        std::fs::rename(&original, root.path().join("renamed.rs")).unwrap();
+        let renamed = walker
+            .metadata_fingerprint(root.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(renamed, removed, "a renamed path must be detected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_metadata_fingerprint_falls_back_for_unavailable_entries() {
+        let dangling_root = tempfile::tempdir().unwrap();
+        std::fs::write(dangling_root.path().join("healthy.rs"), "fn healthy() {}\n").unwrap();
+        std::os::unix::fs::symlink(
+            dangling_root.path().join("missing-target.rs"),
+            dangling_root.path().join("dangling.rs"),
+        )
+        .unwrap();
+        let dangling_server = ContextPlusServer::new(
+            dangling_root.path().to_path_buf(),
+            semantic_fill_config("http://127.0.0.1:1", 20, 1_000),
+        );
+        let dangling_walker = CachedWalkerIndexer {
+            config: dangling_server.state.config.clone(),
+            ollama: dangling_server.state.ollama.clone(),
+            state: Arc::clone(&dangling_server.state),
+        };
+        let dangling = dangling_walker
+            .metadata_fingerprint(dangling_root.path())
+            .await;
+        assert!(
+            matches!(dangling, Ok(None)),
+            "a dangling symlink must disable the cheap fingerprint and fall back: {dangling:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_metadata_removal_between_enumeration_and_stat_falls_back_to_walk() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let removed_root = tempfile::tempdir().unwrap();
+        let stable = removed_root.path().join("stable.rs");
+        let ephemeral = removed_root.path().join("ephemeral.rs");
+        std::fs::write(&stable, "fn STABLE_AFTER_REMOVAL() {}\n").unwrap();
+        std::fs::write(&ephemeral, "fn REMOVE_AFTER_ENUMERATION() {}\n").unwrap();
+        let server = ContextPlusServer::new(
+            removed_root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+
+        let pause = crate::server_adapters::test_seams::pause_after_metadata_enumeration(
+            removed_root.path(),
+        );
+        let query_server = server.clone();
+        let query = tokio::spawn(async move {
+            query_server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+        });
+        let wait_pause = Arc::clone(&pause);
+        tokio::task::spawn_blocking(move || wait_pause.wait_until_enumerated())
+            .await
+            .unwrap();
+        std::fs::remove_file(&ephemeral).unwrap();
+        tokio::task::spawn_blocking(move || pause.resume())
+            .await
+            .unwrap();
+
+        let result = query.await.unwrap().unwrap();
+        assert!(
+            result.is_error != Some(true) && text_of(&result).contains("STABLE_AFTER_REMOVAL"),
+            "a regular-file removal race must fall back to the full walk: {}",
+            text_of(&result)
+        );
     }
 }
