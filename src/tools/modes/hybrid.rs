@@ -679,6 +679,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_chat_provider_error_keeps_hybrid_heuristic_cache() {
+        use crate::config::ChatProvider;
+        use semantic_navigate::{
+            CachedLabel, LabelQuality, load_label_cache_full, save_label_cache_full,
+        };
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for provider in [
+            ChatProvider::Ollama,
+            ChatProvider::OpenAi,
+            ChatProvider::Anthropic,
+            ChatProvider::Claude,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(if provider == ChatProvider::Claude {
+                    0
+                } else {
+                    1
+                })
+                .mount(&server)
+                .await;
+            let mut config = config_with_host(&server.uri());
+            config.chat_provider = provider;
+            config.openai_base_url = server.uri();
+            config.chat_base_url = None;
+            config.anthropic_base_url = server.uri();
+            config.claude_path = dir
+                .path()
+                .join("missing-claude")
+                .to_string_lossy()
+                .into_owned();
+            let file = make_file("src/auth/session.rs");
+            let key = semantic_navigate::cluster_cache_key(&[&file.relative_path]);
+            let cache =
+                HashMap::from([(key.clone(), CachedLabel::heuristic("Session Flow".into()))]);
+            save_label_cache_full(dir.path(), &cache);
+            let queue = vec![OwnedSubcluster {
+                cache_key: key.clone(),
+                parent_label: "auth".into(),
+                files: vec![file],
+            }];
+            run_subcluster_llm_heal(&queue, &OllamaClient::new(&config), dir.path()).await;
+            let after = load_label_cache_full(dir.path());
+            assert_eq!(after[&key].label, "Session Flow");
+            assert_eq!(after[&key].quality, LabelQuality::Heuristic);
+        }
+    }
+
+    #[tokio::test]
     async fn label_subclusters_with_llm_uses_cached_labels_without_network() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let files = vec![

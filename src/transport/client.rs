@@ -61,9 +61,27 @@ pub struct RegisterSession {
 /// Configuration that can change search results or embedding-cache contents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchConfig {
+    #[serde(default)]
+    pub embed_provider: String,
+    #[serde(default)]
+    pub chat_provider: String,
     pub ollama_embed_model: String,
     pub ollama_chat_model: String,
     pub ollama_host: String,
+    #[serde(default)]
+    pub openai_embed_model: String,
+    #[serde(default)]
+    pub openai_chat_model: String,
+    #[serde(default)]
+    pub openai_base_url: String,
+    #[serde(default)]
+    pub chat_base_url: Option<String>,
+    #[serde(default)]
+    pub claude_path: String,
+    #[serde(default)]
+    pub claude_model: String,
+    #[serde(default)]
+    pub anthropic_chat_model: String,
     pub embed_tracker_mode: String,
     pub ignore_dirs: Vec<String>,
     pub max_embed_file_size: usize,
@@ -85,9 +103,18 @@ impl From<&crate::config::Config> for SearchConfig {
         let mut ignore_dirs: Vec<_> = config.ignore_dirs.iter().cloned().collect();
         ignore_dirs.sort();
         Self {
+            embed_provider: config.embed_provider.to_string(),
+            chat_provider: config.chat_provider.to_string(),
             ollama_embed_model: config.ollama_embed_model.clone(),
             ollama_chat_model: config.ollama_chat_model.clone(),
             ollama_host: config.ollama_host.clone(),
+            openai_embed_model: config.openai_embed_model.clone(),
+            openai_chat_model: config.openai_chat_model.clone(),
+            openai_base_url: config.openai_base_url.clone(),
+            chat_base_url: config.chat_base_url.clone(),
+            claude_path: config.claude_path.clone(),
+            claude_model: config.claude_model.clone(),
+            anthropic_chat_model: config.anthropic_chat_model.clone(),
             embed_tracker_mode: config.embed_tracker_mode.to_string(),
             ignore_dirs,
             max_embed_file_size: config.max_embed_file_size,
@@ -115,9 +142,32 @@ impl SearchConfig {
         }
 
         vec![
+            ("CONTEXTPLUS_EMBED_PROVIDER", self.embed_provider.clone()),
+            ("CONTEXTPLUS_CHAT_PROVIDER", self.chat_provider.clone()),
             ("OLLAMA_EMBED_MODEL", self.ollama_embed_model.clone()),
             ("OLLAMA_CHAT_MODEL", self.ollama_chat_model.clone()),
             ("OLLAMA_HOST", self.ollama_host.clone()),
+            (
+                "CONTEXTPLUS_OPENAI_EMBED_MODEL",
+                self.openai_embed_model.clone(),
+            ),
+            (
+                "CONTEXTPLUS_OPENAI_CHAT_MODEL",
+                self.openai_chat_model.clone(),
+            ),
+            ("CONTEXTPLUS_OPENAI_BASE_URL", self.openai_base_url.clone()),
+            (
+                "CONTEXTPLUS_CHAT_BASE_URL",
+                self.chat_base_url
+                    .clone()
+                    .unwrap_or_else(|| "<unset>".to_string()),
+            ),
+            ("CONTEXTPLUS_CLAUDE_PATH", self.claude_path.clone()),
+            ("CONTEXTPLUS_CLAUDE_MODEL", self.claude_model.clone()),
+            (
+                "CONTEXTPLUS_ANTHROPIC_CHAT_MODEL",
+                self.anthropic_chat_model.clone(),
+            ),
             ("CONTEXTPLUS_EMBED_TRACKER", self.embed_tracker_mode.clone()),
             ("CONTEXTPLUS_IGNORE_DIRS", self.ignore_dirs.join(",")),
             (

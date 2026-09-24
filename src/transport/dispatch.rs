@@ -168,7 +168,7 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
     tracing::info!(
         "Starting contextplus MCP server on {} (model: {})",
         root_dir.display(),
-        config.ollama_embed_model
+        config.embed_model()
     );
 
     let server = ContextPlusServer::new(root_dir.clone(), config.clone());

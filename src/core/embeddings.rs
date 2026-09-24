@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::cache::rkyv_store;
-use crate::config::Config;
+use crate::config::{ChatProvider, Config, EmbedProvider};
 use crate::error::{ContextPlusError, Result};
 
 /// Type alias for the boxed future returned by embedding functions.
@@ -31,10 +31,9 @@ const MAX_SINGLE_INPUT_RETRIES: usize = 15;
 const EMBED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
-// OllamaClient
+// Model providers
 // ---------------------------------------------------------------------------
 
-/// HTTP client for Ollama embedding and chat APIs with adaptive batch/retry.
 /// Runtime options for Ollama embed requests.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbedRuntimeOptions {
@@ -151,18 +150,17 @@ type InFlightResult = std::result::Result<Vec<f32>, String>;
 #[derive(Clone)]
 pub struct OllamaClient {
     client: reqwest::Client,
-    host: String,
-    model: String,
+    embed_backend: EmbedBackend,
+    chat_backend: ChatBackend,
     query_cache_identity: String,
-    chat_model: String,
     query_prefix: String,
     document_prefix: String,
     batch_size: usize,
     query_batch_size: usize,
-    embed_options: Option<EmbedRuntimeOptions>,
     embed_chunk_chars: usize,
     cancel_token: CancellationToken,
     request_timeout: std::time::Duration,
+    chat_timeout: std::time::Duration,
     query_cache: Arc<std::sync::Mutex<BoundedLruCache>>,
     /// Root directory used to locate the persistent query-embedding cache file.
     /// `None` when the client was constructed without a project root (e.g. in
@@ -194,6 +192,51 @@ pub struct OllamaClient {
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
+#[derive(Clone)]
+enum EmbedBackend {
+    Ollama {
+        host: String,
+        model: String,
+        api_key: Option<String>,
+        options: Option<EmbedRuntimeOptions>,
+    },
+    OpenAi {
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+enum ChatBackend {
+    Ollama {
+        host: String,
+        model: String,
+        api_key: Option<String>,
+    },
+    OpenAi {
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    },
+    Claude {
+        executable: String,
+        model: String,
+    },
+    Anthropic {
+        base_url: String,
+        model: String,
+        auth: AnthropicAuth,
+    },
+}
+
+#[derive(Clone)]
+enum AnthropicAuth {
+    ApiKey(String),
+    Bearer(String),
+    None,
+}
+
 #[derive(serde::Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
@@ -212,6 +255,23 @@ struct EmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+#[derive(serde::Serialize)]
+struct OpenAiEmbedRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiEmbedItem {
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiEmbedResponse {
+    data: Vec<OpenAiEmbedItem>,
+}
+
 impl OllamaClient {
     pub fn new(config: &Config) -> Self {
         Self::new_with_root(config, None)
@@ -226,22 +286,6 @@ impl OllamaClient {
     /// 2. Spawns a background Tokio task that debounce-flushes the LRU to disk
     ///    whenever a new query embedding is inserted.
     pub fn new_with_root(config: &Config, root_dir: Option<PathBuf>) -> Self {
-        // Build default headers — Authorization is injected once at construction
-        // time so there is zero per-request cost.
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        if let Some(key) = config
-            .ollama_api_key
-            .as_deref()
-            .filter(|k| !k.trim().is_empty())
-        {
-            let bearer = format!("Bearer {}", key.trim());
-            if let Ok(mut val) = reqwest::header::HeaderValue::from_str(&bearer) {
-                // Mark sensitive so reqwest / debug logs redact the bearer token.
-                val.set_sensitive(true);
-                default_headers.insert(reqwest::header::AUTHORIZATION, val);
-            }
-        }
-
         // NOTE: we deliberately do NOT call `.http2_prior_knowledge()`.
         // Ollama (as of 0.3.x and earlier) serves HTTP/1.1 only — sending an
         // h2 preface upfront produces "Remote peer returned unexpected data
@@ -258,7 +302,6 @@ impl OllamaClient {
             // TCP keepalive pings every 30 s so NAT/firewall state is preserved
             // even when the connection is otherwise silent.
             .tcp_keepalive(std::time::Duration::from_secs(30))
-            .default_headers(default_headers)
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("reqwest client build");
@@ -309,20 +352,65 @@ impl OllamaClient {
             None
         };
 
+        let embed_backend = match config.embed_provider {
+            EmbedProvider::Ollama => EmbedBackend::Ollama {
+                host: config.ollama_host.clone(),
+                model: config.ollama_embed_model.clone(),
+                api_key: config.ollama_api_key.clone(),
+                options: EmbedRuntimeOptions::from_config(config),
+            },
+            EmbedProvider::OpenAi => EmbedBackend::OpenAi {
+                base_url: config.openai_base_url.trim_end_matches('/').to_string(),
+                model: config.openai_embed_model.clone(),
+                api_key: config.openai_api_key.clone(),
+            },
+        };
+        let chat_backend = match config.chat_provider {
+            ChatProvider::Ollama => ChatBackend::Ollama {
+                host: config.ollama_host.clone(),
+                model: config.ollama_chat_model.clone(),
+                api_key: config.ollama_api_key.clone(),
+            },
+            ChatProvider::OpenAi => ChatBackend::OpenAi {
+                base_url: config
+                    .chat_base_url
+                    .as_deref()
+                    .unwrap_or(&config.openai_base_url)
+                    .trim_end_matches('/')
+                    .to_string(),
+                model: config.openai_chat_model.clone(),
+                api_key: config.chat_api_key.clone(),
+            },
+            ChatProvider::Claude => ChatBackend::Claude {
+                executable: config.claude_path.clone(),
+                model: config.claude_model.clone(),
+            },
+            ChatProvider::Anthropic => ChatBackend::Anthropic {
+                base_url: config.anthropic_base_url.trim_end_matches('/').to_string(),
+                model: config.anthropic_chat_model.clone(),
+                auth: if let Some(key) = &config.anthropic_api_key {
+                    AnthropicAuth::ApiKey(key.clone())
+                } else if let Some(token) = &config.anthropic_auth_token {
+                    AnthropicAuth::Bearer(token.clone())
+                } else {
+                    AnthropicAuth::None
+                },
+            },
+        };
+
         Self {
             client,
-            host: config.ollama_host.clone(),
-            model: config.ollama_embed_model.clone(),
+            embed_backend,
+            chat_backend,
             query_cache_identity: config.query_cache_identity(),
-            chat_model: config.ollama_chat_model.clone(),
             query_prefix: config.embed_query_prefix.clone(),
             document_prefix: config.embed_doc_prefix.clone(),
             batch_size: config.embed_batch_size,
             query_batch_size: config.query_batch_size,
-            embed_options: EmbedRuntimeOptions::from_config(config),
             embed_chunk_chars: config.embed_chunk_chars,
             cancel_token: CancellationToken::new(),
             request_timeout: EMBED_REQUEST_TIMEOUT,
+            chat_timeout: std::time::Duration::from_secs(90),
             query_cache: cache,
             root_dir: root_dir.map(Arc::new),
             flush_tx: flush_tx_arc,
@@ -357,6 +445,12 @@ impl OllamaClient {
     /// Override the per-request wall-clock deadline. Mostly useful in tests.
     pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_chat_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.chat_timeout = timeout;
         self
     }
 
@@ -578,30 +672,70 @@ impl OllamaClient {
         self.query_batch_size
     }
 
-    /// Send a chat completion request to Ollama and return the response content.
+    /// Send a chat request through the configured provider.
     pub async fn chat(&self, prompt: &str) -> Result<String> {
-        let url = format!("{}/api/chat", self.host);
+        let request = async {
+            match &self.chat_backend {
+                ChatBackend::Ollama {
+                    host,
+                    model,
+                    api_key,
+                } => {
+                    self.chat_ollama(host, model, api_key.as_deref(), prompt)
+                        .await
+                }
+                ChatBackend::OpenAi {
+                    base_url,
+                    model,
+                    api_key,
+                } => {
+                    self.chat_openai(base_url, model, api_key.as_deref(), prompt)
+                        .await
+                }
+                ChatBackend::Claude { executable, model } => {
+                    chat_claude_cli(executable, model, prompt).await
+                }
+                ChatBackend::Anthropic {
+                    base_url,
+                    model,
+                    auth,
+                } => self.chat_anthropic(base_url, model, auth, prompt).await,
+            }
+        };
+        tokio::time::timeout(self.chat_timeout, request)
+            .await
+            .map_err(|_| {
+                ContextPlusError::Ollama(format!(
+                    "Chat request timed out after {}ms",
+                    self.chat_timeout.as_millis()
+                ))
+            })?
+    }
+
+    async fn chat_ollama(
+        &self,
+        host: &str,
+        model: &str,
+        api_key: Option<&str>,
+        prompt: &str,
+    ) -> Result<String> {
+        let url = format!("{}/api/chat", host.trim_end_matches('/'));
         let body = serde_json::json!({
-            "model": self.chat_model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": false,
             "think": false,
         });
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            self.client.post(&url).json(&body).send(),
-        )
-        .await
-        .map_err(|_| ContextPlusError::Ollama("Chat request timed out after 90s".to_string()))?
-        .map_err(|e| ContextPlusError::Ollama(format!("Chat request failed: {}", e)))?;
+        let resp = with_bearer(self.client.post(&url).json(&body), api_key)
+            .send()
+            .await
+            .map_err(|_| ContextPlusError::Ollama("Chat request failed".into()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
             return Err(ContextPlusError::Ollama(format!(
-                "Ollama chat returned {}: {}",
-                status, text
+                "Ollama chat returned {status}"
             )));
         }
 
@@ -614,11 +748,133 @@ impl OllamaClient {
             message: ChatMessage,
         }
 
-        let chat_resp: ChatResponse = resp.json().await.map_err(|e| {
-            ContextPlusError::Ollama(format!("Failed to parse chat response: {}", e))
-        })?;
+        let chat_resp: ChatResponse = resp
+            .json()
+            .await
+            .map_err(|_| ContextPlusError::Ollama("Failed to parse chat response".into()))?;
 
-        Ok(chat_resp.message.content)
+        nonempty_chat_text(chat_resp.message.content, "Ollama")
+    }
+
+    async fn chat_openai(
+        &self,
+        base_url: &str,
+        model: &str,
+        api_key: Option<&str>,
+        prompt: &str,
+    ) -> Result<String> {
+        let url = format!("{base_url}/chat/completions");
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        });
+        let response = with_bearer(self.client.post(url).json(&body), api_key)
+            .send()
+            .await
+            .map_err(|_| ContextPlusError::Ollama("Chat request failed".into()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ContextPlusError::Ollama(format!(
+                "OpenAI chat returned {status}"
+            )));
+        }
+        #[derive(serde::Deserialize)]
+        struct Message {
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Choice {
+            message: Message,
+        }
+        #[derive(serde::Deserialize)]
+        struct Response {
+            choices: Vec<Choice>,
+        }
+        let response: Response = response
+            .json()
+            .await
+            .map_err(|_| ContextPlusError::Ollama("Failed to parse OpenAI chat response".into()))?;
+        let content = response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message.content)
+            .ok_or_else(|| ContextPlusError::Ollama("OpenAI chat returned no choices".into()))?;
+        nonempty_chat_text(content, "OpenAI")
+    }
+
+    async fn chat_anthropic(
+        &self,
+        base_url: &str,
+        model: &str,
+        auth: &AnthropicAuth,
+        prompt: &str,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": prompt}],
+        });
+        let mut request = self
+            .client
+            .post(format!("{base_url}/messages"))
+            .header("anthropic-version", "2023-06-01")
+            .json(&body);
+        match auth {
+            AnthropicAuth::ApiKey(key) => {
+                request = with_sensitive_header(request, "x-api-key", key);
+            }
+            AnthropicAuth::Bearer(token) => {
+                request = with_bearer(request, Some(token));
+                request = request.header("anthropic-beta", "oauth-2025-04-20");
+            }
+            AnthropicAuth::None => {}
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| ContextPlusError::Ollama("Chat request failed".into()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ContextPlusError::Ollama(format!(
+                "Anthropic chat returned {status}"
+            )));
+        }
+        #[derive(serde::Deserialize)]
+        struct ContentBlock {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            text: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Response {
+            content: Vec<ContentBlock>,
+            stop_reason: Option<String>,
+        }
+        let response: Response = response.json().await.map_err(|_| {
+            ContextPlusError::Ollama("Failed to parse Anthropic chat response".into())
+        })?;
+        if response.stop_reason.as_deref() != Some("end_turn") {
+            let reason = match response.stop_reason.as_deref() {
+                Some("max_tokens") => "max_tokens",
+                Some("tool_use") => "tool_use",
+                Some("stop_sequence") => "stop_sequence",
+                Some("pause_turn") => "pause_turn",
+                Some("refusal") => "refusal",
+                _ => "unknown or missing",
+            };
+            return Err(ContextPlusError::Ollama(format!(
+                "Anthropic chat stopped with reason {reason}"
+            )));
+        }
+        let content = response
+            .content
+            .into_iter()
+            .filter(|block| block.kind == "text")
+            .map(|block| block.text)
+            .collect::<String>();
+        nonempty_chat_text(content, "Anthropic")
     }
 
     fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String]) -> EmbedFuture<'a> {
@@ -682,63 +938,82 @@ impl OllamaClient {
             return Err(ContextPlusError::Cancelled);
         }
 
-        // Acquire a concurrency permit (if a semaphore is configured) before
-        // making the outbound HTTP call.  The permit is held for the full
-        // send + body-read lifecycle and dropped automatically when `_permit`
-        // goes out of scope — including on the error paths below.
-        //
-        // Note: `acquire_owned` is used so the permit lifetime is not tied to
-        // the `&Semaphore` borrow (the semaphore lives in an `Arc`).
-        // `ok()` converts the `AcquireError` (only fires when the semaphore is
-        // closed, which never happens in normal operation) into `None`,
-        // effectively skipping the gate on the rare closed-semaphore case.
-        let _permit = if let Some(ref sem) = self.semaphore {
-            Some(Arc::clone(sem).acquire_owned().await.ok())
-        } else {
-            None
-        };
-
-        let url = format!("{}/api/embed", self.host);
-        let body = EmbedRequest {
-            model: &self.model,
-            input: inputs,
-            options: self.embed_options.as_ref(),
-            keep_alive: -1,
-        };
-
-        // Cover the WHOLE request lifecycle (send + status check + body read)
+        // Cover the WHOLE request lifecycle (permit + send + status + body)
         // under a single deadline + cancel race. Previously only `.send()` was
         // raced against the cancel token, which left `response.json().await`
         // unsupervised — a slow/wedged Ollama body read could hang forever,
         // deadlocking the warmup binaries.
         let token = self.cancel_token.clone();
         let request = async {
-            let response = self
-                .client
-                .post(&url)
-                .json(&body)
+            // Hold the permit until the body has been read, including error
+            // paths. A closed semaphore retains the existing ungated behavior.
+            let _permit = if let Some(sem) = &self.semaphore {
+                Arc::clone(sem).acquire_owned().await.ok()
+            } else {
+                None
+            };
+            let (request, api_key) = match &self.embed_backend {
+                EmbedBackend::Ollama {
+                    host,
+                    model,
+                    api_key,
+                    options,
+                } => {
+                    let url = format!("{}/api/embed", host.trim_end_matches('/'));
+                    let body = EmbedRequest {
+                        model,
+                        input: inputs,
+                        options: options.as_ref(),
+                        keep_alive: -1,
+                    };
+                    (self.client.post(url).json(&body), api_key.as_deref())
+                }
+                EmbedBackend::OpenAi {
+                    base_url,
+                    model,
+                    api_key,
+                } => {
+                    let url = format!("{base_url}/embeddings");
+                    let body = OpenAiEmbedRequest {
+                        model,
+                        input: inputs,
+                    };
+                    (self.client.post(url).json(&body), api_key.as_deref())
+                }
+            };
+            let response = with_bearer(request, api_key)
                 .send()
                 .await
-                .map_err(|e| ContextPlusError::Ollama(format!("request failed: {}", e)))?;
+                .map_err(|_| ContextPlusError::Ollama("embedding request failed".into()))?;
 
             if !response.status().is_success() {
                 let status = response.status();
-                let text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "unknown error".to_string());
-                return Err(ContextPlusError::Ollama(format!(
-                    "HTTP {}: {}",
-                    status, text
-                )));
+                // Remote bodies and transport errors may echo credentials. Only
+                // retain the context-length classification needed for retries.
+                let text = response.text().await.unwrap_or_default();
+                let reason = if is_context_length_message(&text) {
+                    ": input length exceeds context length"
+                } else {
+                    ""
+                };
+                return Err(ContextPlusError::Ollama(format!("HTTP {status}{reason}")));
             }
 
-            let embed_response: EmbedResponse = response
-                .json()
-                .await
-                .map_err(|e| ContextPlusError::Ollama(format!("response parse error: {}", e)))?;
-
-            Ok(embed_response.embeddings)
+            match &self.embed_backend {
+                EmbedBackend::Ollama { .. } => {
+                    let embed_response: EmbedResponse = response.json().await.map_err(|_| {
+                        ContextPlusError::Ollama("embedding response parse error".into())
+                    })?;
+                    Ok(embed_response.embeddings)
+                }
+                EmbedBackend::OpenAi { .. } => {
+                    let embed_response: OpenAiEmbedResponse =
+                        response.json().await.map_err(|_| {
+                            ContextPlusError::Ollama("embedding response parse error".into())
+                        })?;
+                    reorder_openai_embeddings(embed_response.data, inputs.len())
+                }
+            }
         };
 
         let deadline = self.request_timeout;
@@ -754,6 +1029,166 @@ impl OllamaClient {
             },
         }
     }
+}
+
+fn nonempty_chat_text(content: String, provider: &str) -> Result<String> {
+    if content.trim().is_empty() {
+        Err(ContextPlusError::Ollama(format!(
+            "{provider} chat returned empty text"
+        )))
+    } else {
+        Ok(content)
+    }
+}
+
+fn with_sensitive_header(
+    request: reqwest::RequestBuilder,
+    name: &'static str,
+    secret: &str,
+) -> reqwest::RequestBuilder {
+    let Ok(mut value) = reqwest::header::HeaderValue::from_str(secret) else {
+        return request;
+    };
+    value.set_sensitive(true);
+    request.header(name, value)
+}
+
+struct TemporaryWorkingDir(PathBuf);
+
+impl TemporaryWorkingDir {
+    fn create() -> std::io::Result<Self> {
+        let base = std::env::temp_dir();
+        for _ in 0..10 {
+            let path = base.join(format!(
+                "contextplus-claude-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "unable to create unique Claude working directory",
+        ))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryWorkingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn chat_claude_cli(executable: &str, model: &str, prompt: &str) -> Result<String> {
+    let working_dir = TemporaryWorkingDir::create().map_err(|_| {
+        ContextPlusError::Ollama("Failed to create Claude working directory".into())
+    })?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("json")
+        .arg("--model")
+        .arg(model)
+        .arg("--safe-mode")
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg(r#"{"mcpServers":{}}"#)
+        .arg("--tools")
+        .arg("")
+        .arg("--disable-slash-commands")
+        .arg("--setting-sources")
+        .arg("")
+        .arg("--no-session-persistence")
+        .arg("--permission-mode")
+        .arg("dontAsk")
+        .arg("--permission-prompts")
+        .arg("none")
+        .arg("--no-chrome")
+        .current_dir(working_dir.path())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    // Command inherits the parent environment unchanged. In particular, this
+    // path never reads or rewrites Claude Code or Anthropic credentials.
+    let output = command
+        .output()
+        .await
+        .map_err(|_| ContextPlusError::Ollama("Failed to run Claude Code CLI".into()))?;
+    if !output.status.success() {
+        return Err(ContextPlusError::Ollama(format!(
+            "Claude Code CLI exited with status {}",
+            output.status
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| ContextPlusError::Ollama("Failed to parse Claude Code JSON output".into()))?;
+    if value.get("is_error").and_then(serde_json::Value::as_bool) == Some(true)
+        || value
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|subtype| subtype != "success")
+    {
+        return Err(ContextPlusError::Ollama(
+            "Claude Code CLI returned an error result".into(),
+        ));
+    }
+    let content = value
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ContextPlusError::Ollama("Claude Code JSON output has no result".into()))?;
+    nonempty_chat_text(content.to_string(), "Claude Code")
+}
+
+fn with_bearer(request: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::RequestBuilder {
+    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
+        return request;
+    };
+    with_sensitive_header(request, "authorization", &format!("Bearer {api_key}"))
+}
+
+fn reorder_openai_embeddings(data: Vec<OpenAiEmbedItem>, expected: usize) -> Result<Vec<Vec<f32>>> {
+    if data.len() != expected {
+        return Err(ContextPlusError::Ollama(format!(
+            "embedding response size mismatch: expected {expected}, got {}",
+            data.len()
+        )));
+    }
+    let mut ordered: Vec<Option<Vec<f32>>> = (0..expected).map(|_| None).collect();
+    for item in data {
+        let slot = ordered.get_mut(item.index).ok_or_else(|| {
+            ContextPlusError::Ollama(format!(
+                "embedding response index {} is out of range for {expected} inputs",
+                item.index
+            ))
+        })?;
+        if slot.is_some() {
+            return Err(ContextPlusError::Ollama(format!(
+                "embedding response contains duplicate index {}",
+                item.index
+            )));
+        }
+        *slot = Some(item.embedding);
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            embedding.ok_or_else(|| {
+                ContextPlusError::Ollama(format!("embedding response is missing index {index}"))
+            })
+        })
+        .collect()
 }
 
 /// Background task that debounce-flushes the query-embedding LRU to disk.
@@ -807,9 +1242,15 @@ async fn query_cache_flush_task(
 }
 
 fn is_context_length_error(err: &ContextPlusError) -> bool {
-    let msg = err.to_string().to_lowercase();
+    is_context_length_message(&err.to_string())
+}
+
+fn is_context_length_message(message: &str) -> bool {
+    let msg = message.to_lowercase();
     msg.contains("input length exceeds context length")
         || (msg.contains("context") && msg.contains("exceed"))
+        || msg.contains("maximum context length")
+        || msg.contains("too many tokens")
 }
 
 fn shrink_input(input: &str) -> String {
@@ -1475,6 +1916,10 @@ pub use crate::core::parser::hash_content as content_hash;
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "provider_tests.rs"]
+mod provider_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::parser::hash_content;
@@ -1770,10 +2215,18 @@ mod tests {
         config.embed_batch_size = 25;
 
         let client = OllamaClient::new(&config);
-        assert_eq!(client.host, "http://test:1234");
-        assert_eq!(client.model, "test-model");
-        assert_eq!(client.chat_model, "test-chat");
         assert_eq!(client.batch_size, 25);
+        match client.embed_backend {
+            EmbedBackend::Ollama { model, .. } => assert_eq!(model, "test-model"),
+            EmbedBackend::OpenAi { .. } => panic!("expected Ollama embedding backend"),
+        }
+        match client.chat_backend {
+            ChatBackend::Ollama { host, model, .. } => {
+                assert_eq!(host, "http://test:1234");
+                assert_eq!(model, "test-chat");
+            }
+            _ => panic!("expected Ollama chat backend"),
+        }
     }
 
     // -- OllamaClient::chat tests (wiremock) --
@@ -1782,6 +2235,17 @@ mod tests {
         let mut config = Config::from_env();
         config.ollama_host = host.to_string();
         config.ollama_chat_model = "test-chat-model".to_string();
+        config
+    }
+
+    fn openai_config(base_url: &str) -> Config {
+        let mut config = Config::from_env();
+        config.embed_provider = crate::config::EmbedProvider::OpenAi;
+        config.openai_base_url = base_url.to_string();
+        config.openai_api_key = Some("openai-test-key".to_string());
+        config.openai_embed_model = "test-embed-model".to_string();
+        config.embed_query_prefix.clear();
+        config.embed_doc_prefix.clear();
         config
     }
 
@@ -1850,6 +2314,302 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["model"], "my-specific-model");
+    }
+
+    fn openai_chat_config(base_url: &str) -> Config {
+        let mut config = Config::from_env();
+        config.chat_provider = crate::config::ChatProvider::OpenAi;
+        config.chat_base_url = Some(base_url.to_string());
+        config.chat_api_key = Some("chat-test-key".to_string());
+        config.openai_chat_model = "test-chat-model".to_string();
+        config
+    }
+
+    fn anthropic_chat_config(base_url: &str) -> Config {
+        let mut config = Config::from_env();
+        config.chat_provider = crate::config::ChatProvider::Anthropic;
+        config.anthropic_base_url = base_url.to_string();
+        config.anthropic_chat_model = "test-claude-model".to_string();
+        config
+    }
+
+    #[tokio::test]
+    async fn openai_chat_sends_compatible_request_and_parses_content() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer chat-test-key"))
+            .and(body_json(serde_json::json!({
+                "model": "test-chat-model",
+                "messages": [{"role": "user", "content": "label this"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "OpenAI Label"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&openai_chat_config(&server.uri()));
+        assert_eq!(client.chat("label this").await.unwrap(), "OpenAI Label");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_error_does_not_expose_api_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad chat-test-key"))
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&openai_chat_config(&server.uri()));
+        let error = client.chat("label").await.unwrap_err().to_string();
+        assert!(!error.contains("chat-test-key"), "secret leaked: {error}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_prefers_api_key_and_parses_text_blocks() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "anthropic-api-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(serde_json::json!({
+                "model": "test-claude-model",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": "label this"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "Anthropic "},
+                    {"type": "tool_use", "id": "ignored"},
+                    {"type": "text", "text": "Label"}
+                ],
+                "stop_reason": "end_turn"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = anthropic_chat_config(&format!("{}/v1", server.uri()));
+        config.anthropic_api_key = Some("anthropic-api-key".to_string());
+        config.anthropic_auth_token = Some("ignored-token".to_string());
+        let client = OllamaClient::new(&config);
+
+        assert_eq!(client.chat("label this").await.unwrap(), "Anthropic Label");
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0].headers.get("authorization").is_none());
+        assert!(requests[0].headers.get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_uses_bearer_token_and_oauth_beta() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("authorization", "Bearer anthropic-token"))
+            .and(header("anthropic-beta", "oauth-2025-04-20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "OAuth Label"}],
+                "stop_reason": "end_turn"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = anthropic_chat_config(&format!("{}/v1", server.uri()));
+        config.anthropic_api_key = None;
+        config.anthropic_auth_token = Some("anthropic-token".to_string());
+        let client = OllamaClient::new(&config);
+
+        assert_eq!(client.chat("label").await.unwrap(), "OAuth Label");
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_rejects_non_end_turn_without_leaking_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "partial anthropic-secret"}],
+                "stop_reason": "max_tokens"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = anthropic_chat_config(&format!("{}/v1", server.uri()));
+        config.anthropic_api_key = Some("anthropic-secret".to_string());
+        let client = OllamaClient::new(&config);
+        let error = client.chat("label").await.unwrap_err().to_string();
+
+        assert!(error.contains("max_tokens"));
+        assert!(
+            !error.contains("anthropic-secret"),
+            "secret leaked: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    pub(super) fn write_fake_claude(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-claude");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    pub(super) fn claude_chat_config(path: &std::path::Path) -> Config {
+        let mut config = Config::from_env();
+        config.chat_provider = crate::config::ChatProvider::Claude;
+        config.claude_path = path.to_string_lossy().into_owned();
+        config.claude_model = "claude-test-model".to_string();
+        config
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_chat_uses_isolated_noninteractive_flags_and_json_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let args_path = dir.path().join("args.txt");
+        let cwd_path = dir.path().join("cwd.txt");
+        let script = write_fake_claude(
+            dir.path(),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'; pwd > '{}'; printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Claude Label\"}}'",
+                args_path.display(),
+                cwd_path.display()
+            ),
+        );
+        let client = OllamaClient::new(&claude_chat_config(&script));
+
+        assert_eq!(client.chat("label this").await.unwrap(), "Claude Label");
+        let args = std::fs::read_to_string(args_path).unwrap();
+        for expected in [
+            "-p",
+            "label this",
+            "--output-format",
+            "json",
+            "--model",
+            "claude-test-model",
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{\"mcpServers\":{}}",
+            "--tools",
+            "--disable-slash-commands",
+            "--setting-sources",
+            "--no-session-persistence",
+            "--permission-mode",
+            "dontAsk",
+            "--permission-prompts",
+            "none",
+            "--no-chrome",
+        ] {
+            assert!(
+                args.lines().any(|arg| arg == expected),
+                "missing arg {expected}: {args}"
+            );
+        }
+        let cwd = std::fs::read_to_string(cwd_path).unwrap();
+        assert_ne!(
+            cwd.trim(),
+            std::env::current_dir().unwrap().to_string_lossy()
+        );
+        // The implementation removes the child's temp cwd right after the
+        // subprocess exits, so it may already be gone here: canonicalize
+        // only the (still-existing) system temp dir, not the observed path.
+        // On macOS `pwd` in the child resolves the `/var` -> `/private/var`
+        // symlink while `std::env::temp_dir()` does not, so a canonicalized
+        // system temp dir is needed on that side for the comparison to hold.
+        let expected_temp_dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        assert!(std::path::Path::new(cwd.trim()).starts_with(expected_temp_dir));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_chat_reports_nonzero_garbage_and_timeout_without_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let nonzero = write_fake_claude(dir.path(), "echo claude-cli-secret >&2; exit 7");
+        let error = OllamaClient::new(&claude_chat_config(&nonzero))
+            .chat("label")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("status"));
+        assert!(!error.contains("claude-cli-secret"));
+
+        let garbage = write_fake_claude(dir.path(), "printf 'not-json'");
+        let error = OllamaClient::new(&claude_chat_config(&garbage))
+            .chat("label")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("JSON"));
+
+        let empty = write_fake_claude(
+            dir.path(),
+            r#"printf '%s\n' '{"type":"result","subtype":"success","result":""}'"#,
+        );
+        let error = OllamaClient::new(&claude_chat_config(&empty))
+            .chat("label")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty text"));
+
+        let hanging = write_fake_claude(dir.path(), "sleep 5");
+        let client = OllamaClient::new(&claude_chat_config(&hanging))
+            .with_chat_timeout(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let error = client.chat("label").await.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_error_does_not_expose_api_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad ollama-secret"))
+            .mount(&server)
+            .await;
+        let mut config = config_with_host(&server.uri());
+        config.ollama_api_key = Some("ollama-secret".to_string());
+        let error = OllamaClient::new(&config)
+            .chat("label")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains("ollama-secret"), "secret leaked: {error}");
     }
 
     // -- OllamaClient::embed tests --
@@ -2209,6 +2969,208 @@ mod tests {
         assert!(result.is_ok(), "batch should succeed after splitting");
         let embeddings = result.unwrap();
         assert_eq!(embeddings.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn openai_embed_sends_auth_and_reorders_by_index() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(header("authorization", "Bearer openai-test-key"))
+            .and(body_json(serde_json::json!({
+                "model": "test-embed-model",
+                "input": ["first", "second"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"index": 1, "embedding": [2.0, 0.0]},
+                    {"index": 0, "embedding": [1.0, 0.0]}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&openai_config(&server.uri()));
+        let result = client
+            .embed_documents(&["first".to_string(), "second".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result, vec![vec![1.0, 0.0], vec![2.0, 0.0]]);
+    }
+
+    #[tokio::test]
+    async fn openai_embed_uses_shared_batching() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let data: Vec<_> = body["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        serde_json::json!({
+                            "index": index,
+                            "embedding": [index as f32, 1.0]
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": data}))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = openai_config(&server.uri());
+        config.embed_batch_size = 2;
+        let client = OllamaClient::new(&config);
+        let result = client
+            .embed_documents(&["one".to_string(), "two".to_string(), "three".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        let requests = server.received_requests().await.unwrap();
+        let sizes: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["input"].as_array().unwrap().len()
+            })
+            .collect();
+        assert_eq!(sizes, vec![2, 1]);
+    }
+
+    #[tokio::test]
+    async fn openai_embed_adaptive_split_handles_context_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let count = body["input"].as_array().unwrap().len();
+                if count > 2 {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {"code": "context_length_exceeded", "message": "maximum context length"}
+                    }))
+                } else {
+                    let data: Vec<_> = (0..count)
+                        .map(|index| serde_json::json!({"index": index, "embedding": [1.0, 0.0]}))
+                        .collect();
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": data}))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&openai_config(&server.uri()));
+        let texts: Vec<String> = (0..4).map(|index| format!("text-{index}")).collect();
+        let result = client.embed_batch_adaptive(&texts).await.unwrap();
+
+        assert_eq!(result.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn openai_embed_error_does_not_expose_api_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("rejected openai-test-key"))
+            .mount(&server)
+            .await;
+
+        let client = OllamaClient::new(&openai_config(&server.uri()));
+        let error = client
+            .embed_documents(&["secret-safe".to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains("openai-test-key"), "secret leaked: {error}");
+    }
+
+    #[tokio::test]
+    async fn openai_embed_reuses_shared_coalescing_and_query_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({
+                        "data": [{"index": 0, "embedding": [1.0, 2.0]}]
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(OllamaClient::new(&openai_config(&server.uri())));
+        let first = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.embed_query("same query").await.unwrap() })
+        };
+        let second = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.embed_query("same query").await.unwrap() })
+        };
+        assert_eq!(first.await.unwrap(), second.await.unwrap());
+        assert_eq!(
+            client.embed_query("same query").await.unwrap(),
+            vec![1.0, 2.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_embed_cancellation_uses_shared_cancel_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(10))
+                    .set_body_json(serde_json::json!({
+                        "data": [{"index": 0, "embedding": [1.0, 2.0]}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(OllamaClient::new(&openai_config(&server.uri())));
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.embed_query("cancel me").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.cancel_all_embeddings();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ContextPlusError::Cancelled)
+        ));
     }
 
     // -- cancellation tests --

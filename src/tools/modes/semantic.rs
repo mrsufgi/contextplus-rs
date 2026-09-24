@@ -207,6 +207,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_chat_provider_error_keeps_semantic_fallback() {
+        use crate::config::ChatProvider;
+        let dir = tempfile::tempdir().unwrap();
+        for provider in [
+            ChatProvider::Ollama,
+            ChatProvider::OpenAi,
+            ChatProvider::Anthropic,
+            ChatProvider::Claude,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(if provider == ChatProvider::Claude {
+                    0
+                } else {
+                    1
+                })
+                .mount(&server)
+                .await;
+            let mut config = config_with_host(&server.uri());
+            config.chat_provider = provider;
+            config.openai_base_url = server.uri();
+            config.chat_base_url = None;
+            config.anthropic_base_url = server.uri();
+            config.claude_path = dir
+                .path()
+                .join("missing-claude")
+                .to_string_lossy()
+                .into_owned();
+            let file = make_file("src/auth/session.rs", "authentication");
+            let clusters = vec![(vec![&file], None)];
+            let labels =
+                label_clusters_for_semantic_mode(&clusters, &OllamaClient::new(&config)).await;
+            assert_eq!(labels, vec![fallback_label(&[&file])]);
+        }
+    }
+
+    #[tokio::test]
     async fn label_clusters_for_semantic_mode_parses_rich_label_objects() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

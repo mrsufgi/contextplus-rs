@@ -34,6 +34,40 @@ pub enum EmbedDocShape {
     Outline,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedProvider {
+    Ollama,
+    OpenAi,
+}
+
+impl fmt::Display for EmbedProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ollama => write!(f, "ollama"),
+            Self::OpenAi => write!(f, "openai"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatProvider {
+    Ollama,
+    OpenAi,
+    Claude,
+    Anthropic,
+}
+
+impl fmt::Display for ChatProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ollama => write!(f, "ollama"),
+            Self::OpenAi => write!(f, "openai"),
+            Self::Claude => write!(f, "claude"),
+            Self::Anthropic => write!(f, "anthropic"),
+        }
+    }
+}
+
 impl fmt::Display for EmbedDocShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -95,12 +129,26 @@ pub fn parse_tracker_mode(value: Option<&str>) -> TrackerMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
+    pub embed_provider: EmbedProvider,
+    pub chat_provider: ChatProvider,
     pub ollama_host: String,
     pub ollama_embed_model: String,
     pub ollama_chat_model: String,
     pub ollama_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
+    pub openai_base_url: String,
+    pub openai_embed_model: String,
+    pub openai_chat_model: String,
+    pub chat_base_url: Option<String>,
+    pub chat_api_key: Option<String>,
+    pub claude_path: String,
+    pub claude_model: String,
+    pub anthropic_chat_model: String,
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_auth_token: Option<String>,
+    pub(crate) anthropic_base_url: String,
     pub embed_query_prefix: String,
     pub embed_doc_prefix: String,
     pub embed_doc_shape: EmbedDocShape,
@@ -164,6 +212,11 @@ pub const DEFAULT_HNSW_EF_SEARCH: usize = 32;
 const DEFAULT_OLLAMA_HOST: &str = "http://localhost:11434";
 const DEFAULT_EMBED_MODEL: &str = "snowflake-arctic-embed2";
 const DEFAULT_CHAT_MODEL: &str = "llama3.2";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_EMBED_MODEL: &str = "text-embedding-3-small";
+const DEFAULT_OPENAI_CHAT_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_CLAUDE_MODEL: &str = "claude-haiku-4-5";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_EMBED_BATCH_SIZE: usize = 50;
 const DEFAULT_EMBED_TRACKER_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_EMBED_TRACKER_MAX_FILES: usize = 8;
@@ -286,6 +339,57 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_embed_provider(value: Option<&str>) -> EmbedProvider {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "openai" => EmbedProvider::OpenAi,
+        None => EmbedProvider::Ollama,
+        Some(value) if value == "ollama" => EmbedProvider::Ollama,
+        Some(value) => {
+            tracing::warn!(
+                value,
+                default = "ollama",
+                "unknown CONTEXTPLUS_EMBED_PROVIDER value; falling back to ollama"
+            );
+            EmbedProvider::Ollama
+        }
+    }
+}
+
+fn parse_chat_provider(value: Option<&str>) -> ChatProvider {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "openai" => ChatProvider::OpenAi,
+        Some(value) if value == "claude" => ChatProvider::Claude,
+        Some(value) if value == "anthropic" => ChatProvider::Anthropic,
+        None => ChatProvider::Ollama,
+        Some(value) if value == "ollama" => ChatProvider::Ollama,
+        Some(value) => {
+            tracing::warn!(
+                value,
+                default = "ollama",
+                "unknown CONTEXTPLUS_CHAT_PROVIDER value; falling back to ollama"
+            );
+            ChatProvider::Ollama
+        }
+    }
+}
+
+fn is_groq_base_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("api.groq.com"))
+        })
+        .unwrap_or(false)
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
@@ -317,21 +421,45 @@ fn build_ignore_dirs() -> HashSet<String> {
 }
 
 impl Config {
+    pub fn embed_model(&self) -> &str {
+        match self.embed_provider {
+            EmbedProvider::Ollama => &self.ollama_embed_model,
+            EmbedProvider::OpenAi => &self.openai_embed_model,
+        }
+    }
+
+    fn embed_cache_identity(&self) -> String {
+        match self.embed_provider {
+            EmbedProvider::Ollama => self.ollama_embed_model.clone(),
+            EmbedProvider::OpenAi => format!(
+                "openai-{}-{}",
+                embedding_settings_hash(&format!(
+                    "{}\0{}",
+                    self.openai_base_url.trim_end_matches('/'),
+                    self.openai_embed_model
+                )),
+                self.openai_embed_model
+            ),
+        }
+    }
+
     pub fn query_cache_identity(&self) -> String {
+        let model = self.embed_cache_identity();
         if self.embed_query_prefix.is_empty() {
-            self.ollama_embed_model.clone()
+            model
         } else {
             format!(
                 "q{}-{}",
                 embedding_settings_hash(&self.embed_query_prefix),
-                self.ollama_embed_model
+                model
             )
         }
     }
 
     pub fn document_cache_identity(&self) -> String {
+        let model = self.embed_cache_identity();
         if self.embed_doc_prefix.is_empty() && self.embed_doc_shape == EmbedDocShape::Head {
-            self.ollama_embed_model.clone()
+            model
         } else {
             format!(
                 "d{}-{}",
@@ -339,23 +467,76 @@ impl Config {
                     "{}\0{}",
                     self.embed_doc_prefix, self.embed_doc_shape
                 )),
-                self.ollama_embed_model
+                model
             )
         }
     }
 
     pub fn from_env() -> Self {
+        let embed_provider =
+            parse_embed_provider(env::var("CONTEXTPLUS_EMBED_PROVIDER").ok().as_deref());
+        let chat_provider =
+            parse_chat_provider(env::var("CONTEXTPLUS_CHAT_PROVIDER").ok().as_deref());
         let batch_size: usize = env_parse("CONTEXTPLUS_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
         let batch_size = batch_size.clamp(MIN_EMBED_BATCH_SIZE, MAX_EMBED_BATCH_SIZE);
         let ollama_embed_model = env_or("OLLAMA_EMBED_MODEL", DEFAULT_EMBED_MODEL);
+        let openai_embed_model =
+            env_or("CONTEXTPLUS_OPENAI_EMBED_MODEL", DEFAULT_OPENAI_EMBED_MODEL);
+        let active_embed_model = match embed_provider {
+            EmbedProvider::Ollama => &ollama_embed_model,
+            EmbedProvider::OpenAi => &openai_embed_model,
+        };
         let (default_query_prefix, default_doc_prefix, default_doc_shape) =
-            default_embedding_settings(&ollama_embed_model);
+            default_embedding_settings(active_embed_model);
+        let openai_base_url = env_or("CONTEXTPLUS_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL);
+        let chat_base_url = env_nonempty("CONTEXTPLUS_CHAT_BASE_URL");
+        let openai_api_key =
+            if embed_provider == EmbedProvider::OpenAi || chat_provider == ChatProvider::OpenAi {
+                env_nonempty("CONTEXTPLUS_OPENAI_API_KEY")
+            } else {
+                None
+            };
+        let chat_api_key = if chat_provider == ChatProvider::OpenAi {
+            env_nonempty("CONTEXTPLUS_CHAT_API_KEY").or_else(|| {
+                let base_url = chat_base_url.as_deref().unwrap_or(&openai_base_url);
+                if is_groq_base_url(base_url) {
+                    env_nonempty("GROQ_API_KEY").or_else(|| openai_api_key.clone())
+                } else {
+                    openai_api_key.clone()
+                }
+            })
+        } else {
+            None
+        };
+        let (anthropic_api_key, anthropic_auth_token) = if chat_provider == ChatProvider::Anthropic
+        {
+            (
+                env_nonempty("ANTHROPIC_API_KEY"),
+                env_nonempty("ANTHROPIC_AUTH_TOKEN"),
+            )
+        } else {
+            (None, None)
+        };
 
         Config {
+            embed_provider,
+            chat_provider,
             ollama_host: env_or("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
             ollama_embed_model,
             ollama_chat_model: env_or("OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
-            ollama_api_key: env::var("OLLAMA_API_KEY").ok(),
+            ollama_api_key: env_nonempty("OLLAMA_API_KEY"),
+            openai_api_key,
+            openai_base_url,
+            openai_embed_model,
+            openai_chat_model: env_or("CONTEXTPLUS_OPENAI_CHAT_MODEL", DEFAULT_OPENAI_CHAT_MODEL),
+            chat_base_url,
+            chat_api_key,
+            claude_path: env_or("CONTEXTPLUS_CLAUDE_PATH", "claude"),
+            claude_model: env_or("CONTEXTPLUS_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
+            anthropic_chat_model: env_or("CONTEXTPLUS_ANTHROPIC_CHAT_MODEL", DEFAULT_CLAUDE_MODEL),
+            anthropic_api_key,
+            anthropic_auth_token,
+            anthropic_base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             embed_query_prefix: env_or("CONTEXTPLUS_EMBED_QUERY_PREFIX", default_query_prefix),
             embed_doc_prefix: env_or("CONTEXTPLUS_EMBED_DOC_PREFIX", default_doc_prefix),
             embed_doc_shape: parse_embed_doc_shape(
@@ -478,6 +659,20 @@ mod tests {
     fn defaults_are_correct() {
         with_cleared_env(
             &[
+                "CONTEXTPLUS_EMBED_PROVIDER",
+                "CONTEXTPLUS_CHAT_PROVIDER",
+                "CONTEXTPLUS_OPENAI_API_KEY",
+                "CONTEXTPLUS_OPENAI_BASE_URL",
+                "CONTEXTPLUS_OPENAI_EMBED_MODEL",
+                "CONTEXTPLUS_OPENAI_CHAT_MODEL",
+                "CONTEXTPLUS_CHAT_BASE_URL",
+                "CONTEXTPLUS_CHAT_API_KEY",
+                "GROQ_API_KEY",
+                "CONTEXTPLUS_CLAUDE_PATH",
+                "CONTEXTPLUS_CLAUDE_MODEL",
+                "CONTEXTPLUS_ANTHROPIC_CHAT_MODEL",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
                 "OLLAMA_HOST",
                 "OLLAMA_EMBED_MODEL",
                 "OLLAMA_CHAT_MODEL",
@@ -501,6 +696,14 @@ mod tests {
             ],
             || {
                 let cfg = Config::from_env();
+                assert_eq!(cfg.embed_provider, EmbedProvider::Ollama);
+                assert_eq!(cfg.chat_provider, ChatProvider::Ollama);
+                assert_eq!(cfg.openai_base_url, "https://api.openai.com/v1");
+                assert_eq!(cfg.openai_embed_model, "text-embedding-3-small");
+                assert_eq!(cfg.openai_chat_model, "gpt-4o-mini");
+                assert_eq!(cfg.claude_path, "claude");
+                assert_eq!(cfg.claude_model, "claude-haiku-4-5");
+                assert_eq!(cfg.anthropic_chat_model, "claude-haiku-4-5");
                 assert_eq!(cfg.ollama_host, "http://localhost:11434");
                 assert_eq!(cfg.ollama_embed_model, "snowflake-arctic-embed2");
                 assert_eq!(cfg.ollama_chat_model, "llama3.2");
@@ -526,6 +729,221 @@ mod tests {
                 assert_eq!(cfg.ollama_max_concurrent, 4);
             },
         );
+    }
+
+    #[test]
+    fn provider_env_overrides_and_groq_key_fallback() {
+        // Keep provider changes out of the other concurrently running tests.
+        if env::var_os("CONTEXTPLUS_TEST_PROVIDER_ENV").is_none() {
+            let result = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::provider_env_overrides_and_groq_key_fallback",
+                ])
+                .env("CONTEXTPLUS_TEST_PROVIDER_ENV", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "isolated provider environment test failed"
+            );
+            return;
+        }
+        with_env(
+            &[
+                ("CONTEXTPLUS_EMBED_PROVIDER", "openai"),
+                ("CONTEXTPLUS_CHAT_PROVIDER", "openai"),
+                ("CONTEXTPLUS_CHAT_API_KEY", ""),
+                ("CONTEXTPLUS_OPENAI_API_KEY", ""),
+                (
+                    "CONTEXTPLUS_OPENAI_BASE_URL",
+                    "http://embeddings.example/v1",
+                ),
+                ("CONTEXTPLUS_OPENAI_EMBED_MODEL", "embed-model"),
+                ("CONTEXTPLUS_OPENAI_CHAT_MODEL", "chat-model"),
+                (
+                    "CONTEXTPLUS_CHAT_BASE_URL",
+                    "https://api.groq.com/openai/v1",
+                ),
+                ("GROQ_API_KEY", "groq-test-key"),
+                ("CONTEXTPLUS_CLAUDE_PATH", "/opt/claude"),
+                ("CONTEXTPLUS_CLAUDE_MODEL", "claude-test"),
+                ("CONTEXTPLUS_ANTHROPIC_CHAT_MODEL", "anthropic-test"),
+            ],
+            || {
+                let cfg = Config::from_env();
+                assert_eq!(cfg.embed_provider, EmbedProvider::OpenAi);
+                assert_eq!(cfg.chat_provider, ChatProvider::OpenAi);
+                assert_eq!(cfg.openai_base_url, "http://embeddings.example/v1");
+                assert_eq!(cfg.openai_embed_model, "embed-model");
+                assert_eq!(cfg.openai_chat_model, "chat-model");
+                assert_eq!(
+                    cfg.chat_base_url.as_deref(),
+                    Some("https://api.groq.com/openai/v1")
+                );
+                assert_eq!(cfg.chat_api_key.as_deref(), Some("groq-test-key"));
+                assert_eq!(cfg.claude_path, "/opt/claude");
+                assert_eq!(cfg.claude_model, "claude-test");
+                assert_eq!(cfg.anthropic_chat_model, "anthropic-test");
+            },
+        );
+    }
+
+    #[test]
+    fn cache_identity_preserves_ollama_and_names_openai_provider() {
+        let mut cfg = Config::from_env();
+        cfg.embed_query_prefix.clear();
+        cfg.embed_doc_prefix.clear();
+        cfg.embed_doc_shape = EmbedDocShape::Head;
+        cfg.ollama_embed_model = "same-model".to_string();
+        cfg.openai_embed_model = "same-model".to_string();
+
+        cfg.embed_provider = EmbedProvider::Ollama;
+        assert_eq!(cfg.query_cache_identity(), "same-model");
+        assert_eq!(cfg.document_cache_identity(), "same-model");
+
+        cfg.embed_provider = EmbedProvider::OpenAi;
+        assert!(cfg.query_cache_identity().starts_with("openai-"));
+        assert!(cfg.query_cache_identity().ends_with("-same-model"));
+        assert_eq!(cfg.document_cache_identity(), cfg.query_cache_identity());
+    }
+
+    #[test]
+    fn openai_cache_names_distinguish_models_after_slugging_and_endpoints() {
+        let mut cfg = Config::from_env();
+        cfg.embed_provider = EmbedProvider::OpenAi;
+        cfg.embed_query_prefix.clear();
+        cfg.embed_doc_prefix.clear();
+        cfg.embed_doc_shape = EmbedDocShape::Head;
+        let mut names = std::collections::HashSet::new();
+        for model in [
+            "org/model".to_string(),
+            "org-model".to_string(),
+            format!("{}-a", "long".repeat(30)),
+            format!("{}-b", "long".repeat(30)),
+        ] {
+            for endpoint in ["http://first.example/v1", "http://second.example/v1"] {
+                cfg.openai_embed_model = model.clone();
+                cfg.openai_base_url = endpoint.into();
+                let query = crate::cache::rkyv_store::query_cache_name(&cfg.query_cache_identity());
+                assert!(names.insert(query), "OpenAI cache collision");
+                assert_eq!(cfg.query_cache_identity(), cfg.document_cache_identity());
+            }
+        }
+    }
+
+    #[test]
+    fn provider_environment_selection_matrix() {
+        const CASE: &str = "CONTEXTPLUS_TEST_PROVIDER_CASE";
+        if let Ok(case) = env::var(CASE) {
+            let cfg = Config::from_env();
+            match case.as_str() {
+                "explicit" | "shared" | "groq" | "lookalike" | "base_groq" => {
+                    assert_eq!(cfg.embed_provider, EmbedProvider::OpenAi);
+                    assert_eq!(cfg.chat_provider, ChatProvider::OpenAi);
+                    assert_eq!(cfg.openai_embed_model, "text-embedding-3-small");
+                    assert_eq!(cfg.openai_chat_model, "gpt-4o-mini");
+                    assert!(cfg.embed_query_prefix.is_empty());
+                    let expected = match case.as_str() {
+                        "explicit" => "chat-fixture",
+                        "groq" | "base_groq" => "groq-fixture",
+                        _ => "shared-fixture",
+                    };
+                    assert!(
+                        cfg.chat_api_key.as_deref() == Some(expected),
+                        "incorrect chat auth selection"
+                    );
+                }
+                "anthropic" => {
+                    assert_eq!(cfg.chat_provider, ChatProvider::Anthropic);
+                    assert!(cfg.anthropic_api_key.is_some());
+                    assert!(cfg.anthropic_auth_token.is_some());
+                    assert_eq!(cfg.anthropic_base_url, "https://api.anthropic.com/v1");
+                }
+                "prefixes" => {
+                    assert_eq!(cfg.embed_model(), "embeddinggemma");
+                    assert_eq!(cfg.embed_query_prefix, "task: code retrieval | query: ");
+                    assert_eq!(cfg.embed_doc_prefix, "title: none | text: ");
+                    assert_eq!(cfg.embed_doc_shape, EmbedDocShape::Outline);
+                }
+                _ => panic!("unknown test case"),
+            }
+            return;
+        }
+        for case in [
+            "explicit",
+            "shared",
+            "groq",
+            "lookalike",
+            "base_groq",
+            "anthropic",
+            "prefixes",
+        ] {
+            let mut command = std::process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::provider_environment_selection_matrix",
+                ])
+                .env(CASE, case)
+                .env("CONTEXTPLUS_EMBED_PROVIDER", "openai")
+                .env("CONTEXTPLUS_CHAT_PROVIDER", "openai")
+                .env("CONTEXTPLUS_OPENAI_API_KEY", "shared-fixture")
+                .env("GROQ_API_KEY", "groq-fixture")
+                .env("ANTHROPIC_API_KEY", "api-fixture")
+                .env("ANTHROPIC_AUTH_TOKEN", "bearer-fixture");
+            for name in [
+                "CONTEXTPLUS_CHAT_BASE_URL",
+                "CONTEXTPLUS_CHAT_API_KEY",
+                "CONTEXTPLUS_OPENAI_BASE_URL",
+                "CONTEXTPLUS_OPENAI_EMBED_MODEL",
+                "CONTEXTPLUS_OPENAI_CHAT_MODEL",
+                "CONTEXTPLUS_EMBED_QUERY_PREFIX",
+                "CONTEXTPLUS_EMBED_DOC_PREFIX",
+                "CONTEXTPLUS_EMBED_DOC_SHAPE",
+            ] {
+                command.env_remove(name);
+            }
+            match case {
+                "explicit" => {
+                    command
+                        .env(
+                            "CONTEXTPLUS_CHAT_BASE_URL",
+                            "https://api.groq.com/openai/v1",
+                        )
+                        .env("CONTEXTPLUS_CHAT_API_KEY", "chat-fixture");
+                }
+                "groq" => {
+                    command.env(
+                        "CONTEXTPLUS_CHAT_BASE_URL",
+                        "https://api.groq.com/openai/v1",
+                    );
+                }
+                "base_groq" => {
+                    command.env(
+                        "CONTEXTPLUS_OPENAI_BASE_URL",
+                        "https://api.groq.com/openai/v1",
+                    );
+                }
+                "lookalike" => {
+                    command.env(
+                        "CONTEXTPLUS_CHAT_BASE_URL",
+                        "https://api.groq.com.example/v1",
+                    );
+                }
+                "anthropic" => {
+                    command.env("CONTEXTPLUS_CHAT_PROVIDER", "anthropic");
+                }
+                "prefixes" => {
+                    command.env("CONTEXTPLUS_OPENAI_EMBED_MODEL", "embeddinggemma");
+                }
+                _ => {}
+            }
+            assert!(
+                command.output().unwrap().status.success(),
+                "provider environment case {case} failed"
+            );
+        }
     }
 
     #[test]
