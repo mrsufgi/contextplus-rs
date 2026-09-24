@@ -2536,7 +2536,16 @@ mod tests {
             cwd.trim(),
             std::env::current_dir().unwrap().to_string_lossy()
         );
-        assert!(std::path::Path::new(cwd.trim()).starts_with(std::env::temp_dir()));
+        // The implementation removes the child's temp cwd right after the
+        // subprocess exits, so it may already be gone here: canonicalize
+        // only the (still-existing) system temp dir, not the observed path.
+        // On macOS `pwd` in the child resolves the `/var` -> `/private/var`
+        // symlink while `std::env::temp_dir()` does not, so a canonicalized
+        // system temp dir is needed on that side for the comparison to hold.
+        let expected_temp_dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        assert!(std::path::Path::new(cwd.trim()).starts_with(expected_temp_dir));
     }
 
     #[cfg(unix)]
