@@ -855,6 +855,10 @@ mod tests {
     }
 
     fn assert_cwd_injected(message: &Value) {
+        // parent_process_cwd reads /proc, so only Linux injects a cwd.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         assert!(
             message["params"]["arguments"][crate::core::client_cwd::CWD_ARG]
                 .as_str()

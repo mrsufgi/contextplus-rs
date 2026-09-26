@@ -724,7 +724,8 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let root = canonical_root.as_path();
         let log_path = daemon_log_path(root);
         assert_eq!(
             log_path,
