@@ -10136,15 +10136,22 @@ mod tests {
             })
             .await;
         let child_server = server.with_session(child_id);
-        let pause =
-            crate::server_adapters::test_seams::pause_after_file_snapshot(child.path(), hash);
+        let pause = crate::server_adapters::test_seams::pause_after_file_snapshot(
+            &child.path().canonicalize().unwrap(),
+            hash,
+        );
         let query = tokio::spawn(async move {
             child_server
                 .handle_semantic_code_search(semantic_args("needle"))
                 .await
         });
 
-        pause.wait_until_entered().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pause.wait_until_entered(),
+        )
+        .await
+        .expect("query never reached the file snapshot");
         let registry_writer = server.state.refs.write().await;
         pause.resume();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
