@@ -4380,6 +4380,125 @@ mod tests {
         assert!(text_of(&hits).contains("auth.rs"), "{}", text_of(&hits));
     }
 
+    #[tokio::test]
+    async fn routed_attached_worktree_clusters_read_their_healed_label_without_primary_leakage() {
+        use crate::tools::semantic_navigate::{
+            LabelQuality, cluster_cache_key, load_label_cache_full,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; count]
+                }))
+            })
+            .mount(&provider)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "content": "[\"Attached Payment Flow\", \"Attached Refund Flow\"]"
+                }
+            })))
+            .mount(&provider)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let canonical_worktree = worktree.path().canonicalize().unwrap();
+        let mut payment_paths = Vec::new();
+        for i in 0..6 {
+            let relative = format!("packages/payments/service/payment_{i}.rs");
+            let path = canonical_worktree.join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("pub fn payment_{i}() {{}}\n")).unwrap();
+            payment_paths.push(relative);
+        }
+        for i in 0..5 {
+            let relative = format!("packages/refunds/service/refund_{i}.rs");
+            let path = canonical_worktree.join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("pub fn refund_{i}() {{}}\n")).unwrap();
+        }
+
+        let mut config = Config::from_env();
+        config.ollama_host = provider.uri();
+        config.ollama_chat_model = "test-chat-model".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let attach = server
+            .handle_attach_worktree(serde_json::Map::from_iter([(
+                "path".to_string(),
+                json!(canonical_worktree.to_string_lossy().into_owned()),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(attach.is_error, Some(false), "{}", text_of(&attach));
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
+        let session = server.with_session(ref_id);
+
+        let request_args = || {
+            serde_json::Map::from_iter([
+                ("query".to_string(), json!("payments")),
+                ("kind".to_string(), json!("clusters")),
+                ("path".to_string(), json!(".")),
+                ("max_clusters".to_string(), json!(4)),
+                ("min_clusters".to_string(), json!(1)),
+            ])
+        };
+        let first = session.dispatch("explore", request_args()).await;
+        assert_eq!(first.is_error, Some(false), "{}", text_of(&first));
+        assert!(
+            text_of(&first).contains("[payments/service]"),
+            "first routed clusters response did not use the worktree files: {}",
+            text_of(&first)
+        );
+
+        let path_refs: Vec<&str> = payment_paths.iter().map(String::as_str).collect();
+        let key = cluster_cache_key(&path_refs);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let cache = load_label_cache_full(&canonical_worktree);
+                if cache.get(&key).is_some_and(|entry| {
+                    entry.quality == LabelQuality::Llm && entry.label == "Attached Payment Flow"
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attached-ref clusters heal did not complete");
+
+        let second = session.dispatch("explore", request_args()).await;
+        let second_text = text_of(&second);
+        assert_eq!(second.is_error, Some(false), "{second_text}");
+        assert!(
+            second_text.contains("[Attached Payment Flow] (6 files)"),
+            "second routed clusters response did not read the healed worktree label: {second_text}"
+        );
+        assert!(
+            second_text.contains("packages/payments/service/payment_0.rs")
+                && second_text.contains("packages/payments/service/payment_5.rs"),
+            "healed node did not preserve the flat worktree file group: {second_text}"
+        );
+        assert!(
+            !load_label_cache_full(primary.path()).contains_key(&key),
+            "attached-ref label cache leaked into the primary ref"
+        );
+    }
+
     /// `kind: identifiers` with `match: keywords` must rank by keyword coverage
     /// only: with a mock embedder that returns the same vector for everything,
     /// semantic similarity is 100% for every identifier, so only keyword-only

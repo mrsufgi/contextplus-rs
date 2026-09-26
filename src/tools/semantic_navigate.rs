@@ -118,6 +118,7 @@ static IN_FLIGHT_HEAL_KEYS: LazyLock<Mutex<HashSet<String>>> =
 
 /// Mark these cache keys as in-flight. Returns the subset that was NOT already
 /// in-flight — the caller should heal exactly those keys.
+#[cfg(test)]
 pub(crate) fn claim_in_flight_keys(keys: &[String]) -> Vec<String> {
     let mut guard = IN_FLIGHT_HEAL_KEYS.lock().expect("heal lock poisoned");
     let mut claimed = Vec::with_capacity(keys.len());
@@ -135,6 +136,64 @@ pub(crate) fn release_in_flight_keys(keys: &[String]) {
     for k in keys {
         guard.remove(k);
     }
+}
+
+pub(crate) fn claim_heal_for_root(keys: &[String], root: &Path) -> (Vec<String>, HealClaims) {
+    let root = get_label_cache_dir(root);
+    let root = root.canonicalize().unwrap_or(root);
+    let mut guard = IN_FLIGHT_HEAL_KEYS.lock().expect("heal lock poisoned");
+    let mut claimed = Vec::new();
+    let mut scoped = Vec::new();
+    for key in keys {
+        let scoped_key = format!("{}:{key}", root.display());
+        if !guard.contains(key) && guard.insert(scoped_key.clone()) {
+            claimed.push(key.clone());
+            scoped.push(scoped_key);
+        }
+    }
+    (claimed, HealClaims(scoped))
+}
+
+pub(crate) struct HealClaims(pub(crate) Vec<String>);
+
+impl Drop for HealClaims {
+    fn drop(&mut self) {
+        release_in_flight_keys(&self.0);
+        tracing::debug!(count = self.0.len(), "heal in-flight claims released");
+    }
+}
+
+pub(crate) fn heal_chat_error_reason(error: &crate::error::ContextPlusError) -> String {
+    if let crate::error::ContextPlusError::Cache(reason) = error {
+        return reason.clone();
+    }
+    let text = error.to_string();
+    for provider in ["Ollama", "OpenAI", "Anthropic"] {
+        let prefix = format!("{provider} chat returned ");
+        if let Some((_, status)) = text.split_once(&prefix)
+            && let Some(code) = status
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u16>().ok())
+            && let Ok(status) = reqwest::StatusCode::from_u16(code)
+        {
+            return format!("{provider} chat returned {status}");
+        }
+    }
+    for reason in [
+        "label response parse failure",
+        "Chat request timed out",
+        "Failed to run Claude Code CLI",
+        "Claude Code CLI exited with status",
+        "Failed to parse Claude Code JSON output",
+        "Claude Code CLI returned an error result",
+        "Claude Code JSON output has no result",
+    ] {
+        if text.contains(reason) {
+            return reason.to_string();
+        }
+    }
+    "chat transport or response error".to_string()
 }
 
 /// Load cached LLM labels from disk. Returns a map of cluster_hash -> label.
@@ -170,6 +229,7 @@ fn get_label_cache_dir(start: &Path) -> PathBuf {
 pub(crate) fn load_label_cache_full(root_dir: &Path) -> HashMap<String, CachedLabel> {
     let cache_dir = get_label_cache_dir(root_dir);
     let cache_path = cache_dir.join(LABEL_CACHE_FILE);
+    tracing::debug!(path = %cache_path.display(), "label cache read");
     if let Ok(data) = std::fs::read_to_string(&cache_path) {
         match serde_json::from_str::<LabelCacheFile>(&data) {
             Ok(file) => file.entries,
@@ -200,15 +260,9 @@ pub(crate) fn load_label_cache(root_dir: &Path) -> HashMap<String, String> {
 
 /// Save the (full quality-aware) label cache to disk. Uses the workspace root's
 /// `.mcp_data`.
+#[cfg(test)]
 pub(crate) fn save_label_cache_full(root_dir: &Path, cache: &HashMap<String, CachedLabel>) {
-    let cache_dir = get_label_cache_dir(root_dir);
-    let cache_path = cache_dir.join(LABEL_CACHE_FILE);
-    let file = LabelCacheFile {
-        entries: cache.clone(),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&file) {
-        let _ = std::fs::write(&cache_path, json);
-    }
+    save_label_cache_merged(root_dir, cache).unwrap();
 }
 
 /// Merge-write helper: load existing cache, overlay `incoming` entries (with
@@ -219,7 +273,20 @@ pub(crate) fn save_label_cache_full(root_dir: &Path, cache: &HashMap<String, Cac
 /// writes a heuristic, then a background task writes the LLM upgrade. We must
 /// not clobber the LLM upgrade with a parallel heuristic write for a different
 /// key, and we must not regress an LLM label back to a heuristic.
-pub(crate) fn save_label_cache_merged(root_dir: &Path, incoming: &HashMap<String, CachedLabel>) {
+pub(crate) fn save_label_cache_merged(
+    root_dir: &Path,
+    incoming: &HashMap<String, CachedLabel>,
+) -> anyhow::Result<()> {
+    let cache_dir = get_label_cache_dir(root_dir);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cache_dir.join("navigate-labels.lock"))?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write()?;
+    tracing::debug!(root = %root_dir.display(), incoming = incoming.len(), "label cache merge");
     let mut existing = load_label_cache_full(root_dir);
     for (k, new_entry) in incoming {
         match existing.get(k) {
@@ -234,7 +301,41 @@ pub(crate) fn save_label_cache_merged(root_dir: &Path, incoming: &HashMap<String
             }
         }
     }
-    save_label_cache_full(root_dir, &existing);
+    let cache_path = cache_dir.join(LABEL_CACHE_FILE);
+    let temporary = cache_dir.join("navigate-labels.json.tmp");
+    let json = serde_json::to_vec_pretty(&LabelCacheFile { entries: existing })?;
+    std::fs::write(&temporary, json)?;
+    std::fs::rename(&temporary, &cache_path)?;
+    Ok(())
+}
+
+pub(crate) async fn load_label_cache_async(root_dir: &Path) -> HashMap<String, CachedLabel> {
+    let root = root_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || load_label_cache_full(&root))
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn save_label_cache_async(
+    root_dir: &Path,
+    entries: &HashMap<String, CachedLabel>,
+) -> Result<()> {
+    let root = root_dir.to_path_buf();
+    let entries = entries.clone();
+    tokio::task::spawn_blocking(move || save_label_cache_merged(&root, &entries))
+        .await
+        .map_err(|_| {
+            crate::error::ContextPlusError::Cache(
+                "cache publication failed: worker join failure".to_string(),
+            )
+        })?
+        .map_err(|error| {
+            let reason = error
+                .downcast_ref::<std::io::Error>()
+                .map(|error| format!("{:?}", error.kind()))
+                .unwrap_or_else(|| "serialization or locking error".to_string());
+            crate::error::ContextPlusError::Cache(format!("cache publication failed: {reason}"))
+        })
 }
 
 /// Save the legacy `key -> label_string` map. Preserves quality of existing
@@ -247,7 +348,9 @@ pub(crate) fn save_label_cache(root_dir: &Path, cache: &HashMap<String, String>)
         .iter()
         .map(|(k, v)| (k.clone(), CachedLabel::llm(v.clone())))
         .collect();
-    save_label_cache_merged(root_dir, &upgraded);
+    if let Err(error) = save_label_cache_merged(root_dir, &upgraded) {
+        tracing::info!(reason = %error, "label cache save failed");
+    }
 }
 
 /// Hash a cluster's file paths to create a stable cache key.
@@ -551,7 +654,7 @@ pub(crate) struct OwnedClusterSnapshot {
 }
 
 /// Label clusters with stale-while-revalidate semantics:
-///   - Cache hit (heuristic OR llm) → return cached label.
+///   - Cache hit → return cached label; requeue heuristic-quality entries.
 ///   - Cache miss → write a heuristic immediately, return it, queue an LLM heal.
 ///
 /// After collecting heals, spawn a single background task that runs the LLM
@@ -562,7 +665,7 @@ pub(crate) async fn label_clusters_with_cache(
     ollama: &OllamaClient,
     root_dir: &Path,
 ) -> Vec<String> {
-    let label_cache = load_label_cache_full(root_dir);
+    let label_cache = load_label_cache_async(root_dir).await;
     let mut labels: Vec<String> = Vec::with_capacity(label_input.len());
     let mut cache_keys: Vec<String> = Vec::with_capacity(label_input.len());
     let mut heal_queue: Vec<OwnedClusterSnapshot> = Vec::new();
@@ -578,22 +681,27 @@ pub(crate) async fn label_clusters_with_cache(
 
         if let Some(cached) = label_cache.get(&key) {
             labels.push(cached.label.clone());
+            if cached.quality == LabelQuality::Llm {
+                continue;
+            }
         } else {
             let heuristic = heuristic_label(cluster_files);
             labels.push(heuristic.clone());
             heuristic_writes.insert(key.clone(), CachedLabel::heuristic(heuristic));
-            heal_queue.push(OwnedClusterSnapshot {
-                cache_key: key,
-                files: cluster_files.iter().map(|f| (*f).clone()).collect(),
-                parent: parent.clone(),
-            });
         }
+        heal_queue.push(OwnedClusterSnapshot {
+            cache_key: key,
+            files: cluster_files.iter().map(|f| (*f).clone()).collect(),
+            parent: parent.clone(),
+        });
     }
 
     // Persist heuristics immediately so a crash before the LLM heal still leaves
     // a usable label on disk.
-    if !heuristic_writes.is_empty() {
-        save_label_cache_merged(root_dir, &heuristic_writes);
+    if !heuristic_writes.is_empty()
+        && let Err(error) = save_label_cache_async(root_dir, &heuristic_writes).await
+    {
+        tracing::info!(reason = %error, "label cache save failed");
     }
 
     // Fire-and-forget background heal. Caller does not await this future.
@@ -615,8 +723,9 @@ pub(crate) fn spawn_background_heal(
     root_dir: PathBuf,
 ) {
     let keys: Vec<String> = queue.iter().map(|s| s.cache_key.clone()).collect();
-    let claimed = claim_in_flight_keys(&keys);
+    let (claimed, claims) = claim_heal_for_root(&keys, &root_dir);
     if claimed.is_empty() {
+        tracing::info!("semantic_navigate: heal spawn skipped: all keys already in-flight");
         return;
     }
     let to_heal: Vec<OwnedClusterSnapshot> = queue
@@ -624,17 +733,20 @@ pub(crate) fn spawn_background_heal(
         .filter(|s| claimed.contains(&s.cache_key))
         .collect();
 
+    tracing::info!(claimed = claimed.len(), root = %root_dir.display(), "semantic_navigate: heal spawn");
     tokio::spawn(async move {
+        let _claims = claims;
         let result = run_llm_heal(&to_heal, &ollama, &root_dir).await;
-        if let Err(e) = result {
-            tracing::warn!(
-                error = %e,
+        if let Err(e) = result
+            && !matches!(&e, crate::error::ContextPlusError::Other(reason) if reason == "label response parse failure")
+        {
+            tracing::info!(
+                reason = %heal_chat_error_reason(&e),
                 count = to_heal.len(),
                 "semantic_navigate: background LLM heal failed (heuristics retained)"
             );
         }
-        let claimed_keys: Vec<String> = to_heal.iter().map(|s| s.cache_key.clone()).collect();
-        release_in_flight_keys(&claimed_keys);
+        tracing::info!("semantic_navigate: heal completed");
     });
 }
 
@@ -652,18 +764,40 @@ async fn run_llm_heal(
         let refs: Vec<&FileInfo> = snap.files.iter().collect();
         input.push((refs, snap.parent.clone()));
     }
-    let llm_labels = super::modes::semantic::label_clusters_for_semantic_mode(&input, ollama).await;
+    let llm_labels =
+        super::modes::semantic::try_label_clusters_for_semantic_mode(&input, ollama).await?;
 
     let mut upgrades: HashMap<String, CachedLabel> = HashMap::new();
+    let mut rejections = Vec::new();
     for (i, snap) in queue.iter().enumerate() {
-        if let Some(label) = llm_labels.get(i)
-            && !label.is_empty()
-        {
-            upgrades.insert(snap.cache_key.clone(), CachedLabel::llm(label.clone()));
+        if let Some(label) = llm_labels.get(i) {
+            let label = label.trim();
+            if label.is_empty() || label.len() > 50 || label.contains('.') || label.contains('/') {
+                rejections.push(format!(
+                    "invalid label format; total_files={}",
+                    input[i].0.len()
+                ));
+                continue;
+            }
+            if let Some((matching_files, total_files)) =
+                super::labels::label_validation_rejection(label, &input[i].0)
+            {
+                rejections.push(format!("minority path match: matching_files={matching_files}, total_files={total_files}"));
+                continue;
+            }
+            upgrades.insert(snap.cache_key.clone(), CachedLabel::llm(label.to_string()));
         }
     }
+    if !rejections.is_empty() {
+        tracing::info!(reasons = ?rejections, "semantic_navigate: heal validation rejected labels");
+    }
     if !upgrades.is_empty() {
-        save_label_cache_merged(root_dir, &upgrades);
+        save_label_cache_async(root_dir, &upgrades).await?;
+        tracing::info!(
+            upgraded = upgrades.len(),
+            queued = queue.len(),
+            "semantic_navigate: heal upgraded labels"
+        );
     }
     Ok(())
 }
@@ -899,15 +1033,70 @@ fn count_files_in_node(node: &ClusterNode) -> usize {
     }
 }
 
-/// Extract a JSON array string from LLM response text.
-pub(crate) fn extract_json_array(text: &str) -> Option<String> {
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    if end >= start {
-        Some(text[start..=end].to_string())
-    } else {
-        None
+pub(crate) fn extract_label_array(text: &str, expected: usize, rich: bool) -> Option<Vec<String>> {
+    for (start, _) in text.match_indices('[') {
+        let mut stream = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<Vec<serde_json::Value>>();
+        if let Some(Ok(values)) = stream.next() {
+            if values.len() != expected {
+                continue;
+            }
+            let labels: Option<Vec<String>> = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| {
+                            if rich {
+                                value.get("label").and_then(|v| v.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                })
+                .collect();
+            if labels.is_some() {
+                return labels;
+            }
+        }
     }
+    None
+}
+
+pub(crate) fn response_shape(response: &str) -> String {
+    // Provider text can echo source code or credentials, so only its shape is logged.
+    let trimmed = response.trim();
+    let kind = match trimmed.chars().next() {
+        None => "empty",
+        Some('[') => "array",
+        Some('{') => "object",
+        Some(_) => "prose",
+    };
+    format!(
+        "kind={kind} chars={} brackets={}",
+        trimmed.chars().count(),
+        trimmed.matches('[').count()
+    )
+}
+
+/// Extract a JSON array string from LLM response text.
+#[cfg(test)]
+pub(crate) fn extract_json_array(text: &str) -> Option<String> {
+    let mut empty = None;
+    for (start, _) in text.match_indices('[') {
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(serde_json::Value::Array(values))) = stream.next() {
+            let candidate = text[start..start + stream.byte_offset()].to_string();
+            if !values.is_empty() {
+                return Some(candidate);
+            }
+            empty = Some(candidate);
+        }
+    }
+    empty
 }
 
 /// Render a cluster tree as indented text.
@@ -968,6 +1157,41 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_info_logs() -> (Arc<Mutex<Vec<u8>>>, impl tracing::Subscriber) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer_logs = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || CapturedWriter(Arc::clone(&writer_logs)))
+            .finish();
+        (logs, subscriber)
+    }
+
+    fn logs_as_string(logs: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(logs.lock().unwrap().clone()).unwrap()
+    }
 
     #[test]
     fn extract_header_comment_slashes() {
@@ -1222,12 +1446,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_json_array_multiple_arrays_picks_outer() {
-        // find('[') gives first bracket, rfind(']') gives last bracket
+    fn extract_json_array_multiple_arrays_picks_first_valid() {
         let text = "[\"a\"] and then [\"b\"]";
         let arr = extract_json_array(text);
-        // Should span from first [ to last ]
-        assert_eq!(arr, Some("[\"a\"] and then [\"b\"]".to_string()));
+        assert_eq!(arr, Some("[\"a\"]".to_string()));
     }
 
     #[test]
@@ -2214,7 +2436,7 @@ mod tests {
 
         let mut h_writes: HashMap<String, CachedLabel> = HashMap::new();
         h_writes.insert(key.clone(), CachedLabel::heuristic("auth/* ".to_string()));
-        save_label_cache_merged(tempdir.path(), &h_writes);
+        save_label_cache_merged(tempdir.path(), &h_writes).unwrap();
 
         // Verify heuristic landed.
         let after_h = load_label_cache_full(tempdir.path());
@@ -2227,7 +2449,7 @@ mod tests {
             key.clone(),
             CachedLabel::llm("Authentication Flow".to_string()),
         );
-        save_label_cache_merged(tempdir.path(), &l_writes);
+        save_label_cache_merged(tempdir.path(), &l_writes).unwrap();
 
         let after_l = load_label_cache_full(tempdir.path());
         assert_eq!(after_l[&key].quality, LabelQuality::Llm);
@@ -2244,15 +2466,129 @@ mod tests {
 
         let mut llm: HashMap<String, CachedLabel> = HashMap::new();
         llm.insert(key.clone(), CachedLabel::llm("Good Label".to_string()));
-        save_label_cache_merged(tempdir.path(), &llm);
+        save_label_cache_merged(tempdir.path(), &llm).unwrap();
 
         let mut heur: HashMap<String, CachedLabel> = HashMap::new();
         heur.insert(key.clone(), CachedLabel::heuristic("auth/* ".to_string()));
-        save_label_cache_merged(tempdir.path(), &heur);
+        save_label_cache_merged(tempdir.path(), &heur).unwrap();
 
         let after = load_label_cache_full(tempdir.path());
         assert_eq!(after[&key].quality, LabelQuality::Llm);
         assert_eq!(after[&key].label, "Good Label");
+    }
+
+    #[test]
+    fn concurrent_cache_merges_are_cross_process_safe_and_atomically_readable() {
+        const ROOT_ENV: &str = "CONTEXTPLUS_LABEL_CACHE_RACE_ROOT";
+        const READY_ENV: &str = "CONTEXTPLUS_LABEL_CACHE_RACE_READY";
+        const START_ENV: &str = "CONTEXTPLUS_LABEL_CACHE_RACE_START";
+        const KEY_ENV: &str = "CONTEXTPLUS_LABEL_CACHE_RACE_KEY";
+
+        if let Ok(root) = std::env::var(ROOT_ENV) {
+            let ready = std::env::var(READY_ENV).expect("worker ready path");
+            let start = std::env::var(START_ENV).expect("worker start path");
+            let key = std::env::var(KEY_ENV).expect("worker cache key");
+            std::fs::write(&ready, b"ready").expect("signal worker ready");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !Path::new(&start).exists() {
+                assert!(Instant::now() < deadline, "worker start barrier timed out");
+                std::thread::yield_now();
+            }
+            save_label_cache_merged(
+                Path::new(&root),
+                &HashMap::from([(key.clone(), CachedLabel::llm(format!("label-{key}")))]),
+            )
+            .unwrap();
+            return;
+        }
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tempdir.path().join(".mcp_data")).unwrap();
+        let mut initial = HashMap::new();
+        initial.insert(
+            "baseline".to_string(),
+            CachedLabel::llm("baseline-label".to_string()),
+        );
+        for i in 0..20_000 {
+            initial.insert(
+                format!("seed-{i:05}"),
+                CachedLabel::heuristic(format!("{}-{i}", "x".repeat(160))),
+            );
+        }
+        save_label_cache_full(tempdir.path(), &initial);
+
+        let start = tempdir.path().join("start");
+        let mut children = Vec::new();
+        let mut ready_paths = Vec::new();
+        let worker_keys: Vec<String> = (0..4).map(|i| format!("upgrade-{i}")).collect();
+        for (i, key) in worker_keys.iter().enumerate() {
+            let ready = tempdir.path().join(format!("ready-{i}"));
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(
+                    "tools::semantic_navigate::tests::concurrent_cache_merges_are_cross_process_safe_and_atomically_readable",
+                )
+                .arg("--exact")
+                .env(ROOT_ENV, tempdir.path())
+                .env(READY_ENV, &ready)
+                .env(START_ENV, &start)
+                .env(KEY_ENV, key)
+                .spawn()
+                .expect("spawn cache writer process");
+            children.push(child);
+            ready_paths.push(ready);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready_paths.iter().all(|path| path.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "cache writers did not reach barrier"
+            );
+            std::thread::yield_now();
+        }
+
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let invalid_read = Arc::new(AtomicBool::new(false));
+        let reader_root = tempdir.path().to_path_buf();
+        let reader_stop = Arc::clone(&stop_reader);
+        let reader_invalid = Arc::clone(&invalid_read);
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Acquire) {
+                let cache = load_label_cache_full(&reader_root);
+                if cache
+                    .get("baseline")
+                    .is_none_or(|entry| entry.label != "baseline-label")
+                {
+                    reader_invalid.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        });
+
+        std::fs::write(&start, b"go").expect("release cache writers");
+        for mut child in children {
+            let status = child.wait().expect("wait for cache writer");
+            assert!(status.success(), "cache writer exited with {status}");
+        }
+        stop_reader.store(true, Ordering::Release);
+        reader.join().expect("cache reader thread");
+
+        assert!(
+            !invalid_read.load(Ordering::Acquire),
+            "a reader observed missing baseline data while the cache was being published"
+        );
+        let final_cache = load_label_cache_full(tempdir.path());
+        for key in worker_keys {
+            let entry = final_cache
+                .get(&key)
+                .unwrap_or_else(|| panic!("concurrent merge lost completed upgrade {key}"));
+            assert_eq!(
+                entry.label,
+                format!("label-{key}"),
+                "concurrent merge corrupted completed upgrade {key}"
+            );
+            assert_eq!(entry.quality, LabelQuality::Llm);
+        }
     }
 
     /// In-flight dedup: claiming the same key twice gives it once.
@@ -2368,5 +2704,202 @@ mod tests {
             }
         }
         assert!(upgraded, "background heal did not upgrade label to Llm");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r3_semantic_parse_and_validation_diagnostics() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (response, expected) in [
+            (
+                "I cannot produce labels for these files",
+                vec!["parse failure", "kind=prose chars=39"],
+            ),
+            (
+                "[\"bad/path\",\"Stripe Services\"]",
+                vec![
+                    "invalid label format",
+                    "minority path match",
+                    "matching_files=1",
+                    "total_files=6",
+                ],
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/chat"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"message": {"content": response}})),
+                )
+                .mount(&server)
+                .await;
+            let mut config = Config::from_env();
+            config.ollama_host = server.uri();
+            let client = OllamaClient::new(&config);
+            let files: Vec<FileInfo> = [
+                "src/stripe/a.rs",
+                "src/auth/b.rs",
+                "src/auth/c.rs",
+                "src/auth/d.rs",
+                "src/auth/e.rs",
+                "src/auth/f.rs",
+            ]
+            .iter()
+            .map(|path| FileInfo {
+                relative_path: path.to_string(),
+                ..Default::default()
+            })
+            .collect();
+            let count = if response.starts_with('[') { 2 } else { 1 };
+            let queue: Vec<_> = (0..count)
+                .map(|i| OwnedClusterSnapshot {
+                    cache_key: format!("diagnostic-{i}"),
+                    files: files.clone(),
+                    parent: None,
+                })
+                .collect();
+            let (logs, subscriber) = captured_info_logs();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let _ = run_llm_heal(&queue, &client, root.path()).await;
+            let logs = logs_as_string(&logs);
+            for expected in expected {
+                assert!(logs.contains(expected), "{expected}: {logs}");
+            }
+            assert_eq!(
+                logs.lines()
+                    .filter(|l| l.contains("parse failure") || l.contains("validation rejected"))
+                    .count(),
+                1,
+                "{logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_shape_describes_without_echoing_content() {
+        assert_eq!(
+            response_shape(" I cannot produce labels "),
+            "kind=prose chars=23 brackets=0"
+        );
+        assert_eq!(
+            response_shape("[1, 2] then [\"a\"]"),
+            "kind=array chars=17 brackets=2"
+        );
+        assert_eq!(response_shape("{}"), "kind=object chars=2 brackets=0");
+        assert_eq!(response_shape("  "), "kind=empty chars=0 brackets=0");
+        for response in [
+            "Authorization: Bearer TOP_SECRET",
+            "api_key=TOP_SECRET",
+            "https://user:TOP_SECRET@example.com",
+        ] {
+            assert!(!response_shape(response).contains("TOP_SECRET"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_heal_failure_remains_retryable_and_recovers_on_next_call() {
+        use crate::config::Config;
+        use crate::core::embeddings::OllamaClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tempdir.path().join(".mcp_data")).unwrap();
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(move |_request: &Request| {
+                if response_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    ResponseTemplate::new(503)
+                        .set_body_string("Authorization: Bearer SEMANTIC_FAILURE_SECRET")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "[\"Recovered Authorization Flow\"]" }
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = Config::from_env();
+        config.ollama_host = server.uri();
+        config.ollama_chat_model = "test-model".to_string();
+        let client = OllamaClient::new(&config);
+        let files = [
+            FileInfo {
+                relative_path: "src/auth/login.rs".to_string(),
+                header: "login flow".to_string(),
+                ..Default::default()
+            },
+            FileInfo {
+                relative_path: "src/auth/session.rs".to_string(),
+                header: "session lifecycle".to_string(),
+                ..Default::default()
+            },
+        ];
+        let input = vec![(files.iter().collect::<Vec<_>>(), None)];
+        let key = cluster_cache_key(&["src/auth/login.rs", "src/auth/session.rs"]);
+        let (logs, subscriber) = captured_info_logs();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let first = label_clusters_with_cache(&input, &client, tempdir.path()).await;
+        assert_eq!(first.len(), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if calls.load(Ordering::Acquire) >= 1 {
+                    let (claimed, claims) =
+                        claim_heal_for_root(std::slice::from_ref(&key), tempdir.path());
+                    if !claimed.is_empty() {
+                        drop(claims);
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed semantic heal did not finish");
+
+        let after_failure = load_label_cache_full(tempdir.path());
+        assert_eq!(
+            after_failure[&key].quality,
+            LabelQuality::Heuristic,
+            "provider failure was incorrectly persisted as a final LLM label"
+        );
+
+        let second = label_clusters_with_cache(&input, &client, tempdir.path()).await;
+        assert_eq!(second[0], after_failure[&key].label);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cache = load_label_cache_full(tempdir.path());
+                if cache.get(&key).is_some_and(|entry| {
+                    entry.quality == LabelQuality::Llm
+                        && entry.label == "Recovered Authorization Flow"
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("semantic heal did not retry successfully after provider recovery");
+
+        let logs = logs_as_string(&logs);
+        let failure_lines = logs
+            .lines()
+            .filter(|line| line.contains("heal") && line.contains("fail"))
+            .count();
+        assert_eq!(
+            failure_lines, 1,
+            "failed semantic batch must emit one info diagnostic:\n{logs}"
+        );
+        assert!(
+            !logs.contains("SEMANTIC_FAILURE_SECRET"),
+            "semantic failure diagnostic exposed provider contents:\n{logs}"
+        );
     }
 }

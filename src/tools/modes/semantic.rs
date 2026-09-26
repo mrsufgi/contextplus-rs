@@ -89,12 +89,27 @@ pub(crate) async fn build_semantic_hierarchy(
 }
 
 /// Label clusters for semantic mode using LLM with themed prompt.
+#[cfg(test)]
 pub(crate) async fn label_clusters_for_semantic_mode(
     clusters: &[(Vec<&FileInfo>, Option<String>)],
     ollama: &OllamaClient,
 ) -> Vec<String> {
+    try_label_clusters_for_semantic_mode(clusters, ollama)
+        .await
+        .unwrap_or_else(|_| {
+            clusters
+                .iter()
+                .map(|(files, _)| fallback_label(files))
+                .collect()
+        })
+}
+
+pub(crate) async fn try_label_clusters_for_semantic_mode(
+    clusters: &[(Vec<&FileInfo>, Option<String>)],
+    ollama: &OllamaClient,
+) -> crate::error::Result<Vec<String>> {
     if clusters.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Build LLM prompt — original contextplus asked for overarchingTheme + distinguishingFeature + label
@@ -139,49 +154,16 @@ pub(crate) async fn label_clusters_for_semantic_mode(
         clusters.len()
     );
 
-    match ollama.chat(&prompt).await {
-        Ok(response) => {
-            // Try to parse the rich response format
-            if let Some(json_str) = super::super::semantic_navigate::extract_json_array(&response) {
-                // Try rich format first: [{overarchingTheme, distinguishingFeature, label}]
-                if let Ok(rich) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    let labels: Vec<String> = rich
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            let raw = v
-                                .get("label")
-                                .and_then(|l| l.as_str())
-                                .or_else(|| v.as_str())
-                                .map(|s| s.to_string());
-                            match raw {
-                                Some(s) if !s.is_empty() => s,
-                                _ => {
-                                    let (files, _) = &clusters[i.min(clusters.len() - 1)];
-                                    fallback_label(files)
-                                }
-                            }
-                        })
-                        .collect();
-                    if labels.len() == clusters.len() {
-                        return labels;
-                    }
-                }
-            }
-            // LLM response unparseable — use path-based fallbacks
-            clusters
-                .iter()
-                .map(|(files, _)| fallback_label(files))
-                .collect()
-        }
-        Err(_) => {
-            // LLM failed — use path-based fallbacks
-            clusters
-                .iter()
-                .map(|(files, _)| fallback_label(files))
-                .collect()
-        }
-    }
+    let response = ollama.chat(&prompt).await?;
+    super::super::semantic_navigate::extract_label_array(&response, clusters.len(), true)
+        .ok_or_else(|| {
+            let response_shape = super::super::semantic_navigate::response_shape(&response);
+            tracing::info!(
+                response_shape,
+                "semantic_navigate: heal parse failure: expected one label per cluster"
+            );
+            crate::error::ContextPlusError::Other("label response parse failure".to_string())
+        })
 }
 
 #[cfg(test)]

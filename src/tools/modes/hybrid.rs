@@ -26,15 +26,18 @@ pub(crate) async fn build_labeled_tree(
 ) -> Vec<ClusterNode> {
     let mut children: Vec<ClusterNode> = Vec::new();
     let mut large_groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut pending_groups = Vec::new();
 
     for (dir_label, group_indices) in &dir_groups {
         if group_indices.len() <= MAX_FILES_PER_LEAF {
             // Small group — flat leaf node. Spectral clustering on <10 files
             // produces noisy singletons with #2/#3 suffixes.
-            children.push(ClusterNode {
+            pending_groups.push(PendingGroup {
                 label: dir_label.clone(),
-                files: group_indices.iter().map(|&i| files[i].clone()).collect(),
-                children: Vec::new(),
+                indices: group_indices.clone(),
+                cluster_results: vec![ClusterResult {
+                    indices: (0..group_indices.len()).collect(),
+                }],
             });
         } else {
             // 10+ files — spectral clustering produces meaningful sub-clusters
@@ -65,15 +68,20 @@ pub(crate) async fn build_labeled_tree(
 
     // Now collect ALL unlabeled sub-clusters from ALL groups into one batch
     // and make a single LLM call to label them all
-    let pending_groups: Vec<PendingGroup> = large_groups
-        .into_iter()
-        .zip(all_cluster_results)
-        .map(|((label, indices), clusters)| PendingGroup {
-            label,
-            indices,
-            cluster_results: clusters,
-        })
-        .collect();
+    pending_groups.extend(large_groups.into_iter().zip(all_cluster_results).map(
+        |((label, indices), mut clusters)| {
+            if clusters.is_empty() {
+                clusters.push(ClusterResult {
+                    indices: (0..indices.len()).collect(),
+                });
+            }
+            PendingGroup {
+                label,
+                indices,
+                cluster_results: clusters,
+            }
+        },
+    ));
 
     // Get LLM labels for sub-clusters
     let llm_label_map = label_subclusters_with_llm(&pending_groups, files, ollama, root_dir).await;
@@ -83,7 +91,7 @@ pub(crate) async fn build_labeled_tree(
         if group.cluster_results.len() <= 1 {
             // Single cluster or no split — leaf node
             children.push(ClusterNode {
-                label: group.label,
+                label: llm_label_map.get(&(gi, 0)).cloned().unwrap_or(group.label),
                 files: group.indices.iter().map(|&i| files[i].clone()).collect(),
                 children: Vec::new(),
             });
@@ -249,7 +257,7 @@ struct OwnedSubcluster {
 
 /// Resolve labels for sub-clusters with stale-while-revalidate semantics.
 ///
-/// - cache hit (any quality): return cached label.
+/// - cache hit: return cached label; requeue heuristic-quality entries.
 /// - cache miss: return a heuristic now, persist it, queue an LLM heal.
 ///
 /// Returns the (gi, ci) -> label_to_use_now map. The background task fires
@@ -262,20 +270,18 @@ pub(crate) async fn label_subclusters_with_llm(
 ) -> HashMap<(usize, usize), String> {
     use super::super::labels::heuristic_label;
     use super::super::semantic_navigate::{
-        CachedLabel, cluster_cache_key, load_label_cache_full, save_label_cache_merged,
+        CachedLabel, LabelQuality, cluster_cache_key, load_label_cache_async,
+        save_label_cache_async,
     };
 
     let mut label_map: HashMap<(usize, usize), String> = HashMap::new();
 
     // Load existing label cache (with quality)
-    let label_cache = load_label_cache_full(root_dir);
+    let label_cache = load_label_cache_async(root_dir).await;
 
     // Collect all sub-cluster file lists
     let mut all_sublabels: Vec<(usize, usize, Vec<&FileInfo>)> = Vec::new(); // (group_idx, cluster_idx, files)
     for (gi, group) in pending_groups.iter().enumerate() {
-        if group.cluster_results.len() <= 1 {
-            continue;
-        }
         for (ci, cluster) in group.cluster_results.iter().enumerate() {
             let file_refs: Vec<&FileInfo> = cluster
                 .indices
@@ -305,26 +311,37 @@ pub(crate) async fn label_subclusters_with_llm(
                 cached.label
             );
             label_map.insert((*gi, *ci), cached.label.clone());
+            if cached.quality == LabelQuality::Llm {
+                continue;
+            }
         } else {
-            let h = heuristic_label(file_refs);
+            let h = if pending_groups[*gi].cluster_results.len() == 1 {
+                pending_groups[*gi].label.clone()
+            } else {
+                heuristic_label(file_refs)
+            };
             label_map.insert((*gi, *ci), h.clone());
             heuristic_writes.insert(key.clone(), CachedLabel::heuristic(h));
-            heal_queue.push(OwnedSubcluster {
-                cache_key: key,
-                parent_label: pending_groups[*gi].label.clone(),
-                files: file_refs.iter().map(|f| (*f).clone()).collect(),
-            });
         }
+        heal_queue.push(OwnedSubcluster {
+            cache_key: key,
+            parent_label: pending_groups[*gi].label.clone(),
+            files: file_refs.iter().map(|f| (*f).clone()).collect(),
+        });
     }
 
     // Persist heuristics now so a crash leaves usable labels on disk.
-    if !heuristic_writes.is_empty() {
-        save_label_cache_merged(root_dir, &heuristic_writes);
+    if !heuristic_writes.is_empty()
+        && let Err(error) = save_label_cache_async(root_dir, &heuristic_writes).await
+    {
+        tracing::info!(reason = %error, "label cache save failed");
     }
 
     // Spawn the background LLM heal — caller does NOT await this.
     if !heal_queue.is_empty() {
         spawn_subcluster_heal(heal_queue, ollama.clone(), root_dir.to_path_buf());
+    } else {
+        tracing::info!("semantic_navigate: heal spawn skipped: no heuristic sub-clusters");
     }
 
     label_map
@@ -338,7 +355,7 @@ async fn run_subcluster_llm_heal(
     ollama: &OllamaClient,
     root_dir: &Path,
 ) {
-    use super::super::semantic_navigate::{CachedLabel, save_label_cache_merged};
+    use super::super::semantic_navigate::{CachedLabel, save_label_cache_async};
     if queue.is_empty() {
         return;
     }
@@ -463,29 +480,51 @@ async fn run_subcluster_llm_heal(
             batch.len()
         );
 
-        if let Ok(response) = ollama.chat(&prompt).await {
-            if let Some(json_str) = super::super::semantic_navigate::extract_json_array(&response)
-                && let Ok(labels) = serde_json::from_str::<Vec<String>>(&json_str)
-            {
-                for (j, (queue_idx, _, file_refs)) in batch.iter().enumerate() {
-                    if let Some(label) = labels.get(j) {
-                        let clean_label = label.trim();
-                        if clean_label.is_empty()
-                            || clean_label.len() > 50
-                            || clean_label.contains('.')
-                            || clean_label.contains('/')
-                        {
-                            continue;
-                        }
-                        if !validate_label_against_cluster(clean_label, file_refs) {
-                            continue;
-                        }
-                        llm_label_map.insert(*queue_idx, clean_label.to_string());
-                    }
-                }
+        let response = match ollama.chat(&prompt).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::info!(
+                    reason = %super::super::semantic_navigate::heal_chat_error_reason(&error),
+                    "semantic_navigate: heal — LLM chat call failed for sub-cluster batch"
+                );
+                continue;
             }
-        } else {
-            tracing::info!("semantic_navigate: heal — LLM chat call failed for sub-cluster batch");
+        };
+        tracing::debug!(
+            bytes = response.len(),
+            "semantic_navigate: heal chat result"
+        );
+        let labels =
+            super::super::semantic_navigate::extract_label_array(&response, batch.len(), false);
+        let Some(labels) = labels else {
+            let response_shape = super::super::semantic_navigate::response_shape(&response);
+            tracing::info!(
+                response_shape,
+                "semantic_navigate: heal parse failure: expected one label per cluster"
+            );
+            continue;
+        };
+        let mut rejections = Vec::new();
+        for ((queue_idx, _, file_refs), label) in batch.iter().zip(&labels) {
+            let label = label.trim();
+            if label.is_empty() || label.len() > 50 || label.contains('.') || label.contains('/') {
+                rejections.push(format!(
+                    "invalid label format; total_files={}",
+                    file_refs.len()
+                ));
+                continue;
+            }
+            if !validate_label_against_cluster(label, file_refs) {
+                let (matching_files, total_files) =
+                    super::super::labels::label_validation_rejection(label, file_refs)
+                        .expect("rejected label has a validation reason");
+                rejections.push(format!("minority path match: matching_files={matching_files}, total_files={total_files}"));
+                continue;
+            }
+            llm_label_map.insert(*queue_idx, label.to_string());
+        }
+        if !rejections.is_empty() {
+            tracing::info!(reasons = ?rejections, "semantic_navigate: heal validation rejected labels");
         }
     }
 
@@ -497,7 +536,10 @@ async fn run_subcluster_llm_heal(
         }
     }
     if !upgrades.is_empty() {
-        save_label_cache_merged(root_dir, &upgrades);
+        if let Err(error) = save_label_cache_async(root_dir, &upgrades).await {
+            tracing::info!(reason = %error, "semantic_navigate: heal cache publication failed (heuristics retained)");
+            return;
+        }
         tracing::info!(
             upgraded = upgrades.len(),
             queued = queue.len(),
@@ -516,11 +558,12 @@ fn spawn_subcluster_heal(
     ollama: OllamaClient,
     root_dir: std::path::PathBuf,
 ) {
-    use super::super::semantic_navigate::{claim_in_flight_keys, release_in_flight_keys};
+    use super::super::semantic_navigate::claim_heal_for_root;
 
     let keys: Vec<String> = queue.iter().map(|s| s.cache_key.clone()).collect();
-    let claimed = claim_in_flight_keys(&keys);
+    let (claimed, claims) = claim_heal_for_root(&keys, &root_dir);
     if claimed.is_empty() {
+        tracing::info!("semantic_navigate: heal spawn skipped: all keys already in-flight");
         return;
     }
     let to_heal: Vec<OwnedSubcluster> = queue
@@ -529,9 +572,11 @@ fn spawn_subcluster_heal(
         .collect();
     let claimed_keys: Vec<String> = to_heal.iter().map(|s| s.cache_key.clone()).collect();
 
+    tracing::info!(claimed = claimed_keys.len(), root = %root_dir.display(), "semantic_navigate: heal spawn");
     tokio::spawn(async move {
+        let _claims = claims;
         run_subcluster_llm_heal(&to_heal, &ollama, &root_dir).await;
-        release_in_flight_keys(&claimed_keys);
+        tracing::info!("semantic_navigate: heal completed");
     });
 }
 
@@ -662,6 +707,25 @@ mod tests {
     use crate::config::Config;
     use crate::core::clustering::ClusterResult;
     use crate::tools::semantic_navigate;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn config_with_host(host: &str) -> Config {
         let mut config = Config::from_env();
@@ -676,6 +740,497 @@ mod tests {
             header: format!("header for {path}"),
             ..Default::default()
         }
+    }
+
+    fn two_subclusters(files: &[FileInfo], parent: &str) -> Vec<PendingGroup> {
+        assert_eq!(files.len(), 2);
+        vec![PendingGroup {
+            label: parent.to_string(),
+            indices: vec![0, 1],
+            cluster_results: vec![
+                ClusterResult { indices: vec![0] },
+                ClusterResult { indices: vec![1] },
+            ],
+        }]
+    }
+
+    async fn mock_chat(content: &str) -> (MockServer, OllamaClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": content }
+            })))
+            .mount(&server)
+            .await;
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        (server, client)
+    }
+
+    fn seed_heuristics(root: &Path, files: &[FileInfo], labels: &[&str]) -> Vec<String> {
+        use semantic_navigate::{CachedLabel, cluster_cache_key, save_label_cache_full};
+
+        let keyed_labels: Vec<(String, CachedLabel)> = files
+            .iter()
+            .zip(labels)
+            .map(|(file, label)| {
+                (
+                    cluster_cache_key(&[file.relative_path.as_str()]),
+                    CachedLabel::heuristic((*label).to_string()),
+                )
+            })
+            .collect();
+        let keys = keyed_labels.iter().map(|(key, _)| key.clone()).collect();
+        let entries = keyed_labels.into_iter().collect();
+        save_label_cache_full(root, &entries);
+        keys
+    }
+
+    async fn wait_for_llm_labels(root: &Path, expected: &[(String, &str)]) -> bool {
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let cache = semantic_navigate::load_label_cache_full(root);
+                if expected.iter().all(|(key, label)| {
+                    cache.get(key).is_some_and(|entry| {
+                        entry.quality == semantic_navigate::LabelQuality::Llm
+                            && entry.label == *label
+                    })
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn captured_info_logs() -> (Arc<Mutex<Vec<u8>>>, impl tracing::Subscriber) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer_logs = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || CapturedWriter(Arc::clone(&writer_logs)))
+            .finish();
+        (logs, subscriber)
+    }
+
+    fn logs_as_string(logs: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(logs.lock().unwrap().clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cached_heuristics_are_healed_and_returned_by_the_next_clusters_call() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let files = vec![
+            make_file("packages/payments/repository/stripe.rs"),
+            make_file("packages/payments/service/charge.rs"),
+        ];
+        let pending = two_subclusters(&files, "payments");
+        let keys = seed_heuristics(tempdir.path(), &files, &["repository/stripe", "service"]);
+        let (_server, client) =
+            mock_chat(r#"["Stripe Payment Gateway", "Payment Orchestration"]"#).await;
+
+        let first = label_subclusters_with_llm(&pending, &files, &client, tempdir.path()).await;
+        assert_eq!(
+            first.get(&(0, 0)).map(String::as_str),
+            Some("repository/stripe")
+        );
+        assert_eq!(first.get(&(0, 1)).map(String::as_str), Some("service"));
+
+        let healed = wait_for_llm_labels(
+            tempdir.path(),
+            &[
+                (keys[0].clone(), "Stripe Payment Gateway"),
+                (keys[1].clone(), "Payment Orchestration"),
+            ],
+        )
+        .await;
+        assert!(
+            healed,
+            "background heal did not replace cached heuristic labels before timeout"
+        );
+
+        let second = label_subclusters_with_llm(&pending, &files, &client, tempdir.path()).await;
+        let second_labels: std::collections::HashSet<&str> =
+            second.values().map(String::as_str).collect();
+        assert_eq!(
+            second_labels,
+            std::collections::HashSet::from(["Stripe Payment Gateway", "Payment Orchestration"])
+        );
+    }
+
+    #[tokio::test]
+    async fn prose_wrapped_chat_response_uses_the_valid_label_array() {
+        use semantic_navigate::{CachedLabel, LabelQuality, load_label_cache_full};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let file = make_file("packages/payments/service/authorize.rs");
+        let key = semantic_navigate::cluster_cache_key(&[file.relative_path.as_str()]);
+        semantic_navigate::save_label_cache_full(
+            tempdir.path(),
+            &HashMap::from([(key.clone(), CachedLabel::heuristic("service".to_string()))]),
+        );
+        let response = "I considered calling tools [] but no tool was needed.\n\
+                        The requested labels are [\"Payment Authorization Flow\"].\n\
+                        I hope that helps.";
+        let (_server, client) = mock_chat(response).await;
+        let queue = vec![OwnedSubcluster {
+            cache_key: key.clone(),
+            parent_label: "payments".to_string(),
+            files: vec![file],
+        }];
+
+        run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
+
+        let cache = load_label_cache_full(tempdir.path());
+        assert_eq!(
+            cache[&key].quality,
+            LabelQuality::Llm,
+            "prose-wrapped response did not produce an LLM cache upgrade"
+        );
+        assert_eq!(cache[&key].label, "Payment Authorization Flow");
+    }
+
+    #[tokio::test]
+    async fn heal_scans_past_non_label_arrays_for_the_expected_string_array() {
+        use semantic_navigate::{CachedLabel, LabelQuality, load_label_cache_full};
+
+        let cases = [
+            (
+                "numeric-prefix",
+                "I considered tool arguments [1, 2]. The labels are [\"Payment Authorization Flow\"].",
+            ),
+            (
+                "object-prefix",
+                "Tool metadata [{\"name\":\"search\"}]. The labels are [\"Payment Authorization Flow\"].",
+            ),
+            (
+                "wrong-length-prefix",
+                "Draft labels [\"scratch\", \"notes\"]. Final labels [\"Payment Authorization Flow\"].",
+            ),
+        ];
+        let mut failures = Vec::new();
+
+        for (case, response) in cases {
+            let tempdir = tempfile::tempdir().unwrap();
+            let file = make_file(&format!("packages/payments/service/{case}.rs"));
+            let key = semantic_navigate::cluster_cache_key(&[file.relative_path.as_str()]);
+            semantic_navigate::save_label_cache_full(
+                tempdir.path(),
+                &HashMap::from([(key.clone(), CachedLabel::heuristic("service".to_string()))]),
+            );
+            let (_server, client) = mock_chat(response).await;
+            let queue = vec![OwnedSubcluster {
+                cache_key: key.clone(),
+                parent_label: "payments".to_string(),
+                files: vec![file],
+            }];
+
+            run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
+
+            let cache = load_label_cache_full(tempdir.path());
+            if cache.get(&key).is_none_or(|entry| {
+                entry.quality != LabelQuality::Llm || entry.label != "Payment Authorization Flow"
+            }) {
+                failures.push(case);
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "heal stopped at unrelated arrays instead of scanning for the expected label array: {failures:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validation_rejections_keep_heuristics_and_log_one_batch_reason() {
+        use semantic_navigate::{CachedLabel, LabelQuality, load_label_cache_full};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut first_files: Vec<FileInfo> = (0..9)
+            .map(|i| make_file(&format!("packages/payments/service/charge_{i}.rs")))
+            .collect();
+        first_files.push(make_file("packages/payments/zebra/handler.rs"));
+        let mut second_files: Vec<FileInfo> = (0..9)
+            .map(|i| make_file(&format!("packages/payments/repository/payment_{i}.rs")))
+            .collect();
+        second_files.push(make_file("packages/payments/falcon/handler.rs"));
+        let first_refs: Vec<&str> = first_files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        let second_refs: Vec<&str> = second_files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        let first_key = semantic_navigate::cluster_cache_key(&first_refs);
+        let second_key = semantic_navigate::cluster_cache_key(&second_refs);
+        semantic_navigate::save_label_cache_full(
+            tempdir.path(),
+            &HashMap::from([
+                (
+                    first_key.clone(),
+                    CachedLabel::heuristic("service".to_string()),
+                ),
+                (
+                    second_key.clone(),
+                    CachedLabel::heuristic("repository".to_string()),
+                ),
+            ]),
+        );
+        let queue = vec![
+            OwnedSubcluster {
+                cache_key: first_key.clone(),
+                parent_label: "payments".to_string(),
+                files: first_files,
+            },
+            OwnedSubcluster {
+                cache_key: second_key.clone(),
+                parent_label: "payments".to_string(),
+                files: second_files,
+            },
+        ];
+        let (_server, client) = mock_chat(r#"["Zebra Handler", "Falcon Handler"]"#).await;
+        let (logs, subscriber) = captured_info_logs();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
+
+        let cache = load_label_cache_full(tempdir.path());
+        assert_eq!(cache[&first_key].quality, LabelQuality::Heuristic);
+        assert_eq!(cache[&first_key].label, "service");
+        assert_eq!(cache[&second_key].quality, LabelQuality::Heuristic);
+        assert_eq!(cache[&second_key].label, "repository");
+        let logs = logs_as_string(&logs);
+        let rejection_lines = logs.lines().filter(|line| line.contains("reject")).count();
+        assert_eq!(
+            rejection_lines, 1,
+            "validation rejection must be logged once per batch with a reason:\n{logs}"
+        );
+        assert!(
+            logs.contains("matching_files") && logs.contains("total_files"),
+            "validation rejection log omitted its reason:\n{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_worktree_ref_heal_is_read_by_the_next_call() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let primary = tempdir.path().join("primary");
+        let worktree = tempdir.path().join("feature-payments");
+        let worktree_gitdir = primary.join(".git/worktrees/feature-payments");
+        std::fs::create_dir_all(&worktree_gitdir).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree_gitdir.join("commondir"), "../..").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .unwrap();
+        let files = vec![
+            make_file("packages/payments/repository/stripe.rs"),
+            make_file("packages/payments/service/refund.rs"),
+        ];
+        let pending = two_subclusters(&files, "payments");
+        let keys = seed_heuristics(&worktree, &files, &["repository/stripe", "service"]);
+        let (_server, client) = mock_chat(r#"["Stripe Data Access", "Refund Processing"]"#).await;
+
+        let first = label_subclusters_with_llm(&pending, &files, &client, &worktree).await;
+        assert!(first.values().any(|label| label == "repository/stripe"));
+        let healed = wait_for_llm_labels(
+            &worktree,
+            &[
+                (keys[0].clone(), "Stripe Data Access"),
+                (keys[1].clone(), "Refund Processing"),
+            ],
+        )
+        .await;
+        assert!(
+            healed,
+            "attached worktree heal was not readable from the worktree label cache"
+        );
+
+        let second = label_subclusters_with_llm(&pending, &files, &client, &worktree).await;
+        let labels: std::collections::HashSet<&str> = second.values().map(String::as_str).collect();
+        assert_eq!(
+            labels,
+            std::collections::HashSet::from(["Stripe Data Access", "Refund Processing"])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_error_is_logged_once_with_reason_and_without_secrets() {
+        use semantic_navigate::{CachedLabel, load_label_cache_full};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let file = make_file("packages/payments/service/capture.rs");
+        let key = semantic_navigate::cluster_cache_key(&[file.relative_path.as_str()]);
+        semantic_navigate::save_label_cache_full(
+            tempdir.path(),
+            &HashMap::from([(key.clone(), CachedLabel::heuristic("service".to_string()))]),
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("provider-secret-must-not-be-logged"),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+        let queue = vec![OwnedSubcluster {
+            cache_key: key.clone(),
+            parent_label: "payments".to_string(),
+            files: vec![file],
+        }];
+        let (logs, subscriber) = captured_info_logs();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
+
+        assert_eq!(load_label_cache_full(tempdir.path())[&key].label, "service");
+        let logs = logs_as_string(&logs);
+        let failure_lines = logs
+            .lines()
+            .filter(|line| line.contains("chat") && line.contains("fail"))
+            .count();
+        assert_eq!(
+            failure_lines, 1,
+            "chat failure must be logged once per batch:\n{logs}"
+        );
+        assert!(
+            logs.contains("503 Service Unavailable"),
+            "chat failure log omitted the provider error reason:\n{logs}"
+        );
+        assert!(
+            !logs.contains("provider-secret-must-not-be-logged"),
+            "chat failure log exposed provider response contents:\n{logs}"
+        );
+        assert!(
+            !logs.contains("packages/payments/service/capture.rs"),
+            "chat failure log exposed prompt contents:\n{logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r3_cache_write_failure_retains_heuristics_without_upgrade_log() {
+        use semantic_navigate::CachedLabel;
+        let tempdir = tempfile::tempdir().unwrap();
+        let file = make_file("packages/payments/service/settle.rs");
+        let key = semantic_navigate::cluster_cache_key(&[file.relative_path.as_str()]);
+        semantic_navigate::save_label_cache_full(
+            tempdir.path(),
+            &HashMap::from([(key.clone(), CachedLabel::heuristic("service".to_string()))]),
+        );
+        std::fs::create_dir(tempdir.path().join(".mcp_data/navigate-labels.json.tmp")).unwrap();
+        let (_server, client) = mock_chat("[\"Payment Processing Core\"]").await;
+        let queue = vec![OwnedSubcluster {
+            cache_key: key.clone(),
+            parent_label: "payments".to_string(),
+            files: vec![file],
+        }];
+        let (logs, subscriber) = captured_info_logs();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
+        assert_eq!(
+            semantic_navigate::load_label_cache_full(tempdir.path())[&key].quality,
+            semantic_navigate::LabelQuality::Heuristic
+        );
+        let logs = logs_as_string(&logs);
+        assert_eq!(
+            logs.lines().filter(|l| l.contains("failed")).count(),
+            1,
+            "{logs}"
+        );
+        assert!(!logs.contains("upgraded"), "{logs}");
+        assert!(logs.contains("cache publication failed"), "{logs}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parse_failure_logs_one_truncated_response_snippet() {
+        use semantic_navigate::CachedLabel;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let file = make_file("packages/payments/service/settle.rs");
+        let key = semantic_navigate::cluster_cache_key(&[file.relative_path.as_str()]);
+        semantic_navigate::save_label_cache_full(
+            tempdir.path(),
+            &HashMap::from([(key.clone(), CachedLabel::heuristic("service".to_string()))]),
+        );
+        let response = format!(
+            "Authorization: Bearer PARSE_SECRET_NEAR_PREFIX; model returned prose instead of labels: {}NEVER_LOG_THIS_RESPONSE_TAIL",
+            "x".repeat(512)
+        );
+        let (_server, client) = mock_chat(&response).await;
+        let queue = vec![OwnedSubcluster {
+            cache_key: key,
+            parent_label: "payments".to_string(),
+            files: vec![file],
+        }];
+        let (logs, subscriber) = captured_info_logs();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
+
+        let logs = logs_as_string(&logs);
+        let parse_lines = logs.lines().filter(|line| line.contains("parse")).count();
+        assert_eq!(
+            parse_lines, 1,
+            "parse failure must be logged once per batch:\n{logs}"
+        );
+        assert!(
+            logs.contains("kind=prose") && logs.contains("brackets=0"),
+            "parse failure log omitted the response shape:\n{logs}"
+        );
+        assert!(
+            !logs.contains("PARSE_SECRET_NEAR_PREFIX"),
+            "parse failure logged credential text from the response prefix:\n{logs}"
+        );
+        assert!(
+            !logs.contains("NEVER_LOG_THIS_RESPONSE_TAIL"),
+            "parse failure logged the untruncated response:\n{logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_flight_batch_skip_is_logged_once_with_reason() {
+        use semantic_navigate::{claim_in_flight_keys, release_in_flight_keys};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let files = vec![
+            make_file("packages/payments/repository/inflight_stripe.rs"),
+            make_file("packages/payments/service/inflight_charge.rs"),
+        ];
+        let pending = two_subclusters(&files, "payments");
+        let keys = seed_heuristics(tempdir.path(), &files, &["repository", "service"]);
+        let claimed = claim_in_flight_keys(&keys);
+        assert_eq!(claimed.len(), 2);
+        let client = OllamaClient::new(&config_with_host("http://127.0.0.1:9"));
+        let (logs, subscriber) = captured_info_logs();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let labels = label_subclusters_with_llm(&pending, &files, &client, tempdir.path()).await;
+        release_in_flight_keys(&keys);
+
+        assert_eq!(labels.get(&(0, 0)).map(String::as_str), Some("repository"));
+        assert_eq!(labels.get(&(0, 1)).map(String::as_str), Some("service"));
+        let logs = logs_as_string(&logs);
+        let skipped_lines = logs
+            .lines()
+            .filter(|line| line.contains("spawn") && line.contains("skip"))
+            .count();
+        assert_eq!(
+            skipped_lines, 1,
+            "heal spawn skip must be logged once per batch:\n{logs}"
+        );
+        assert!(
+            logs.contains("in-flight") || logs.contains("in_flight"),
+            "heal spawn skip log omitted the in-flight reason:\n{logs}"
+        );
     }
 
     #[tokio::test]
@@ -797,5 +1352,111 @@ mod tests {
         assert_eq!(tree[0].label, "auth");
         assert!(tree[0].children.is_empty());
         assert_eq!(tree[0].files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn build_labeled_tree_uses_healed_label_for_a_flat_small_group() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let files = vec![
+            make_file("packages/payments/service/authorize.rs"),
+            make_file("packages/payments/service/capture.rs"),
+        ];
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let groups = vec![("payments/service".to_string(), vec![0, 1])];
+        let params = ClusterParams {
+            max_clusters: 4,
+            min_clusters: 2,
+            max_depth: 3,
+        };
+        let (_server, client) = mock_chat(r#"["Payment Authorization Flow"]"#).await;
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        let key = semantic_navigate::cluster_cache_key(&paths);
+
+        let first = build_labeled_tree(
+            &files,
+            &vectors,
+            groups.clone(),
+            &params,
+            &client,
+            tempdir.path(),
+        )
+        .await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].label, "payments/service");
+        assert!(first[0].children.is_empty());
+        assert_eq!(first[0].files.len(), files.len());
+
+        assert!(
+            wait_for_llm_labels(
+                tempdir.path(),
+                &[(key.clone(), "Payment Authorization Flow")]
+            )
+            .await,
+            "flat small-group heal did not complete before timeout"
+        );
+        let second =
+            build_labeled_tree(&files, &vectors, groups, &params, &client, tempdir.path()).await;
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].label, "Payment Authorization Flow");
+        assert!(second[0].children.is_empty(), "flat group became nested");
+        assert_eq!(
+            second[0]
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            paths
+        );
+    }
+
+    #[tokio::test]
+    async fn build_labeled_tree_uses_healed_label_for_an_unsplit_large_group() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let files: Vec<FileInfo> = (0..128)
+            .map(|i| make_file(&format!("packages/payments/service/payment_{i}.rs")))
+            .collect();
+        let vectors = vec![vec![f32::NAN, 0.0]; files.len()];
+        let groups = vec![("payments/service".to_string(), (0..files.len()).collect())];
+        let params = ClusterParams {
+            max_clusters: 4,
+            min_clusters: 1,
+            max_depth: 3,
+        };
+        let (_server, client) = mock_chat(r#"["Payment Processing Core"]"#).await;
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        let key = semantic_navigate::cluster_cache_key(&paths);
+
+        let first = build_labeled_tree(
+            &files,
+            &vectors,
+            groups.clone(),
+            &params,
+            &client,
+            tempdir.path(),
+        )
+        .await;
+        assert_eq!(first.len(), 1, "large group unexpectedly split");
+        assert_eq!(first[0].label, "payments/service");
+        assert!(first[0].children.is_empty());
+        assert_eq!(first[0].files.len(), files.len());
+
+        assert!(
+            wait_for_llm_labels(tempdir.path(), &[(key.clone(), "Payment Processing Core")]).await,
+            "unsplit large-group heal did not complete before timeout"
+        );
+        let second =
+            build_labeled_tree(&files, &vectors, groups, &params, &client, tempdir.path()).await;
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].label, "Payment Processing Core");
+        assert!(second[0].children.is_empty(), "unsplit group became nested");
+        assert_eq!(second[0].files.len(), files.len());
     }
 }
