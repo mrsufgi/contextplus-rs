@@ -8719,6 +8719,299 @@ mod tests {
             .collect()
     }
 
+    async fn matching_embed_input_count(ollama: &wiremock::MockServer, marker: &str) -> usize {
+        ollama
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .flat_map(embed_request_inputs)
+            .filter(|input| input.contains(marker))
+            .count()
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "ContextPlus Test")
+            .env("GIT_AUTHOR_EMAIL", "contextplus@example.com")
+            .env("GIT_COMMITTER_NAME", "ContextPlus Test")
+            .env("GIT_COMMITTER_EMAIL", "contextplus@example.com")
+            .output()
+            .unwrap_or_else(|error| panic!("git {args:?} failed to start: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn add_linked_worktree(primary: &std::path::Path, worktree: &std::path::Path) {
+        run_git(
+            primary,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().unwrap(),
+                "-b",
+                "semantic-worktree-test",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_worktree_reuses_primary_vectors_and_embeds_only_changed_files() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let vectors: Vec<Vec<f32>> = embed_request_inputs(request)
+                    .iter()
+                    .map(|input| {
+                        if input == "invoice payment status"
+                            || input.contains("SHARED_STRIPE_RECONCILER")
+                        {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        run_git(&primary, &["init", "-b", "main"]);
+        std::fs::write(
+            primary.join("src/stripe_webhook.rs"),
+            "fn SHARED_STRIPE_RECONCILER() { /* invoice payment status */ }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            primary.join("src/changed.rs"),
+            "fn PRIMARY_CHANGED_VERSION() {}\n",
+        )
+        .unwrap();
+        run_git(&primary, &["add", "."]);
+        run_git(&primary, &["commit", "-m", "baseline"]);
+
+        let server = ContextPlusServer::new(
+            primary.clone(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        let primary_result = server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&primary_result).contains("1. src/stripe_webhook.rs"),
+            "primary ranking must establish the reusable vector: {}",
+            text_of(&primary_result)
+        );
+        assert_eq!(server.current_ref().embedding_cache.read().await.len(), 2);
+
+        add_linked_worktree(&primary, &worktree);
+        std::fs::write(
+            worktree.join("src/changed.rs"),
+            "fn WORKTREE_CHANGED_VERSION() {}\n",
+        )
+        .unwrap();
+        run_git(&worktree, &["add", "."]);
+        run_git(&worktree, &["commit", "-m", "change one file"]);
+
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".into(),
+            json!(canonical_worktree.to_string_lossy().into_owned()),
+        );
+        let attached = server.handle_attach_worktree(attach_args).await.unwrap();
+        assert_eq!(attached.is_error, Some(false), "{}", text_of(&attached));
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
+        let worktree_ref = server.state.ref_index(ref_id).unwrap();
+        assert!(
+            worktree_ref.embedding_cache.read().await.is_empty(),
+            "attach must begin with an empty per-ref cache in this regression setup"
+        );
+        let worktree_server = server.with_session(ref_id);
+
+        let worktree_result = worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&worktree_result).contains("1. src/stripe_webhook.rs"),
+            "the worktree must preserve the primary ranking for identical files: {}",
+            text_of(&worktree_result)
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_CHANGED_VERSION").await,
+            1,
+            "the changed worktree file must be embedded exactly once"
+        );
+
+        let document_requests_before_warm_query = ollama
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| embed_request_inputs(&request))
+            .filter(|inputs| inputs.iter().any(|input| input.contains("_VERSION")))
+            .count();
+        let started = Instant::now();
+        let warm_result = worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a warm worktree query took {:?}",
+            started.elapsed()
+        );
+        assert!(text_of(&warm_result).contains("1. src/stripe_webhook.rs"));
+        let document_requests_after_warm_query = ollama
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| embed_request_inputs(&request))
+            .filter(|inputs| inputs.iter().any(|input| input.contains("_VERSION")))
+            .count();
+        assert_eq!(
+            document_requests_after_warm_query, document_requests_before_warm_query,
+            "a warm worktree query must not re-embed documents"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "src/stripe_webhook.rs").await,
+            1,
+            "the identical file must reuse the primary vector instead of being re-embedded"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_worktree_filler_completes_missing_vectors_for_the_next_query() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let vectors: Vec<Vec<f32>> = inputs
+                    .iter()
+                    .map(|input| {
+                        if input == "invoice payment status"
+                            || input.contains("WORKTREE_FILL_TARGET")
+                        {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }));
+                if inputs
+                    .iter()
+                    .any(|input| input.contains("WORKTREE_FILL_TARGET"))
+                {
+                    response.set_delay(std::time::Duration::from_millis(100))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("target.rs"),
+            "fn WORKTREE_FILL_TARGET() { /* invoice payment status */ }\n",
+        )
+        .unwrap();
+        let server = ContextPlusServer::new(
+            primary.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 10, 500),
+        );
+        let canonical_worktree = worktree.path().canonicalize().unwrap();
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".into(),
+            json!(canonical_worktree.to_string_lossy().into_owned()),
+        );
+        let attached = server.handle_attach_worktree(attach_args).await.unwrap();
+        assert_eq!(attached.is_error, Some(false), "{}", text_of(&attached));
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
+        let worktree_ref = server.state.ref_index(ref_id).unwrap();
+        let worktree_server = server.with_session(ref_id);
+
+        let first = worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert!(
+            !text_of(&first).contains("target.rs"),
+            "a vectorless document must not receive synthetic semantic credit: {}",
+            text_of(&first)
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if worktree_ref
+                    .embedding_cache
+                    .read()
+                    .await
+                    .contains_key("target.rs")
+                    && worktree_ref.search_index_cache.read().await.is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the attached ref filler must cache the vector and invalidate its index");
+        assert!(
+            !server
+                .current_ref()
+                .embedding_cache
+                .read()
+                .await
+                .contains_key("target.rs"),
+            "the worktree filler must not write into the primary cache"
+        );
+        let document_requests_before_next_query =
+            matching_embed_input_count(&ollama, "WORKTREE_FILL_TARGET").await;
+
+        let next = worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&next).contains("1. target.rs"),
+            "the next query must use the filled vector: {}",
+            text_of(&next)
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_FILL_TARGET").await,
+            document_requests_before_next_query,
+            "the next query must use the cached fill instead of re-embedding"
+        );
+    }
+
     struct GatedOllama {
         uri: String,
         fill_started: Arc<tokio::sync::Semaphore>,
@@ -9511,6 +9804,168 @@ mod tests {
                 .await
                 .is_empty(),
             "admission must use the newly filled cache entry instead of embedding it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_inheritance_preserves_newer_child_cache_and_pending_fill() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        let path = "versioned.rs";
+        let old_content = "fn INHERITED_OLDER_A() {}\n";
+        let new_content = "fn CHILD_NEWER_B() {}\n";
+        std::fs::write(primary.path().join(path), old_content).unwrap();
+        std::fs::write(child.path().join(path), old_content).unwrap();
+
+        let server = ContextPlusServer::new(
+            primary.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        let old_hash = crate::core::embeddings::content_hash(old_content);
+        server.current_ref().embedding_cache.write().await.insert(
+            path.to_string(),
+            CacheEntry {
+                hash: old_hash.clone(),
+                vector: vec![1.0, 0.0],
+            },
+        );
+
+        let canonical_child = child.path().canonicalize().unwrap();
+        let child_id = crate::ref_index::RefId::for_canonical_path(&canonical_child);
+        let child_ref = server
+            .state
+            .attach_ref(child_id, || {
+                Arc::new(crate::ref_index::RefIndex::new(
+                    canonical_child.clone(),
+                    canonical_child.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let pause =
+            crate::server_adapters::test_seams::pause_after_file_snapshot(child.path(), old_hash);
+        let walk_root = child.path().to_path_buf();
+        let walk_state = Arc::clone(&server.state);
+        let stale_walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: walk_state.config.clone(),
+                ollama: walk_state.ollama.clone(),
+                state: walk_state,
+            }
+            .walk_and_index(&walk_root)
+            .await
+        });
+
+        pause.wait_until_entered().await;
+        std::fs::write(child.path().join(path), new_content).unwrap();
+        let new_hash = crate::core::embeddings::content_hash(new_content);
+        child_ref.embedding_cache.write().await.insert(
+            path.to_string(),
+            CacheEntry {
+                hash: new_hash.clone(),
+                vector: vec![0.0, 1.0],
+            },
+        );
+        crate::server_adapters::test_seams::seed_pending(
+            &child_ref,
+            path,
+            new_hash.clone(),
+            new_content.to_string(),
+        )
+        .await;
+        pause.resume();
+        stale_walk.await.unwrap().unwrap();
+
+        assert_eq!(
+            child_ref
+                .embedding_cache
+                .read()
+                .await
+                .get(path)
+                .map(|entry| entry.hash.as_str()),
+            Some(new_hash.as_str()),
+            "stale inherited content must not replace the child's newer cached hash"
+        );
+        assert_eq!(
+            crate::server_adapters::test_seams::pending_hash(&child_ref, path).await,
+            Some(new_hash),
+            "stale inheritance must not cancel pending work for the child's newer hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_ancestor_lookup_waits_for_registry_writer_and_reuses_vector() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        let path = "shared.rs";
+        let content = "fn REGISTRY_CONTENTION_SHARED() {}\n";
+        std::fs::write(primary.path().join(path), content).unwrap();
+        std::fs::write(child.path().join(path), content).unwrap();
+        let server = ContextPlusServer::new(
+            primary.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 1_000),
+        );
+        let hash = crate::core::embeddings::content_hash(content);
+        server.current_ref().embedding_cache.write().await.insert(
+            path.to_string(),
+            CacheEntry {
+                hash: hash.clone(),
+                vector: vec![1.0, 0.0],
+            },
+        );
+
+        let canonical_child = child.path().canonicalize().unwrap();
+        let child_id = crate::ref_index::RefId::for_canonical_path(&canonical_child);
+        server
+            .state
+            .attach_ref(child_id, || {
+                Arc::new(crate::ref_index::RefIndex::new(
+                    canonical_child.clone(),
+                    canonical_child,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let child_server = server.with_session(child_id);
+        let pause =
+            crate::server_adapters::test_seams::pause_after_file_snapshot(child.path(), hash);
+        let query = tokio::spawn(async move {
+            child_server
+                .handle_semantic_code_search(semantic_args("needle"))
+                .await
+        });
+
+        pause.wait_until_entered().await;
+        let registry_writer = server.state.refs.write().await;
+        pause.resume();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !query.is_finished(),
+            "ancestor lookup treated registry contention as an absent parent"
+        );
+        drop(registry_writer);
+
+        query.await.unwrap().unwrap();
+        assert_eq!(
+            matching_embed_input_count(&ollama, "REGISTRY_CONTENTION_SHARED").await,
+            0,
+            "the child must inherit the ancestor vector without embedding the document"
         );
     }
 
