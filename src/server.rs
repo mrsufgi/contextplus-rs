@@ -19,6 +19,7 @@ use crate::core::embedding_tracker::{
     EmbeddingTrackerConfig, EmbeddingTrackerHandle, RefreshCallback,
 };
 use crate::core::embeddings::{CacheEntry, OllamaClient};
+use crate::core::structural_pool::STRUCTURAL_POOL;
 use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::{ContextPlusError, Result};
@@ -819,23 +820,25 @@ impl ContextPlusServer {
                 .cache_generation
                 .load(std::sync::atomic::Ordering::Acquire);
             let new_cache = tokio::task::spawn_blocking(move || {
-                use rayon::prelude::*;
-                let entries = walk_with_config(&root, &config);
-                let file_content: HashMap<String, Arc<String>> = entries
-                    .par_iter()
-                    .filter(|e| !e.is_directory)
-                    .filter_map(|e| {
-                        let full = root.join(&e.relative_path);
-                        std::fs::read_to_string(&full)
-                            .ok()
-                            .map(|c| (e.relative_path.clone(), Arc::new(c)))
-                    })
-                    .collect();
-                ProjectCache {
-                    file_entries: entries,
-                    file_content,
-                    last_refresh: std::time::Instant::now(),
-                }
+                STRUCTURAL_POOL.install(|| {
+                    use rayon::prelude::*;
+                    let entries = walk_with_config(&root, &config);
+                    let file_content: HashMap<String, Arc<String>> = entries
+                        .par_iter()
+                        .filter(|e| !e.is_directory)
+                        .filter_map(|e| {
+                            let full = root.join(&e.relative_path);
+                            std::fs::read_to_string(&full)
+                                .ok()
+                                .map(|c| (e.relative_path.clone(), Arc::new(c)))
+                        })
+                        .collect();
+                    ProjectCache {
+                        file_entries: entries,
+                        file_content,
+                        last_refresh: std::time::Instant::now(),
+                    }
+                })
             })
             .await;
 
@@ -1060,23 +1063,25 @@ impl ContextPlusServer {
                 .cache_generation
                 .load(std::sync::atomic::Ordering::Acquire);
             let new_cache = tokio::task::spawn_blocking(move || {
-                use rayon::prelude::*;
-                let entries = walk_with_config(&root, &config);
-                let file_content: HashMap<String, Arc<String>> = entries
-                    .par_iter()
-                    .filter(|e| !e.is_directory)
-                    .filter_map(|e| {
-                        let full = root.join(&e.relative_path);
-                        std::fs::read_to_string(&full)
-                            .ok()
-                            .map(|c| (e.relative_path.clone(), Arc::new(c)))
-                    })
-                    .collect();
-                ProjectCache {
-                    file_entries: entries,
-                    file_content,
-                    last_refresh: std::time::Instant::now(),
-                }
+                STRUCTURAL_POOL.install(|| {
+                    use rayon::prelude::*;
+                    let entries = walk_with_config(&root, &config);
+                    let file_content: HashMap<String, Arc<String>> = entries
+                        .par_iter()
+                        .filter(|e| !e.is_directory)
+                        .filter_map(|e| {
+                            let full = root.join(&e.relative_path);
+                            std::fs::read_to_string(&full)
+                                .ok()
+                                .map(|c| (e.relative_path.clone(), Arc::new(c)))
+                        })
+                        .collect();
+                    ProjectCache {
+                        file_entries: entries,
+                        file_content,
+                        last_refresh: std::time::Instant::now(),
+                    }
+                })
             })
             .await;
 
@@ -1399,24 +1404,26 @@ impl ContextPlusServer {
         let config = self.state.config.clone();
 
         let new_cache = tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
+            STRUCTURAL_POOL.install(|| {
+                use rayon::prelude::*;
 
-            let entries = walk_with_config(&root, &config);
-            let file_content: HashMap<String, Arc<String>> = entries
-                .par_iter()
-                .filter(|entry| !entry.is_directory)
-                .filter_map(|entry| {
-                    let full_path = root.join(&entry.relative_path);
-                    std::fs::read_to_string(&full_path)
-                        .ok()
-                        .map(|content| (entry.relative_path.clone(), Arc::new(content)))
-                })
-                .collect();
-            ProjectCache {
-                file_entries: entries,
-                file_content,
-                last_refresh: Instant::now(),
-            }
+                let entries = walk_with_config(&root, &config);
+                let file_content: HashMap<String, Arc<String>> = entries
+                    .par_iter()
+                    .filter(|entry| !entry.is_directory)
+                    .filter_map(|entry| {
+                        let full_path = root.join(&entry.relative_path);
+                        std::fs::read_to_string(&full_path)
+                            .ok()
+                            .map(|content| (entry.relative_path.clone(), Arc::new(content)))
+                    })
+                    .collect();
+                ProjectCache {
+                    file_entries: entries,
+                    file_content,
+                    last_refresh: Instant::now(),
+                }
+            })
         })
         .await
         .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
@@ -4057,6 +4064,72 @@ mod tests {
         let root = std::env::temp_dir().join("contextplus-test");
         let _ = std::fs::create_dir_all(&root);
         ContextPlusServer::new(root, config)
+    }
+
+    #[tokio::test]
+    async fn project_cache_refresh_survives_global_rayon_saturation() {
+        const CHILD: &str = "CONTEXTPLUS_RAYON_SATURATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate saturation from other tests that legitimately use the global pool.
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "server::tests::project_cache_refresh_survives_global_rayon_saturation",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RAYON_NUM_THREADS", "2")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let tree = tempfile::tempdir().unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::write(
+                tree.path().join(format!("{name}.rs")),
+                format!("fn {name}() {{}}"),
+            )
+            .unwrap();
+        }
+        let server = ContextPlusServer::new(tree.path().to_path_buf(), Config::from_env());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..rayon::current_num_threads() {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started_tx = started_tx.clone();
+            rayon::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+        }
+        for _ in &releases {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        let refreshed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.ensure_project_cache(),
+        )
+        .await;
+        // Release even on timeout so Tokio can drain its blocked refresh task.
+        drop(releases);
+        let cache = refreshed
+            .expect("project-cache refresh starved by global Rayon work")
+            .unwrap();
+        assert_eq!(cache.file_content.len(), 3);
     }
 
     #[test]
