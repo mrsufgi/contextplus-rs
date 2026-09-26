@@ -104,6 +104,36 @@ pub(crate) mod test_seams {
         }
     }
 
+    pub(crate) async fn seed_pending(
+        ref_index: &crate::ref_index::RefIndex,
+        path: &str,
+        hash: String,
+        text: String,
+    ) {
+        ref_index.semantic_fill.lock().await.pending.insert(
+            path.to_string(),
+            super::FillDocument {
+                path: path.to_string(),
+                hash,
+                text,
+                owner: None,
+            },
+        );
+    }
+
+    pub(crate) async fn pending_hash(
+        ref_index: &crate::ref_index::RefIndex,
+        path: &str,
+    ) -> Option<String> {
+        ref_index
+            .semantic_fill
+            .lock()
+            .await
+            .pending
+            .get(path)
+            .map(|document| document.hash.clone())
+    }
+
     pub(crate) struct MetadataPause {
         enumerated: Barrier,
         resume: Barrier,
@@ -416,7 +446,17 @@ impl CachedWalkerIndexer {
                 return Ok((docs, Vec::new()));
             }
 
+            let fill_snapshot = ref_index.semantic_fill.lock().await;
             let cache_read = embedding_cache.read().await;
+            let observed: Vec<_> = content_hashes
+                .iter()
+                .map(|(path, _)| {
+                    (
+                        cache_read.get(path).map(|entry| entry.hash.clone()),
+                        fill_snapshot.pending.get(path).map(|doc| doc.hash.clone()),
+                    )
+                })
+                .collect();
             let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
             let mut uncached_indices: Vec<usize> = Vec::new();
             let mut uncached_texts: Vec<String> = Vec::new();
@@ -433,31 +473,93 @@ impl CachedWalkerIndexer {
                 uncached_texts.push(embedding_texts[i].clone());
             }
             drop(cache_read);
+            drop(fill_snapshot);
+
+            // Query and filler vectors live in memory even when no CAS manifest exists.
+            let mut ancestor_id = ref_index.parent_ref_id;
+            let mut visited = std::collections::HashSet::new();
+            let mut inherited = Vec::new();
+            while let Some(id) = ancestor_id {
+                if !visited.insert(id) {
+                    break;
+                }
+                let ancestor = self.state.refs.read().await.get(&id).cloned();
+                let Some(ancestor) = ancestor else {
+                    break;
+                };
+                let cache = ancestor.embedding_cache.read().await;
+                for &idx in &uncached_indices {
+                    let (path, hash) = &content_hashes[idx];
+                    if vectors[idx].is_none()
+                        && let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash)
+                    {
+                        vectors[idx] = Some(entry.vector.clone());
+                        inherited.push((idx, entry.clone()));
+                    }
+                }
+                tracing::info!(
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    ancestor_ref_id = %ancestor.cas_ref_id_hex,
+                    ancestor_entries = cache.len(),
+                    inherited = inherited.len(),
+                    "semantic ancestor cache lookup"
+                );
+                ancestor_id = ancestor.parent_ref_id;
+            }
+            let mut current = vec![true; content_hashes.len()];
+            for &(idx, _) in &inherited {
+                let (path, hash) = &content_hashes[idx];
+                current[idx] = FillDocument {
+                    path: path.clone(),
+                    hash: hash.clone(),
+                    text: String::new(),
+                    owner: None,
+                }
+                .is_current(&ref_index.canonical_root, config.max_embed_file_size)
+                .await;
+            }
+            if !inherited.is_empty() {
+                let fill = ref_index.semantic_fill.lock().await;
+                let mut cache = embedding_cache.write().await;
+                for (idx, entry) in inherited {
+                    let (path, _) = &content_hashes[idx];
+                    // File validation runs without locks; reject intervening cache/fill changes.
+                    if current[idx]
+                        && cache.get(path).map(|entry| &entry.hash) == observed[idx].0.as_ref()
+                        && fill.pending.get(path).map(|doc| &doc.hash) == observed[idx].1.as_ref()
+                    {
+                        cache.insert(path.clone(), entry);
+                    } else {
+                        current[idx] = false;
+                        vectors[idx] = None;
+                    }
+                }
+            }
+            uncached_indices.retain(|&idx| vectors[idx].is_none());
 
             #[cfg(test)]
             test_seams::after_cache_snapshot(&root).await;
 
+            let cache_entries = embedding_cache.read().await.len();
             tracing::info!(
+                ref_id = %ref_index.cas_ref_id_hex,
+                cache_entries,
                 cached = docs.len() - uncached_indices.len(),
                 uncached = uncached_indices.len(),
                 "semantic_code_search embedding cache hit/miss"
             );
 
-            let mut current = Vec::with_capacity(content_hashes.len());
             for (idx, (path, hash)) in content_hashes.iter().enumerate() {
-                let valid = if vectors[idx].is_none() {
-                    FillDocument {
+                if current[idx] && vectors[idx].is_none() {
+                    current[idx] = FillDocument {
                         path: path.clone(),
                         hash: hash.clone(),
                         text: String::new(),
                         owner: None,
                     }
                     .is_current(&ref_index.canonical_root, config.max_embed_file_size)
-                    .await
-                } else {
-                    true
-                };
-                current.push(valid);
+                    .await;
+                }
             }
             let owner = Arc::new(());
             let mut fill = ref_index.semantic_fill.lock().await;
@@ -469,7 +571,9 @@ impl CachedWalkerIndexer {
                 }
                 if let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash) {
                     vectors[idx] = Some(entry.vector.clone());
-                    fill.pending.remove(path);
+                    if fill.pending.get(path).is_some_and(|doc| doc.hash == *hash) {
+                        fill.pending.remove(path);
+                    }
                     continue;
                 }
                 let mut doc = FillDocument {

@@ -3529,6 +3529,57 @@ mod tests {
     }
 
     #[test]
+    fn vectorless_documents_receive_no_shared_semantic_credit() {
+        let docs = vec![
+            SearchDocument::new(
+                "src/exact.rs".to_string(),
+                "invoice payment status reconciler".to_string(),
+                vec!["reconcileInvoicePaymentStatus".to_string()],
+                vec![],
+                "invoice payment status is reconciled from a Stripe webhook event".to_string(),
+            ),
+            SearchDocument::new(
+                "src/partial.rs".to_string(),
+                "invoice helper".to_string(),
+                vec!["loadInvoice".to_string()],
+                vec![],
+                "load an invoice for display".to_string(),
+            ),
+        ];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vec![None, None]);
+
+        let results = index.search(
+            "invoice payment status reconciled Stripe webhook",
+            &[1.0, 0.0],
+            &ResolvedSearchOptions {
+                top_k: 2,
+                semantic_weight: 0.72,
+                keyword_weight: 0.28,
+                min_semantic_score: 0.0,
+                min_keyword_score: 0.0,
+                min_combined_score: 0.0,
+                require_keyword_match: true,
+                require_semantic_match: false,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].path, "src/exact.rs");
+        assert_eq!(results[0].semantic_score, 0.0);
+        assert_eq!(results[1].semantic_score, 0.0);
+        assert!(
+            results[0].keyword_score > results[1].keyword_score,
+            "vectorless documents must be distinguished only by keyword evidence: {results:?}"
+        );
+        assert!(
+            results[0].score > results[1].score,
+            "a shared/default vector must not give vectorless documents the same rank: {results:?}"
+        );
+    }
+
+    #[test]
     fn test_no_embedding_doc_without_keyword_does_not_pollute_results() {
         // Regression guard for the zero-score pollution gap: a doc with NO
         // embedding AND NO keyword match must NOT surface just because
