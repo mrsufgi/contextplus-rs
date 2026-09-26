@@ -139,8 +139,8 @@ pub fn resolve_want_daemon(mode: TransportMode, root_dir: &Path) -> bool {
 /// Behaviour:
 /// - `Stdio`  → serve directly over stdio.
 /// - `Daemon` → proxy through the per-workspace daemon; propagate errors.
-/// - `Auto`   → probe writability; attempt daemon first; if it fails **warn**
-///   and fall back to stdio.
+/// - `Auto`   → probe writability; use daemon if writable, otherwise stdio.
+///   Once selected, daemon errors propagate because host input may be consumed.
 pub async fn run_implicit_default(
     mode: TransportMode,
     root_dir: PathBuf,
@@ -149,13 +149,7 @@ pub async fn run_implicit_default(
     let want_daemon = resolve_want_daemon(mode, &root_dir);
 
     if want_daemon {
-        match crate::transport::client::run_with_config(&root_dir, &config).await {
-            Ok(()) => return Ok(()),
-            Err(e) if mode == TransportMode::Auto => {
-                tracing::warn!("daemon transport failed ({e}); falling back to stdio");
-            }
-            Err(e) => return Err(e),
-        }
+        return crate::transport::client::run_with_config(&root_dir, &config).await;
     }
 
     run_mcp_server(root_dir, config).await

@@ -49,6 +49,62 @@ use crate::transport::client::{
 };
 use crate::transport::paths;
 
+pub const DAEMON_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+pub fn daemon_log_path(root_dir: &Path) -> PathBuf {
+    paths::daemon_dir(root_dir).join("logs/daemon.log")
+}
+
+pub fn open_daemon_log(root_dir: &Path) -> Result<std::fs::File> {
+    open_log_file(&daemon_log_path(root_dir))
+}
+
+pub fn open_log_file(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if file.metadata()?.len() > DAEMON_LOG_MAX_BYTES {
+        file.set_len(0)?;
+    }
+    Ok(file)
+}
+
+pub fn bounded_log_writer(path: &Path) -> Result<impl std::io::Write + Send + 'static> {
+    struct BoundedLog(std::fs::File);
+    impl std::io::Write for BoundedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.metadata()?.len() + bytes.len() as u64 > DAEMON_LOG_MAX_BYTES {
+                self.0.set_len(0)?;
+            }
+            self.0.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    Ok(BoundedLog(open_log_file(path)?))
+}
+
+pub fn install_panic_hook(log_path: &Path) -> Result<()> {
+    use std::io::Write;
+    let file = std::sync::Mutex::new(bounded_log_writer(log_path)?);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut file) = file.lock() {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(file, "PANIC: {info}\n{backtrace}");
+            let _ = file.flush();
+        }
+        previous(info);
+    }));
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ConfigDifference {
     pub field: &'static str,
@@ -650,6 +706,63 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn panic_log_child_process_helper() {
+        let Some(root_dir) = std::env::var_os("CONTEXTPLUS_TEST_PANIC_LOG_ROOT") else {
+            return;
+        };
+        let log_path = daemon_log_path(Path::new(&root_dir));
+        install_panic_hook(&log_path).unwrap();
+        panic!("daemon panic sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_log_is_size_bounded_and_panic_hook_records_message_and_location() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let root = canonical_root.as_path();
+        let log_path = daemon_log_path(root);
+        assert_eq!(
+            log_path,
+            root.join(".mcp_data").join("logs").join("daemon.log")
+        );
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, vec![b'x'; DAEMON_LOG_MAX_BYTES as usize + 1]).unwrap();
+        drop(open_daemon_log(root).unwrap());
+        assert!(
+            std::fs::metadata(&log_path).unwrap().len() <= DAEMON_LOG_MAX_BYTES,
+            "oversized daemon log was not truncated or rotated"
+        );
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transport::daemon::tests::panic_log_child_process_helper",
+                "--nocapture",
+            ])
+            .env("CONTEXTPLUS_TEST_PANIC_LOG_ROOT", root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "panic helper unexpectedly exited zero");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("daemon panic sentinel"),
+            "panic payload missing from daemon log: {contents}"
+        );
+        assert!(
+            contents.contains("daemon.rs"),
+            "panic location missing from daemon log: {contents}"
+        );
+    }
 
     #[test]
     fn search_config_comparison_lists_exactly_differing_fields() {

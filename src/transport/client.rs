@@ -19,8 +19,7 @@
 //!         connect → bridge
 //! ```
 //!
-//! The bridge runs two `tokio::io::copy` halves: stdin→socket and
-//! socket→stdout. Either direction closing terminates the bridge.
+//! Host EOF terminates the bridge; daemon disconnects restore the MCP session.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -265,7 +264,7 @@ mod register_session_tests {
 pub enum SessionReady {
     /// Daemon accepted the session and assigned a ref.
     Ready { session_id: String, ref_id: u64 },
-    /// Daemon is draining; bridge should exit 0 cleanly.
+    /// Daemon is draining; reconnecting bridges should retry.
     RejectedDraining,
     /// Ref is being warmed (initial embedding); calls will succeed but may
     /// observe stale index until warming finishes.
@@ -332,20 +331,197 @@ pub const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Polling interval while waiting for the daemon socket to appear.
 pub const SPAWN_POLL: Duration = Duration::from_millis(50);
 
-/// Connect to the per-workspace daemon, spawning one if absent, then bridge
-/// stdin↔socket↔stdout until either side closes.
-///
-/// Performs the `register_session` handshake before entering the stdio
-/// passthrough loop. If the daemon responds with `RejectedDraining` the
-/// function returns `Ok(())` immediately (bridge exits 0, clean shutdown).
+/// Connect to the workspace daemon and restore the session after disconnects.
 pub async fn run(root_dir: &Path) -> Result<()> {
     run_with_config(root_dir, &crate::config::Config::from_env()).await
 }
 
 /// Connect using an already-resolved bridge configuration.
 pub async fn run_with_config(root_dir: &Path, config: &crate::config::Config) -> Result<()> {
-    let stream = connect_or_spawn(root_dir).await?;
-    run_with_handshake_config(root_dir, config, stream).await
+    run_with_io(
+        root_dir,
+        config,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        BridgeOptions::default(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BridgeOptions {
+    pub reconnect_timeout: Duration,
+    pub reconnect_backoff: Duration,
+}
+
+impl Default for BridgeOptions {
+    fn default() -> Self {
+        Self {
+            reconnect_timeout: Duration::from_secs(60),
+            reconnect_backoff: Duration::from_millis(50),
+        }
+    }
+}
+
+pub async fn run_with_io<R, W>(
+    root_dir: &Path,
+    config: &crate::config::Config,
+    host_input: R,
+    mut host_output: W,
+    options: BridgeOptions,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    let (sender, mut pending) = tokio::sync::mpsc::unbounded_channel();
+    let read_host = async {
+        let mut input = tokio::io::BufReader::new(host_input).lines();
+        while let Some(line) = input.next_line().await? {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let forward = async {
+        let mut initialize: Option<String> = None;
+        let mut initialized: Option<String> = None;
+        let mut inflight = std::collections::BTreeMap::new();
+        let mut reconnecting = false;
+        loop {
+            let restore = async {
+                loop {
+                    let attempt = async {
+                        let mut stream = connect_or_spawn(root_dir).await?;
+                        let reg = RegisterSession {
+                            client_root: root_dir.to_path_buf(),
+                            head_sha: resolve_head_sha(root_dir),
+                            client_pid: std::process::id(),
+                            search_config: Some(SearchConfig::from(config)),
+                        };
+                        write_frame(&mut stream, &reg).await?;
+                        if read_frame::<_, SessionReady>(&mut stream).await?
+                            == SessionReady::RejectedDraining
+                        {
+                            bail!("daemon is draining");
+                        }
+                        let mut stream = tokio::io::BufReader::new(stream);
+                        if let Some(line) = &initialize {
+                            send_host_line(stream.get_mut(), line).await?;
+                            let id = serde_json::from_str::<serde_json::Value>(line)?["id"].clone();
+                            loop {
+                                let mut response = String::new();
+                                if stream.read_line(&mut response).await? == 0 {
+                                    bail!("daemon closed during initialization replay");
+                                }
+                                let value: serde_json::Value = serde_json::from_str(&response)?;
+                                if value.get("id") == Some(&id) && value.get("method").is_none() {
+                                    if value.get("error").is_some() {
+                                        bail!("daemon rejected initialization replay");
+                                    }
+                                    break;
+                                }
+                                host_output.write_all(response.as_bytes()).await?;
+                                host_output.flush().await?;
+                            }
+                        }
+                        if let Some(line) = &initialized {
+                            send_host_line(stream.get_mut(), line).await?;
+                        }
+                        if reconnecting {
+                            tracing::info!("session re-registered after reconnect; initialization replay complete");
+                        }
+                        Ok::<_, anyhow::Error>(stream)
+                    }
+                    .await;
+                    match attempt {
+                        Ok(stream) => return Ok::<_, anyhow::Error>(stream),
+                        Err(error) => tracing::debug!(%error, "daemon reconnect failed; retrying"),
+                    }
+                    tokio::time::sleep(options.reconnect_backoff).await;
+                }
+            };
+            let stream = tokio::time::timeout(options.reconnect_timeout, restore)
+                .await
+                .context("daemon reconnect deadline exceeded")??;
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut responses = tokio::io::BufReader::new(reader).lines();
+            let mut outgoing = Vec::new();
+            let mut written = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    result = responses.next_line() => {
+                        match result {
+                            Ok(None) | Err(_) => break,
+                            Ok(Some(response)) => {
+                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&response)
+                                    && value.get("method").is_none()
+                                    && let Some(id) = value.get("id") {
+                                    inflight.remove(&id.to_string());
+                                }
+                                host_output.write_all(format!("{response}\n").as_bytes()).await?;
+                                host_output.flush().await?;
+                            }
+                        }
+                    }
+                    result = writer.write(&outgoing[written..]), if written < outgoing.len() => {
+                        match result {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => written += count,
+                        }
+                    }
+                    Some(line) = pending.recv(), if written == outgoing.len() => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                            match value["method"].as_str() {
+                                Some("initialize") if initialize.is_none() => initialize = Some(line.clone()),
+                                Some("notifications/initialized") if initialized.is_none() => initialized = Some(line.clone()),
+                                _ => {}
+                            }
+                            if value.get("method").is_some() && let Some(id) = value.get("id") {
+                                inflight.insert(id.to_string(), id.clone());
+                            }
+                        }
+                        let cwd = crate::core::client_cwd::parent_process_cwd();
+                        outgoing = crate::core::client_cwd::inject_cwd(
+                            format!("{line}\n").as_bytes(), cwd.as_deref(),
+                        );
+                        written = 0;
+                    }
+                }
+            }
+            reconnecting = true;
+            tracing::info!("daemon connection lost; reconnecting session");
+            for (_, id) in std::mem::take(&mut inflight) {
+                let error = serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32000, "message": "contextplus daemon restarted; retry the call"}
+                });
+                host_output
+                    .write_all(format!("{error}\n").as_bytes())
+                    .await?;
+            }
+            host_output.flush().await?;
+        }
+    };
+    tokio::select! {
+        biased;
+        result = read_host => result,
+        result = forward => result,
+    }
+}
+
+async fn send_host_line<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    line: &str,
+) -> Result<()> {
+    let cwd = crate::core::client_cwd::parent_process_cwd();
+    let line = format!("{line}\n");
+    let out = crate::core::client_cwd::inject_cwd(line.as_bytes(), cwd.as_deref());
+    writer.write_all(&out).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 /// Perform the register_session handshake and then bridge stdio. Exposed for
@@ -495,13 +671,19 @@ pub async fn connect_or_spawn(root_dir: &Path) -> Result<UnixStream> {
 /// child survives client (Claude Code) termination.
 fn spawn_daemon(root_dir: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe() failed")?;
+    let log_path = std::env::var_os("CONTEXTPLUS_DAEMON_LOG")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| daemon::daemon_log_path(root_dir));
+    let log = daemon::open_log_file(&log_path)?;
     let mut cmd = std::process::Command::new(&exe);
+    cmd.env("CONTEXTPLUS_DAEMON_LOG", log_path);
     cmd.arg("--root-dir")
         .arg(root_dir)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(log));
 
     #[cfg(unix)]
     {
@@ -520,14 +702,15 @@ fn spawn_daemon(root_dir: &Path) -> Result<()> {
         }
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn daemon: {}", exe.display()))?;
 
     tracing::debug!("spawned daemon pid={}", child.id());
-    // We don't `wait()` — the child is detached by `setsid` and we don't want
-    // to keep a zombie or block the client.
-    std::mem::forget(child);
+    // Reap the detached daemon without blocking bridge shutdown.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -583,6 +766,572 @@ pub async fn bridge(stream: UnixStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::sync::oneshot;
+
+    struct FakeSession {
+        reader: BufReader<OwnedReadHalf>,
+        writer: OwnedWriteHalf,
+    }
+
+    impl FakeSession {
+        async fn read_json(&mut self) -> Value {
+            let mut line = String::new();
+            let read = self.reader.read_line(&mut line).await.unwrap();
+            assert_ne!(read, 0, "fake daemon expected another JSON-RPC line");
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn write_json(&mut self, value: Value) {
+            let mut line = serde_json::to_vec(&value).unwrap();
+            line.push(b'\n');
+            self.writer.write_all(&line).await.unwrap();
+            self.writer.flush().await.unwrap();
+        }
+    }
+
+    struct FakeHost {
+        input: DuplexStream,
+        output: BufReader<DuplexStream>,
+    }
+
+    impl FakeHost {
+        async fn write_json(&mut self, value: Value) {
+            let mut line = serde_json::to_vec(&value).unwrap();
+            line.push(b'\n');
+            self.input.write_all(&line).await.unwrap();
+            self.input.flush().await.unwrap();
+        }
+
+        async fn read_json(&mut self) -> Value {
+            let mut line = String::new();
+            let read = self.output.read_line(&mut line).await.unwrap();
+            assert_ne!(read, 0, "host expected another JSON-RPC line");
+            serde_json::from_str(&line).unwrap()
+        }
+    }
+
+    fn host_io() -> (DuplexStream, DuplexStream, FakeHost) {
+        let (host_input, bridge_input) = tokio::io::duplex(16 * 1024);
+        let (bridge_output, host_output) = tokio::io::duplex(16 * 1024);
+        (
+            bridge_input,
+            bridge_output,
+            FakeHost {
+                input: host_input,
+                output: BufReader::new(host_output),
+            },
+        )
+    }
+
+    async fn accept_session(
+        listener: &tokio::net::UnixListener,
+        reply: SessionReady,
+    ) -> FakeSession {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: RegisterSession = read_frame(&mut stream).await.unwrap();
+        write_frame(&mut stream, &reply).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        FakeSession {
+            reader: BufReader::new(reader),
+            writer,
+        }
+    }
+
+    fn ready(name: &str) -> SessionReady {
+        SessionReady::Ready {
+            session_id: name.into(),
+            ref_id: 1,
+        }
+    }
+
+    fn short_reconnect_policy() -> BridgeOptions {
+        BridgeOptions {
+            reconnect_timeout: Duration::from_millis(250),
+            reconnect_backoff: Duration::from_millis(10),
+        }
+    }
+
+    fn assert_cwd_injected(message: &Value) {
+        // parent_process_cwd reads /proc, so only Linux injects a cwd.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        assert!(
+            message["params"]["arguments"][crate::core::client_cwd::CWD_ARG]
+                .as_str()
+                .is_some(),
+            "tools/call did not contain injected cwd: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_child_process_helper() {
+        let Some(root_dir) = std::env::var_os("CONTEXTPLUS_TEST_BRIDGE_CHILD_ROOT") else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(run_with_io(
+                Path::new(&root_dir),
+                &crate::config::Config::from_env(),
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+                BridgeOptions::default(),
+            ))
+            .expect("bridge child should stop cleanly when stdin closes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_stdin_close_exits_bridge_process_zero_promptly() {
+        use std::process::{Command, Stdio};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket_path = paths::daemon_socket_path(&root);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _: RegisterSession = read_frame(&mut stream).await.unwrap();
+            write_frame(
+                &mut stream,
+                &SessionReady::Ready {
+                    session_id: "stdin-close".into(),
+                    ref_id: 1,
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transport::client::tests::bridge_child_process_helper",
+                "--nocapture",
+            ])
+            .env("CONTEXTPLUS_TEST_BRIDGE_CHILD_ROOT", root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !socket_path.exists() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(child.stdin.take());
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "bridge child exited with {status}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bridge child did not exit within 1s after host stdin closed")
+        });
+
+        daemon.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_replays_session_fails_inflight_and_flushes_buffered_request() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket_path = paths::daemon_socket_path(&root);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let replacement_path = socket_path.clone();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let (second_registered_tx, second_registered_rx) = oneshot::channel();
+        let (allow_second_tx, allow_second_rx) = oneshot::channel();
+
+        let daemon = tokio::spawn(async move {
+            let mut first = accept_session(&listener, ready("daemon-a")).await;
+            let initialize = first.read_json().await;
+            assert_eq!(initialize["method"], "initialize");
+            first
+                .write_json(json!({"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"a"}}}))
+                .await;
+
+            let initialized = first.read_json().await;
+            assert_eq!(initialized["method"], "notifications/initialized");
+
+            let completed = first.read_json().await;
+            assert_eq!(completed["id"], 2);
+            assert_cwd_injected(&completed);
+            first
+                .write_json(json!({"jsonrpc":"2.0","id":2,"result":{"ok":"a"}}))
+                .await;
+
+            let interrupted = first.read_json().await;
+            assert_eq!(interrupted["id"], 3);
+            assert_cwd_injected(&interrupted);
+            drop(listener);
+            std::fs::remove_file(&replacement_path).unwrap();
+            let second_listener = UnixListener::bind(&replacement_path).unwrap();
+            drop(first);
+            dropped_tx.send(()).unwrap();
+
+            let (mut stream, _) = second_listener.accept().await.unwrap();
+            let _: RegisterSession = read_frame(&mut stream).await.unwrap();
+            second_registered_tx.send(()).unwrap();
+            allow_second_rx.await.unwrap();
+            write_frame(&mut stream, &ready("daemon-b")).await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut second = FakeSession {
+                reader: BufReader::new(reader),
+                writer,
+            };
+
+            let replayed_initialize = second.read_json().await;
+            assert_eq!(replayed_initialize, initialize);
+            second
+                .write_json(json!({"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"b"}}}))
+                .await;
+            let replayed_initialized = second.read_json().await;
+            assert_eq!(replayed_initialized, initialized);
+
+            let buffered = second.read_json().await;
+            assert_eq!(buffered["id"], 4);
+            assert_cwd_injected(&buffered);
+            second
+                .write_json(json!({"jsonrpc":"2.0","id":4,"result":{"ok":"b"}}))
+                .await;
+        });
+
+        let (bridge_input, bridge_output, mut host) = host_io();
+        let config = crate::config::Config::from_env();
+        let bridge_root = root.clone();
+        let bridge = tokio::spawn(async move {
+            run_with_io(
+                &bridge_root,
+                &config,
+                bridge_input,
+                bridge_output,
+                short_reconnect_policy(),
+            )
+            .await
+        });
+
+        host.write_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+            .await;
+        let initialize_response = host.read_json().await;
+        assert_eq!(initialize_response["id"], 1);
+        host.write_json(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        host.write_json(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"first","arguments":{}}}))
+            .await;
+        assert_eq!(host.read_json().await["id"], 2);
+
+        host.write_json(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"interrupted","arguments":{}}}))
+            .await;
+        dropped_rx.await.unwrap();
+        second_registered_rx.await.unwrap();
+        host.write_json(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"buffered","arguments":{}}}))
+            .await;
+        allow_second_tx.send(()).unwrap();
+
+        let mut responses = vec![initialize_response];
+        responses.push(host.read_json().await);
+        responses.push(host.read_json().await);
+        let interrupted = responses.iter().find(|value| value["id"] == 3).unwrap();
+        assert_eq!(interrupted["error"]["code"], -32000);
+        assert_eq!(
+            interrupted["error"]["message"],
+            "contextplus daemon restarted; retry the call"
+        );
+        assert!(
+            responses
+                .iter()
+                .any(|value| value["id"] == 4 && value["result"]["ok"] == "b")
+        );
+        assert_eq!(
+            responses.iter().filter(|value| value["id"] == 1).count(),
+            1,
+            "host received a duplicate initialize response"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), host.read_json())
+                .await
+                .is_err(),
+            "host received an unexpected extra response"
+        );
+
+        drop(host.input);
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .expect("bridge did not stop after host input closed")
+            .unwrap()
+            .unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_timeout_returns_error_while_host_input_is_open() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket_path = paths::daemon_socket_path(&root);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let daemon = tokio::spawn(async move {
+            let mut first = accept_session(&listener, ready("daemon-a")).await;
+            assert_eq!(first.read_json().await["method"], "initialize");
+            first
+                .write_json(json!({"jsonrpc":"2.0","id":1,"result":{}}))
+                .await;
+            assert_eq!(first.read_json().await["id"], 9);
+            drop(first);
+
+            let (mut reconnect, _) = listener.accept().await.unwrap();
+            let _: RegisterSession = read_frame(&mut reconnect).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (bridge_input, bridge_output, mut host) = host_io();
+        let config = crate::config::Config::from_env();
+        let started = Instant::now();
+        let bridge_root = root.clone();
+        let bridge = tokio::spawn(async move {
+            run_with_io(
+                &bridge_root,
+                &config,
+                bridge_input,
+                bridge_output,
+                BridgeOptions {
+                    reconnect_timeout: Duration::from_millis(100),
+                    reconnect_backoff: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        host.write_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+            .await;
+        assert_eq!(host.read_json().await["id"], 1);
+        host.write_json(json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"never-finishes","arguments":{}}}))
+            .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .expect("bridge exceeded its reconnect deadline")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "bridge returned success after reconnect timeout"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(host.input);
+        daemon.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_responses_progress_while_large_host_request_is_still_writing() {
+        use tokio::net::UnixListener;
+
+        const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket_path = paths::daemon_socket_path(&root);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (prior_request_tx, prior_request_rx) = oneshot::channel();
+        let (request_received_tx, request_received_rx) = oneshot::channel();
+        let (close_daemon_tx, close_daemon_rx) = oneshot::channel();
+
+        let daemon = tokio::spawn(async move {
+            let mut session = accept_session(&listener, ready("backpressure")).await;
+            let prior_request = session.read_json().await;
+            assert_eq!(prior_request["id"], 41);
+            prior_request_tx.send(()).unwrap();
+
+            let mut first_byte = [0_u8; 1];
+            session.reader.read_exact(&mut first_byte).await.unwrap();
+
+            session
+                .write_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 41,
+                    "result": {"payload": "r".repeat(PAYLOAD_SIZE)}
+                }))
+                .await;
+
+            let mut request_tail = String::new();
+            session.reader.read_line(&mut request_tail).await.unwrap();
+            let request: Value =
+                serde_json::from_slice(&[first_byte.as_slice(), request_tail.as_bytes()].concat())
+                    .unwrap();
+            assert_eq!(request["id"], 42);
+            assert_eq!(
+                request["params"]["payload"].as_str().unwrap().len(),
+                PAYLOAD_SIZE
+            );
+            session
+                .write_json(json!({"jsonrpc": "2.0", "id": 42, "result": {"received": true}}))
+                .await;
+            request_received_tx.send(()).unwrap();
+            close_daemon_rx.await.unwrap();
+        });
+
+        let (bridge_input, bridge_output, mut host) = host_io();
+        let config = crate::config::Config::from_env();
+        let bridge_root = root.clone();
+        let bridge = tokio::spawn(async move {
+            run_with_io(
+                &bridge_root,
+                &config,
+                bridge_input,
+                bridge_output,
+                short_reconnect_policy(),
+            )
+            .await
+        });
+
+        host.write_json(json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "test/prior-request",
+            "params": {}
+        }))
+        .await;
+        prior_request_rx.await.unwrap();
+        host.write_json(json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "test/large-request",
+            "params": {"payload": "q".repeat(PAYLOAD_SIZE)}
+        }))
+        .await;
+
+        let response = tokio::time::timeout(Duration::from_secs(5), host.read_json())
+            .await
+            .expect("daemon response stalled behind the host-to-daemon write");
+        assert_eq!(response["id"], 41);
+        assert_eq!(
+            response["result"]["payload"].as_str().unwrap().len(),
+            PAYLOAD_SIZE
+        );
+        tokio::time::timeout(Duration::from_secs(5), request_received_rx)
+            .await
+            .expect("daemon did not receive the complete host request")
+            .unwrap();
+        let request_response = tokio::time::timeout(Duration::from_secs(1), host.read_json())
+            .await
+            .expect("host did not receive the large request's response");
+        assert_eq!(request_response["id"], 42);
+        assert_eq!(request_response["result"]["received"], true);
+
+        drop(host.input);
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .expect("bridge did not stop after host EOF")
+            .unwrap()
+            .unwrap();
+        close_daemon_tx.send(()).unwrap();
+        daemon.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_draining_is_retried_until_ready_daemon_resumes_session() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket_path = paths::daemon_socket_path(&root);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+
+        let daemon = tokio::spawn(async move {
+            let mut first = accept_session(&listener, ready("daemon-a")).await;
+            let initialize = first.read_json().await;
+            first
+                .write_json(json!({"jsonrpc":"2.0","id":1,"result":{"daemon":"a"}}))
+                .await;
+            let initialized = first.read_json().await;
+            drop(first);
+            dropped_tx.send(()).unwrap();
+
+            let _draining = accept_session(&listener, SessionReady::RejectedDraining).await;
+            let mut ready_daemon = accept_session(&listener, ready("daemon-c")).await;
+            assert_eq!(ready_daemon.read_json().await, initialize);
+            ready_daemon
+                .write_json(json!({"jsonrpc":"2.0","id":1,"result":{"daemon":"c"}}))
+                .await;
+            assert_eq!(ready_daemon.read_json().await, initialized);
+            let resumed = ready_daemon.read_json().await;
+            assert_eq!(resumed["id"], 5);
+            assert_cwd_injected(&resumed);
+            ready_daemon
+                .write_json(json!({"jsonrpc":"2.0","id":5,"result":{"daemon":"c"}}))
+                .await;
+        });
+
+        let (bridge_input, bridge_output, mut host) = host_io();
+        let config = crate::config::Config::from_env();
+        let bridge_root = root.clone();
+        let bridge = tokio::spawn(async move {
+            run_with_io(
+                &bridge_root,
+                &config,
+                bridge_input,
+                bridge_output,
+                short_reconnect_policy(),
+            )
+            .await
+        });
+
+        host.write_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+            .await;
+        let initialize_response = host.read_json().await;
+        assert_eq!(initialize_response["result"]["daemon"], "a");
+        host.write_json(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            .await;
+        dropped_rx.await.unwrap();
+        host.write_json(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"after-drain","arguments":{}}}))
+            .await;
+        let resumed = tokio::time::timeout(Duration::from_secs(1), host.read_json())
+            .await
+            .expect("session did not resume after RejectedDraining");
+        assert_eq!(resumed["id"], 5);
+        assert_eq!(resumed["result"]["daemon"], "c");
+
+        drop(host.input);
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        daemon.await.unwrap();
+    }
 
     #[tokio::test]
     async fn connect_to_missing_socket_yields_error_kind() {
