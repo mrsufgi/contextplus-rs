@@ -1224,9 +1224,16 @@ pub(crate) static LABEL_ALLOWLIST: LazyLock<HashSet<&'static str>> = LazyLock::n
 /// file paths. If the label words match a specific subdirectory holding <20% of
 /// files (and don't match the majority), the label is rejected.
 pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo]) -> bool {
+    label_validation_rejection(label, file_refs).is_none()
+}
+
+pub(crate) fn label_validation_rejection(
+    label: &str,
+    file_refs: &[&FileInfo],
+) -> Option<(usize, usize)> {
     if file_refs.len() < 5 {
         // Too small to have a mislabeling problem
-        return true;
+        return None;
     }
 
     let label_lower = label.to_lowercase();
@@ -1236,7 +1243,7 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
         .collect();
 
     if label_words.is_empty() {
-        return true;
+        return None;
     }
 
     // Filter out allowlisted terms — only use path-specific words for validation
@@ -1248,12 +1255,7 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
     // If ALL label words are allowlisted terms (e.g. "React Form Components"),
     // the label is conceptual, not path-derived — always accept it.
     if path_specific_words.is_empty() {
-        tracing::info!(
-            label = label,
-            "semantic_navigate: validate_label — all words are allowlisted terms, accepting: {:?}",
-            label
-        );
-        return true;
+        return None;
     }
 
     // Count how many files have paths matching any PATH-SPECIFIC label word
@@ -1271,32 +1273,10 @@ pub(crate) fn validate_label_against_cluster(label: &str, file_refs: &[&FileInfo
     // the LLM likely named the cluster after a minority feature.
     // Exception: labels with zero matches are conceptual (not path-derived) — accept them.
     if matching_files > 0 && match_ratio < 0.20 {
-        tracing::info!(
-            label = label,
-            matching_files = matching_files,
-            total_files = file_refs.len(),
-            match_ratio = format!("{:.2}", match_ratio).as_str(),
-            path_specific_words = format!("{:?}", path_specific_words).as_str(),
-            "semantic_navigate: validate_label — rejecting {:?} (match_ratio={:.2}, path_words={:?})",
-            label,
-            match_ratio,
-            path_specific_words
-        );
-        return false;
+        return Some((matching_files, file_refs.len()));
     }
 
-    tracing::info!(
-        label = label,
-        matching_files = matching_files,
-        total_files = file_refs.len(),
-        match_ratio = format!("{:.2}", match_ratio).as_str(),
-        "semantic_navigate: validate_label — accepting {:?} (match_ratio={:.2}, {} of {} files)",
-        label,
-        match_ratio,
-        matching_files,
-        file_refs.len()
-    );
-    true
+    None
 }
 
 // ── Stale-while-revalidate heuristic label ──────────────────────────
