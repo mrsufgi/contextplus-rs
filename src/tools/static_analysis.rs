@@ -930,7 +930,7 @@ mod tests {
         .await
         .unwrap();
 
-        let package_dir = dir.path().join("packages/app");
+        let package_dir = dir.path().canonicalize().unwrap().join("packages/app");
         let ts_runs = typescript_invocations(&invocations);
         assert!(!ts_runs.is_empty(), "expected a scoped TS run");
         for invocation in &ts_runs {
@@ -965,7 +965,7 @@ mod tests {
         );
         assert_eq!(
             invocation_project_config(&ts_runs[0]),
-            Some(dir.path().join("tsconfig.json")),
+            Some(dir.path().canonicalize().unwrap().join("tsconfig.json")),
             "the file check must use the applicable ancestor config: {ts_runs:?}"
         );
     }
@@ -992,7 +992,7 @@ mod tests {
         );
         assert_eq!(
             invocation_project_config(&ts_runs[0]),
-            Some(dir.path().join("tsconfig.json")),
+            Some(dir.path().canonicalize().unwrap().join("tsconfig.json")),
             "the directory check must use the applicable ancestor config: {ts_runs:?}"
         );
     }
@@ -1204,7 +1204,7 @@ mod tests {
             assert_eq!(runs.len(), 1, "{runs:?}");
             assert_eq!(
                 invocation_project_config(&runs[0]),
-                Some(dir.path().join("tsconfig.json"))
+                Some(dir.path().canonicalize().unwrap().join("tsconfig.json"))
             );
         }
     }
