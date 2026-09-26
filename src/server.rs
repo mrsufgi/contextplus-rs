@@ -2578,6 +2578,7 @@ impl ContextPlusServer {
         let (root_dir, target_path) = self.route_static_analysis_target(&args, target_path).await;
 
         let options = crate::tools::static_analysis::StaticAnalysisOptions {
+            executable_path: None,
             root_dir,
             target_path,
         };
