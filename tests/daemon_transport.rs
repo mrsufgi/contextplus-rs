@@ -1066,6 +1066,97 @@ fn rpc_initialize_sync(stream: &mut std::os::unix::net::UnixStream) -> String {
     line
 }
 
+#[test]
+fn default_invocation_exits_nonzero_after_established_session_cannot_reconnect() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let data_dir = root.join(paths::MCP_DATA_DIR);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let socket_path = paths::daemon_socket_path(root);
+    let listener = StdUnixListener::bind(&socket_path).unwrap();
+    let (replacement_accepted_tx, replacement_accepted_rx) = mpsc::channel();
+
+    let daemon = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let _: RegisterSession = read_frame_sync(&mut first);
+        write_frame_sync(
+            &mut first,
+            &SessionReady::Ready {
+                session_id: "initial".into(),
+                ref_id: 1,
+            },
+        );
+
+        let mut request = String::new();
+        BufReader::new(first.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "initialize");
+        writeln!(first, r#"{{"jsonrpc":"2.0","id":1,"result":{{}}}}"#).unwrap();
+        first.flush().unwrap();
+        drop(first);
+
+        let (mut replacement, _) = listener.accept().unwrap();
+        let _: RegisterSession = read_frame_sync(&mut replacement);
+        replacement_accepted_tx.send(()).unwrap();
+        let mut byte = [0_u8; 1];
+        let _ = std::io::Read::read(&mut replacement, &mut byte);
+    });
+
+    let child = Command::new(subprocess_bin())
+        .args(["--root-dir", root.to_str().unwrap()])
+        .env_remove("CONTEXTPLUS_TRANSPORT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn default invocation");
+    let mut guard = ProcessGuard { child };
+
+    writeln!(
+        guard.child.stdin.as_mut().unwrap(),
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .unwrap();
+    guard.child.stdin.as_mut().unwrap().flush().unwrap();
+    let mut response = String::new();
+    BufReader::new(guard.child.stdout.as_mut().unwrap())
+        .read_line(&mut response)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).unwrap()["id"],
+        1
+    );
+    replacement_accepted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bridge did not attempt to reconnect");
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = guard.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(65),
+            "default invocation stayed alive after reconnect exhaustion"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !status.success(),
+        "default invocation exited successfully after reconnect exhaustion: {status}"
+    );
+
+    daemon.join().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: daemon subcommand binds socket, serves MCP initialize, then exits
 //         cleanly after SIGTERM.
