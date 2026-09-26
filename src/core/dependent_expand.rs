@@ -59,16 +59,19 @@ pub fn build_reverse_graph(all_files: &[PathBuf]) -> HashMap<PathBuf, HashSet<Pa
 
     // Parse imports in parallel (each file is independent CPU + blocking I/O).
     // Collect per-file edge lists, then merge sequentially into the final map.
-    let edge_lists: Vec<Vec<(PathBuf, PathBuf)>> = all_files
-        .par_iter()
-        .map(|file| {
-            let imports = ts::extract_imports(file);
-            import_resolver::resolve_file_imports(file, &imports)
-                .into_iter()
-                .filter(|(_, imported)| in_set.contains(imported.as_path()))
+    let edge_lists: Vec<Vec<(PathBuf, PathBuf)>> = crate::core::structural_pool::STRUCTURAL_POOL
+        .install(|| {
+            all_files
+                .par_iter()
+                .map(|file| {
+                    let imports = ts::extract_imports(file);
+                    import_resolver::resolve_file_imports(file, &imports)
+                        .into_iter()
+                        .filter(|(_, imported)| in_set.contains(imported.as_path()))
+                        .collect()
+                })
                 .collect()
-        })
-        .collect();
+        });
 
     let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
     for edges in edge_lists {

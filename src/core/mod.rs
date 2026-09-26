@@ -10,6 +10,7 @@ pub mod parser;
 pub mod path_translation;
 pub mod process_lifecycle;
 pub mod safe_path;
+pub(crate) mod structural_pool;
 pub mod tree_sitter;
 pub mod utils;
 pub mod walker;
