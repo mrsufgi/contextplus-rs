@@ -669,8 +669,17 @@ pub async fn connect_or_spawn(root_dir: &Path) -> Result<UnixStream> {
 
 /// Re-exec ourselves with `--daemon` flag and detach via `setsid` so the
 /// child survives client (Claude Code) termination.
+/// The binary to launch as the daemon. After an in-place upgrade Linux reports
+/// our own executable as "<path> (deleted)"; launch the new file at that path.
+fn daemon_executable(current: std::path::PathBuf) -> std::path::PathBuf {
+    match current.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(replaced) if Path::new(replaced).is_file() => std::path::PathBuf::from(replaced),
+        _ => current,
+    }
+}
+
 fn spawn_daemon(root_dir: &Path) -> Result<()> {
-    let exe = std::env::current_exe().context("current_exe() failed")?;
+    let exe = daemon_executable(std::env::current_exe().context("current_exe() failed")?);
     let log_path = std::env::var_os("CONTEXTPLUS_DAEMON_LOG")
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
@@ -1332,6 +1341,20 @@ mod tests {
             .unwrap()
             .unwrap();
         daemon.await.unwrap();
+    }
+
+    #[test]
+    fn daemon_executable_follows_an_upgraded_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("contextplus-rs");
+        std::fs::write(&installed, b"new build").unwrap();
+        let deleted = std::path::PathBuf::from(format!("{} (deleted)", installed.display()));
+        assert_eq!(daemon_executable(deleted), installed);
+
+        let missing =
+            std::path::PathBuf::from(format!("{} (deleted)", dir.path().join("gone").display()));
+        assert_eq!(daemon_executable(missing.clone()), missing);
+        assert_eq!(daemon_executable(installed.clone()), installed);
     }
 
     #[tokio::test]
