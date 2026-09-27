@@ -29,6 +29,7 @@
 //! `<root>/.mcp_data/contextplus.daemon.lock`. The lock is bound to the
 //! file-descriptor lifetime: keep [`LockGuard`] alive and the lock holds.
 
+use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -132,7 +133,149 @@ pub(crate) fn compare_search_config(
         .collect()
 }
 
-fn config_warning(differences: &[ConfigDifference]) -> Option<String> {
+pub(crate) struct AppliedConfigValue {
+    pub key: String,
+    pub inherited_value: Option<String>,
+    pub configured_value: String,
+}
+
+pub(crate) struct DaemonConfigResolution {
+    pub config: Config,
+    pub applied_values: Vec<AppliedConfigValue>,
+}
+
+const SEARCH_CONFIG_KEYS: &[&str] = &[
+    "CONTEXTPLUS_EMBED_PROVIDER",
+    "CONTEXTPLUS_CHAT_PROVIDER",
+    "OLLAMA_HOST",
+    "OLLAMA_EMBED_MODEL",
+    "OLLAMA_CHAT_MODEL",
+    "CONTEXTPLUS_OPENAI_BASE_URL",
+    "CONTEXTPLUS_OPENAI_EMBED_MODEL",
+    "CONTEXTPLUS_OPENAI_CHAT_MODEL",
+    "CONTEXTPLUS_CHAT_BASE_URL",
+    "CONTEXTPLUS_CLAUDE_PATH",
+    "CONTEXTPLUS_CLAUDE_MODEL",
+    "CONTEXTPLUS_ANTHROPIC_CHAT_MODEL",
+    "CONTEXTPLUS_EMBED_QUERY_PREFIX",
+    "CONTEXTPLUS_EMBED_DOC_PREFIX",
+    "CONTEXTPLUS_EMBED_DOC_SHAPE",
+    "CONTEXTPLUS_EMBED_BATCH_SIZE",
+    "CONTEXTPLUS_EMBED_BUDGET_MS",
+    "CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS",
+    "CONTEXTPLUS_EMBED_TRACKER",
+    "CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS",
+    "CONTEXTPLUS_EMBED_TRACKER_MAX_FILES",
+    "CONTEXTPLUS_IGNORE_DIRS",
+    "CONTEXTPLUS_CACHE_TTL_SECS",
+    "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",
+    "CONTEXTPLUS_EMBED_NUM_GPU",
+    "CONTEXTPLUS_EMBED_MAIN_GPU",
+    "CONTEXTPLUS_EMBED_NUM_THREAD",
+    "CONTEXTPLUS_EMBED_NUM_BATCH",
+    "CONTEXTPLUS_EMBED_NUM_CTX",
+    "CONTEXTPLUS_EMBED_LOW_VRAM",
+    "CONTEXTPLUS_EMBED_CHUNK_CHARS",
+    "CONTEXTPLUS_QUERY_BATCH_SIZE",
+    "CONTEXTPLUS_WARMUP_ON_START",
+    "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
+    "CONTEXTPLUS_HNSW_EF_SEARCH",
+    "CONTEXTPLUS_REF_WARMUP_MODE",
+    "CONTEXTPLUS_OLLAMA_MAX_CONCURRENT",
+];
+
+fn matching_server(document: &serde_json::Value) -> Option<&serde_json::Value> {
+    let servers = document.get("mcpServers")?.as_object()?;
+    servers.get("contextplus").or_else(|| {
+        servers.values().find(|server| {
+            server
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|command| Path::new(command).file_name())
+                .is_some_and(|name| name == "contextplus-rs")
+        })
+    })
+}
+
+pub(crate) fn resolve_daemon_config_contents(
+    contents: Option<&str>,
+    inherited_env: &HashMap<String, String>,
+) -> serde_json::Result<DaemonConfigResolution> {
+    let document = contents
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?;
+    let mut env = inherited_env.clone();
+    let mut applied_values = Vec::new();
+    if let Some(values) = document
+        .as_ref()
+        .and_then(matching_server)
+        .and_then(|server| server.get("env"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for &key in SEARCH_CONFIG_KEYS {
+            if let Some(value) = values.get(key).and_then(serde_json::Value::as_str) {
+                if inherited_env.get(key).map(String::as_str) != Some(value) {
+                    applied_values.push(AppliedConfigValue {
+                        key: key.to_string(),
+                        inherited_value: inherited_env.get(key).cloned(),
+                        configured_value: value.to_string(),
+                    });
+                }
+                env.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    Ok(DaemonConfigResolution {
+        config: Config::from_env_map(&env),
+        applied_values,
+    })
+}
+
+pub(crate) fn resolve_daemon_startup_config(
+    root_dir: &Path,
+    inherited_env: &HashMap<String, String>,
+) -> DaemonConfigResolution {
+    let path = crate::core::git_worktree::resolve_primary_worktree(root_dir).join(".mcp.json");
+    let contents = std::fs::read_to_string(&path).ok();
+    let mut resolved = match resolve_daemon_config_contents(contents.as_deref(), inherited_env) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), reason = %error, "cannot parse daemon config JSON; using process environment");
+            resolve_daemon_config_contents(None, inherited_env).expect("no file is valid")
+        }
+    };
+    if contents
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .as_ref()
+        .and_then(matching_server)
+        .is_some()
+    {
+        resolved.config.config_source = Some(path.clone());
+    }
+    let changes = resolved
+        .applied_values
+        .iter()
+        .map(|value| {
+            format!(
+                "{}: inherited={:?}, configured={:?}",
+                value.key,
+                value.inherited_value.as_deref().unwrap_or("<unset>"),
+                value.configured_value
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    tracing::info!(path = %path.display(), source = %resolved.config.config_source.as_deref()
+        .map(|p| p.display().to_string()).unwrap_or_else(|| "process environment".into()),
+        overrides = %changes, "daemon search config source");
+    resolved
+}
+
+fn config_warning(
+    differences: &[ConfigDifference],
+    config_source: Option<&Path>,
+) -> Option<String> {
     if differences.is_empty() {
         return None;
     }
@@ -146,8 +289,11 @@ fn config_warning(differences: &[ConfigDifference]) -> Option<String> {
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let source = config_source
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "process environment".into());
     Some(format!(
-        "contextplus warning: this daemon runs {details}; restart the daemon from a session with the right config."
+        "contextplus warning: daemon config comes from {source}: {details}; differing bridge values are ignored."
     ))
 }
 
@@ -508,10 +654,11 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
             field = difference.field,
             daemon_value = difference.daemon_value,
             bridge_value = difference.bridge_value,
-            "bridge search configuration differs from daemon"
+            source = %server.state.config.config_source.as_deref().map(|path| path.display().to_string()).unwrap_or_else(|| "process environment".into()),
+            "bridge search configuration differs from daemon config source; bridge values are ignored"
         );
     }
-    let warning = config_warning(&differences);
+    let warning = config_warning(&differences, server.state.config.config_source.as_deref());
 
     // Reject immediately if draining.
     if server.state.draining.load(Ordering::Acquire) {
@@ -676,12 +823,13 @@ fn spawn_signal_listener(draining: Arc<AtomicBool>) {
 /// Top-level entry called from `main`. Acquire lock → bind → write pid → run.
 /// Returns `Ok(false)` if another daemon is already running (caller falls
 /// back to client mode).
-pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
+pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     let lock = match acquire_lock(&root_dir)? {
         AcquireOutcome::Acquired(l) => l,
         AcquireOutcome::AlreadyRunning => return Ok(false),
     };
 
+    let config = resolve_daemon_startup_config(&root_dir, &crate::config::env_snapshot()).config;
     let listener = bind_listener(&root_dir)?;
     write_pid_file(&root_dir);
 
@@ -706,6 +854,26 @@ pub async fn run_if_owner(root_dir: PathBuf, config: Config) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn env_map(values: &[(&str, &str)]) -> HashMap<String, String> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn named_contextplus_config(env: serde_json::Value) -> String {
+        serde_json::json!({
+            "mcpServers": {
+                "contextplus": {
+                    "command": "/opt/contextplus-rs",
+                    "env": env
+                }
+            }
+        })
+        .to_string()
+    }
 
     #[cfg(unix)]
     #[test]
@@ -784,13 +952,333 @@ mod tests {
                 "CONTEXTPLUS_MAX_EMBED_FILE_SIZE"
             ]
         );
-        let warning = config_warning(&differences).unwrap();
+        let warning = config_warning(&differences, None).unwrap();
         for field in names {
             assert!(
                 warning.contains(field),
                 "warning omitted {field}: {warning}"
             );
         }
+    }
+
+    #[test]
+    fn primary_mcp_file_overrides_inherited_search_environment() {
+        let inherited = env_map(&[
+            ("OLLAMA_EMBED_MODEL", "model-from-spawning-session"),
+            ("OLLAMA_HOST", "http://inherited:11434"),
+        ]);
+        let contents = named_contextplus_config(serde_json::json!({
+            "OLLAMA_EMBED_MODEL": "model-from-primary-file"
+        }));
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &inherited).unwrap();
+
+        assert_eq!(
+            resolved.config.ollama_embed_model,
+            "model-from-primary-file"
+        );
+        assert_eq!(resolved.config.ollama_host, "http://inherited:11434");
+        assert_eq!(resolved.applied_values.len(), 1);
+        assert_eq!(resolved.applied_values[0].key, "OLLAMA_EMBED_MODEL");
+        assert_eq!(
+            resolved.applied_values[0].inherited_value.as_deref(),
+            Some("model-from-spawning-session")
+        );
+        assert_eq!(
+            resolved.applied_values[0].configured_value,
+            "model-from-primary-file"
+        );
+    }
+
+    #[test]
+    fn secret_named_file_values_are_ignored_and_inherited_secrets_are_preserved() {
+        let inherited = env_map(&[
+            ("CONTEXTPLUS_EMBED_PROVIDER", "openai"),
+            ("CONTEXTPLUS_OPENAI_API_KEY", "inherited-contextplus-key"),
+            ("OPENAI_API_KEY", "inherited-openai-key"),
+            ("OLLAMA_API_KEY", "inherited-ollama-key"),
+            ("OLLAMA_EMBED_MODEL", "inherited-model"),
+        ]);
+        let contents = named_contextplus_config(serde_json::json!({
+            "CONTEXTPLUS_OPENAI_API_KEY": "file-contextplus-key",
+            "OPENAI_API_KEY": "file-openai-key",
+            "OLLAMA_API_KEY": "file-ollama-key",
+            "CONTEXTPLUS_AUTH_TOKEN": "file-token",
+            "CONTEXTPLUS_CLIENT_SECRET": "file-secret",
+            "CONTEXTPLUS_PASSWORD": "file-password",
+            "CONTEXTPLUS_TYPO": "file-unknown-setting",
+            "OLLAMA_EMBED_MODEL": "file-model"
+        }));
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &inherited).unwrap();
+
+        assert_eq!(resolved.config.ollama_embed_model, "file-model");
+        assert_eq!(
+            resolved.config.openai_api_key.as_deref(),
+            Some("inherited-contextplus-key")
+        );
+        assert_eq!(
+            resolved.config.ollama_api_key.as_deref(),
+            Some("inherited-ollama-key")
+        );
+        let applied_keys: Vec<_> = resolved
+            .applied_values
+            .iter()
+            .map(|value| value.key.as_str())
+            .collect();
+        assert_eq!(applied_keys, ["OLLAMA_EMBED_MODEL"]);
+    }
+
+    #[test]
+    fn absent_file_key_falls_back_to_inherited_environment() {
+        let inherited = env_map(&[
+            ("OLLAMA_EMBED_MODEL", "inherited-model"),
+            ("OLLAMA_CHAT_MODEL", "inherited-chat-model"),
+            ("CONTEXTPLUS_WARMUP_ON_START", "false"),
+        ]);
+        let contents = named_contextplus_config(serde_json::json!({
+            "OLLAMA_EMBED_MODEL": "file-model"
+        }));
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &inherited).unwrap();
+
+        assert_eq!(resolved.config.ollama_embed_model, "file-model");
+        assert_eq!(resolved.config.ollama_chat_model, "inherited-chat-model");
+        assert!(!resolved.config.warmup_on_start);
+    }
+
+    #[test]
+    fn no_mcp_file_keeps_inherited_environment_without_warning() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let inherited = env_map(&[
+            ("OLLAMA_EMBED_MODEL", "inherited-model"),
+            ("OLLAMA_HOST", "http://inherited:11434"),
+        ]);
+        let (logs, _guard) = crate::test_logs::captured_info_logs();
+
+        let resolved = resolve_daemon_startup_config(root.path(), &inherited);
+        let logs = crate::test_logs::logs_as_string(&logs);
+
+        assert_eq!(resolved.config.ollama_embed_model, "inherited-model");
+        assert_eq!(resolved.config.ollama_host, "http://inherited:11434");
+        assert!(
+            !logs.lines().any(|line| line.contains(" WARN ")),
+            "missing .mcp.json should not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn no_matching_server_entry_keeps_inherited_environment_without_warning() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(
+            root.path().join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "other-server": {
+                        "command": "/opt/not-contextplus",
+                        "env": {"OLLAMA_EMBED_MODEL": "file-model"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inherited = env_map(&[("OLLAMA_EMBED_MODEL", "inherited-model")]);
+        let (logs, _guard) = crate::test_logs::captured_info_logs();
+
+        let resolved = resolve_daemon_startup_config(root.path(), &inherited);
+        let logs = crate::test_logs::logs_as_string(&logs);
+
+        assert_eq!(resolved.config.ollama_embed_model, "inherited-model");
+        assert!(
+            !logs.lines().any(|line| line.contains(" WARN ")),
+            "unmatched .mcp.json should not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn malformed_mcp_file_keeps_environment_and_warns_once_with_path_and_reason() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let config_path = root.path().join(".mcp.json");
+        std::fs::write(&config_path, r#"{"secret":"must-not-be-logged""#).unwrap();
+        let inherited = env_map(&[("OLLAMA_EMBED_MODEL", "inherited-model")]);
+        let (logs, _guard) = crate::test_logs::captured_info_logs();
+
+        let resolved = resolve_daemon_startup_config(root.path(), &inherited);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let warnings: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains(" WARN "))
+            .collect();
+
+        assert_eq!(resolved.config.ollama_embed_model, "inherited-model");
+        assert_eq!(warnings.len(), 1, "expected one warning: {logs}");
+        assert!(warnings[0].contains(&config_path.display().to_string()));
+        assert!(
+            warnings[0].contains("parse") || warnings[0].contains("JSON"),
+            "warning did not name the reason: {}",
+            warnings[0]
+        );
+        assert!(!logs.contains("must-not-be-logged"));
+    }
+
+    #[test]
+    fn contextplus_entry_is_matched_by_name() {
+        let contents = serde_json::json!({
+            "mcpServers": {
+                "contextplus": {
+                    "command": "/opt/some-other-binary",
+                    "env": {
+                        "CONTEXTPLUS_OPENAI_BASE_URL": "https://file.example/v1",
+                        "CONTEXTPLUS_OPENAI_EMBED_MODEL": "file-embed-model",
+                        "CONTEXTPLUS_CLAUDE_MODEL": "file-claude-model",
+                        "CONTEXTPLUS_ANTHROPIC_CHAT_MODEL": "file-anthropic-model"
+                    }
+                },
+                "also-matches-command": {
+                    "command": "/opt/contextplus-rs",
+                    "env": {
+                        "CONTEXTPLUS_OPENAI_BASE_URL": "https://wrong.example/v1",
+                        "CONTEXTPLUS_OPENAI_EMBED_MODEL": "wrong-embed-model",
+                        "CONTEXTPLUS_CLAUDE_MODEL": "wrong-claude-model",
+                        "CONTEXTPLUS_ANTHROPIC_CHAT_MODEL": "wrong-anthropic-model"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &HashMap::new()).unwrap();
+
+        assert_eq!(resolved.config.openai_base_url, "https://file.example/v1");
+        assert_eq!(resolved.config.openai_embed_model, "file-embed-model");
+        assert_eq!(resolved.config.claude_model, "file-claude-model");
+        assert_eq!(resolved.config.anthropic_chat_model, "file-anthropic-model");
+    }
+
+    #[test]
+    fn contextplus_entry_is_matched_by_command_basename() {
+        let contents = serde_json::json!({
+            "mcpServers": {
+                "legacy-name": {
+                    "command": "/opt/contextplus/bin/contextplus-rs",
+                    "env": {"OLLAMA_EMBED_MODEL": "file-model"}
+                }
+            }
+        })
+        .to_string();
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &HashMap::new()).unwrap();
+
+        assert_eq!(resolved.config.ollama_embed_model, "file-model");
+    }
+
+    #[test]
+    fn linked_worktree_loads_config_from_primary_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let linked = temp.path().join("linked");
+        let linked_gitdir = primary.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&linked_gitdir).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked_gitdir.join("commondir"), "../..").unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_gitdir.display()),
+        )
+        .unwrap();
+        let config_path = primary.join(".mcp.json");
+        std::fs::write(
+            &config_path,
+            named_contextplus_config(serde_json::json!({
+                "OLLAMA_EMBED_MODEL": "model-from-primary-file"
+            })),
+        )
+        .unwrap();
+        let inherited = env_map(&[("OLLAMA_EMBED_MODEL", "model-from-linked-session")]);
+
+        let resolved = resolve_daemon_startup_config(&linked, &inherited);
+
+        assert_eq!(
+            resolved.config.ollama_embed_model,
+            "model-from-primary-file"
+        );
+        assert_eq!(
+            resolved.config.config_source.as_deref(),
+            Some(config_path.canonicalize().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn startup_log_names_source_and_changed_values_without_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let config_path = root.path().join(".mcp.json");
+        std::fs::write(
+            &config_path,
+            named_contextplus_config(serde_json::json!({
+                "OLLAMA_EMBED_MODEL": "file-model",
+                "OLLAMA_HOST": "http://same:11434",
+                "OPENAI_API_KEY": "file-openai-secret",
+                "CONTEXTPLUS_OPENAI_API_KEY": "file-contextplus-secret"
+            })),
+        )
+        .unwrap();
+        let inherited = env_map(&[
+            ("OLLAMA_EMBED_MODEL", "inherited-model"),
+            ("OLLAMA_HOST", "http://same:11434"),
+            ("OPENAI_API_KEY", "inherited-openai-secret"),
+            ("CONTEXTPLUS_OPENAI_API_KEY", "inherited-contextplus-secret"),
+        ]);
+        let (logs, _guard) = crate::test_logs::captured_info_logs();
+
+        let _resolved = resolve_daemon_startup_config(root.path(), &inherited);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let source_lines: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("daemon search config source"))
+            .collect();
+
+        assert_eq!(source_lines.len(), 1, "startup source log: {logs}");
+        let source_line = source_lines[0];
+        assert!(source_line.contains(&config_path.display().to_string()));
+        assert!(source_line.contains("OLLAMA_EMBED_MODEL"));
+        assert!(source_line.contains("inherited-model"));
+        assert!(source_line.contains("file-model"));
+        assert!(
+            !source_line.contains("OLLAMA_HOST"),
+            "unchanged values must not be listed: {source_line}"
+        );
+        for forbidden in [
+            "OPENAI_API_KEY",
+            "CONTEXTPLUS_OPENAI_API_KEY",
+            "file-openai-secret",
+            "file-contextplus-secret",
+            "inherited-openai-secret",
+            "inherited-contextplus-secret",
+        ] {
+            assert!(!logs.contains(forbidden), "log leaked {forbidden}: {logs}");
+        }
+    }
+
+    #[test]
+    fn mismatch_warning_names_daemon_source_and_ignored_bridge_values() {
+        let daemon = Config::from_env();
+        let mut bridge = crate::transport::client::SearchConfig::from(&daemon);
+        bridge.ollama_embed_model = "bridge-model".into();
+        let differences = compare_search_config(&daemon, &bridge);
+        let source = Path::new("/primary/repo/.mcp.json");
+
+        let warning = config_warning(&differences, Some(source)).unwrap();
+
+        assert!(warning.contains(&source.display().to_string()));
+        assert!(warning.contains("OLLAMA_EMBED_MODEL"));
+        assert!(warning.contains("bridge-model"));
+        assert!(warning.contains("ignored"));
+        assert!(!warning.contains("session with the right config"));
     }
 
     #[test]

@@ -2124,3 +2124,34 @@ async fn u9_session_ref_id_routes_tool_call_to_registered_worktree() {
     handle.abort();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 }
+
+#[cfg(unix)]
+#[test]
+fn stdio_server_starts_with_non_utf8_environment_entries() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new().unwrap();
+    let output = std::process::Command::new(subprocess_bin())
+        .arg("--root-dir")
+        .arg(dir.path())
+        .env("CONTEXTPLUS_TRANSPORT", "stdio")
+        .env("CONTEXTPLUS_WARMUP_ON_START", "false")
+        .env("CONTEXTPLUS_EMBED_TRACKER", "off")
+        .env("UNRELATED_NON_UTF8", OsStr::from_bytes(b"\xff"))
+        .env("OLLAMA_EMBED_MODEL", OsStr::from_bytes(b"\xfe"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    // Closed stdin before `initialize` is a normal exit 1; a panic aborts via a signal.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code().is_some() && !stderr.contains("panicked"),
+        "stdio server must start without panicking: {:?}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("Starting contextplus MCP server"),
+        "stdio server did not start: {stderr}"
+    );
+}

@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
+use std::path::PathBuf;
 
 /// Controls how the embedding tracker starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +132,7 @@ pub fn parse_tracker_mode(value: Option<&str>) -> TrackerMode {
 
 #[derive(Clone)]
 pub struct Config {
+    pub config_source: Option<PathBuf>,
     pub embed_provider: EmbedProvider,
     pub chat_provider: ChatProvider,
     pub ollama_host: String,
@@ -319,10 +321,10 @@ const BASE_IGNORE_DIRS: &[&str] = &[
 ];
 
 /// Parse a `usize` env var, emitting a `tracing::warn` and returning `default` on invalid input.
-fn parse_usize_env_warn(key: &str, default: usize) -> usize {
-    match env::var(key) {
-        Err(_) => default,
-        Ok(raw) => match raw.trim().parse::<usize>() {
+fn parse_usize_env_warn(env: &HashMap<String, String>, key: &str, default: usize) -> usize {
+    match env.get(key) {
+        None => default,
+        Some(raw) => match raw.trim().parse::<usize>() {
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!(
@@ -337,13 +339,20 @@ fn parse_usize_env_warn(key: &str, default: usize) -> usize {
     }
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+/// The process environment as a map. Entries that are not valid UTF-8 are
+/// skipped, matching `env::var` treating such values as absent.
+pub(crate) fn env_snapshot() -> HashMap<String, String> {
+    env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
+fn env_or(env: &HashMap<String, String>, key: &str, default: &str) -> String {
+    env.get(key).cloned().unwrap_or_else(|| default.to_string())
+}
+
+fn env_nonempty(env: &HashMap<String, String>, key: &str) -> Option<String> {
+    env.get(key)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -392,26 +401,23 @@ fn is_groq_base_url(value: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+fn env_parse<T: std::str::FromStr>(env: &HashMap<String, String>, key: &str, default: T) -> T {
+    env.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn env_opt<T: std::str::FromStr>(key: &str) -> Option<T> {
-    env::var(key).ok().and_then(|v| v.parse().ok())
+fn env_opt<T: std::str::FromStr>(env: &HashMap<String, String>, key: &str) -> Option<T> {
+    env.get(key).and_then(|v| v.parse().ok())
 }
-fn env_opt_bool(key: &str) -> Option<bool> {
-    match env::var(key).ok().as_deref() {
+fn env_opt_bool(env: &HashMap<String, String>, key: &str) -> Option<bool> {
+    match env.get(key).map(String::as_str) {
         Some("true") | Some("1") | Some("yes") => Some(true),
         Some("false") | Some("0") | Some("no") => Some(false),
         _ => None,
     }
 }
-fn build_ignore_dirs() -> HashSet<String> {
+fn build_ignore_dirs(env: &HashMap<String, String>) -> HashSet<String> {
     let mut dirs: HashSet<String> = BASE_IGNORE_DIRS.iter().map(|s| (*s).to_string()).collect();
-    if let Ok(extra) = env::var("CONTEXTPLUS_IGNORE_DIRS") {
+    if let Some(extra) = env.get("CONTEXTPLUS_IGNORE_DIRS") {
         for dir in extra.split(',') {
             let trimmed = dir.trim();
             if !trimmed.is_empty() {
@@ -475,34 +481,45 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
+        Self::from_env_map(&env_snapshot())
+    }
+
+    pub(crate) fn from_env_map(env: &HashMap<String, String>) -> Self {
         let embed_provider =
-            parse_embed_provider(env::var("CONTEXTPLUS_EMBED_PROVIDER").ok().as_deref());
+            parse_embed_provider(env.get("CONTEXTPLUS_EMBED_PROVIDER").map(String::as_str));
         let chat_provider =
-            parse_chat_provider(env::var("CONTEXTPLUS_CHAT_PROVIDER").ok().as_deref());
-        let batch_size: usize = env_parse("CONTEXTPLUS_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
+            parse_chat_provider(env.get("CONTEXTPLUS_CHAT_PROVIDER").map(String::as_str));
+        let batch_size: usize = env_parse(
+            env,
+            "CONTEXTPLUS_EMBED_BATCH_SIZE",
+            DEFAULT_EMBED_BATCH_SIZE,
+        );
         let batch_size = batch_size.clamp(MIN_EMBED_BATCH_SIZE, MAX_EMBED_BATCH_SIZE);
-        let ollama_embed_model = env_or("OLLAMA_EMBED_MODEL", DEFAULT_EMBED_MODEL);
-        let openai_embed_model =
-            env_or("CONTEXTPLUS_OPENAI_EMBED_MODEL", DEFAULT_OPENAI_EMBED_MODEL);
+        let ollama_embed_model = env_or(env, "OLLAMA_EMBED_MODEL", DEFAULT_EMBED_MODEL);
+        let openai_embed_model = env_or(
+            env,
+            "CONTEXTPLUS_OPENAI_EMBED_MODEL",
+            DEFAULT_OPENAI_EMBED_MODEL,
+        );
         let active_embed_model = match embed_provider {
             EmbedProvider::Ollama => &ollama_embed_model,
             EmbedProvider::OpenAi => &openai_embed_model,
         };
         let (default_query_prefix, default_doc_prefix, default_doc_shape) =
             default_embedding_settings(active_embed_model);
-        let openai_base_url = env_or("CONTEXTPLUS_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL);
-        let chat_base_url = env_nonempty("CONTEXTPLUS_CHAT_BASE_URL");
+        let openai_base_url = env_or(env, "CONTEXTPLUS_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL);
+        let chat_base_url = env_nonempty(env, "CONTEXTPLUS_CHAT_BASE_URL");
         let openai_api_key =
             if embed_provider == EmbedProvider::OpenAi || chat_provider == ChatProvider::OpenAi {
-                env_nonempty("CONTEXTPLUS_OPENAI_API_KEY")
+                env_nonempty(env, "CONTEXTPLUS_OPENAI_API_KEY")
             } else {
                 None
             };
         let chat_api_key = if chat_provider == ChatProvider::OpenAi {
-            env_nonempty("CONTEXTPLUS_CHAT_API_KEY").or_else(|| {
+            env_nonempty(env, "CONTEXTPLUS_CHAT_API_KEY").or_else(|| {
                 let base_url = chat_base_url.as_deref().unwrap_or(&openai_base_url);
                 if is_groq_base_url(base_url) {
-                    env_nonempty("GROQ_API_KEY").or_else(|| openai_api_key.clone())
+                    env_nonempty(env, "GROQ_API_KEY").or_else(|| openai_api_key.clone())
                 } else {
                     openai_api_key.clone()
                 }
@@ -513,81 +530,100 @@ impl Config {
         let (anthropic_api_key, anthropic_auth_token) = if chat_provider == ChatProvider::Anthropic
         {
             (
-                env_nonempty("ANTHROPIC_API_KEY"),
-                env_nonempty("ANTHROPIC_AUTH_TOKEN"),
+                env_nonempty(env, "ANTHROPIC_API_KEY"),
+                env_nonempty(env, "ANTHROPIC_AUTH_TOKEN"),
             )
         } else {
             (None, None)
         };
 
         Config {
+            config_source: None,
             embed_provider,
             chat_provider,
-            ollama_host: env_or("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
+            ollama_host: env_or(env, "OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
             ollama_embed_model,
-            ollama_chat_model: env_or("OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
-            ollama_api_key: env_nonempty("OLLAMA_API_KEY"),
+            ollama_chat_model: env_or(env, "OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
+            ollama_api_key: env_nonempty(env, "OLLAMA_API_KEY"),
             openai_api_key,
             openai_base_url,
             openai_embed_model,
-            openai_chat_model: env_or("CONTEXTPLUS_OPENAI_CHAT_MODEL", DEFAULT_OPENAI_CHAT_MODEL),
+            openai_chat_model: env_or(
+                env,
+                "CONTEXTPLUS_OPENAI_CHAT_MODEL",
+                DEFAULT_OPENAI_CHAT_MODEL,
+            ),
             chat_base_url,
             chat_api_key,
-            claude_path: env_or("CONTEXTPLUS_CLAUDE_PATH", "claude"),
-            claude_model: env_or("CONTEXTPLUS_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
-            anthropic_chat_model: env_or("CONTEXTPLUS_ANTHROPIC_CHAT_MODEL", DEFAULT_CLAUDE_MODEL),
+            claude_path: env_or(env, "CONTEXTPLUS_CLAUDE_PATH", "claude"),
+            claude_model: env_or(env, "CONTEXTPLUS_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
+            anthropic_chat_model: env_or(
+                env,
+                "CONTEXTPLUS_ANTHROPIC_CHAT_MODEL",
+                DEFAULT_CLAUDE_MODEL,
+            ),
             anthropic_api_key,
             anthropic_auth_token,
             anthropic_base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
-            embed_query_prefix: env_or("CONTEXTPLUS_EMBED_QUERY_PREFIX", default_query_prefix),
-            embed_doc_prefix: env_or("CONTEXTPLUS_EMBED_DOC_PREFIX", default_doc_prefix),
+            embed_query_prefix: env_or(env, "CONTEXTPLUS_EMBED_QUERY_PREFIX", default_query_prefix),
+            embed_doc_prefix: env_or(env, "CONTEXTPLUS_EMBED_DOC_PREFIX", default_doc_prefix),
             embed_doc_shape: parse_embed_doc_shape(
-                env::var("CONTEXTPLUS_EMBED_DOC_SHAPE").ok().as_deref(),
+                env.get("CONTEXTPLUS_EMBED_DOC_SHAPE").map(String::as_str),
                 default_doc_shape,
             ),
             embed_batch_size: batch_size,
-            embed_budget_ms: env_parse("CONTEXTPLUS_EMBED_BUDGET_MS", 20_000),
+            embed_budget_ms: env_parse(env, "CONTEXTPLUS_EMBED_BUDGET_MS", 20_000),
             embed_fill_batch_timeout_ms: env_parse(
+                env,
                 "CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS",
                 120_000,
             ),
             embed_tracker_mode: parse_tracker_mode(
-                env::var("CONTEXTPLUS_EMBED_TRACKER").ok().as_deref(),
+                env.get("CONTEXTPLUS_EMBED_TRACKER").map(String::as_str),
             ),
             embed_tracker_debounce_ms: env_parse(
+                env,
                 "CONTEXTPLUS_EMBED_TRACKER_DEBOUNCE_MS",
                 DEFAULT_EMBED_TRACKER_DEBOUNCE_MS,
             ),
             embed_tracker_max_files: env_parse(
+                env,
                 "CONTEXTPLUS_EMBED_TRACKER_MAX_FILES",
                 DEFAULT_EMBED_TRACKER_MAX_FILES,
             ),
-            ignore_dirs: build_ignore_dirs(),
-            cache_ttl_secs: env_parse("CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            ignore_dirs: build_ignore_dirs(env),
+            cache_ttl_secs: env_parse(env, "CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
             max_embed_file_size: env_parse(
+                env,
                 "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",
                 DEFAULT_MAX_EMBED_FILE_SIZE,
             )
             .max(MIN_MAX_EMBED_FILE_SIZE),
-            embed_num_gpu: env_opt("CONTEXTPLUS_EMBED_NUM_GPU"),
-            embed_main_gpu: env_opt("CONTEXTPLUS_EMBED_MAIN_GPU"),
-            embed_num_thread: env_opt("CONTEXTPLUS_EMBED_NUM_THREAD"),
-            embed_num_batch: env_opt("CONTEXTPLUS_EMBED_NUM_BATCH"),
-            embed_num_ctx: env_opt("CONTEXTPLUS_EMBED_NUM_CTX"),
-            embed_low_vram: env_opt_bool("CONTEXTPLUS_EMBED_LOW_VRAM"),
+            embed_num_gpu: env_opt(env, "CONTEXTPLUS_EMBED_NUM_GPU"),
+            embed_main_gpu: env_opt(env, "CONTEXTPLUS_EMBED_MAIN_GPU"),
+            embed_num_thread: env_opt(env, "CONTEXTPLUS_EMBED_NUM_THREAD"),
+            embed_num_batch: env_opt(env, "CONTEXTPLUS_EMBED_NUM_BATCH"),
+            embed_num_ctx: env_opt(env, "CONTEXTPLUS_EMBED_NUM_CTX"),
+            embed_low_vram: env_opt_bool(env, "CONTEXTPLUS_EMBED_LOW_VRAM"),
             idle_timeout_ms: crate::core::process_lifecycle::get_idle_shutdown_ms(
-                env::var("CONTEXTPLUS_IDLE_TIMEOUT_MS").ok().as_deref(),
+                env.get("CONTEXTPLUS_IDLE_TIMEOUT_MS").map(String::as_str),
             ),
             parent_poll_ms: crate::core::process_lifecycle::get_parent_poll_ms(
-                env::var("CONTEXTPLUS_PARENT_POLL_MS").ok().as_deref(),
+                env.get("CONTEXTPLUS_PARENT_POLL_MS").map(String::as_str),
             ),
             embed_chunk_chars: env_parse(
+                env,
                 "CONTEXTPLUS_EMBED_CHUNK_CHARS",
                 DEFAULT_EMBED_CHUNK_CHARS,
             )
             .clamp(MIN_EMBED_CHUNK_CHARS, MAX_EMBED_CHUNK_CHARS),
-            query_batch_size: env_parse("CONTEXTPLUS_QUERY_BATCH_SIZE", DEFAULT_QUERY_BATCH_SIZE),
-            warmup_on_start: env::var("CONTEXTPLUS_WARMUP_ON_START")
+            query_batch_size: env_parse(
+                env,
+                "CONTEXTPLUS_QUERY_BATCH_SIZE",
+                DEFAULT_QUERY_BATCH_SIZE,
+            ),
+            warmup_on_start: env
+                .get("CONTEXTPLUS_WARMUP_ON_START")
                 .map(|v| {
                     !matches!(
                         v.trim().to_lowercase().as_str(),
@@ -596,17 +632,20 @@ impl Config {
                 })
                 .unwrap_or(true),
             hnsw_ef_construction: parse_usize_env_warn(
+                env,
                 "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
                 DEFAULT_HNSW_EF_CONSTRUCTION,
             ),
             hnsw_ef_search: parse_usize_env_warn(
+                env,
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
                 DEFAULT_HNSW_EF_SEARCH,
             ),
             ref_warmup_mode: parse_ref_warmup_mode(
-                env::var("CONTEXTPLUS_REF_WARMUP_MODE").ok().as_deref(),
+                env.get("CONTEXTPLUS_REF_WARMUP_MODE").map(String::as_str),
             ),
             ollama_max_concurrent: parse_usize_env_warn(
+                env,
                 "CONTEXTPLUS_OLLAMA_MAX_CONCURRENT",
                 DEFAULT_OLLAMA_MAX_CONCURRENT,
             )
