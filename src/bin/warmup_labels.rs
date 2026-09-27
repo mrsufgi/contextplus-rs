@@ -53,6 +53,8 @@ async fn main() {
 
 async fn run_warmup(ollama: &OllamaClient, config: &Config, dir: &Path, mode: &str) {
     let options = SemanticNavigateOptions {
+        query: None,
+        max_tokens: None,
         root_dir: dir.to_string_lossy().to_string(),
         max_depth: Some(3),
         max_clusters: Some(10),
@@ -61,7 +63,7 @@ async fn run_warmup(ollama: &OllamaClient, config: &Config, dir: &Path, mode: &s
     };
 
     let embedding_cache = RwLock::new(HashMap::new());
-    match semantic_navigate(options, ollama, config, &embedding_cache, dir).await {
+    match semantic_navigate(options, ollama, config, &embedding_cache, dir, None).await {
         Ok(_) => println!("  ✓ Labels cached"),
         Err(e) => eprintln!("  ✗ Error: {}", e),
     }

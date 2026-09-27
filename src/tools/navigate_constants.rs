@@ -6,6 +6,9 @@ use std::sync::LazyLock;
 
 use crate::core::embeddings::content_hash;
 
+/// Maximum query-relevant files clustered per request.
+pub const QUERY_CLUSTER_FILE_LIMIT: usize = 60;
+
 /// Default cap on files fed to the top-level navigate clustering step.
 /// Even with Lanczos top-k eigendecomposition (O(n^2*k)), affinity-matrix
 /// construction is O(n^2) at ~8 bytes/entry — n=2000 is ~32MB, still cheap;
