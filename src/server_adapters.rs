@@ -297,6 +297,17 @@ pub struct RefWalkerIndexer {
     pub ref_index: Arc<crate::ref_index::RefIndex>,
 }
 
+impl RefWalkerIndexer {
+    pub(crate) fn walk_candidates(
+        &self,
+        root: &Path,
+        candidates: std::collections::HashSet<String>,
+    ) -> crate::tools::semantic_search::WalkAndIndexFuture<'_> {
+        self.walker
+            .walk_for_ref_candidates(root, self.ref_index.clone(), Some(candidates))
+    }
+}
+
 impl WalkAndIndexFn for RefWalkerIndexer {
     fn vector_generation(&self, _root: &Path) -> u64 {
         self.ref_index
@@ -331,6 +342,15 @@ impl CachedWalkerIndexer {
         root_dir: &Path,
         ref_index: Arc<crate::ref_index::RefIndex>,
     ) -> crate::tools::semantic_search::WalkAndIndexFuture<'_> {
+        self.walk_for_ref_candidates(root_dir, ref_index, None)
+    }
+
+    fn walk_for_ref_candidates(
+        &self,
+        root_dir: &Path,
+        ref_index: Arc<crate::ref_index::RefIndex>,
+        candidates: Option<std::collections::HashSet<String>>,
+    ) -> crate::tools::semantic_search::WalkAndIndexFuture<'_> {
         let root = root_dir.to_path_buf();
         let config = self.config.clone();
         let ollama = self.ollama.clone();
@@ -346,6 +366,12 @@ impl CachedWalkerIndexer {
             // Read all files concurrently (up to 32 at a time)
             let mut join_set = tokio::task::JoinSet::new();
             for (i, entry) in entries.iter().enumerate() {
+                if candidates
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(&entry.relative_path))
+                {
+                    continue;
+                }
                 let full_path = root.join(&entry.relative_path);
                 let rel_path = prefix
                     .join(&entry.relative_path)

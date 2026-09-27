@@ -2551,6 +2551,8 @@ impl ContextPlusServer {
         let root = self.resolve_root(&args);
 
         let options = crate::tools::semantic_navigate::SemanticNavigateOptions {
+            query: Self::get_str(&args, "query"),
+            max_tokens: Self::get_usize(&args, "max_tokens"),
             root_dir: root.to_string_lossy().into(),
             max_depth: Self::get_usize(&args, "max_depth"),
             max_clusters: Self::get_usize(&args, "max_clusters"),
@@ -2559,12 +2561,21 @@ impl ContextPlusServer {
         };
 
         let ref_index = self.current_ref();
+        let indexer = crate::server_adapters::RefWalkerIndexer {
+            ref_index: self.current_ref(),
+            walker: CachedWalkerIndexer {
+                config: self.state.config.clone(),
+                ollama: self.state.ollama.clone(),
+                state: self.state.clone(),
+            },
+        };
         let result = crate::tools::semantic_navigate::semantic_navigate(
             options,
             &self.state.ollama,
             &self.state.config,
             &ref_index.embedding_cache,
             &ref_index.root_dir,
+            Some(&indexer),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -4310,6 +4321,62 @@ mod tests {
         (tmp, server)
     }
 
+    async fn cluster_facade_server(
+        files: impl IntoIterator<Item = (String, String)>,
+    ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().cloned())
+                    .unwrap_or_default();
+                let embeddings: Vec<Vec<f32>> = inputs
+                    .iter()
+                    .map(|input| {
+                        let text = input.as_str().unwrap_or_default().to_lowercase();
+                        if text.contains("projection") {
+                            vec![1.0, 0.0]
+                        } else if text.contains("event sourcing")
+                            || text.contains("consumer checkpoint")
+                            || text.contains("topic_alpha")
+                        {
+                            vec![0.8, 0.6]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": embeddings }))
+            })
+            .mount(&provider)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&provider)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for (relative, content) in files {
+            let absolute = tmp.path().join(relative);
+            std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            std::fs::write(absolute, content).unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = provider.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        (tmp, provider, server)
+    }
+
     fn text_of(result: &CallToolResult) -> String {
         match &result.content[0].raw {
             RawContent::Text(t) => t.text.clone(),
@@ -4379,6 +4446,203 @@ mod tests {
         let hits = server.dispatch("explore", args).await;
         assert_eq!(hits.is_error, Some(false), "{}", text_of(&hits));
         assert!(text_of(&hits).contains("auth.rs"), "{}", text_of(&hits));
+    }
+
+    #[tokio::test]
+    async fn explore_clusters_query_selects_and_orders_only_relevant_topic_files() {
+        let projection_files = (0..24).map(|i| {
+            (
+                format!("packages/platform/projections/projection_rebuild_{i:02}.rs"),
+                format!(
+                    "pub fn topic_alpha_projection_{i:02}() {{ /* event sourcing consumer checkpoint rebuild */ }}"
+                ),
+            )
+        });
+        let consumer_files = (0..36).map(|i| {
+            (
+                format!("packages/platform/consumers/checkpoint_recovery_{i:02}.rs"),
+                format!(
+                    "pub fn topic_alpha_consumer_{i:02}() {{ /* event sourcing consumer checkpoint recovery */ }}"
+                ),
+            )
+        });
+        let payment_files = (0..64).map(|i| {
+            (
+                format!("packages/domains/payments/payment_settlement_{i:02}.rs"),
+                format!("pub fn settle_invoice_{i:02}() {{ /* payment ledger */ }}"),
+            )
+        });
+        let (_tmp, _provider, server) =
+            cluster_facade_server(projection_files.chain(consumer_files).chain(payment_files))
+                .await;
+        let args = serde_json::Map::from_iter([
+            (
+                "query".to_string(),
+                json!("event sourcing projection rebuild after consumer falls behind"),
+            ),
+            ("kind".to_string(), json!("clusters")),
+            ("max_clusters".to_string(), json!(4)),
+            ("min_clusters".to_string(), json!(1)),
+        ]);
+
+        let result = server.dispatch("explore", args).await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        let output = text_of(&result);
+        assert!(
+            output.contains("projection_rebuild_") && output.contains("checkpoint_recovery_"),
+            "query-relevant topic-A files were absent:\n{output}"
+        );
+        assert!(
+            !output.contains("payments") && !output.contains("payment_settlement_"),
+            "query-driven clusters leaked unrelated payment files:\n{output}"
+        );
+        let first_group = output
+            .lines()
+            .filter(|line| line.trim_start().starts_with('['))
+            .nth(1)
+            .expect("first cluster group");
+        assert!(
+            first_group.contains("projection"),
+            "the most relevant group must be first, got {first_group:?}\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_clusters_scoped_generated_paths_are_excluded() {
+        for scope in ["contracts/gen", "src/generated/subdir"] {
+            for query in [None, Some("projection rebuild")] {
+                let (_tmp, provider, server) = cluster_facade_server([(
+                    format!("{scope}/client.rs"),
+                    "pub fn projection_rebuild() {}".to_string(),
+                )])
+                .await;
+                let mut args = serde_json::Map::from_iter([
+                    ("kind".to_string(), json!("clusters")),
+                    ("path".to_string(), json!(scope)),
+                ]);
+                if let Some(query) = query {
+                    args.insert("query".to_string(), json!(query));
+                }
+                let result = server.dispatch("explore", args).await;
+                assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+                assert_eq!(
+                    text_of(&result),
+                    "No supported source files found in the project.",
+                    "scope={scope}, query={query:?}"
+                );
+                assert!(
+                    provider.received_requests().await.unwrap().is_empty(),
+                    "excluded files must not reach embedding or labeling"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explore_clusters_respects_max_tokens_at_line_boundaries_with_marker() {
+        let files = (0..48).map(|i| {
+            (
+                format!(
+                    "packages/topic_{}/very_long_cluster_candidate_file_{i:02}.rs",
+                    i % 3
+                ),
+                format!("pub fn cluster_candidate_{i:02}() {{}}"),
+            )
+        });
+        let (_tmp, _provider, server) = cluster_facade_server(files).await;
+        let max_tokens = 75usize;
+        let args = serde_json::Map::from_iter([
+            ("query".to_string(), json!("")),
+            ("kind".to_string(), json!("clusters")),
+            ("max_tokens".to_string(), json!(max_tokens)),
+            ("max_clusters".to_string(), json!(2)),
+            ("min_clusters".to_string(), json!(1)),
+        ]);
+
+        let result = server.dispatch("explore", args).await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        let output = text_of(&result);
+        assert!(
+            output.chars().count() <= max_tokens * 4,
+            "cluster output exceeded the {max_tokens}-token/{}-character budget: {} chars\n{output}",
+            max_tokens * 4,
+            output.chars().count()
+        );
+        assert!(
+            output.contains("more files"),
+            "capped cluster output must report omitted files:\n{output}"
+        );
+        for line in output.lines().filter(|line| line.contains("packages/")) {
+            assert!(
+                line.trim_end().ends_with(".rs"),
+                "cluster output truncated a file line: {line:?}\n{output}"
+            );
+        }
+        let explore = tool_definitions()
+            .iter()
+            .find(|tool| tool.name.as_ref() == "explore")
+            .expect("explore definition");
+        assert!(
+            explore.input_schema["properties"]
+                .get("max_tokens")
+                .is_some(),
+            "explore schema must advertise max_tokens for cluster output"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_clusters_without_query_keeps_whole_repo_map_under_cap() {
+        let alpha = (0..12).map(|i| {
+            (
+                format!("packages/topics/alpha/alpha_{i:02}.rs"),
+                format!("pub fn alpha_{i:02}() {{}}"),
+            )
+        });
+        let beta = (0..12).map(|i| {
+            (
+                format!("packages/topics/beta/beta_{i:02}.rs"),
+                format!("pub fn beta_{i:02}() {{}}"),
+            )
+        });
+        let (_tmp, _provider, server) = cluster_facade_server(alpha.chain(beta)).await;
+        let max_tokens = 120usize;
+
+        for query in [None, Some("   ")] {
+            let mut args = serde_json::Map::from_iter([
+                ("kind".to_string(), json!("clusters")),
+                ("max_tokens".to_string(), json!(max_tokens)),
+                ("max_clusters".to_string(), json!(2)),
+                ("min_clusters".to_string(), json!(1)),
+            ]);
+            if let Some(query) = query {
+                args.insert("query".to_string(), json!(query));
+            }
+
+            let result = server.dispatch("explore", args).await;
+            assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+            let output = text_of(&result);
+            assert!(
+                output.contains("alpha") && output.contains("beta"),
+                "no-query clusters must retain the whole-repo map:\n{output}"
+            );
+            assert!(
+                output.chars().count() <= max_tokens * 4,
+                "no-query cluster map exceeded the cap: {} chars\n{output}",
+                output.chars().count()
+            );
+        }
+        let explore = tool_definitions()
+            .iter()
+            .find(|tool| tool.name.as_ref() == "explore")
+            .expect("explore definition");
+        let required = explore.input_schema["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !required.iter().any(|name| name == "query"),
+            "explore schema cannot require query when kind=clusters supports a whole-repo map"
+        );
     }
 
     #[tokio::test]

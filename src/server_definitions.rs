@@ -24,7 +24,7 @@ fn build_tool_definitions() -> Vec<Tool> {
                 (
                     "query",
                     "string",
-                    true,
+                    false,
                     "What you are looking for: plain words for match = meaning, the exact identifier or keyword for match = keywords.",
                 ),
                 (
@@ -38,6 +38,12 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "string",
                     false,
                     "meaning (default): embedding similarity plus keyword overlap; keywords: exact tokens and camelCase parts only (for files: no embeddings, fastest; for identifiers: ranked by keyword coverage alone).",
+                ),
+                (
+                    "max_tokens",
+                    "integer",
+                    false,
+                    "Cluster output budget (default 5000 tokens, approximately 20000 characters).",
                 ),
                 (
                     "top_k",
@@ -187,7 +193,7 @@ pub fn make_tool(name: &str, description: &str, params: &[(&str, &str, bool, &st
     let mut schema = serde_json::Map::new();
     schema.insert("type".into(), Value::String("object".into()));
     schema.insert("properties".into(), Value::Object(properties));
-    if !required.is_empty() {
+    if !required.is_empty() || name == "explore" {
         schema.insert("required".into(), Value::Array(required));
     }
 

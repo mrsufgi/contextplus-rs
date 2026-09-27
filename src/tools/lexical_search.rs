@@ -58,7 +58,7 @@ pub(crate) fn classify_path_prior(path: &str) -> PathPriorClassification {
         .iter()
         .any(|pattern| path.contains(pattern))
             || path.ends_with(".snap"),
-        is_generated: ["/generated/", ".generated.", "_pb.", ".pb."]
+        is_generated: ["/generated/", "/gen/", ".generated.", "_pb.", ".pb."]
             .iter()
             .any(|pattern| path.contains(pattern)),
         is_planning_prose: [

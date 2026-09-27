@@ -370,6 +370,8 @@ pub(crate) fn cluster_cache_key(file_paths: &[&str]) -> String {
 #[derive(Debug, Clone)]
 pub struct SemanticNavigateOptions {
     pub root_dir: String,
+    pub query: Option<String>,
+    pub max_tokens: Option<usize>,
     pub max_depth: Option<usize>,
     pub max_clusters: Option<usize>,
     pub min_clusters: Option<usize>,
@@ -411,6 +413,7 @@ pub async fn semantic_navigate(
     config: &Config,
     _embedding_cache: &RwLock<HashMap<String, CacheEntry>>,
     root_dir: &Path,
+    indexer: Option<&crate::server_adapters::RefWalkerIndexer>,
 ) -> Result<String> {
     // max_clusters controls spectral clustering at depth 1+.
     // Depth 0 uses directory-based grouping which creates one group per
@@ -423,16 +426,61 @@ pub async fn semantic_navigate(
     };
     let root = PathBuf::from(&options.root_dir);
 
+    let budget = options.max_tokens.unwrap_or(5_000).saturating_mul(4);
+
     // Walk directory for source files using shared walker infrastructure
-    let mut files = collect_source_files_via_walker(&root, config).await?;
+    let mut files = collect_source_files_via_walker(&root, root_dir, config).await?;
     if files.is_empty() {
-        return Ok("No supported source files found in the project.".to_string());
+        let message = "No supported source files found in the project.";
+        return Ok(if message.chars().count() <= budget {
+            message.to_string()
+        } else {
+            String::new()
+        });
+    }
+
+    let mut relevance = HashMap::new();
+    if let Some(query) = options
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        use super::semantic_search::{ResolvedSearchOptions, SearchIndex};
+        let indexer = indexer.ok_or_else(|| {
+            crate::error::ContextPlusError::Other(
+                "Query navigation requires a search indexer".into(),
+            )
+        })?;
+        let eligible = files.iter().map(|f| f.relative_path.clone()).collect();
+        let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let query_vector = ollama.embed_query(query).await?;
+        let results = index.search(
+            query,
+            &query_vector,
+            &ResolvedSearchOptions {
+                top_k: QUERY_CLUSTER_FILE_LIMIT,
+                root_dir: root.clone(),
+                ..Default::default()
+            },
+        );
+        relevance = results.into_iter().map(|r| (r.path, r.score)).collect();
+        files.retain(|f| relevance.contains_key(&f.relative_path));
+        files.sort_by(|a, b| relevance[&b.relative_path].total_cmp(&relevance[&a.relative_path]));
+    } else {
+        files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     }
 
     // Cap file count to keep spectral clustering tractable.
     // Sample evenly across the sorted file list to preserve directory diversity.
     // Cap is env-overridable via `CONTEXTPLUS_NAVIGATE_MAX_FILES`.
-    let max_files = max_navigate_files();
+    let max_files = if relevance.is_empty() {
+        max_navigate_files()
+    } else {
+        QUERY_CLUSTER_FILE_LIMIT
+    };
     let sampled = files.len() > max_files;
     if sampled {
         let total = files.len();
@@ -493,28 +541,16 @@ pub async fn semantic_navigate(
     };
 
     if files.len() <= MAX_FILES_PER_LEAF {
-        // Small project: just list files with labels
-        let file_labels = label_files(&files).await;
-        let mut lines = vec![format!("Semantic Navigator: {} files\n", files.len())];
-        for (i, file) in files.iter().enumerate() {
-            let symbols = if file.symbol_preview.is_empty() {
-                String::new()
-            } else {
-                format!(" | symbols: {}", file.symbol_preview.join(", "))
-            };
-            let label = file_labels
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| file.header.clone());
-            lines.push(format!("  {} - {}{}", file.relative_path, label, symbols));
+        let labels = label_files(&files).await;
+        for (file, label) in files.iter_mut().zip(labels) {
+            file.header = label;
         }
-        return Ok(lines.join("\n"));
     }
 
     let use_semantic_mode = options.mode.as_deref() == Some("semantic");
     let use_imports_mode = options.mode.as_deref() == Some("imports");
 
-    let root_node = if use_imports_mode {
+    let mut root_node = if use_imports_mode {
         // IMPORTS MODE: Blend embedding similarity with import graph
         // for structure-aware semantic clustering.
         let all_indices: Vec<usize> = (0..files.len()).collect();
@@ -629,18 +665,20 @@ pub async fn semantic_navigate(
         }
     };
 
-    let tree_text = render_cluster_tree(&root_node, 0);
+    if !relevance.is_empty() {
+        order_by_relevance(&mut root_node, &relevance);
+    }
     let sampled_note = if sampled {
         format!(" (sampled {} of total)", max_files)
     } else {
         String::new()
     };
-    Ok(format!(
-        "Semantic Navigator: {} files{} organized by meaning\n\n{}",
+    let preamble = format!(
+        "Semantic Navigator: {} files{} organized by meaning\n\n",
         files.len(),
-        sampled_note,
-        tree_text
-    ))
+        sampled_note
+    );
+    Ok(render_budgeted_tree(&root_node, &preamble, budget))
 }
 
 /// Owned snapshot of a cluster's labelable data, suitable for moving across
@@ -803,7 +841,11 @@ async fn run_llm_heal(
 }
 
 /// Walk the directory using shared walker infrastructure and collect source file information.
-async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result<Vec<FileInfo>> {
+async fn collect_source_files_via_walker(
+    root: &Path,
+    repository_root: &Path,
+    config: &Config,
+) -> Result<Vec<FileInfo>> {
     let allowed_extensions: HashSet<&str> = NAVIGATE_EXTENSIONS.iter().copied().collect();
 
     // walk_with_config is synchronous (uses the `ignore` crate), run on blocking thread
@@ -819,7 +861,14 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
     let filtered: Vec<_> = entries
         .into_iter()
         .filter(|entry| {
-            if entry.is_directory {
+            let repository_path = entry
+                .path
+                .strip_prefix(repository_root)
+                .unwrap_or(&entry.path);
+            if entry.is_directory
+                || super::lexical_search::classify_path_prior(&repository_path.to_string_lossy())
+                    .is_generated
+            {
                 return false;
             }
             let ext = entry
@@ -850,6 +899,13 @@ async fn collect_source_files_via_walker(root: &Path, config: &Config) -> Result
             tokio::fs::read_to_string(&entry.path).await.ok()?
         };
 
+        let leading = content.to_ascii_lowercase();
+        if ["auto-generated", "@generated", "do not edit"]
+            .iter()
+            .any(|marker| leading.contains(marker))
+        {
+            return None;
+        }
         let header = extract_header(&content);
         let truncated_content = if content.len() > MAX_CONTENT_CHARS {
             crate::core::parser::truncate_to_char_boundary(&content, MAX_CONTENT_CHARS).to_string()
@@ -1099,6 +1155,79 @@ pub(crate) fn extract_json_array(text: &str) -> Option<String> {
     empty
 }
 
+fn order_by_relevance(node: &mut ClusterNode, scores: &HashMap<String, f64>) -> f64 {
+    node.files
+        .sort_by(|a, b| scores[&b.relative_path].total_cmp(&scores[&a.relative_path]));
+    let mut children: Vec<_> = std::mem::take(&mut node.children)
+        .into_iter()
+        .map(|mut child| {
+            let score = order_by_relevance(&mut child, scores);
+            (child, score)
+        })
+        .collect();
+    children.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let best = children
+        .first()
+        .map(|(_, score)| *score)
+        .unwrap_or(0.0)
+        .max(
+            node.files
+                .first()
+                .map(|f| scores[&f.relative_path])
+                .unwrap_or(0.0),
+        );
+    node.children = children.into_iter().map(|(child, _)| child).collect();
+    best
+}
+
+fn render_budgeted_tree(node: &ClusterNode, preamble: &str, budget: usize) -> String {
+    let full = format!("{preamble}{}", render_cluster_tree(node, 0));
+    if full.chars().count() <= budget {
+        return full;
+    }
+    fn render(node: &ClusterNode, depth: usize, max_depth: usize, limit: usize, out: &mut String) {
+        let pad = "  ".repeat(depth);
+        out.push_str(&format!(
+            "{pad}[{}] ({} files)\n",
+            node.label,
+            count_files_in_node(node)
+        ));
+        if !node.children.is_empty() && depth < max_depth {
+            for child in &node.children {
+                render(child, depth + 1, max_depth, limit, out);
+            }
+        } else {
+            let shown = if node.children.is_empty() {
+                node.files.len().min(limit)
+            } else {
+                0
+            };
+            for file in node.files.iter().take(shown) {
+                out.push_str(&format!("{pad}  {}\n", file.relative_path));
+            }
+            let omitted = count_files_in_node(node) - shown;
+            if omitted > 0 {
+                out.push_str(&format!("{pad}  … and {omitted} more files\n"));
+            }
+        }
+    }
+    for depth in (0..=3).rev() {
+        for limit in (0..=MAX_FILES_PER_LEAF_DISPLAY).rev() {
+            let mut out = preamble.to_string();
+            render(node, 0, depth, limit, &mut out);
+            if out.chars().count() <= budget {
+                return out;
+            }
+        }
+    }
+    let marker = format!("… and {} more files\n", count_files_in_node(node));
+    if marker.chars().count() <= budget {
+        marker
+    } else {
+        String::new()
+    }
+}
+
 /// Render a cluster tree as indented text.
 fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
     let pad = "  ".repeat(indent);
@@ -1318,7 +1447,7 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 1);
@@ -1347,12 +1476,62 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|f| f.relative_path.contains("main.rs")));
         assert!(files.iter().any(|f| f.relative_path.contains("lib.rs")));
+    }
+
+    #[tokio::test]
+    async fn clusters_sampling_excludes_generated_paths_and_header_marked_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for relative in ["src", "src/generated", "contracts/gen", "libs/types"] {
+            tokio::fs::create_dir_all(root.join(relative))
+                .await
+                .expect("mkdir");
+        }
+        tokio::fs::write(
+            root.join("src/projection.rs"),
+            "pub fn rebuild_projection() {}",
+        )
+        .await
+        .expect("write handwritten source");
+        tokio::fs::write(
+            root.join("src/generated/client.rs"),
+            "pub fn generated_client() {}",
+        )
+        .await
+        .expect("write generated path");
+        tokio::fs::write(
+            root.join("contracts/gen/messages.ts"),
+            "export const generatedMessage = true;",
+        )
+        .await
+        .expect("write gen path");
+        tokio::fs::write(
+            root.join("libs/types/api.ts"),
+            "// DO NOT EDIT: auto-generated by OpenAPI\nexport type Api = string;",
+        )
+        .await
+        .expect("write header-marked generated source");
+
+        let files = collect_source_files_via_walker(root, root, &Config::from_env())
+            .await
+            .expect("collect cluster candidates");
+        let mut paths: Vec<&str> = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        paths.sort_unstable();
+
+        assert_eq!(
+            paths,
+            vec!["src/projection.rs"],
+            "generated files must never reach cluster sampling: {paths:?}"
+        );
     }
 
     // --- extract_header additional tests ---
@@ -1647,7 +1826,7 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 1);
@@ -1670,7 +1849,7 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 1);
@@ -1690,7 +1869,7 @@ mod tests {
         .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 1);
@@ -1729,7 +1908,7 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         // 6 accepted extensions, 2 excluded
@@ -1745,7 +1924,7 @@ mod tests {
         let root = dir.path().to_path_buf();
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert!(files.is_empty());
@@ -1766,7 +1945,7 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 2);
@@ -1785,7 +1964,7 @@ mod tests {
             .expect("write");
 
         let config = Config::from_env();
-        let files = collect_source_files_via_walker(&root, &config)
+        let files = collect_source_files_via_walker(&root, &root, &config)
             .await
             .expect("collect");
         assert_eq!(files.len(), 1);
@@ -1797,6 +1976,8 @@ mod tests {
     #[test]
     fn semantic_navigate_options_defaults() {
         let opts = SemanticNavigateOptions {
+            query: None,
+            max_tokens: None,
             root_dir: "/tmp".to_string(),
             max_depth: None,
             max_clusters: None,
@@ -1813,6 +1994,8 @@ mod tests {
     #[test]
     fn semantic_navigate_options_with_values() {
         let opts = SemanticNavigateOptions {
+            query: None,
+            max_tokens: None,
             root_dir: "/project".to_string(),
             max_depth: Some(5),
             max_clusters: Some(10),
