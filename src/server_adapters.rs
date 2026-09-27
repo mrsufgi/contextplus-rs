@@ -134,6 +134,10 @@ pub(crate) mod test_seams {
             .map(|document| document.hash.clone())
     }
 
+    pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
+        ref_index.semantic_fill.lock().await.running
+    }
+
     pub(crate) struct MetadataPause {
         enumerated: Barrier,
         resume: Barrier,
@@ -360,6 +364,10 @@ impl CachedWalkerIndexer {
                 .strip_prefix(&ref_index.canonical_root)
                 .unwrap_or(Path::new(""));
             let embedding_cache = Arc::clone(&ref_index.embedding_cache);
+            #[cfg(test)]
+            ref_index
+                .semantic_walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let entries = walk_with_config(&root, &config);
 
             let max_file_size = config.max_embed_file_size as u64;
@@ -457,7 +465,8 @@ impl CachedWalkerIndexer {
                 ));
             }
 
-            for doc in &mut docs {
+            for (doc, (_, hash)) in docs.iter_mut().zip(&content_hashes) {
+                doc.source_hash = hash.clone();
                 doc.path = Path::new(&doc.path)
                     .strip_prefix(prefix)
                     .unwrap_or(Path::new(&doc.path))
@@ -730,6 +739,48 @@ impl CachedWalkerIndexer {
                 );
             }
 
+            let replacement_dims = ref_index
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .and_then(|entry| entry.pending_vector_dimensions());
+            if let Some(dims) = replacement_dims {
+                let missing: Vec<_> = vectors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, vector)| vector.as_ref().is_none_or(|v| v.len() != dims))
+                    .map(|(i, _)| i)
+                    .collect();
+                if !missing.is_empty() {
+                    let texts: Vec<_> = missing
+                        .iter()
+                        .map(|&i| embedding_texts[i].clone())
+                        .collect();
+                    let replacements = ollama.embed_documents(&texts).await?;
+                    if replacements.len() != missing.len()
+                        || replacements.iter().any(|v| v.len() != dims)
+                    {
+                        return Err(crate::error::ContextPlusError::Other(
+                            "incompatible replacement embedding shape".into(),
+                        ));
+                    }
+                    let mut cache = embedding_cache.write().await;
+                    for (i, vector) in missing.into_iter().zip(replacements) {
+                        let (path, hash) = &content_hashes[i];
+                        if cache.get(path).is_none_or(|entry| entry.hash == *hash) {
+                            cache.insert(
+                                path.clone(),
+                                CacheEntry {
+                                    hash: hash.clone(),
+                                    vector: vector.clone(),
+                                },
+                            );
+                        }
+                        vectors[i] = Some(vector);
+                    }
+                }
+            }
             Ok((docs, vectors))
         })
     }
@@ -857,10 +908,6 @@ async fn run_fill(
                 continue;
             }
             persist_fill(&ref_index, &config).await;
-            ref_index
-                .semantic_vector_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            *ref_index.search_index_cache.write().await = None;
             let mut fill = ref_index.semantic_fill.lock().await;
             if fill.pending.is_empty() {
                 fill.running = false;
@@ -893,6 +940,7 @@ async fn run_fill(
                 }
             }
             let mut fill = ref_index.semantic_fill.lock().await;
+            let mut ready = Vec::new();
             match outcome {
                 Ok(Ok(vectors))
                     if vectors.len() == batch.len() && vectors.iter().all(|v| !v.is_empty()) =>
@@ -907,6 +955,7 @@ async fn run_fill(
                             fill.pending.remove(&doc.path);
                         }
                         if current && pending_matches {
+                            ready.push((doc.path.clone(), doc.hash.clone(), vector.clone()));
                             cache.insert(
                                 doc.path.clone(),
                                 CacheEntry {
@@ -917,9 +966,28 @@ async fn run_fill(
                             completed += 1;
                         }
                     }
-                    ref_index
+                    if ready.is_empty() {
+                        continue;
+                    }
+                    let vector_generation = ref_index
                         .semantic_vector_generation
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                        + 1;
+                    let mut index = ref_index.search_index_cache.write().await;
+                    if index
+                        .as_ref()
+                        .is_some_and(|entry| !entry.has_vector_shape())
+                    {
+                        // A vectorless bootstrap has no searchable generation to preserve.
+                        *index = None;
+                    } else if let Some(entry) = index.as_mut() {
+                        crate::tools::semantic_search::CachedSearchIndex::refresh_vectors(
+                            entry,
+                            &ref_index.canonical_root,
+                            ready,
+                            vector_generation,
+                        );
+                    }
                 }
                 result => {
                     for doc in &batch {
@@ -946,10 +1014,6 @@ async fn run_fill(
             }
             drop(fill);
             if completed >= 64 {
-                ref_index
-                    .semantic_vector_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-                *ref_index.search_index_cache.write().await = None;
                 persist_fill(&ref_index, &config).await;
                 completed = 0;
             }

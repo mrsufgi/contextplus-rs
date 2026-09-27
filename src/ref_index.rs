@@ -158,6 +158,17 @@ pub struct RefIndex {
     /// Cached identifier index (parsed symbols + embedding vectors).
     /// `Arc`-wrapped for the same backward-compat reason as `embedding_cache`.
     pub identifier_index: Arc<RwLock<Option<Arc<IdentifierIndex>>>>,
+    pub(crate) identifier_source: RwLock<Option<Arc<ProjectCache>>>,
+    pub(crate) identifier_vectors: tokio::sync::OnceCell<RwLock<HashMap<String, CacheEntry>>>,
+    pub(crate) identifier_persist_generation: AtomicU64,
+    #[cfg(test)]
+    pub(crate) semantic_walks: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) identifier_resident_vector_elements_copied: AtomicUsize,
+    pub(crate) identifier_update: tokio::sync::Mutex<()>,
+    pub(crate) identifier_rebuilding: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) lexical_update: tokio::sync::Mutex<()>,
+    pub(crate) lexical_rebuilding: Arc<std::sync::atomic::AtomicBool>,
 
     /// Cached HNSW search index with generation counter.
     /// Already `Arc<RwLock<…>>` so background rebuild tasks can hold a clone.
@@ -213,6 +224,17 @@ impl RefIndex {
             session_count: Arc::new(AtomicUsize::new(0)),
             embedding_cache: Arc::new(RwLock::new(HashMap::new())),
             identifier_index: Arc::new(RwLock::new(None)),
+            identifier_source: RwLock::new(None),
+            identifier_vectors: tokio::sync::OnceCell::new(),
+            identifier_persist_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_resident_vector_elements_copied: AtomicUsize::new(0),
+            identifier_update: tokio::sync::Mutex::new(()),
+            identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lexical_update: tokio::sync::Mutex::new(()),
+            lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
@@ -244,6 +266,17 @@ impl RefIndex {
             session_count: Arc::new(AtomicUsize::new(0)),
             embedding_cache: Arc::new(RwLock::new(HashMap::new())),
             identifier_index: Arc::new(RwLock::new(None)),
+            identifier_source: RwLock::new(None),
+            identifier_vectors: tokio::sync::OnceCell::new(),
+            identifier_persist_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_resident_vector_elements_copied: AtomicUsize::new(0),
+            identifier_update: tokio::sync::Mutex::new(()),
+            identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lexical_update: tokio::sync::Mutex::new(()),
+            lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
@@ -277,6 +310,17 @@ impl RefIndex {
             session_count: Arc::new(AtomicUsize::new(0)),
             embedding_cache: Arc::new(RwLock::new(initial_embedding_cache)),
             identifier_index: Arc::new(RwLock::new(None)),
+            identifier_source: RwLock::new(None),
+            identifier_vectors: tokio::sync::OnceCell::new(),
+            identifier_persist_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_resident_vector_elements_copied: AtomicUsize::new(0),
+            identifier_update: tokio::sync::Mutex::new(()),
+            identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lexical_update: tokio::sync::Mutex::new(()),
+            lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),

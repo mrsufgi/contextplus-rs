@@ -292,7 +292,7 @@ pub fn save_cache_with_deletions(
     // until the cache file is manually removed. Rotate the broken file aside
     // (preserving operator-recoverable data) and proceed with the incoming
     // snapshot — refusing to write forever is strictly worse than rotating.
-    let mut merged = match load_cache(root_dir, name) {
+    let mut merged = match read_cache(root_dir, name, false) {
         Ok(Some(disk)) => merge_cache_data(disk, data),
         Ok(None) => clone_cache_data(data),
         Err(e) => {
@@ -489,6 +489,12 @@ fn merge_cache_data(disk: CacheData, incoming: &CacheData) -> CacheData {
 /// Load a CacheData from disk.
 /// Validates version byte and uses rkyv bytecheck for safe deserialization.
 pub fn load_cache(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
+    #[cfg(test)]
+    test_seams::record(root_dir, name);
+    read_cache(root_dir, name, true)
+}
+
+fn read_cache(root_dir: &Path, name: &str, sweep: bool) -> Result<Option<CacheData>> {
     let path = cache_path(root_dir, name);
     if !path.exists() {
         return Ok(None);
@@ -515,7 +521,7 @@ pub fn load_cache(root_dir: &Path, name: &str) -> Result<Option<CacheData>> {
     // Hygiene sweep: drop any entries whose key would be excluded by the
     // walker's dot-segment rule (e.g. stale `.claude/worktrees/…` paths that
     // were indexed before the exclusion was enforced).
-    let removed = data.sweep_excluded_keys();
+    let removed = if sweep { data.sweep_excluded_keys() } else { 0 };
     if removed > 0 {
         tracing::info!(
             removed,
@@ -2251,5 +2257,52 @@ mod tests {
             K + N * UNIQUE_PER_THREAD,
             loaded.count()
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+    type Registration = ((PathBuf, String), Weak<AtomicUsize>);
+    static PROBES: LazyLock<Mutex<Vec<Registration>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+    pub(crate) struct LoadCacheProbe(Arc<AtomicUsize>);
+    impl LoadCacheProbe {
+        pub(crate) fn new(root_dir: &Path, name: &str) -> Self {
+            let counter = Arc::new(AtomicUsize::new(0));
+            PROBES.lock().unwrap().push((
+                (
+                    root_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| root_dir.to_owned()),
+                    name.to_owned(),
+                ),
+                Arc::downgrade(&counter),
+            ));
+            Self(counter)
+        }
+        pub(crate) fn count(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    impl Drop for LoadCacheProbe {
+        fn drop(&mut self) {
+            PROBES
+                .lock()
+                .unwrap()
+                .retain(|(_, counter)| !counter.ptr_eq(&Arc::downgrade(&self.0)));
+        }
+    }
+    pub(super) fn record(root: &Path, name: &str) {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+        for ((path, cache), counter) in PROBES.lock().unwrap().iter() {
+            if *path == root
+                && cache == name
+                && let Some(counter) = counter.upgrade()
+            {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
