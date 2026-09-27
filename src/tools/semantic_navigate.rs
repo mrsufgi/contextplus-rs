@@ -1157,41 +1157,10 @@ fn render_cluster_tree(node: &ClusterNode, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::test_logs::{captured_info_logs, logs_as_string};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
-
-    #[derive(Clone)]
-    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn captured_info_logs() -> (Arc<Mutex<Vec<u8>>>, impl tracing::Subscriber) {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let writer_logs = Arc::clone(&logs);
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(move || CapturedWriter(Arc::clone(&writer_logs)))
-            .finish();
-        (logs, subscriber)
-    }
-
-    fn logs_as_string(logs: &Arc<Mutex<Vec<u8>>>) -> String {
-        String::from_utf8(logs.lock().unwrap().clone()).unwrap()
-    }
 
     #[test]
     fn extract_header_comment_slashes() {
@@ -2760,8 +2729,7 @@ mod tests {
                     parent: None,
                 })
                 .collect();
-            let (logs, subscriber) = captured_info_logs();
-            let _guard = tracing::subscriber::set_default(subscriber);
+            let (logs, _guard) = captured_info_logs();
             let _ = run_llm_heal(&queue, &client, root.path()).await;
             let logs = logs_as_string(&logs);
             for expected in expected {
@@ -2843,8 +2811,7 @@ mod tests {
         ];
         let input = vec![(files.iter().collect::<Vec<_>>(), None)];
         let key = cluster_cache_key(&["src/auth/login.rs", "src/auth/session.rs"]);
-        let (logs, subscriber) = captured_info_logs();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (logs, _guard) = captured_info_logs();
 
         let first = label_clusters_with_cache(&input, &client, tempdir.path()).await;
         assert_eq!(first.len(), 1);

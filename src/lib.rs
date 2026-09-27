@@ -10,3 +10,6 @@ pub mod server_definitions;
 pub mod server_helpers;
 pub mod tools;
 pub mod transport;
+
+#[cfg(test)]
+mod test_logs;
