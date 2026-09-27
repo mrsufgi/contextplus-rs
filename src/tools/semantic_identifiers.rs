@@ -564,12 +564,45 @@ pub fn score_identifiers(
     )
 }
 
+pub trait IndexData<T>: Sync {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn get(&self, index: usize) -> &T;
+    fn slice(&self, range: std::ops::Range<usize>) -> &[T];
+}
+
+impl<T: Sync> IndexData<T> for [T] {
+    fn len(&self) -> usize {
+        <[T]>::len(self)
+    }
+    fn get(&self, index: usize) -> &T {
+        &self[index]
+    }
+    fn slice(&self, range: std::ops::Range<usize>) -> &[T] {
+        &self[range]
+    }
+}
+
+impl<T: Sync> IndexData<T> for Vec<T> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn get(&self, index: usize) -> &T {
+        &self[index]
+    }
+    fn slice(&self, range: std::ops::Range<usize>) -> &[T] {
+        &self[range]
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn score_identifier_candidates(
-    docs: &[IdentifierDoc],
+    docs: &(impl IndexData<IdentifierDoc> + ?Sized),
     query_vec: &[f32],
     query_terms: &HashSet<String>,
-    vector_buffer: &[f32],
+    vector_buffer: &(impl IndexData<f32> + ?Sized),
     vector_dims: usize,
     include_kinds: &Option<HashSet<String>>,
     semantic_weight: f64,
@@ -583,7 +616,7 @@ fn score_identifier_candidates(
         .into_par_iter()
         .filter_map(|position| {
             let i = candidates.map_or(position, |indices| indices[position]);
-            let doc = &docs[i];
+            let doc = docs.get(i);
             if let Some(kinds) = include_kinds
                 && !kinds.contains(&doc.kind_lower)
             {
@@ -594,7 +627,7 @@ fn score_identifier_candidates(
             if offset + vector_dims > vector_buffer.len() {
                 return None;
             }
-            let vec_slice = &vector_buffer[offset..offset + vector_dims];
+            let vec_slice = vector_buffer.slice(offset..offset + vector_dims);
             let semantic_score =
                 crate::core::embeddings::cosine_similarity_simsimd(query_vec, vec_slice).max(0.0)
                     as f64;
@@ -642,7 +675,7 @@ fn score_identifier_candidates(
         .into_iter()
         .map(
             |(idx, score, semantic_score, keyword_score)| RankedIdentifier {
-                doc: docs[idx].clone(),
+                doc: docs.get(idx).clone(),
                 semantic_score,
                 keyword_score,
                 score,
@@ -729,8 +762,8 @@ pub fn format_identifier_results(
 pub async fn semantic_identifier_search(
     options: SemanticIdentifierSearchOptions,
     embed_fn: &dyn crate::tools::semantic_search::EmbedFn,
-    identifier_docs: &[IdentifierDoc],
-    vector_buffer: &[f32],
+    identifier_docs: &(impl IndexData<IdentifierDoc> + ?Sized),
+    vector_buffer: &(impl IndexData<f32> + ?Sized),
     vector_dims: usize,
     file_content: &HashMap<String, Arc<String>>,
     candidates: Option<&[usize]>,

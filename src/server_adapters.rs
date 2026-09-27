@@ -134,6 +134,10 @@ pub(crate) mod test_seams {
             .map(|document| document.hash.clone())
     }
 
+    pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
+        ref_index.semantic_fill.lock().await.running
+    }
+
     pub(crate) struct MetadataPause {
         enumerated: Barrier,
         resume: Barrier,
@@ -860,7 +864,7 @@ async fn run_fill(
             ref_index
                 .semantic_vector_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
-            *ref_index.search_index_cache.write().await = None;
+
             let mut fill = ref_index.semantic_fill.lock().await;
             if fill.pending.is_empty() {
                 fill.running = false;
@@ -893,6 +897,7 @@ async fn run_fill(
                 }
             }
             let mut fill = ref_index.semantic_fill.lock().await;
+            let mut ready = Vec::new();
             match outcome {
                 Ok(Ok(vectors))
                     if vectors.len() == batch.len() && vectors.iter().all(|v| !v.is_empty()) =>
@@ -907,6 +912,7 @@ async fn run_fill(
                             fill.pending.remove(&doc.path);
                         }
                         if current && pending_matches {
+                            ready.push((doc.path.clone(), doc.hash.clone(), vector.clone()));
                             cache.insert(
                                 doc.path.clone(),
                                 CacheEntry {
@@ -920,6 +926,20 @@ async fn run_fill(
                     ref_index
                         .semantic_vector_generation
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    let mut index = ref_index.search_index_cache.write().await;
+                    if index
+                        .as_ref()
+                        .is_some_and(|entry| !entry.has_vector_shape())
+                    {
+                        // A vectorless bootstrap has no searchable generation to preserve.
+                        *index = None;
+                    } else if let Some(entry) = index.as_mut() {
+                        crate::tools::semantic_search::CachedSearchIndex::refresh_vectors(
+                            entry,
+                            &ref_index.canonical_root,
+                            ready,
+                        );
+                    }
                 }
                 result => {
                     for doc in &batch {
@@ -949,7 +969,7 @@ async fn run_fill(
                 ref_index
                     .semantic_vector_generation
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
-                *ref_index.search_index_cache.write().await = None;
+
                 persist_fill(&ref_index, &config).await;
                 completed = 0;
             }

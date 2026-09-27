@@ -935,7 +935,22 @@ pub type MetadataFingerprintFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<MetadataFingerprint>>> + Send + 'a>,
 >;
 
+#[derive(Clone)]
+struct RefreshBatch {
+    docs: Vec<SearchDocument>,
+    vectors: Vec<Option<Vec<f32>>>,
+    deleted: Vec<String>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct PendingRefresh {
+    batches: Vec<RefreshBatch>,
+}
+
 pub struct CachedSearchIndex {
+    pending: std::sync::Mutex<PendingRefresh>,
+    scoped_refresh: std::sync::atomic::AtomicBool,
     search_root: std::path::PathBuf,
     pub metadata: std::sync::RwLock<Option<MetadataFingerprint>>,
     vector_generation: u64,
@@ -977,6 +992,8 @@ impl Drop for RebuildGuard {
 impl CachedSearchIndex {
     pub(crate) fn new(index: SearchIndex, fingerprint: IndexFingerprint, generation: u64) -> Self {
         Self {
+            pending: std::sync::Mutex::new(PendingRefresh::default()),
+            scoped_refresh: std::sync::atomic::AtomicBool::new(false),
             index,
             fingerprint,
             metadata: std::sync::RwLock::new(None),
@@ -986,6 +1003,123 @@ impl CachedSearchIndex {
             reuse_count: std::sync::atomic::AtomicU64::new(0),
             rebuild_in_progress: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn refresh_paths(
+        entry: &mut Arc<Self>,
+        root: &Path,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        deleted: &[String],
+        generation: u64,
+    ) -> bool {
+        if entry.search_root != root {
+            entry
+                .scoped_refresh
+                .store(true, std::sync::atomic::Ordering::Release);
+            return false;
+        }
+        let large = entry.index.requires_full_rebuild(&docs, &vectors, deleted);
+        {
+            let mut pending = entry.pending.lock().unwrap();
+            if large
+                || !pending.batches.is_empty()
+                || entry
+                    .rebuild_in_progress
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                pending.batches.push(RefreshBatch {
+                    docs,
+                    vectors,
+                    deleted: deleted.to_vec(),
+                    generation,
+                });
+                return !large;
+            }
+        }
+        if Arc::get_mut(entry).is_none() {
+            let mut copy = Self::new(entry.index.clone(), entry.fingerprint.clone(), generation);
+            copy.search_root = entry.search_root.clone();
+            copy.vector_generation = entry.vector_generation;
+            *entry = Arc::new(copy);
+        }
+        let fresh = Arc::get_mut(entry).unwrap();
+        fresh.index.apply_delta(docs, vectors, deleted);
+        fresh.fingerprint = IndexFingerprint::from_docs(&fresh.index.documents);
+        fresh
+            .generation
+            .store(generation, std::sync::atomic::Ordering::Release);
+        *fresh.metadata.write().unwrap() = None;
+        true
+    }
+
+    pub(crate) fn refresh_ref_paths(
+        entry: &mut Arc<Self>,
+        root: &Path,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        deleted: &[String],
+        generation: u64,
+    ) -> bool {
+        let scope = entry.search_root.clone();
+        let Ok(prefix) = scope.strip_prefix(root) else {
+            return false;
+        };
+        let (docs, vectors) = docs
+            .into_iter()
+            .zip(vectors)
+            .filter_map(|(mut doc, vector)| {
+                let path = Path::new(&doc.path)
+                    .strip_prefix(prefix)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                doc.path = path;
+                Some((doc, vector))
+            })
+            .unzip();
+        let deleted: Vec<_> = deleted
+            .iter()
+            .filter_map(|path| {
+                Path::new(path)
+                    .strip_prefix(prefix)
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        Self::refresh_paths(entry, &scope, docs, vectors, &deleted, generation)
+    }
+
+    pub(crate) fn has_vector_shape(&self) -> bool {
+        self.index.dims != 0
+    }
+
+    pub(crate) fn refresh_vectors(
+        entry: &mut Arc<Self>,
+        root: &Path,
+        updates: Vec<(String, String, Vec<f32>)>,
+    ) {
+        let mut docs = Vec::new();
+        let mut vectors = Vec::new();
+        let prefix = entry
+            .search_root
+            .strip_prefix(root)
+            .unwrap_or(Path::new(""));
+        for (path, hash, vector) in updates {
+            let Ok(path) = Path::new(&path).strip_prefix(prefix) else {
+                continue;
+            };
+            if let Some(doc) = entry.index.documents.iter().find(|doc| {
+                Path::new(&doc.path) == path
+                    && crate::core::embeddings::content_hash(&doc.content) == hash
+            }) {
+                docs.push(doc.clone());
+                vectors.push(Some(vector));
+            }
+        }
+        let root = entry.search_root.clone();
+        let generation = entry.generation.load(std::sync::atomic::Ordering::Acquire);
+        Self::refresh_paths(entry, &root, docs, vectors, &[], generation);
     }
 
     /// Increment and return the reuse counter.
@@ -1023,7 +1157,18 @@ impl CachedSearchIndex {
 /// already owns an identical copy. The cosine-scoring path then retrieves
 /// per-document vectors from `ann_store` via `get_vector`. Below threshold the
 /// buffer is kept for the brute-force O(N) scan.
+pub const FULL_REBUILD_CHANGE_FRACTION: f64 = 0.2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexUpdateKind {
+    Incremental,
+    FullRebuild,
+}
+
+#[derive(Clone)]
 pub struct SearchIndex {
+    full_rebuilds: u64,
+    vector_updates: std::collections::HashMap<String, Vec<f32>>,
     documents: Vec<SearchDocument>,
     /// Flat buffer: `vector_buffer[i * dims .. (i+1) * dims]` is the vector for doc `i`.
     /// Docs without vectors have `has_vector[i] == false` and zeros in the buffer.
@@ -1037,7 +1182,7 @@ pub struct SearchIndex {
     /// HNSW-backed VectorStore built when the number of embedded docs exceeds
     /// `ANN_THRESHOLD`. Maps relative file path → embedding vector.
     /// `None` when the corpus is below threshold or no vectors are available.
-    ann_store: Option<VectorStore>,
+    ann_store: Option<Arc<VectorStore>>,
 }
 
 impl Default for SearchIndex {
@@ -1047,8 +1192,16 @@ impl Default for SearchIndex {
 }
 
 impl SearchIndex {
+    fn prepare_ann(&self) {
+        if let Some(store) = &self.ann_store {
+            store.find_nearest_hnsw(&vec![0.0; self.dims], 1);
+        }
+    }
+
     pub fn new() -> Self {
         Self {
+            full_rebuilds: 0,
+            vector_updates: Default::default(),
             documents: Vec::new(),
             vector_buffer: Vec::new(),
             has_vector: Vec::new(),
@@ -1081,6 +1234,8 @@ impl SearchIndex {
         vectors: Vec<Option<Vec<f32>>>,
         hnsw_tuning: crate::core::embeddings::HnswTuning,
     ) {
+        self.full_rebuilds += 1;
+        self.vector_updates.clear();
         debug_assert_eq!(docs.len(), vectors.len());
         // Determine dims from first non-None vector
         let dims = vectors
@@ -1121,13 +1276,13 @@ impl SearchIndex {
                     flat.extend_from_slice(&buffer[offset..offset + dims]);
                 }
             }
-            Some(VectorStore::new_with_tuning(
+            Some(Arc::new(VectorStore::new_with_tuning(
                 dims as u32,
                 keys,
                 hashes,
                 flat,
                 hnsw_tuning,
-            ))
+            )))
         } else {
             None
         };
@@ -1145,6 +1300,150 @@ impl SearchIndex {
         self.has_vector = has_vec;
         self.dims = dims;
         self.ann_store = ann_store;
+    }
+
+    pub fn full_rebuild_count(&self) -> u64 {
+        self.full_rebuilds
+    }
+
+    fn vector_at(&self, i: usize) -> Option<&[f32]> {
+        if !self.has_vector[i] {
+            return None;
+        }
+        let path = &self.documents[i].path;
+        if let Some(vector) = self.vector_updates.get(path) {
+            return Some(vector);
+        }
+        if let Some(store) = &self.ann_store {
+            return store.get_vector(path);
+        }
+        Some(&self.vector_buffer[i * self.dims..(i + 1) * self.dims])
+    }
+
+    fn requires_full_rebuild(
+        &self,
+        docs: &[SearchDocument],
+        vectors: &[Option<Vec<f32>>],
+        deleted: &[String],
+    ) -> bool {
+        let content_changes = docs
+            .iter()
+            .filter(|doc| {
+                !self.documents.iter().any(|old| {
+                    old.path == doc.path
+                        && old.content == doc.content
+                        && old.search_text == doc.search_text
+                })
+            })
+            .count();
+        (content_changes + deleted.len()) as f64
+            > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
+            || vectors.iter().flatten().any(|v| v.len() != self.dims)
+    }
+
+    pub fn apply_delta(
+        &mut self,
+        changed_docs: Vec<SearchDocument>,
+        changed_vectors: Vec<Option<Vec<f32>>>,
+        deleted_paths: &[String],
+    ) -> IndexUpdateKind {
+        let rebuild = self.requires_full_rebuild(&changed_docs, &changed_vectors, deleted_paths);
+        if rebuild {
+            let affected: HashSet<&str> = deleted_paths
+                .iter()
+                .map(String::as_str)
+                .chain(changed_docs.iter().map(|d| d.path.as_str()))
+                .collect();
+            let mut docs = Vec::new();
+            let mut vectors = Vec::new();
+            for (i, doc) in self.documents.iter().enumerate() {
+                if !affected.contains(doc.path.as_str()) {
+                    docs.push(doc.clone());
+                    vectors.push(self.vector_at(i).map(<[f32]>::to_vec));
+                }
+            }
+            docs.extend(changed_docs);
+            vectors.extend(changed_vectors);
+            self.index_with_vectors_and_tuning(
+                docs,
+                vectors,
+                crate::core::embeddings::HnswTuning::global(),
+            );
+            return IndexUpdateKind::FullRebuild;
+        }
+        for path in deleted_paths {
+            if let Some(i) = self.documents.iter().position(|d| &d.path == path) {
+                let last = self.documents.len() - 1;
+                if self.ann_store.is_none() {
+                    self.vector_buffer
+                        .copy_within(last * self.dims..(last + 1) * self.dims, i * self.dims);
+                    self.vector_buffer.truncate(last * self.dims);
+                }
+                self.documents.swap_remove(i);
+                self.has_vector.swap_remove(i);
+                self.vector_updates.remove(path);
+            }
+        }
+        for (doc, vector) in changed_docs.into_iter().zip(changed_vectors) {
+            let i = self
+                .documents
+                .iter()
+                .position(|d| d.path == doc.path)
+                .unwrap_or(self.documents.len());
+            if i == self.documents.len() {
+                self.documents.push(doc.clone());
+                self.has_vector.push(false);
+                if self.ann_store.is_none() {
+                    self.vector_buffer.resize((i + 1) * self.dims, 0.0);
+                }
+            }
+            self.has_vector[i] = vector.is_some();
+            if let Some(vector) = vector {
+                if self.ann_store.is_some() {
+                    self.vector_updates.insert(doc.path.clone(), vector);
+                } else {
+                    self.vector_buffer[i * self.dims..(i + 1) * self.dims].copy_from_slice(&vector);
+                }
+            } else {
+                self.vector_updates.remove(&doc.path);
+            }
+            self.documents[i] = doc;
+        }
+        IndexUpdateKind::Incremental
+    }
+
+    fn delta_from(
+        &self,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+    ) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>, Vec<String>) {
+        let old: std::collections::HashMap<&str, usize> = self
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.path.as_str(), i))
+            .collect();
+        let paths: HashSet<&str> = docs.iter().map(|d| d.path.as_str()).collect();
+        let deleted = self
+            .documents
+            .iter()
+            .filter(|d| !paths.contains(d.path.as_str()))
+            .map(|d| d.path.clone())
+            .collect();
+        let mut changed = Vec::new();
+        let mut changed_vectors = Vec::new();
+        for (doc, vector) in docs.into_iter().zip(vectors) {
+            let same = old.get(doc.path.as_str()).is_some_and(|&i| {
+                self.documents[i].content == doc.content
+                    && self.documents[i].search_text == doc.search_text
+                    && self.vector_at(i) == vector.as_deref()
+            });
+            if !same {
+                changed.push(doc);
+                changed_vectors.push(vector);
+            }
+        }
+        (changed, changed_vectors, deleted)
     }
 
     /// Perform hybrid search against the indexed documents.
@@ -1166,12 +1465,8 @@ impl SearchIndex {
             .enumerate()
             .step_by(stride)
             .filter(|(i, _)| self.has_vector[*i])
-            .filter_map(|(i, doc)| {
-                let vector = if let Some(store) = &self.ann_store {
-                    store.get_vector(&doc.path)?
-                } else {
-                    &self.vector_buffer[i * self.dims..(i + 1) * self.dims]
-                };
+            .filter_map(|(i, _)| {
+                let vector = self.vector_at(i)?;
                 Some(cosine(query_vec, vector))
             })
             .collect();
@@ -1224,10 +1519,15 @@ impl SearchIndex {
                     .enumerate()
                     .map(|(i, d)| (d.path.as_str(), i))
                     .collect();
-                let indices: std::collections::HashSet<usize> = hits
+                let mut indices: std::collections::HashSet<usize> = hits
                     .iter()
                     .filter_map(|(path, _)| path_to_idx.get(path.as_str()).copied())
                     .collect();
+                indices.extend(
+                    self.vector_updates
+                        .keys()
+                        .filter_map(|p| path_to_idx.get(p.as_str()).copied()),
+                );
                 Some(indices)
             });
 
@@ -1256,27 +1556,7 @@ impl SearchIndex {
                 // flat buffer has been dropped to save memory; retrieve via the
                 // store's key→index map.  Below threshold the buffer is used
                 // directly for cache-friendly sequential access.
-                let vec_slice: &[f32] = if let Some(store) = self.ann_store.as_ref() {
-                    match store.get_vector(&doc.path) {
-                        Some(v) => v,
-                        None => {
-                            // Should be unreachable for well-formed input: every
-                            // has_vector=true doc was pushed into ann_store by path
-                            // at index_with_vectors time. The only way this fires
-                            // in practice is a duplicate path that got overwritten
-                            // during VectorStore construction — a latent bug at a
-                            // different layer. Log so the silent-drop is visible.
-                            tracing::warn!(
-                                path = %doc.path,
-                                "ann_store missing vector for has_vector=true doc — excluding from results"
-                            );
-                            return None;
-                        }
-                    }
-                } else {
-                    let offset = i * self.dims;
-                    &self.vector_buffer[offset..offset + self.dims]
-                };
+                let vec_slice = self.vector_at(i)?;
                 let semantic_score = cosine(query_vec, vec_slice);
 
                 let matched_entries = get_matched_symbol_entries(
@@ -1582,6 +1862,123 @@ pub fn format_search_results_with_freshness(
 ///
 /// Concurrent callers that race on a stale cache use double-check locking so at most one
 /// rebuild occurs.
+pub(crate) async fn semantic_code_search_owned(
+    options: SemanticSearchOptions,
+    embed_fn: &dyn EmbedFn,
+    walk_and_index_fn: Arc<dyn WalkAndIndexFn>,
+    index_cache: Option<Arc<RwLock<Option<Arc<CachedSearchIndex>>>>>,
+    cache_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Result<String> {
+    use std::sync::atomic::Ordering;
+    if let (Some(lock), Some(generation)) = (&index_cache, &cache_generation) {
+        let stale = lock.read().await.as_ref().cloned();
+        if let Some(stale) = stale
+            && stale.generation.load(Ordering::Acquire) != generation.load(Ordering::Acquire)
+            && !stale.scoped_refresh.load(Ordering::Acquire)
+            && stale.search_root
+                == std::fs::canonicalize(&options.root_dir)
+                    .unwrap_or_else(|_| options.root_dir.clone())
+        {
+            if stale
+                .rebuild_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let previous = Arc::clone(&stale);
+                let lock = Arc::clone(lock);
+                let walker = Arc::clone(&walk_and_index_fn);
+                let root = options.root_dir.clone();
+                let build_generation = generation.load(Ordering::Acquire);
+                tokio::spawn(async move {
+                    let _reset = RebuildGuard(Arc::clone(&previous));
+                    let vector_generation = walker.vector_generation(&root);
+                    match walker.walk_and_index(&root).await {
+                        Ok((docs, vectors)) => {
+                            let base = Arc::clone(&previous);
+                            let built = tokio::task::spawn_blocking(move || {
+                                let pending = base.pending.lock().unwrap();
+                                let mut snapshot: std::collections::BTreeMap<_, _> = docs
+                                    .into_iter()
+                                    .zip(vectors)
+                                    .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
+                                    .collect();
+                                let mut ready_generation = build_generation;
+                                for RefreshBatch {
+                                    docs,
+                                    vectors,
+                                    deleted,
+                                    generation,
+                                } in &pending.batches
+                                {
+                                    if *generation < build_generation {
+                                        continue;
+                                    }
+                                    for path in deleted {
+                                        snapshot.remove(path);
+                                    }
+                                    for (doc, vector) in docs.iter().zip(vectors) {
+                                        snapshot.insert(
+                                            doc.path.clone(),
+                                            (doc.clone(), vector.clone()),
+                                        );
+                                    }
+                                    ready_generation = ready_generation.max(*generation);
+                                }
+                                let consumed = pending.batches.len();
+                                drop(pending);
+                                let (docs, vectors) = snapshot.into_values().unzip();
+                                let (changed, vectors, deleted) =
+                                    base.index.delta_from(docs, vectors);
+                                let mut index = base.index.clone();
+                                index.apply_delta(changed, vectors, &deleted);
+                                index.prepare_ann();
+                                (index, ready_generation, consumed)
+                            })
+                            .await;
+                            if let Ok((index, ready_generation, consumed)) = built {
+                                let mut guard = lock.write().await;
+                                if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
+                                    let fp = IndexFingerprint::from_docs(&index.documents);
+                                    let mut entry =
+                                        CachedSearchIndex::new(index, fp, ready_generation);
+                                    entry.pending.get_mut().unwrap().batches =
+                                        previous.pending.lock().unwrap().batches[consumed..]
+                                            .to_vec();
+                                    entry.search_root = previous.search_root.clone();
+                                    entry.vector_generation = vector_generation;
+                                    *guard = Some(Arc::new(entry));
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "Background index refresh failed"),
+                    }
+                });
+            }
+            let query = sanitize_query(&options.query);
+            let vectors = embed_fn.embed(&[query.to_string()]).await?;
+            let vector = vectors
+                .first()
+                .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
+            let results = stale
+                .index
+                .search(&query, vector, &resolve_search_options(&options));
+            return Ok(format_search_results_with_freshness(
+                &query,
+                &results,
+                Some(stale.index.document_count()),
+            ));
+        }
+    }
+    semantic_code_search(
+        options,
+        embed_fn,
+        walk_and_index_fn.as_ref(),
+        index_cache,
+        cache_generation,
+    )
+    .await
+}
+
 pub async fn semantic_code_search(
     options: SemanticSearchOptions,
     embed_fn: &dyn EmbedFn,
@@ -1646,6 +2043,7 @@ pub async fn semantic_code_search(
                     && cached.generation.load(std::sync::atomic::Ordering::Acquire) == current_gen
                     && cached.vector_generation == vector_generation
                     && cached.search_root == search_root
+                    && cached.pending.lock().unwrap().batches.is_empty()
                 {
                     let reuses = cached.record_reuse();
                     tracing::debug!(
@@ -1680,6 +2078,7 @@ pub async fn semantic_code_search(
                 if let Some(cached) = guard.as_ref()
                     && cached.vector_generation == vector_generation
                     && cached.search_root == search_root
+                    && cached.pending.lock().unwrap().batches.is_empty()
                     && metadata.is_some()
                     && *cached.metadata.read().unwrap() == metadata
                 {
@@ -1707,6 +2106,7 @@ pub async fn semantic_code_search(
                     && cached.fingerprint == fp
                     && cached.vector_generation == vector_generation
                     && cached.search_root == search_root
+                    && cached.pending.lock().unwrap().batches.is_empty()
                 {
                     *cached.metadata.write().unwrap() = metadata.clone();
                     let reuses = cached.record_reuse();
@@ -1742,6 +2142,7 @@ pub async fn semantic_code_search(
                 && cached.fingerprint == fp
                 && cached.vector_generation == vector_generation
                 && cached.search_root == search_root
+                && cached.pending.lock().unwrap().batches.is_empty()
             {
                 let reuses = cached.record_reuse();
                 // Same fix as the read-lock path: bring the cached generation
@@ -1757,120 +2158,115 @@ pub async fn semantic_code_search(
                 break 'cache Arc::clone(cached);
             }
 
-            // Background-rebuild fast-return: if the existing stale entry qualifies
-            // (small-delta corpus change) and no rebuild is already in flight, serve
-            // the stale index immediately and spawn a background task to rebuild.
-            if let Some(ref stale) = *guard
-                && stale.search_root == search_root
-                && stale.vector_generation == vector_generation
-                && stale.qualifies_for_background_rebuild(&fp)
-                && stale
-                    .rebuild_in_progress
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                // CAS succeeded — we own the rebuild slot. Drop the write-lock
-                // immediately so readers aren't blocked during the background build.
-                let stale_arc = Arc::clone(stale);
-                let stale_fp = stale.fingerprint.clone();
-                drop(guard);
-
-                let lock_clone = Arc::clone(&lock);
-                let new_fp = fp.clone();
-                let root_dir_clone = options.root_dir.clone();
-                let stale_arc_for_guard = Arc::clone(&stale_arc);
-                // Capture the tracker generation handle (not a snapshot) so the
-                // background task can re-read it at install time. Without this,
-                // a tracker bump during the rebuild would leave the installed
-                // entry stamped with a stale `current_gen`, suppressing a
-                // legitimate walk on the next request. (Review #57 F4.)
-                let cache_gen_for_bg = cache_generation.clone();
-                tracing::info!(
-                    old_n_docs = stale_fp.n_docs,
-                    new_n_docs = new_fp.n_docs,
-                    "SearchIndex small-delta miss — serving stale, spawning background rebuild"
-                );
-                tokio::spawn(async move {
-                    // RAII guard resets `rebuild_in_progress` even on panic.
-                    let _guard = crate::tools::semantic_search::RebuildGuard(stale_arc_for_guard);
-
-                    let mut new_idx = SearchIndex::new();
-                    // Re-walk to get fresh vectors (the docs/vectors we computed
-                    // above are already moved; a second walk is the safe path).
-                    let walk_result = {
-                        // We need a WalkAndIndexFn here but we can't capture the
-                        // trait object across the spawn boundary. Instead, store
-                        // the pre-walked docs & vectors via a channel-less approach:
-                        // they are passed directly as captured values from the outer scope.
-                        // The vectors captured here are the ones from our walk above.
-                        Ok::<_, crate::error::ContextPlusError>((docs, vectors))
-                    };
-                    let (bg_docs, bg_vectors) = match walk_result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("Background rebuild walk failed: {e}");
-                            return;
-                        }
-                    };
-                    new_idx.index_with_vectors_and_tuning(
-                        bg_docs,
-                        bg_vectors,
-                        crate::core::embeddings::HnswTuning::global(),
-                    );
-                    // Stale-write guard + fresh-generation snapshot: acquire the
-                    // write lock FIRST, then re-read `cache_generation` (if any)
-                    // right before constructing the entry. This closes the #57 F4
-                    // window where a tracker bump during rebuild would cause the
-                    // installed entry to carry a stale generation.
-                    let mut wguard = lock_clone.write().await;
-                    let should_install = match *wguard {
-                        Some(ref cur) => {
-                            cur.fingerprint == stale_fp && cur.search_root == search_root
-                        }
-                        None => false,
-                    };
-                    if should_install {
-                        let install_gen = cache_gen_for_bg
-                            .as_ref()
-                            .map(|g| g.load(std::sync::atomic::Ordering::Acquire))
-                            .unwrap_or(0);
-                        let mut entry =
-                            CachedSearchIndex::new(new_idx, new_fp.clone(), install_gen);
-                        entry.vector_generation = vector_generation;
-                        entry.search_root = search_root;
-                        let new_entry = Arc::new(entry);
-                        *new_entry.metadata.write().unwrap() = metadata;
-                        *wguard = Some(new_entry);
-                        tracing::info!(
-                            n_docs = new_fp.n_docs,
-                            "Background SearchIndex rebuild complete — swapped into cache"
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Background rebuild skipped swap — fresher index already installed"
-                        );
+            if let Some(stale) = guard.as_ref().filter(|s| s.search_root == search_root) {
+                let (changed, changed_vectors, deleted) = stale.index.delta_from(docs, vectors);
+                let large = stale
+                    .index
+                    .requires_full_rebuild(&changed, &changed_vectors, &deleted);
+                if large {
+                    let stale = Arc::clone(stale);
+                    if stale
+                        .rebuild_in_progress
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        let previous = Arc::clone(&stale);
+                        let lock = Arc::clone(&lock);
+                        tokio::spawn(async move {
+                            let _reset = RebuildGuard(Arc::clone(&previous));
+                            let base = Arc::clone(&previous);
+                            let built = tokio::task::spawn_blocking(move || {
+                                let mut changes: std::collections::BTreeMap<_, _> = changed
+                                    .into_iter()
+                                    .zip(changed_vectors)
+                                    .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
+                                    .collect();
+                                let mut deleted: HashSet<_> = deleted.into_iter().collect();
+                                let pending = base.pending.lock().unwrap();
+                                let mut ready_generation = current_gen;
+                                for RefreshBatch {
+                                    docs,
+                                    vectors,
+                                    deleted: removed,
+                                    generation,
+                                } in &pending.batches
+                                {
+                                    if *generation < current_gen {
+                                        continue;
+                                    }
+                                    for path in removed {
+                                        changes.remove(path);
+                                        deleted.insert(path.clone());
+                                    }
+                                    for (doc, vector) in docs.iter().zip(vectors) {
+                                        deleted.remove(&doc.path);
+                                        changes.insert(
+                                            doc.path.clone(),
+                                            (doc.clone(), vector.clone()),
+                                        );
+                                    }
+                                    ready_generation = ready_generation.max(*generation);
+                                }
+                                let consumed = pending.batches.len();
+                                drop(pending);
+                                let (changed, changed_vectors) = changes.into_values().unzip();
+                                let mut index = base.index.clone();
+                                index.apply_delta(
+                                    changed,
+                                    changed_vectors,
+                                    &deleted.into_iter().collect::<Vec<_>>(),
+                                );
+                                index.prepare_ann();
+                                (index, ready_generation, consumed)
+                            })
+                            .await;
+                            if let Ok((index, ready_generation, consumed)) = built {
+                                let mut guard = lock.write().await;
+                                if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
+                                    let fp = IndexFingerprint::from_docs(&index.documents);
+                                    let mut entry =
+                                        CachedSearchIndex::new(index, fp, ready_generation);
+                                    entry.pending.get_mut().unwrap().batches =
+                                        previous.pending.lock().unwrap().batches[consumed..]
+                                            .to_vec();
+                                    entry.search_root = search_root;
+                                    entry.vector_generation = vector_generation;
+                                    *entry.metadata.write().unwrap() = metadata;
+                                    *guard = Some(Arc::new(entry));
+                                }
+                            }
+                        });
                     }
-                    drop(wguard);
-                    // `_guard` drops here, resetting rebuild_in_progress.
-                    let _ = root_dir_clone; // ensure the clone is owned by the task
-                });
-
-                break 'cache stale_arc;
+                    break 'cache stale;
+                }
+                let mut entry = guard.take().unwrap();
+                let index = if let Some(entry) = Arc::get_mut(&mut entry) {
+                    entry.index.apply_delta(changed, changed_vectors, &deleted);
+                    None
+                } else {
+                    let mut index = entry.index.clone();
+                    index.apply_delta(changed, changed_vectors, &deleted);
+                    Some(index)
+                };
+                if let Some(index) = index {
+                    entry = Arc::new(CachedSearchIndex::new(index, fp.clone(), current_gen));
+                }
+                let fresh = Arc::get_mut(&mut entry).unwrap();
+                fresh.fingerprint = fp;
+                fresh
+                    .generation
+                    .store(current_gen, std::sync::atomic::Ordering::Release);
+                fresh.search_root = search_root;
+                fresh.vector_generation = vector_generation;
+                *fresh.metadata.write().unwrap() = metadata;
+                *guard = Some(Arc::clone(&entry));
+                break 'cache entry;
             }
-
-            // No stale entry, large-delta change, or another rebuild already in
-            // flight — synchronous rebuild (same as before).
-            tracing::info!(
-                n_docs = fp.n_docs,
-                generation = current_gen,
-                reason = "cache miss after double-check",
-                "SearchIndex cache miss — rebuilding index"
-            );
             let mut idx = SearchIndex::new();
             idx.index_with_vectors_and_tuning(
                 docs,
@@ -1880,14 +2276,9 @@ pub async fn semantic_code_search(
             let mut entry = CachedSearchIndex::new(idx, fp, current_gen);
             entry.vector_generation = vector_generation;
             entry.search_root = search_root;
+            *entry.metadata.write().unwrap() = metadata;
             let arc = Arc::new(entry);
-            *arc.metadata.write().unwrap() = metadata;
             *guard = Some(Arc::clone(&arc));
-            tracing::debug!(
-                generation = current_gen,
-                documents = arc.index.document_count(),
-                "SearchIndex replaced after rebuild"
-            );
             arc
         }
     };
@@ -5286,5 +5677,578 @@ mod tests {
         drop(new_entry);
         // Verify stale_fp != fresh_fp (sanity).
         assert_ne!(stale_fp, fresh_fp);
+    }
+
+    #[tokio::test]
+    async fn single_changed_file_in_large_index_is_visible_without_full_rebuild() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct OneFileChangeWalker(Arc<AtomicU32>);
+        impl WalkAndIndexFn for OneFileChangeWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let changed = self.0.fetch_add(1, Ordering::Relaxed) > 0;
+                Box::pin(async move {
+                    let docs: Vec<_> = (0..1_000)
+                        .map(|i| {
+                            let content = if changed && i == 777 {
+                                "fn incremental_delta_needle() {}"
+                            } else {
+                                "fn stable_content() {}"
+                            };
+                            make_doc(&format!("src/file_{i}.rs"), content)
+                        })
+                        .collect();
+                    let vectors = vec![Some(vec![1.0, 0.0]); docs.len()];
+                    Ok((docs, vectors))
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let walker = OneFileChangeWalker(Arc::clone(&calls));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let mut options = gen_test_opts();
+        options.query = "incremental delta needle".to_string();
+        options.semantic_weight = Some(0.0);
+        options.keyword_weight = Some(1.0);
+        options.min_keyword_score = Some(0.01);
+        options.require_keyword_match = Some(true);
+
+        semantic_code_search(
+            options.clone(),
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+        let before_count = cache.read().await.as_ref().unwrap().index.document_count();
+        let before_full_rebuilds = cache
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .index
+            .full_rebuild_count();
+
+        generation.fetch_add(1, Ordering::Release);
+        let result = semantic_code_search(
+            options,
+            &FixedEmbedder2,
+            &walker,
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+        let guard = cache.read().await;
+        let current = guard.as_ref().unwrap();
+
+        assert_eq!(before_count, 1_000);
+        assert_eq!(current.index.document_count(), before_count);
+        assert_eq!(
+            current.index.full_rebuild_count(),
+            before_full_rebuilds,
+            "one changed document must not trigger a full rebuild"
+        );
+        assert_eq!(
+            current.generation.load(Ordering::Acquire),
+            1,
+            "an in-place delta must advance the cached generation"
+        );
+        assert!(
+            result.contains("src/file_777.rs"),
+            "the first query after vectors are ready must see changed content: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_full_rebuild_serves_previous_generation_without_blocking() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct BlockingMassChangeWalker {
+            calls: Arc<AtomicU32>,
+            rebuild_started: Arc<tokio::sync::Notify>,
+            release_rebuild: Arc<tokio::sync::Notify>,
+        }
+        impl WalkAndIndexFn for BlockingMassChangeWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                let rebuild_started = Arc::clone(&self.rebuild_started);
+                let release_rebuild = Arc::clone(&self.release_rebuild);
+                Box::pin(async move {
+                    let count = if call == 0 {
+                        100
+                    } else {
+                        rebuild_started.notify_one();
+                        release_rebuild.notified().await;
+                        150
+                    };
+                    let docs: Vec<_> = (0..count)
+                        .map(|i| make_doc(&format!("src/stale_{i}.rs"), "stale generation"))
+                        .collect();
+                    let vectors = vec![Some(vec![1.0, 0.0]); docs.len()];
+                    Ok((docs, vectors))
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let rebuild_started = Arc::new(tokio::sync::Notify::new());
+        let release_rebuild = Arc::new(tokio::sync::Notify::new());
+        let walker = Arc::new(BlockingMassChangeWalker {
+            calls: Arc::clone(&calls),
+            rebuild_started: Arc::clone(&rebuild_started),
+            release_rebuild: Arc::clone(&release_rebuild),
+        });
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let mut options = gen_test_opts();
+        options.query = "stale generation".to_string();
+
+        let initial_walker: Arc<dyn WalkAndIndexFn> = walker.clone();
+        semantic_code_search_owned(
+            options.clone(),
+            &FixedEmbedder2,
+            initial_walker,
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+        generation.fetch_add(1, Ordering::Release);
+
+        let query_walker: Arc<dyn WalkAndIndexFn> = walker.clone();
+        let query_cache = Arc::clone(&cache);
+        let query_generation = Arc::clone(&generation);
+        let query = tokio::spawn(async move {
+            semantic_code_search_owned(
+                options,
+                &FixedEmbedder2,
+                query_walker,
+                Some(query_cache),
+                Some(query_generation),
+            )
+            .await
+        });
+        rebuild_started.notified().await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), query)
+            .await
+            .expect("query waited for the required full rebuild instead of serving the previous generation")
+            .unwrap()
+            .unwrap();
+        release_rebuild.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let count = cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|entry| entry.index.document_count());
+                if count == Some(150) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released background rebuild did not install the 150-document generation");
+
+        assert!(
+            result.contains("Index: 100 document(s)"),
+            "the query should report the previous generation during rebuild: {result}"
+        );
+        assert!(
+            result.contains("src/stale_"),
+            "the stale generation should remain queryable during rebuild: {result}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ann_rebuild_stays_stale_until_replacement_graph_is_ready() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct AnnRebuildWalker(Arc<AtomicU32>);
+        impl WalkAndIndexFn for AnnRebuildWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let changed = self.0.fetch_add(1, Ordering::Relaxed) > 0;
+                Box::pin(async move {
+                    let (mut docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
+                    if changed {
+                        for doc in docs.iter_mut().take(500) {
+                            doc.content.push_str(" mass replacement");
+                        }
+                    }
+                    Ok((docs, vectors))
+                })
+            }
+        }
+
+        struct AnnEmbedder;
+        impl EmbedFn for AnnEmbedder {
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0, 0.0, 0.0, 0.0]]) })
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let walker: Arc<dyn WalkAndIndexFn> = Arc::new(AnnRebuildWalker(calls));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let mut options = gen_test_opts();
+        options.query = "file".to_string();
+        semantic_code_search_owned(
+            options.clone(),
+            &AnnEmbedder,
+            Arc::clone(&walker),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+        let previous = cache.read().await.as_ref().cloned().unwrap();
+        assert!(
+            previous
+                .index
+                .ann_store
+                .as_ref()
+                .unwrap()
+                .hnsw_is_initialized(),
+            "the warm generation must have an initialized ANN graph"
+        );
+
+        generation.store(1, Ordering::Release);
+        let graph_pause = crate::core::embeddings::hnsw_test_seam::pause_next_build();
+        let stale_result = semantic_code_search_owned(
+            options,
+            &AnnEmbedder,
+            walker,
+            Some(Arc::clone(&cache)),
+            Some(generation),
+        )
+        .await
+        .unwrap();
+        assert!(stale_result.contains("Index: 2050 document(s)"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            graph_pause.wait_until_entered(),
+        )
+        .await
+        .expect("replacement ANN construction never started before publication");
+        assert!(
+            cache
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &previous)),
+            "the previous generation was retired before the replacement ANN graph was ready"
+        );
+
+        graph_pause.release();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let current = cache.read().await.as_ref().cloned().unwrap();
+                if !Arc::ptr_eq(&current, &previous) {
+                    assert!(
+                        current
+                            .index
+                            .ann_store
+                            .as_ref()
+                            .unwrap()
+                            .hnsw_is_initialized(),
+                        "published replacement has a lazy ANN graph"
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ready replacement ANN generation was not published");
+    }
+
+    #[test]
+    fn rejected_mass_delta_cannot_be_hidden_by_a_later_small_delta() {
+        use std::sync::atomic::Ordering;
+
+        let docs = (0..25)
+            .map(|i| make_doc(&format!("src/file_{i}.rs"), "original content"))
+            .collect::<Vec<_>>();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs.clone(), vec![Some(vec![1.0, 0.0]); docs.len()]);
+        let mut cached = Arc::new(CachedSearchIndex::new(
+            index,
+            IndexFingerprint::from_docs(&docs),
+            0,
+        ));
+        Arc::get_mut(&mut cached).unwrap().search_root = std::path::PathBuf::from("/tmp");
+
+        let mass_docs = (0..6)
+            .map(|i| make_doc(&format!("src/file_{i}.rs"), "mass refresh needle"))
+            .collect::<Vec<_>>();
+        assert!(!CachedSearchIndex::refresh_paths(
+            &mut cached,
+            std::path::Path::new("/tmp"),
+            mass_docs,
+            vec![Some(vec![1.0, 0.0]); 6],
+            &[],
+            1,
+        ));
+        CachedSearchIndex::refresh_paths(
+            &mut cached,
+            std::path::Path::new("/tmp"),
+            vec![make_doc("src/file_24.rs", "later small delta")],
+            vec![Some(vec![1.0, 0.0])],
+            &[],
+            2,
+        );
+
+        let advanced = cached.generation.load(Ordering::Acquire) == 2;
+        let mass_is_represented = cached.index.documents[..6]
+            .iter()
+            .all(|doc| doc.content.contains("mass refresh needle"));
+        assert!(
+            !advanced || mass_is_represented,
+            "the later small delta advanced generation 2 without the rejected generation-1 batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_scoped_search_applies_ready_replacement_before_answering() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct ScopedReplacementWalker(AtomicU32);
+        impl WalkAndIndexFn for ScopedReplacementWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let fresh = self.0.fetch_add(1, Ordering::Relaxed) > 0;
+                Box::pin(async move {
+                    let docs = (0..10)
+                        .map(|i| {
+                            let content = if i == 0 {
+                                if fresh {
+                                    "zephyrreplacement"
+                                } else {
+                                    "fossilmarker"
+                                }
+                            } else {
+                                "stable decoy"
+                            };
+                            make_doc(&format!("file_{i}.rs"), content)
+                        })
+                        .collect::<Vec<_>>();
+                    let vectors = vec![Some(vec![1.0, 0.0]); docs.len()];
+                    Ok((docs, vectors))
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let walker: Arc<dyn WalkAndIndexFn> = Arc::new(ScopedReplacementWalker(AtomicU32::new(0)));
+        let cache = Arc::new(RwLock::new(None));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut options = gen_test_opts();
+        options.root_dir = root.path().to_path_buf();
+        options.query = "zephyrreplacement".to_string();
+        options.semantic_weight = Some(0.0);
+        options.keyword_weight = Some(1.0);
+        options.require_keyword_match = Some(true);
+        semantic_code_search_owned(
+            options.clone(),
+            &FixedEmbedder2,
+            Arc::clone(&walker),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+
+        let callback_root = root.path().parent().unwrap();
+        assert!(!CachedSearchIndex::refresh_paths(
+            cache.write().await.as_mut().unwrap(),
+            callback_root,
+            vec![make_doc("file_0.rs", "zephyrreplacement")],
+            vec![Some(vec![1.0, 0.0])],
+            &[],
+            1,
+        ));
+        generation.store(1, Ordering::Release);
+        let result = semantic_code_search_owned(
+            options,
+            &FixedEmbedder2,
+            walker,
+            Some(cache),
+            Some(generation),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.contains("file_0.rs"),
+            "the first owned scoped query served the pre-replacement index: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_scoped_search_applies_ready_deletion_before_answering() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct ScopedDeletionWalker(AtomicU32);
+        impl WalkAndIndexFn for ScopedDeletionWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let fresh = self.0.fetch_add(1, Ordering::Relaxed) > 0;
+                Box::pin(async move {
+                    let start = usize::from(fresh);
+                    let docs = (start..10)
+                        .map(|i| {
+                            let content = if i == 0 {
+                                "vanishinguniquetoken"
+                            } else {
+                                "stable decoy"
+                            };
+                            make_doc(&format!("file_{i}.rs"), content)
+                        })
+                        .collect::<Vec<_>>();
+                    let vectors = vec![Some(vec![1.0, 0.0]); docs.len()];
+                    Ok((docs, vectors))
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let walker: Arc<dyn WalkAndIndexFn> = Arc::new(ScopedDeletionWalker(AtomicU32::new(0)));
+        let cache = Arc::new(RwLock::new(None));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut options = gen_test_opts();
+        options.root_dir = root.path().to_path_buf();
+        options.query = "vanishinguniquetoken".to_string();
+        options.semantic_weight = Some(0.0);
+        options.keyword_weight = Some(1.0);
+        options.require_keyword_match = Some(true);
+        semantic_code_search_owned(
+            options.clone(),
+            &FixedEmbedder2,
+            Arc::clone(&walker),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+
+        let callback_root = root.path().parent().unwrap();
+        assert!(!CachedSearchIndex::refresh_paths(
+            cache.write().await.as_mut().unwrap(),
+            callback_root,
+            vec![],
+            vec![],
+            &["file_0.rs".to_string()],
+            1,
+        ));
+        generation.store(1, Ordering::Release);
+        let result = semantic_code_search_owned(
+            options,
+            &FixedEmbedder2,
+            walker,
+            Some(cache),
+            Some(generation),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.contains("file_0.rs"),
+            "the first owned scoped query retained the deleted path: {result}"
+        );
+    }
+
+    #[test]
+    fn mass_change_above_threshold_triggers_exactly_one_full_rebuild() {
+        let threshold = std::hint::black_box(FULL_REBUILD_CHANGE_FRACTION);
+        assert!(
+            threshold > 0.0 && threshold < 1.0,
+            "the full-rebuild threshold must be a named corpus fraction"
+        );
+
+        let corpus_size = 1_000usize;
+        let docs: Vec<_> = (0..corpus_size)
+            .map(|i| make_doc(&format!("src/file_{i}.rs"), "old content"))
+            .collect();
+        let vectors = vec![Some(vec![1.0, 0.0]); corpus_size];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let rebuilds_before = index.full_rebuild_count();
+
+        let changed_count = (corpus_size as f64 * threshold).floor() as usize + 1;
+        let changed_docs: Vec<_> = (0..changed_count)
+            .map(|i| make_doc(&format!("src/file_{i}.rs"), "mass changed content"))
+            .collect();
+        let changed_vectors = vec![Some(vec![0.0, 1.0]); changed_count];
+
+        let outcome = index.apply_delta(changed_docs, changed_vectors, &[]);
+
+        assert_eq!(outcome, IndexUpdateKind::FullRebuild);
+        assert_eq!(
+            index.full_rebuild_count(),
+            rebuilds_before + 1,
+            "one mass-change batch must schedule exactly one full rebuild"
+        );
+        assert_eq!(index.document_count(), corpus_size);
     }
 }

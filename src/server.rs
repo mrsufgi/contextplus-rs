@@ -32,6 +32,7 @@ pub use crate::server_definitions::{make_tool, tool_definitions};
 /// Content is stored as `Arc<String>` so call-sites can clone the pointer
 /// (cheap) and use `content.lines()` when line iteration is needed, avoiding
 /// the `Vec<String>` split + `join("\n")` round-trip on every access.
+#[derive(Clone)]
 pub struct ProjectCache {
     pub file_entries: Vec<crate::core::walker::FileEntry>,
     /// Maps relative_path → raw file content. Clone the Arc (pointer-sized)
@@ -41,6 +42,7 @@ pub struct ProjectCache {
 }
 
 /// Cached lexical index and the document paths used to format its results.
+#[derive(Clone)]
 pub(crate) struct CachedLexicalIndex {
     pub index: crate::tools::lexical_search::LexicalIndex,
     pub document_paths: Vec<String>,
@@ -52,11 +54,84 @@ pub(crate) struct CachedLexicalIndex {
 /// Rebuilt when file count changes. The 300-second TTL is a fallback only when
 /// no tracker is running for the ref.
 pub struct IdentifierIndex {
-    pub docs: Vec<crate::tools::semantic_identifiers::IdentifierDoc>,
-    pub vector_buffer: Vec<f32>,
+    pub docs: Segmented<crate::tools::semantic_identifiers::IdentifierDoc>,
+    pub vector_buffer: Segmented<f32>,
     pub dims: usize,
     pub file_count: usize,
     pub built_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct Segmented<T> {
+    files: std::collections::BTreeMap<String, Arc<Vec<T>>>,
+    offsets: Vec<(usize, String)>,
+    len: usize,
+}
+
+impl<T> Segmented<T> {
+    fn from_files(files: std::collections::BTreeMap<String, Arc<Vec<T>>>) -> Self {
+        let mut len = 0;
+        let offsets = files
+            .iter()
+            .filter(|(_, values)| !values.is_empty())
+            .map(|(path, values)| {
+                let offset = len;
+                len += values.len();
+                (offset, path.clone())
+            })
+            .collect();
+        Self {
+            files,
+            offsets,
+            len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.files.values().flat_map(|values| values.iter())
+    }
+
+    fn locate(&self, index: usize) -> (&[T], usize) {
+        let position = self.offsets.partition_point(|(offset, _)| *offset <= index) - 1;
+        let (offset, path) = &self.offsets[position];
+        (&self.files[path], index - offset)
+    }
+}
+
+impl<T> From<Vec<T>> for Segmented<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self::from_files(std::collections::BTreeMap::from([(
+            String::new(),
+            Arc::new(values),
+        )]))
+    }
+}
+
+impl<T: Send + Sync> crate::tools::semantic_identifiers::IndexData<T> for Segmented<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get(&self, index: usize) -> &T {
+        let (values, local) = self.locate(index);
+        &values[local]
+    }
+    fn slice(&self, range: std::ops::Range<usize>) -> &[T] {
+        let (values, local) = self.locate(range.start);
+        &values[local..local + range.len()]
+    }
+}
+
+struct RefreshGuard(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 struct IncrementalReembedOutcome {
@@ -622,6 +697,7 @@ impl ContextPlusServer {
                         .cache_generation
                         .fetch_add(1, std::sync::atomic::Ordering::Release)
                         + 1;
+                    srv.refresh_search_paths(&files, new_gen).await;
                     tracing::debug!(
                         generation = new_gen,
                         updated,
@@ -645,6 +721,90 @@ impl ContextPlusServer {
                 (updated, skipped)
             })
         })
+    }
+
+    async fn refresh_search_paths(&self, paths: &[String], generation: u64) {
+        use crate::tools::semantic_search::{
+            CachedSearchIndex, SearchDocument, SymbolSearchEntry, extract_plain_text_header,
+            is_text_index_candidate, semantic_embedding_content,
+        };
+        let owner = self.current_ref();
+        if owner.search_index_cache.read().await.is_none() {
+            return;
+        }
+        let mut docs = Vec::new();
+        let mut vectors = Vec::new();
+        let mut deleted = Vec::new();
+        let eligible: std::collections::HashSet<_> =
+            walk_with_config(&owner.root_dir, &self.state.config)
+                .into_iter()
+                .filter(|entry| !entry.is_directory)
+                .map(|entry| entry.relative_path)
+                .collect();
+        for path in paths {
+            if !eligible.contains(path) {
+                deleted.push(path.clone());
+                continue;
+            }
+            let Ok(content) = tokio::fs::read_to_string(owner.root_dir.join(path)).await else {
+                deleted.push(path.clone());
+                continue;
+            };
+            if content.len() > self.state.config.max_embed_file_size {
+                deleted.push(path.clone());
+                continue;
+            }
+            let text = semantic_embedding_content(path, &content);
+            let (header, symbols, entries) = if is_text_index_candidate(path) {
+                (extract_plain_text_header(&text), Vec::new(), Vec::new())
+            } else {
+                let symbols =
+                    parse_with_tree_sitter(&content, path.rsplit('.').next().unwrap_or(""))
+                        .unwrap_or_default();
+                let names = symbols.iter().map(|s| s.name.clone()).collect();
+                let entries = symbols
+                    .into_iter()
+                    .map(|s| SymbolSearchEntry {
+                        name: s.name,
+                        kind: Some(s.kind),
+                        line: s.line,
+                        end_line: Some(s.end_line),
+                        signature: s.signature,
+                    })
+                    .collect();
+                (
+                    crate::core::parser::extract_header(&content),
+                    names,
+                    entries,
+                )
+            };
+            let vector = owner
+                .embedding_cache
+                .read()
+                .await
+                .get(path)
+                .filter(|entry| entry.hash == crate::core::parser::hash_content(&content))
+                .map(|entry| entry.vector.clone());
+            docs.push(SearchDocument::new(
+                path.clone(),
+                header,
+                symbols,
+                entries,
+                text,
+            ));
+            vectors.push(vector);
+        }
+        let mut guard = owner.search_index_cache.write().await;
+        if let Some(entry) = guard.as_mut() {
+            CachedSearchIndex::refresh_ref_paths(
+                entry,
+                &owner.canonical_root,
+                docs,
+                vectors,
+                &deleted,
+                generation,
+            );
+        }
     }
 
     /// Start the embedding tracker for a specific ref if not already running
@@ -961,11 +1121,11 @@ impl ContextPlusServer {
                     };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
-                        docs: doc_list,
+                        docs: doc_list.into(),
                         // vector_buffer + dims left empty — shallow mode omits
                         // embedding calls.  Full mode (or first real tool call)
                         // will populate these fields.
-                        vector_buffer: Vec::new(),
+                        vector_buffer: Vec::new().into(),
                         dims: 0,
                         file_count,
                         built_at: std::time::Instant::now(),
@@ -1196,8 +1356,8 @@ impl ContextPlusServer {
                     };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
-                        docs: doc_list,
-                        vector_buffer: Vec::new(),
+                        docs: doc_list.into(),
+                        vector_buffer: Vec::new().into(),
                         dims: 0,
                         file_count,
                         built_at: std::time::Instant::now(),
@@ -1346,8 +1506,7 @@ impl ContextPlusServer {
             .is_some_and(|handle| handle.take_source_dirty());
         if dirty {
             *project_guard = None;
-            *ref_index.identifier_index.write().await = None;
-            *ref_index.lexical_search_cache.write().await = None;
+
             ref_index
                 .cache_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1424,8 +1583,7 @@ impl ContextPlusServer {
 
         // Store the Arc in per-ref state (cheap clone of the Arc pointer)
         *project_guard = Some(Arc::clone(&arc_cache));
-        *ref_index.identifier_index.write().await = None;
-        *ref_index.lexical_search_cache.write().await = None;
+
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
             files = arc_cache.file_content.len(),
@@ -1452,13 +1610,13 @@ impl ContextPlusServer {
         let project_cache_was_populated = guard.is_some();
         *guard = None;
         drop(guard);
-        let mut idx_guard = ref_index.identifier_index.write().await;
+        let idx_guard = ref_index.identifier_index.read().await;
         let identifier_index_was_populated = idx_guard.is_some();
-        *idx_guard = None;
+
         drop(idx_guard);
-        let mut lexical_guard = ref_index.lexical_search_cache.write().await;
+        let lexical_guard = ref_index.lexical_search_cache.read().await;
         let lexical_index_was_populated = lexical_guard.is_some();
-        *lexical_guard = None;
+
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
             project_cache_was_populated,
@@ -1772,58 +1930,129 @@ impl ContextPlusServer {
             return false;
         }
 
+        *ref_index.identifier_source.write().await = Some(Arc::clone(source_cache));
         *identifier_guard = Some(Arc::clone(index));
         true
     }
 
-    async fn ensure_identifier_index(
-        &self,
-        cache: &Arc<ProjectCache>,
-    ) -> Result<Arc<IdentifierIndex>> {
-        let file_count = cache
-            .file_entries
-            .iter()
-            .filter(|e| !e.is_directory)
-            .count();
-        let ref_index = self.current_ref();
-        let tracker_running = Self::tracker_is_running(&ref_index);
+    fn ensure_identifier_index<'a>(
+        &'a self,
+        cache: &'a Arc<ProjectCache>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<IdentifierIndex>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let file_count = cache
+                .file_entries
+                .iter()
+                .filter(|e| !e.is_directory)
+                .count();
+            let ref_index = self.current_ref();
+            let tracker_running = Self::tracker_is_running(&ref_index);
+            let source = ref_index.identifier_source.read().await.as_ref().cloned();
+            let source_matches = source.as_ref().is_none_or(|old| Arc::ptr_eq(old, cache));
 
-        // Fast path: index exists, file count is unchanged, and either the
-        // tracker is authoritative or the tracker-off TTL remains valid.
-        // A warmup-built index carries docs but no vectors (dims == 0); serving
-        // it would score every identifier at zero similarity, so it does not
-        // count as built.
-        {
-            let guard = ref_index.identifier_index.read().await;
-            if let Some(ref idx) = *guard
-                && idx.file_count == file_count
-                && (tracker_running || idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS)
-                && (idx.dims > 0 || idx.docs.is_empty())
+            // Fast path: index exists, file count is unchanged, and either the
+            // tracker is authoritative or the tracker-off TTL remains valid.
+            // A warmup-built index carries docs but no vectors (dims == 0); serving
+            // it would score every identifier at zero similarity, so it does not
+            // count as built.
             {
+                let guard = ref_index.identifier_index.read().await;
+                if let Some(ref idx) = *guard
+                    && idx.file_count == file_count
+                    && source_matches
+                    && (tracker_running
+                        || idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS)
+                    && (idx.dims > 0 || idx.docs.is_empty())
+                {
+                    tracing::debug!(
+                        ref_id = %ref_index.cas_ref_id_hex,
+                        tracker_running,
+                        age_secs = idx.built_at.elapsed().as_secs(),
+                        "IdentifierIndex hit"
+                    );
+                    return Ok(Arc::clone(idx));
+                }
+
+                let reason = match guard.as_ref() {
+                    None => "cache empty",
+                    Some(idx) if idx.file_count != file_count => "project file count changed",
+                    Some(idx) if idx.dims == 0 && !idx.docs.is_empty() => {
+                        "warmup index has no vectors"
+                    }
+                    Some(_) => "tracker absent and TTL expired",
+                };
                 tracing::debug!(
                     ref_id = %ref_index.cas_ref_id_hex,
                     tracker_running,
-                    age_secs = idx.built_at.elapsed().as_secs(),
-                    "IdentifierIndex hit"
+                    file_count,
+                    reason,
+                    "Rebuilding IdentifierIndex"
                 );
-                return Ok(Arc::clone(idx));
             }
 
-            let reason = match guard.as_ref() {
-                None => "cache empty",
-                Some(idx) if idx.file_count != file_count => "project file count changed",
-                Some(idx) if idx.dims == 0 && !idx.docs.is_empty() => "warmup index has no vectors",
-                Some(_) => "tracker absent and TTL expired",
-            };
-            tracing::debug!(
-                ref_id = %ref_index.cas_ref_id_hex,
-                tracker_running,
-                file_count,
-                reason,
-                "Rebuilding IdentifierIndex"
-            );
-        }
+            let previous = ref_index.identifier_index.read().await.as_ref().cloned();
+            if let (Some(source), Some(previous)) = (&source, previous) {
+                let changed = cache
+                    .file_content
+                    .iter()
+                    .filter(|(path, content)| source.file_content.get(*path) != Some(*content))
+                    .count()
+                    + source
+                        .file_content
+                        .keys()
+                        .filter(|path| !cache.file_content.contains_key(*path))
+                        .count();
+                if changed as f64
+                    > source.file_content.len() as f64
+                        * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
+                {
+                    if ref_index
+                        .identifier_rebuilding
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        let server = self.clone();
+                        let cache = Arc::clone(cache);
+                        let flag = Arc::clone(&ref_index.identifier_rebuilding);
+                        tokio::spawn(async move {
+                            let _reset = RefreshGuard(flag);
+                            if let Err(error) = server.build_identifier_index(&cache).await {
+                                tracing::warn!(%error, "Background identifier rebuild failed");
+                            }
+                        });
+                    }
+                    return Ok(previous);
+                }
+            }
+            self.build_identifier_index(cache).await
+        })
+    }
 
+    async fn build_identifier_index(
+        &self,
+        cache: &Arc<ProjectCache>,
+    ) -> Result<Arc<IdentifierIndex>> {
+        let ref_index = self.current_ref();
+        let update_guard = ref_index.identifier_update.lock().await;
+        let source = ref_index.identifier_source.read().await.as_ref().cloned();
+        let file_count = cache
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .count();
+        if source.as_ref().is_some_and(|old| Arc::ptr_eq(old, cache))
+            && let Some(index) = ref_index.identifier_index.read().await.as_ref()
+            && index.dims > 0
+        {
+            return Ok(Arc::clone(index));
+        }
         // Slow path: rebuild identifier index
         tracing::info!(
             file_count,
@@ -1833,6 +2062,21 @@ impl ContextPlusServer {
             .cache_generation
             .load(std::sync::atomic::Ordering::Acquire);
         let cache_clone = cache.clone();
+        let previous = ref_index.identifier_index.read().await.as_ref().cloned();
+        let incremental = previous.as_ref().is_some_and(|index| index.dims > 0) && source.is_some();
+        let changed_paths: std::collections::HashSet<String> = if incremental {
+            let old = source.as_ref().unwrap();
+            cache
+                .file_content
+                .keys()
+                .chain(old.file_content.keys())
+                .filter(|path| cache.file_content.get(*path) != old.file_content.get(*path))
+                .cloned()
+                .collect()
+        } else {
+            cache.file_content.keys().cloned().collect()
+        };
+        let parse_paths = changed_paths.clone();
 
         // Step 1: Parse symbols (CPU-bound)
         let identifier_docs = tokio::task::spawn_blocking(move || {
@@ -1843,6 +2087,9 @@ impl ContextPlusServer {
                 .filter(|entry| !entry.is_directory)
                 .filter_map(|entry| {
                     let content = cache_clone.file_content.get(&entry.relative_path)?;
+                    if !parse_paths.contains(&entry.relative_path) {
+                        return None;
+                    }
                     let content = Arc::clone(content);
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
                     let (symbols, keyword_signatures) =
@@ -1899,10 +2146,10 @@ impl ContextPlusServer {
         .await
         .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
 
-        if identifier_docs.is_empty() {
+        if identifier_docs.is_empty() && !incremental {
             let idx = Arc::new(IdentifierIndex {
-                docs: Vec::new(),
-                vector_buffer: Vec::new(),
+                docs: Vec::new().into(),
+                vector_buffer: Vec::new().into(),
                 dims: 0,
                 file_count,
                 built_at: Instant::now(),
@@ -1917,6 +2164,7 @@ impl ContextPlusServer {
                     reason = "project cache or generation changed during build",
                     "IdentifierIndex build discarded"
                 );
+                drop(update_guard);
                 let fresh_cache = self.ensure_project_cache().await?;
                 return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
             }
@@ -1943,25 +2191,44 @@ impl ContextPlusServer {
         // re-embedded the whole repo.
         let id_cache_name = cache_name("identifier-embeddings", &self.state.config);
         let primary_root = self.state.root_dir.clone();
-        let load_store = |root: &std::path::Path| match rkyv_store::load_cache(root, &id_cache_name)
-        {
-            Ok(Some(data)) => Some(data.to_store()),
-            _ => None,
-        };
-        let mut id_caches: Vec<crate::core::embeddings::VectorStore> = Vec::new();
-        if let Some(own) = load_store(&ref_index.root_dir) {
-            id_caches.push(own);
-        }
-        if ref_index.root_dir != primary_root
-            && let Some(parent) = load_store(&primary_root)
-        {
-            id_caches.push(parent);
-        }
-        tracing::info!(
-            cached = id_caches.iter().map(|s| s.count()).sum::<usize>(),
-            stores = id_caches.len(),
-            "Loaded identifier embedding cache"
-        );
+        let resident = ref_index
+            .identifier_vectors
+            .get_or_try_init(|| async {
+                let root = ref_index.root_dir.clone();
+                let primary = primary_root.clone();
+                let name = id_cache_name.clone();
+                let primary_ref = self.state.default_ref();
+                let inherited = if root != primary {
+                    if let Some(resident) = primary_ref
+                        .as_ref()
+                        .and_then(|owner| owner.identifier_vectors.get())
+                    {
+                        Some(resident.read().await.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                tokio::task::spawn_blocking(move || {
+                    let resident_primary = inherited.is_some();
+                    let mut vectors = inherited.unwrap_or_default();
+                    if root != primary
+                        && !resident_primary
+                        && let Ok(Some(data)) = rkyv_store::load_cache(&primary, &name)
+                    {
+                        vectors.extend(data.to_store().to_cache());
+                    }
+                    if let Ok(Some(data)) = rkyv_store::load_cache(&root, &name) {
+                        vectors.extend(data.to_store().to_cache());
+                    }
+                    RwLock::new(vectors)
+                })
+                .await
+                .map_err(|error| ContextPlusError::Other(error.to_string()))
+            })
+            .await?;
+        let id_caches = resident.read().await;
 
         // Partition: cached vs uncached identifiers (use &str slices for cache lookup)
         let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_identifiers);
@@ -1969,7 +2236,11 @@ impl ContextPlusServer {
         let mut uncached_texts: Vec<String> = Vec::new();
 
         for (i, doc) in identifier_docs.iter().enumerate() {
-            if let Some(vec) = id_caches.iter().find_map(|s| s.get_vector(&doc.text)) {
+            if let Some(vec) = id_caches.get(&doc.text).map(|entry| &entry.vector) {
+                #[cfg(test)]
+                ref_index
+                    .identifier_resident_vector_elements_copied
+                    .fetch_add(vec.len(), std::sync::atomic::Ordering::Relaxed);
                 result_vectors.push(Some(vec.to_vec()));
                 continue;
             }
@@ -1984,6 +2255,7 @@ impl ContextPlusServer {
             "Identifier embedding cache hit/miss"
         );
 
+        drop(id_caches);
         // Embed only uncached identifiers, in chunks to survive MCP connection timeouts.
         if !uncached_texts.is_empty() {
             let chunk_size = self.state.ollama.batch_size();
@@ -1997,40 +2269,51 @@ impl ContextPlusServer {
                         result_vectors[idx] = Some(chunk_vectors[local_j].clone());
                     }
                 }
+            }
+        }
 
-                // Persist after each chunk so progress survives a timeout on the next batch.
-                let all_vecs: Vec<Vec<f32>> =
-                    result_vectors.iter().filter_map(|v| v.clone()).collect();
-                if all_vecs.len() == n_identifiers {
-                    let dims = all_vecs.first().map_or(0, |v| v.len()) as u32;
-                    let keys: Vec<String> =
-                        identifier_docs.iter().map(|d| d.text.clone()).collect();
-                    let hashes: Vec<String> = keys
-                        .iter()
-                        .map(|k| crate::core::parser::hash_content(k))
-                        .collect();
-                    let flat: Vec<f32> = all_vecs.into_iter().flatten().collect();
-                    let store = crate::core::embeddings::VectorStore::new(dims, keys, hashes, flat);
-                    let root = primary_root.clone();
-                    let cache_name_owned = id_cache_name.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        // Merge with disk under fd-lock so we preserve identifier
-                        // entries written by warmup_identifiers / a second MCP that
-                        // this session never loaded into memory.
-                        rkyv_store::save_vector_store_merged(&root, &cache_name_owned, &store)
-                    })
-                    .await;
-                    match result {
-                        Ok(Err(e)) => {
-                            tracing::warn!("Failed to save identifier embedding cache: {e}")
-                        }
-                        Err(join_err) => tracing::warn!(
-                            "save_vector_store spawn_blocking join failed: {join_err}"
-                        ),
-                        Ok(Ok(())) => {}
-                    }
+        if !uncached_indices.is_empty() {
+            let mut resident = resident.write().await;
+            for &i in &uncached_indices {
+                if let Some(vector) = &result_vectors[i] {
+                    let key = identifier_docs[i].text.clone();
+                    resident.insert(
+                        key.clone(),
+                        CacheEntry {
+                            hash: crate::core::parser::hash_content(&key),
+                            vector: vector.clone(),
+                        },
+                    );
                 }
             }
+            drop(resident);
+            let ticket = ref_index
+                .identifier_persist_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
+            let owner = Arc::clone(&ref_index);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if owner
+                    .identifier_persist_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != ticket
+                {
+                    return;
+                }
+                let cache = owner.identifier_vectors.get().unwrap().read().await;
+                let store = crate::core::embeddings::VectorStore::from_cache(&cache);
+                drop(cache);
+                if let Some(store) = store {
+                    let result = tokio::task::spawn_blocking(move || {
+                        rkyv_store::save_vector_store_merged(&primary_root, &id_cache_name, &store)
+                    })
+                    .await;
+                    if let Ok(Err(error)) = result {
+                        tracing::warn!(%error, "Identifier cache persistence failed");
+                    }
+                }
+            });
         }
 
         let dims = result_vectors
@@ -2042,10 +2325,51 @@ impl ContextPlusServer {
             .flat_map(|v| v.unwrap_or_else(|| vec![0.0; dims]))
             .collect();
 
+        let mut docs_by_file: std::collections::BTreeMap<String, Vec<_>> =
+            std::collections::BTreeMap::new();
+        let mut vectors_by_file: std::collections::BTreeMap<String, Vec<f32>> =
+            std::collections::BTreeMap::new();
+        for (i, doc) in identifier_docs.into_iter().enumerate() {
+            vectors_by_file
+                .entry(doc.path.clone())
+                .or_default()
+                .extend_from_slice(&flat_buffer[i * dims..(i + 1) * dims]);
+            docs_by_file.entry(doc.path.clone()).or_default().push(doc);
+        }
+        let mut docs = if incremental {
+            previous.as_ref().unwrap().docs.files.clone()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let mut vectors = if incremental {
+            previous.as_ref().unwrap().vector_buffer.files.clone()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        for path in &changed_paths {
+            docs.remove(path);
+            vectors.remove(path);
+        }
+        docs.extend(
+            docs_by_file
+                .into_iter()
+                .map(|(path, docs)| (path, Arc::new(docs))),
+        );
+        vectors.extend(
+            vectors_by_file
+                .into_iter()
+                .map(|(path, vectors)| (path, Arc::new(vectors))),
+        );
+        let previous_dims = previous.as_ref().map_or(0, |index| index.dims);
+        if incremental && dims != 0 && dims != previous_dims {
+            *ref_index.identifier_source.write().await = None;
+            drop(update_guard);
+            return Box::pin(self.build_identifier_index(cache)).await;
+        }
         let idx = Arc::new(IdentifierIndex {
-            docs: identifier_docs,
-            vector_buffer: flat_buffer,
-            dims,
+            docs: Segmented::from_files(docs),
+            vector_buffer: Segmented::from_files(vectors),
+            dims: if incremental { previous_dims } else { dims },
             file_count,
             built_at: Instant::now(),
         });
@@ -2060,6 +2384,7 @@ impl ContextPlusServer {
                 reason = "project cache or generation changed during build",
                 "IdentifierIndex build discarded"
             );
+            drop(update_guard);
             let fresh_cache = self.ensure_project_cache().await?;
             return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
         }
@@ -2087,6 +2412,7 @@ impl ContextPlusServer {
         use std::sync::atomic::Ordering;
 
         let ref_index = self.current_ref();
+        let _update = ref_index.lexical_update.lock().await;
         let generation = ref_index.cache_generation.load(Ordering::Acquire);
 
         {
@@ -2109,6 +2435,78 @@ impl ContextPlusServer {
             return Ok(Arc::clone(cached));
         }
 
+        if let Some(previous) = guard.as_ref() {
+            let changed: Vec<_> = project_cache
+                .file_content
+                .iter()
+                .filter(|(path, content)| {
+                    previous.project_cache.file_content.get(*path) != Some(*content)
+                })
+                .collect();
+            let deleted: Vec<_> = previous
+                .document_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| {
+                    !path.is_empty() && !project_cache.file_content.contains_key(*path)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if (changed.len() + deleted.len()) as f64
+                <= previous.index.document_count() as f64
+                    * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
+            {
+                let mut entry = Arc::clone(previous);
+                drop(guard);
+                let cached = Arc::make_mut(&mut entry);
+                let mut updates = Vec::new();
+                for (path, content) in changed {
+                    let i = cached
+                        .document_paths
+                        .iter()
+                        .position(|p| p == path)
+                        .unwrap_or_else(|| {
+                            cached.document_paths.push(path.clone());
+                            cached.document_paths.len() - 1
+                        });
+                    let ext = path.rsplit('.').next().unwrap_or("");
+                    let symbols = parse_with_tree_sitter(content, ext)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect();
+                    updates.push((
+                        i,
+                        SearchDocument::new(
+                            path.clone(),
+                            crate::core::parser::extract_header(content),
+                            symbols,
+                            vec![],
+                            content.as_str().to_owned(),
+                        ),
+                    ));
+                }
+                for &i in &deleted {
+                    cached.document_paths[i].clear();
+                }
+                cached.generation = generation;
+                cached.project_cache = Arc::clone(project_cache);
+                let entry = tokio::task::spawn_blocking(move || {
+                    Arc::make_mut(&mut entry)
+                        .index
+                        .update_documents(updates, &deleted);
+                    entry
+                })
+                .await
+                .map_err(|error| ContextPlusError::Other(error.to_string()))?;
+                let mut guard = ref_index.lexical_search_cache.write().await;
+                if ref_index.cache_generation.load(Ordering::Acquire) == generation {
+                    *guard = Some(Arc::clone(&entry));
+                }
+                return Ok(entry);
+            }
+        }
+
         let reason = match guard.as_ref() {
             None => "empty",
             Some(cached) if cached.generation != generation => "generation changed",
@@ -2117,7 +2515,12 @@ impl ContextPlusServer {
         tracing::debug!(generation, reason, "Rebuilding LexicalIndex");
 
         let cache_for_build = Arc::clone(project_cache);
-        let (index, document_paths) = tokio::task::spawn_blocking(move || {
+        if let Some(previous) = guard.as_ref()
+            && ref_index.lexical_rebuilding.load(Ordering::Acquire)
+        {
+            return Ok(Arc::clone(previous));
+        }
+        let build = tokio::task::spawn_blocking(move || {
             let docs: Vec<SearchDocument> = cache_for_build
                 .file_entries
                 .iter()
@@ -2141,9 +2544,34 @@ impl ContextPlusServer {
             let index = LexicalIndex::build(&docs);
             let document_paths = docs.into_iter().map(|doc| doc.path).collect();
             (index, document_paths)
-        })
-        .await
-        .map_err(|e| {
+        });
+        if let Some(previous) = guard.as_ref().cloned() {
+            ref_index.lexical_rebuilding.store(true, Ordering::Release);
+            let flag = Arc::clone(&ref_index.lexical_rebuilding);
+            let lock = Arc::clone(&ref_index.lexical_search_cache);
+            let source = Arc::clone(project_cache);
+            let stale = Arc::clone(&previous);
+            drop(guard);
+            tokio::spawn(async move {
+                let _reset = RefreshGuard(flag);
+                if let Ok((index, document_paths)) = build.await {
+                    let mut guard = lock.write().await;
+                    if guard
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &stale))
+                    {
+                        *guard = Some(Arc::new(CachedLexicalIndex {
+                            index,
+                            document_paths,
+                            project_cache: source,
+                            generation,
+                        }));
+                    }
+                }
+            });
+            return Ok(previous);
+        }
+        let (index, document_paths) = build.await.map_err(|e| {
             ContextPlusError::Other(format!("lexical index spawn_blocking failed: {e}"))
         })?;
 
@@ -2493,10 +2921,10 @@ impl ContextPlusServer {
         } else {
             None
         };
-        let result = crate::tools::semantic_search::semantic_code_search(
+        let result = crate::tools::semantic_search::semantic_code_search_owned(
             options,
             &embedder,
-            &walker,
+            Arc::new(walker),
             Some(Arc::clone(&ref_index.search_index_cache)),
             cache_gen.cloned(),
         )
@@ -4415,6 +4843,13 @@ mod tests {
     async fn identifier_server(
         files: &[(&str, &str)],
     ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        identifier_server_with_tracker_mode(files, TrackerMode::Off).await
+    }
+
+    async fn identifier_server_with_tracker_mode(
+        files: &[(&str, &str)],
+        tracker_mode: TrackerMode,
+    ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -4443,7 +4878,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.ollama_host = ollama.uri();
-        config.embed_tracker_mode = TrackerMode::Off;
+        config.embed_tracker_mode = tracker_mode;
         config.ref_warmup_mode = RefWarmupMode::Off;
         let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
         (repo, ollama, server)
@@ -4687,6 +5122,403 @@ mod tests {
                 && !handler.contains("doc.clone()")
                 && !handler.contains("extend_from_slice"),
             "identifier search handler must borrow cached docs/vectors or select by index; it must not deep-copy the corpus"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_file_disappears_from_semantic_lexical_and_identifier_indexes() {
+        let mut owned_files = vec![(
+            "000_deleted.rs".to_string(),
+            "pub fn deleted_index_needle() { /* deleted semantic needle */ }\n".to_string(),
+        )];
+        for i in 0..24 {
+            owned_files.push((
+                format!("src/survivor_{i}.rs"),
+                format!("pub fn survivor_{i}() {{}}\n"),
+            ));
+        }
+        let borrowed_files: Vec<_> = owned_files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let (repo, _ollama, server) = identifier_server(&borrowed_files).await;
+
+        let semantic_before = server
+            .handle_semantic_code_search(semantic_args("deleted semantic needle"))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&semantic_before).contains("000_deleted.rs"),
+            "semantic fixture did not warm the deleted path: {}",
+            text_of(&semantic_before)
+        );
+        let mut lexical_args = serde_json::Map::new();
+        lexical_args.insert("query".into(), json!("deleted_index_needle"));
+        let lexical_before = server
+            .handle_lexical_search(lexical_args.clone())
+            .await
+            .unwrap();
+        assert!(
+            text_of(&lexical_before).contains("000_deleted.rs"),
+            "lexical fixture did not warm the deleted path: {}",
+            text_of(&lexical_before)
+        );
+        let identifier_before = explore_identifier(&server, "deleted_index_needle", None).await;
+        assert!(
+            identifier_before.contains("000_deleted.rs"),
+            "identifier fixture did not warm the deleted path: {identifier_before}"
+        );
+
+        std::fs::remove_file(repo.path().join("000_deleted.rs")).unwrap();
+        let callback = server.build_tracker_callback();
+        callback(
+            repo.path().to_path_buf(),
+            vec!["000_deleted.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let semantic_after = server
+            .handle_semantic_code_search(semantic_args("deleted semantic needle"))
+            .await
+            .unwrap();
+        let lexical_after = server.handle_lexical_search(lexical_args).await.unwrap();
+        let identifier_after = explore_identifier(&server, "deleted_index_needle", None).await;
+
+        assert!(
+            !text_of(&semantic_after).contains("000_deleted.rs"),
+            "deleted path remained in the semantic index: {}",
+            text_of(&semantic_after)
+        );
+        assert!(
+            !text_of(&lexical_after).contains("000_deleted.rs"),
+            "deleted path remained in the lexical index: {}",
+            text_of(&lexical_after)
+        );
+        assert!(
+            !identifier_after.contains("000_deleted.rs"),
+            "deleted path remained in the identifier index: {identifier_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_file_change_does_not_reload_identifier_cache_from_disk() {
+        let files = [(
+            "src/account.rs",
+            "pub fn load_account() { /* original account loader */ }\n",
+        )];
+        let (repo, _ollama, server) = identifier_server(&files).await;
+        let cache_name = cache_name("identifier-embeddings", &server.state.config);
+        let load_probe = rkyv_store::test_seams::LoadCacheProbe::new(repo.path(), &cache_name);
+
+        let before = explore_identifier(&server, "load_account", None).await;
+        assert!(before.contains("src/account.rs"), "{before}");
+        assert_eq!(
+            load_probe.count(),
+            1,
+            "the identifier embedding cache should be loaded once at first use"
+        );
+
+        std::fs::write(
+            repo.path().join("src/account.rs"),
+            "pub fn load_account_v2() { /* refreshed account loader */ }\n",
+        )
+        .unwrap();
+        let callback = server.build_tracker_callback();
+        callback(
+            repo.path().to_path_buf(),
+            vec!["src/account.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let after = explore_identifier(&server, "load_account_v2", None).await;
+        assert!(after.contains("load_account_v2"), "{after}");
+        assert_eq!(
+            load_probe.count(),
+            1,
+            "a one-file refresh must reuse the resident identifier cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_file_identifier_refresh_does_not_copy_unchanged_records_or_vectors() {
+        use std::sync::atomic::Ordering;
+
+        let mut stable = String::new();
+        for i in 0..500 {
+            stable.push_str(&format!("pub fn stable_identifier_{i}() {{}}\n"));
+        }
+        let files = [
+            ("src/stable.rs", stable.as_str()),
+            ("src/changed.rs", "pub fn changed_before() {}\n"),
+        ];
+        let (repo, _ollama, server) = identifier_server(&files).await;
+        let before = explore_identifier(&server, "stable_identifier_499", None).await;
+        assert!(before.contains("stable_identifier_499"), "{before}");
+
+        let owner = server.current_ref();
+        owner
+            .identifier_unchanged_records_copied
+            .store(0, Ordering::Relaxed);
+        owner
+            .identifier_resident_vector_elements_copied
+            .store(0, Ordering::Relaxed);
+        std::fs::write(
+            repo.path().join("src/changed.rs"),
+            "pub fn changed_after() {}\n",
+        )
+        .unwrap();
+        server.build_tracker_callback()(
+            repo.path().to_path_buf(),
+            vec!["src/changed.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let after = explore_identifier(&server, "changed_after", None).await;
+        assert!(after.contains("changed_after"), "{after}");
+        assert_eq!(
+            owner
+                .identifier_unchanged_records_copied
+                .load(Ordering::Relaxed),
+            0,
+            "one-file refresh cloned unchanged identifier records"
+        );
+        assert!(
+            owner
+                .identifier_resident_vector_elements_copied
+                .load(Ordering::Relaxed)
+                <= 2,
+            "one-file refresh copied the unchanged corpus vector payload"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_mass_delta_survives_small_delta_during_blocked_rebuild() {
+        use crate::tools::semantic_search::{
+            CachedSearchIndex, EmbedFn, SearchDocument, SemanticSearchOptions,
+            semantic_code_search_owned,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct BlockingWalker {
+            calls: AtomicU32,
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        impl WalkAndIndexFn for BlockingWalker {
+            fn walk_and_index(
+                &self,
+                _root: &std::path::Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                let started = Arc::clone(&self.started);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    if call > 0 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    let docs = (0..25)
+                        .map(|i| {
+                            let content = if call > 0 && i < 6 {
+                                "blocked mass refresh needle"
+                            } else {
+                                "original content"
+                            };
+                            SearchDocument::new(
+                                format!("src/file_{i}.rs"),
+                                String::new(),
+                                vec![],
+                                vec![],
+                                content.to_string(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let vectors = vec![Some(vec![1.0, 0.0]); docs.len()];
+                    Ok((docs, vectors))
+                })
+            }
+        }
+        struct FixedEmbedder;
+        impl EmbedFn for FixedEmbedder {
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0, 0.0]]) })
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let walker: Arc<dyn WalkAndIndexFn> = Arc::new(BlockingWalker {
+            calls: AtomicU32::new(0),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let cache = Arc::new(RwLock::new(None));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let options = SemanticSearchOptions {
+            root_dir: std::path::PathBuf::from("/tmp"),
+            query: "blocked mass refresh needle".to_string(),
+            top_k: Some(5),
+            semantic_weight: Some(0.0),
+            keyword_weight: Some(1.0),
+            min_semantic_score: None,
+            min_keyword_score: Some(0.01),
+            min_combined_score: None,
+            require_keyword_match: Some(true),
+            require_semantic_match: Some(false),
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+            scope: None,
+        };
+        semantic_code_search_owned(
+            options.clone(),
+            &FixedEmbedder,
+            Arc::clone(&walker),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+        let previous = cache.read().await.as_ref().cloned().unwrap();
+        let mass_docs = (0..6)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/file_{i}.rs"),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    "blocked mass refresh needle".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!CachedSearchIndex::refresh_paths(
+            cache.write().await.as_mut().unwrap(),
+            std::path::Path::new("/tmp"),
+            mass_docs,
+            vec![Some(vec![1.0, 0.0]); 6],
+            &[],
+            1,
+        ));
+        generation.store(1, Ordering::Release);
+
+        semantic_code_search_owned(
+            options.clone(),
+            &FixedEmbedder,
+            Arc::clone(&walker),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+        started.notified().await;
+        assert!(CachedSearchIndex::refresh_paths(
+            cache.write().await.as_mut().unwrap(),
+            std::path::Path::new("/tmp"),
+            vec![SearchDocument::new(
+                "src/file_24.rs".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "concurrent small delta".to_string(),
+            )],
+            vec![Some(vec![1.0, 0.0])],
+            &[],
+            2,
+        ));
+        generation.store(2, Ordering::Release);
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while previous.rebuild_in_progress.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background rebuild did not finish");
+
+        let result = semantic_code_search_owned(
+            options,
+            &FixedEmbedder,
+            walker,
+            Some(cache),
+            Some(generation),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.contains("src/file_0.rs"),
+            "the small delta replaced the rebuild base and discarded pending mass changes: {result}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lexical_one_file_update_keeps_previous_index_available_to_readers() {
+        let owned: Vec<_> = (0..100)
+            .map(|i| {
+                (
+                    format!("src/file_{i}.rs"),
+                    format!("pub fn lexical_symbol_{i}() {{}}\n"),
+                )
+            })
+            .collect();
+        let borrowed: Vec<_> = owned
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        let (repo, _ollama, server) = identifier_server(&borrowed).await;
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("lexical_symbol_0"));
+        server.handle_lexical_search(args.clone()).await.unwrap();
+
+        std::fs::write(
+            repo.path().join("src/file_0.rs"),
+            "pub fn lexical_replacement() {}\n",
+        )
+        .unwrap();
+        server.build_tracker_callback()(
+            repo.path().to_path_buf(),
+            vec!["src/file_0.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let pause = crate::tools::lexical_search::test_seams::pause_next_update();
+        let updating_server = server.clone();
+        let update = tokio::spawn(async move {
+            updating_server.handle_lexical_search(args).await.unwrap();
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pause.wait_until_entered(),
+        )
+        .await
+        .expect("lexical delta did not reach the update seam");
+
+        let cache = Arc::clone(&server.current_ref().lexical_search_cache);
+        let reader_available =
+            tokio::time::timeout(std::time::Duration::from_millis(100), cache.read())
+                .await
+                .is_ok();
+        pause.release();
+        update.await.unwrap();
+
+        assert!(
+            reader_available,
+            "a one-file lexical update held the cache write lock during posting maintenance"
         );
     }
 
@@ -5614,8 +6446,8 @@ mod tests {
 
     fn expired_empty_identifier_index(file_count: usize) -> Arc<IdentifierIndex> {
         Arc::new(IdentifierIndex {
-            docs: Vec::new(),
-            vector_buffer: Vec::new(),
+            docs: Vec::new().into(),
+            vector_buffer: Vec::new().into(),
             dims: 0,
             file_count,
             built_at: Instant::now()
@@ -8861,8 +9693,8 @@ mod tests {
             let ref_index = server.current_ref();
             let mut guard = ref_index.identifier_index.write().await;
             *guard = Some(Arc::new(IdentifierIndex {
-                docs: vec![doc],
-                vector_buffer: Vec::new(),
+                docs: vec![doc].into(),
+                vector_buffer: Vec::new().into(),
                 dims: 0,
                 file_count,
                 built_at: Instant::now(),
@@ -10236,7 +11068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_background_fill_invalidates_vectorless_search_index() {
+    async fn semantic_background_fill_updates_warm_index_without_full_rebuild() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -10291,6 +11123,15 @@ mod tests {
             !text_of(&before).contains("target.rs"),
             "a vectorless target must not satisfy a semantic-only query"
         );
+        let warm = server
+            .current_ref()
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("the partial query must leave a warm SearchIndex");
+        let rebuilds_before = warm.index.full_rebuild_count();
 
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -10300,21 +11141,31 @@ mod tests {
                 .read()
                 .await
                 .contains_key("target.rs");
-            let index_invalidated = server
-                .current_ref()
-                .search_index_cache
-                .read()
-                .await
-                .is_none();
-            if vector_ready && index_invalidated {
+            let fill_finished =
+                !crate::server_adapters::test_seams::fill_running(&server.current_ref()).await;
+            if vector_ready && fill_finished {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "fill did not cache the vector and invalidate the SearchIndex"
+                "fill did not cache the vector and finish"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        let after_fill = server
+            .current_ref()
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("a one-file fill must retain the warm SearchIndex");
+        assert_eq!(
+            after_fill.index.full_rebuild_count(),
+            rebuilds_before,
+            "a one-file fill must be routed through an incremental delta"
+        );
 
         let after = server
             .handle_semantic_code_search(semantic_args("needle"))
@@ -10322,8 +11173,21 @@ mod tests {
             .unwrap();
         assert!(
             text_of(&after).contains("1. target.rs"),
-            "the rebuilt index must rank the newly filled vector: {}",
+            "the incrementally updated index must rank the newly filled vector: {}",
             text_of(&after)
+        );
+        assert_eq!(
+            server
+                .current_ref()
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .index
+                .full_rebuild_count(),
+            rebuilds_before,
+            "the visibility query must not rebuild the full index"
         );
     }
 

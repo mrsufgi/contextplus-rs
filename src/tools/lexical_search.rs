@@ -9,6 +9,7 @@
 //! No external dependencies — pure Rust, no I/O, no async.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::tools::semantic_search::{SearchDocument, split_camel_case};
 
@@ -111,14 +112,82 @@ pub(crate) fn is_test_intent_token(token: &str) -> bool {
     matches!(token, "test" | "spec" | "fixture")
 }
 
+type PostingList = HashMap<usize, [u32; 4]>;
+
 /// In-process inverted index over a [`SearchDocument`] slice.
+#[derive(Clone)]
 pub struct LexicalIndex {
-    posting: HashMap<String, Vec<(usize, [u32; 4])>>,
+    posting: HashMap<String, Arc<PostingList>>,
     documents: Vec<DocumentFields>,
     average_lengths: [f64; 4],
+    total_lengths: [f64; 4],
+    document_terms: Vec<Arc<Vec<String>>>,
     doc_count: usize,
+    #[cfg(test)]
+    last_update_work: UpdateWork,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UpdateWork {
+    pub(crate) postings_visited: usize,
+    pub(crate) documents_visited: usize,
+}
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn slot() -> &'static Mutex<Option<Arc<Pause>>> {
+        static SLOT: OnceLock<Mutex<Option<Arc<Pause>>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(crate) struct Pause {
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl Pause {
+        pub(crate) async fn wait_until_entered(&self) {
+            while !self.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        pub(crate) fn release(&self) {
+            self.released.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    pub(crate) fn pause_next_update() -> Arc<Pause> {
+        let pause = Arc::new(Pause {
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *slot().lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) fn before_update() {
+        let pause = slot().lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.store(true, Ordering::Release);
+            while !pause.released.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 struct DocumentFields {
     lengths: [u32; 4],
     prior: f64,
@@ -152,9 +221,10 @@ impl LexicalIndex {
     ///
     /// Records separate path, definition-name, header and body frequencies.
     pub fn build(docs: &[SearchDocument]) -> Self {
-        let mut posting: HashMap<String, Vec<(usize, [u32; 4])>> = HashMap::new();
+        let mut posting: HashMap<String, Arc<PostingList>> = HashMap::new();
         let mut documents = Vec::with_capacity(docs.len());
         let mut average_lengths = [0.0; 4];
+        let mut document_terms = Vec::with_capacity(docs.len());
 
         for (idx, doc) in docs.iter().enumerate() {
             let symbols = doc.symbols.join(" ");
@@ -170,8 +240,9 @@ impl LexicalIndex {
                 }
                 average_lengths[field] += f64::from(lengths[field]);
             }
+            document_terms.push(Arc::new(terms.keys().cloned().collect()));
             for (token, counts) in terms {
-                posting.entry(token).or_default().push((idx, counts));
+                Arc::make_mut(posting.entry(token).or_default()).insert(idx, counts);
             }
             let classification = classify_path_prior(&doc.path);
             let is_test = classification.is_test_like;
@@ -182,6 +253,7 @@ impl LexicalIndex {
                 is_test,
             });
         }
+        let total_lengths = average_lengths;
         for length in &mut average_lengths {
             *length = if docs.is_empty() {
                 1.0
@@ -193,8 +265,88 @@ impl LexicalIndex {
             posting,
             documents,
             average_lengths,
+            total_lengths,
+            document_terms,
             doc_count: docs.len(),
+            #[cfg(test)]
+            last_update_work: UpdateWork::default(),
         }
+    }
+
+    pub(crate) fn update_documents(
+        &mut self,
+        updates: Vec<(usize, SearchDocument)>,
+        deleted: &[usize],
+    ) {
+        #[cfg(test)]
+        {
+            self.last_update_work = UpdateWork::default();
+            test_seams::before_update();
+        }
+        let affected: std::collections::HashSet<usize> = deleted
+            .iter()
+            .copied()
+            .chain(updates.iter().map(|(i, _)| *i))
+            .collect();
+        #[cfg(test)]
+        let mut postings_visited = 0;
+        for &i in &affected {
+            if i < self.documents.len() {
+                #[cfg(test)]
+                {
+                    self.last_update_work.documents_visited += 1;
+                }
+                for term in Arc::make_mut(&mut self.document_terms[i]).drain(..) {
+                    if let Some(entries) = self.posting.get_mut(&term) {
+                        #[cfg(test)]
+                        {
+                            postings_visited += 1;
+                        }
+                        Arc::make_mut(entries).remove(&i);
+                        if entries.is_empty() {
+                            self.posting.remove(&term);
+                        }
+                    }
+                }
+                for (total, length) in self.total_lengths.iter_mut().zip(self.documents[i].lengths)
+                {
+                    *total -= f64::from(length);
+                }
+                self.documents[i].lengths = [0; 4];
+            }
+        }
+        self.doc_count -= deleted.len();
+        for (i, doc) in updates {
+            let mut single = Self::build(&[doc]);
+            for (total, length) in self.total_lengths.iter_mut().zip(single.total_lengths) {
+                *total += length;
+            }
+            let terms = single.document_terms.remove(0);
+            if i >= self.documents.len() {
+                self.document_terms.push(terms);
+                self.doc_count += 1;
+                self.documents.push(single.documents.remove(0));
+            } else {
+                self.document_terms[i] = terms;
+                self.documents[i] = single.documents.remove(0);
+            }
+            for (term, entries) in single.posting {
+                Arc::make_mut(self.posting.entry(term).or_default()).insert(i, entries[&0]);
+            }
+        }
+        self.average_lengths = self.total_lengths;
+        for total in &mut self.average_lengths {
+            *total = (*total / self.doc_count.max(1) as f64).max(f64::EPSILON);
+        }
+        #[cfg(test)]
+        {
+            self.last_update_work.postings_visited = postings_visited;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_update_work(&self) -> UpdateWork {
+        self.last_update_work
     }
 
     /// Number of documents in the index.
@@ -222,7 +374,7 @@ impl LexicalIndex {
             if let Some(postings) = self.posting.get(token) {
                 let df = postings.len() as f64;
                 let idf = (1.0 + (self.doc_count as f64 - df + 0.5) / (df + 0.5)).ln();
-                for &(doc_idx, counts) in postings {
+                for (&doc_idx, counts) in postings.iter() {
                     let doc = &self.documents[doc_idx];
                     let tf: f64 = (0..4)
                         .map(|field| {
@@ -636,6 +788,45 @@ mod tests {
         ];
         let idx = LexicalIndex::build(&docs);
         assert_eq!(idx.document_count(), 3);
+    }
+
+    #[test]
+    fn one_document_update_only_visits_affected_postings_and_lengths() {
+        let docs: Vec<_> = (0..2_000)
+            .map(|i| {
+                make_doc(
+                    &format!("src/file_{i}.rs"),
+                    &format!("header_{i}"),
+                    &[&format!("symbol_{i}")],
+                    &format!("unique_body_token_{i} shared_token"),
+                )
+            })
+            .collect();
+        let mut index = LexicalIndex::build(&docs);
+
+        index.update_documents(
+            vec![(
+                777,
+                make_doc(
+                    "src/file_777.rs",
+                    "replacement_header",
+                    &["replacement_symbol"],
+                    "replacement_body_token shared_token",
+                ),
+            )],
+            &[],
+        );
+
+        let work = index.last_update_work();
+        assert!(
+            work.postings_visited <= 16,
+            "one-file refresh traversed unrelated posting entries: {work:?}"
+        );
+        assert!(
+            work.documents_visited <= 1,
+            "one-file refresh recomputed lengths across the corpus: {work:?}"
+        );
+        assert_eq!(index.search("replacement_body_token", 1)[0].0, 777);
     }
 
     // -----------------------------------------------------------------------

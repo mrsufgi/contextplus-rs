@@ -1462,6 +1462,68 @@ pub struct VectorStore {
     hnsw_tuning: HnswTuning,
 }
 
+#[cfg(test)]
+pub(crate) mod hnsw_test_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn slot() -> &'static Mutex<Option<Arc<Pause>>> {
+        static SLOT: OnceLock<Mutex<Option<Arc<Pause>>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    struct Pause {
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+
+    pub(crate) struct PauseGuard(Arc<Pause>);
+
+    impl PauseGuard {
+        pub(crate) async fn wait_until_entered(&self) {
+            while !self.0.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        pub(crate) fn release(&self) {
+            self.0.released.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for PauseGuard {
+        fn drop(&mut self) {
+            self.release();
+            let mut slot = slot().lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|pause| Arc::ptr_eq(pause, &self.0))
+            {
+                *slot = None;
+            }
+        }
+    }
+
+    pub(crate) fn pause_next_build() -> PauseGuard {
+        let pause = Arc::new(Pause {
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        *slot().lock().unwrap() = Some(Arc::clone(&pause));
+        PauseGuard(pause)
+    }
+
+    pub(crate) fn before_build() {
+        let pause = slot().lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.store(true, Ordering::Release);
+            while !pause.released.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
 impl VectorStore {
     /// Build a VectorStore from parallel arrays of keys, hashes, and vectors.
     pub fn new(dims: u32, keys: Vec<String>, hashes: Vec<String>, vectors: Vec<f32>) -> Self {
@@ -1721,6 +1783,8 @@ impl VectorStore {
         // Build HNSW index lazily — only once for the lifetime of this VectorStore.
         let tuning = self.hnsw_tuning;
         let index = self.hnsw_index.get_or_init(|| {
+            #[cfg(test)]
+            hnsw_test_seam::before_build();
             let vectors = self.vectors.as_slice();
             let dims = self.dims as usize;
             let n = self.count as usize;
@@ -1758,6 +1822,11 @@ impl VectorStore {
         // Ensure descending similarity order (HNSW returns ascending distance, i.e. descending sim)
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hnsw_is_initialized(&self) -> bool {
+        self.hnsw_index.get().is_some()
     }
 
     /// Brute-force exact nearest neighbor search with SIMD cosine similarity.
