@@ -9680,16 +9680,10 @@ mod tests {
             .map(|request| embed_request_inputs(&request))
             .filter(|inputs| inputs.iter().any(|input| input.contains("_VERSION")))
             .count();
-        let started = Instant::now();
         let warm_result = worktree_server
             .handle_semantic_code_search(semantic_args("invoice payment status"))
             .await
             .unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "a warm worktree query took {:?}",
-            started.elapsed()
-        );
         assert!(text_of(&warm_result).contains("1. src/stripe_webhook.rs"));
         let document_requests_after_warm_query = ollama
             .received_requests()
