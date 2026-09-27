@@ -192,7 +192,7 @@ fn extract_name<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
         .to_string()
 }
 
-/// Extract the first-line signature of a node, capped at 150 chars.
+/// Extract the first-line signature for display and semantic embeddings.
 fn extract_signature<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
     let text = node.utf8_text(source).unwrap_or("");
     let first_line = text.lines().next().unwrap_or("").trim();
@@ -204,6 +204,92 @@ fn extract_signature<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
     } else {
         first_line.to_string()
     }
+}
+
+/// Extract declaration syntax without bodies or comments, capped at 150 bytes.
+fn extract_keyword_signature<'a>(node: &Node<'a>, source: &'a [u8]) -> String {
+    fn excluded_ranges(node: Node<'_>, ranges: &mut Vec<std::ops::Range<usize>>) {
+        if node.kind().contains("comment") {
+            ranges.push(node.byte_range());
+            return;
+        }
+        let body = node.child_by_field_name("body");
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                if body == Some(child) {
+                    ranges.push(child.byte_range());
+                } else {
+                    excluded_ranges(child, ranges);
+                }
+            }
+        }
+    }
+    let mut ranges = Vec::new();
+    excluded_ranges(*node, &mut ranges);
+    let mut text = String::new();
+    let mut start = node.start_byte();
+    for range in ranges {
+        text.push_str(std::str::from_utf8(&source[start..range.start]).unwrap_or(""));
+        text.push(' ');
+        start = range.end;
+    }
+    text.push_str(std::str::from_utf8(&source[start..node.end_byte()]).unwrap_or(""));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first_line = text.trim();
+    if first_line.len() > 150 {
+        format!(
+            "{}...",
+            crate::core::parser::truncate_to_char_boundary(first_line, 150)
+        )
+    } else {
+        first_line.to_string()
+    }
+}
+
+/// Determine visibility from the declaration and its lexical ancestors.
+pub fn identifier_is_exported(content: &str, ext: &str, name: &str, line: usize) -> bool {
+    let Some((grammar, language)) = grammar_for_ext(ext) else {
+        return false;
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return false;
+    };
+    fn find(node: Node<'_>, source: &[u8], grammar: &str, name: &str, line: usize) -> bool {
+        if node.start_position().row + 1 == line
+            && definition_types(grammar)
+                .iter()
+                .any(|(kind, _)| *kind == node.kind())
+            && extract_name(&node, source) == name
+        {
+            let mut ancestor = node.parent();
+            let mut exported = false;
+            while let Some(parent) = ancestor {
+                match parent.kind() {
+                    "export_statement" => exported = true,
+                    "program" | "source_file" | "module" => {}
+                    _ => return false,
+                }
+                ancestor = parent.parent();
+            }
+            return match grammar {
+                "typescript" | "tsx" | "javascript" => exported,
+                "rust" => (0..node.named_child_count()).any(|i| {
+                    node.named_child(i)
+                        .is_some_and(|n| n.kind() == "visibility_modifier")
+                }),
+                _ => true,
+            };
+        }
+        (0..node.named_child_count()).any(|i| {
+            node.named_child(i)
+                .is_some_and(|child| find(child, source, grammar, name, line))
+        })
+    }
+    find(tree.root_node(), content.as_bytes(), grammar, name, line)
 }
 
 /// Return `true` if `node` is a variable/lexical declaration whose binding
@@ -246,6 +332,7 @@ fn collect_symbols(
     def_types: &[(&'static str, &'static str)],
     depth: usize,
     max_depth: usize,
+    keyword_signatures: &mut Option<&mut IdentifierSignatures>,
 ) -> Vec<CodeSymbol> {
     if depth > max_depth {
         return Vec::new();
@@ -270,10 +357,17 @@ fn collect_symbols(
                     def_types,
                     depth + 1,
                     max_depth,
+                    keyword_signatures,
                 ));
             }
         }
 
+        if let Some(signatures) = keyword_signatures {
+            signatures.insert(
+                (extract_name(node, source), node.start_position().row + 1),
+                extract_keyword_signature(node, source),
+            );
+        }
         results.push(CodeSymbol {
             name: extract_name(node, source),
             kind: kind.to_string(),
@@ -286,7 +380,14 @@ fn collect_symbols(
         // Not a definition node — recurse into children at same depth
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i) {
-                results.extend(collect_symbols(&child, source, def_types, depth, max_depth));
+                results.extend(collect_symbols(
+                    &child,
+                    source,
+                    def_types,
+                    depth,
+                    max_depth,
+                    keyword_signatures,
+                ));
             }
         }
     }
@@ -297,6 +398,26 @@ fn collect_symbols(
 /// Parse source code with tree-sitter and extract symbols.
 /// Uses `thread_local!` parser pool since Parser is `!Send` in v0.25.
 pub fn parse_with_tree_sitter(content: &str, ext: &str) -> Result<Vec<CodeSymbol>> {
+    parse_symbols(content, ext, None)
+}
+
+pub type IdentifierSignatures = HashMap<(String, usize), String>;
+
+/// Parse once, keeping semantic text separate from declaration-only keyword evidence.
+pub fn parse_identifier_symbols(
+    content: &str,
+    ext: &str,
+) -> Result<(Vec<CodeSymbol>, IdentifierSignatures)> {
+    let mut signatures = HashMap::new();
+    let symbols = parse_symbols(content, ext, Some(&mut signatures))?;
+    Ok((symbols, signatures))
+}
+
+fn parse_symbols(
+    content: &str,
+    ext: &str,
+    mut keyword_signatures: Option<&mut IdentifierSignatures>,
+) -> Result<Vec<CodeSymbol>> {
     let (grammar_name, language) = grammar_for_ext(ext)
         .ok_or_else(|| ContextPlusError::TreeSitter(format!("unsupported extension: {}", ext)))?;
 
@@ -321,7 +442,7 @@ pub fn parse_with_tree_sitter(content: &str, ext: &str) -> Result<Vec<CodeSymbol
 
         let root = tree.root_node();
         let source = content.as_bytes();
-        let symbols = collect_symbols(&root, source, def_types, 0, 3);
+        let symbols = collect_symbols(&root, source, def_types, 0, 3, &mut keyword_signatures);
         Ok(symbols)
     })
 }
@@ -382,6 +503,7 @@ fn collect_imports_from_node(
     source: &[u8],
     grammar_name: &str,
     imports: &mut Vec<String>,
+    include_types: bool,
 ) {
     match grammar_name {
         "typescript" | "tsx" | "javascript" => {
@@ -392,7 +514,7 @@ fn collect_imports_from_node(
                 // create a runtime dependency. Keeping them in the graph
                 // produces false-positive cycles (e.g. an application
                 // subscription-domain 3-file SCC).
-                if is_type_only_ts_import(&node) {
+                if !include_types && is_type_only_ts_import(&node) {
                     return;
                 }
                 if let Some(source_node) = node.child_by_field_name("source")
@@ -516,7 +638,7 @@ fn collect_imports_from_node(
     // Recurse into children
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            collect_imports_from_node(child, source, grammar_name, imports);
+            collect_imports_from_node(child, source, grammar_name, imports, include_types);
         }
     }
 }
@@ -606,7 +728,7 @@ pub fn extract_imports(path: &Path) -> Vec<String> {
             let root = tree.root_node();
             let source = content.as_bytes();
             let mut imports = Vec::new();
-            collect_imports_from_node(root, source, grammar_name, &mut imports);
+            collect_imports_from_node(root, source, grammar_name, &mut imports, false);
             imports
         })
     });
@@ -623,6 +745,14 @@ pub fn extract_imports(path: &Path) -> Vec<String> {
 
 /// Extract import paths from source code string (for testing or when content is already loaded).
 pub fn extract_imports_from_str(content: &str, ext: &str) -> Vec<String> {
+    extract_imports_with_types(content, ext, false)
+}
+
+pub fn extract_identifier_imports(content: &str, ext: &str) -> Vec<String> {
+    extract_imports_with_types(content, ext, true)
+}
+
+fn extract_imports_with_types(content: &str, ext: &str, include_types: bool) -> Vec<String> {
     let (grammar_name, language) = match grammar_for_ext(ext) {
         Some(g) => g,
         None => return extract_imports_regex(content),
@@ -641,7 +771,7 @@ pub fn extract_imports_from_str(content: &str, ext: &str) -> Vec<String> {
             let root = tree.root_node();
             let source = content.as_bytes();
             let mut imports = Vec::new();
-            collect_imports_from_node(root, source, grammar_name, &mut imports);
+            collect_imports_from_node(root, source, grammar_name, &mut imports, include_types);
             imports
         })
     });

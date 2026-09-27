@@ -6,23 +6,40 @@ use std::path::{Path, PathBuf};
 /// Resolve a raw import specifier to an absolute file path.
 /// Returns None for external imports (npm packages, node builtins).
 pub fn resolve_import(import_path: &str, importing_file: &Path) -> Option<PathBuf> {
+    resolve_import_with(import_path, importing_file, Path::is_file)
+}
+
+pub(crate) fn resolve_import_with(
+    import_path: &str,
+    importing_file: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     // Skip non-relative imports (external packages)
     if !import_path.starts_with('.') {
         return None;
     }
 
     let dir = importing_file.parent()?;
-    let base = dir.join(import_path);
+    let mut base = PathBuf::new();
+    for component in dir.join(import_path).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                base.pop();
+            }
+            other => base.push(other.as_os_str()),
+        }
+    }
 
     // Try exact path first
-    if base.is_file() {
+    if exists(&base) {
         return Some(base);
     }
 
     // Try with extensions
     for ext in &[".ts", ".tsx", ".js", ".jsx", ".go", ".rs"] {
         let with_ext = base.with_extension(&ext[1..]);
-        if with_ext.is_file() {
+        if exists(&with_ext) {
             return Some(with_ext);
         }
     }
@@ -30,7 +47,7 @@ pub fn resolve_import(import_path: &str, importing_file: &Path) -> Option<PathBu
     // Try as directory with index file
     for index in &["index.ts", "index.tsx", "index.js", "index.jsx"] {
         let index_path = base.join(index);
-        if index_path.is_file() {
+        if exists(&index_path) {
             return Some(index_path);
         }
     }

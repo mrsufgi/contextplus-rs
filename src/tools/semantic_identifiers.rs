@@ -6,7 +6,7 @@
 //! - Finds and ranks call-sites for each top identifier
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -71,28 +71,15 @@ pub struct IdentifierDoc {
     pub signature: String,
     pub parent_name: Option<String>,
     pub text: String,
-    /// Pre-computed token set over `name + signature + path + header`, plus
-    /// the whole lowercased `name` (see `build_token_set`).
-    ///
-    /// Built once at index time; eliminates one
-    /// `format!` allocation and one re-tokenization per doc per query in
-    /// the hot `score_identifiers` loop.
-    pub token_set: HashSet<String>,
+    pub name_token_set: HashSet<String>,
+    pub signature_token_set: HashSet<String>,
+    pub parent_token_set: HashSet<String>,
 }
 
 impl IdentifierDoc {
-    /// Build the pre-computed `token_set` from the four fields used in keyword
-    /// scoring.  Call this once at index time; never call inside a query loop.
-    pub fn build_token_set(
-        name: &str,
-        signature: &str,
-        path: &str,
-        header: &str,
-    ) -> HashSet<String> {
-        let combined = format!("{name} {signature} {path} {header}");
-        let mut tokens: HashSet<String> = split_camel_case(&combined).into_iter().collect();
-        tokens.extend(whole_identifiers(name));
-        tokens
+    /// Build one field's keyword evidence once, while constructing the index.
+    pub fn evidence_tokens(text: &str) -> HashSet<String> {
+        identifier_terms(text)
     }
 }
 
@@ -253,9 +240,7 @@ pub fn escape_regex(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Tokenize `input` with `identifier_terms` then delegate to
-/// `scoring::keyword_coverage`.  Identifier search always needs to tokenize
-/// the document string on the fly (unlike file-level search, which
-/// pre-computes token sets at index time).
+/// `scoring::keyword_coverage` for uncached call-site snippets.
 fn get_keyword_coverage(query_terms: &HashSet<String>, input: &str) -> f64 {
     keyword_coverage(query_terms, &identifier_terms(input))
 }
@@ -270,7 +255,7 @@ fn whole_identifiers(text: &str) -> impl Iterator<Item = String> + '_ {
 
 /// camelCase / snake_case parts plus each whole identifier, so a query naming
 /// `selectableScopes` only fully matches an identifier with that exact name.
-fn identifier_terms(text: &str) -> HashSet<String> {
+pub(crate) fn identifier_terms(text: &str) -> HashSet<String> {
     let mut terms: HashSet<String> = split_camel_case(text).into_iter().collect();
     terms.extend(whole_identifiers(text));
     terms
@@ -331,14 +316,14 @@ pub fn rank_call_sites(
         }
     };
 
-    // Cap: only gather enough candidates to fill the embed budget.
-    // Using a hard ceiling avoids unbounded Vec growth when a common symbol
-    // name matches thousands of lines — we only need the top `embed_budget`
-    // by keyword score, so stop collecting once we have far more than that.
     let embed_budget = (limit * 4).max(30);
-    // Collect 4× the embed_budget before applying the top-k filter, giving a
-    // good statistical sample without scanning the entire tail of matches.
-    let candidate_cap = embed_budget * 4;
+    let externally_visible = file_content.get(&symbol.path).is_some_and(|content| {
+        let ext = Path::new(&symbol.path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        crate::core::tree_sitter::identifier_is_exported(content, ext, &symbol.name, symbol.line)
+    });
 
     // Lazy per-file line-split: only files that pass the cheap substring
     // pre-filter on the full content get split. This avoids splitting every
@@ -351,10 +336,26 @@ pub fn rank_call_sites(
     let mut candidates: Vec<(usize, usize, usize, f64)> = Vec::new();
     let mut keyword_buf = String::with_capacity(512);
 
-    'outer: for (file, content) in file_content.iter() {
+    for (file, content) in file_content.iter() {
         // Fast pre-filter on the full file content (no allocation, no split):
         // skip files that don't contain the symbol name at all.
         if !content.contains(symbol.name.as_str()) {
+            continue;
+        }
+        let ext = Path::new(file)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        if !crate::core::tree_sitter::get_supported_extensions()
+            .iter()
+            .any(|supported| supported.trim_start_matches('.') == ext)
+        {
+            continue;
+        }
+        if *file != symbol.path
+            && (!externally_visible
+                || !imports_definition(file, content, ext, symbol, file_content))
+        {
             continue;
         }
 
@@ -368,7 +369,15 @@ pub fn rank_call_sites(
         let lines = &file_entries[fi].1;
 
         for (i, line) in lines.iter().enumerate() {
-            if !call_pattern.is_match(line) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("import ")
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with('#')
+                || !call_pattern.is_match(line)
+            {
                 continue;
             }
             // Skip the symbol's own definition line
@@ -388,13 +397,6 @@ pub fn rank_call_sites(
             keyword_buf.push_str(context);
             let keyword_score = get_keyword_coverage(query_terms, &keyword_buf);
             candidates.push((fi, i + 1, i, keyword_score));
-
-            // Hard cap: once we have enough candidates to fill a good sample
-            // for the embed budget, stop collecting. This prevents O(N) growth
-            // for common symbol names with thousands of matches.
-            if candidates.len() >= candidate_cap {
-                break 'outer;
-            }
         }
     }
 
@@ -456,6 +458,74 @@ pub fn rank_call_sites(
     }
 }
 
+fn imports_definition(
+    file: &str,
+    content: &str,
+    ext: &str,
+    symbol: &IdentifierDoc,
+    files: &HashMap<String, Arc<String>>,
+) -> bool {
+    crate::core::tree_sitter::extract_identifier_imports(content, ext)
+        .iter()
+        .filter_map(|import| {
+            if ext == "rs" {
+                return resolve_rust_identifier_import(import, file, files);
+            }
+            crate::core::import_resolver::resolve_import_with(import, Path::new(file), |path| {
+                files.contains_key(&path.to_string_lossy().into_owned())
+            })
+        })
+        .any(|path| path == Path::new(&symbol.path))
+}
+
+fn resolve_rust_identifier_import(
+    import: &str,
+    file: &str,
+    files: &HashMap<String, Arc<String>>,
+) -> Option<PathBuf> {
+    let mut parts = import.split("::").peekable();
+    let mut base = Path::new(file).parent()?.to_path_buf();
+    if matches!(parts.peek().copied(), Some("self" | "super")) {
+        let stem = Path::new(file).file_stem()?.to_str()?;
+        if !matches!(stem, "lib" | "main" | "mod") {
+            base.push(stem);
+        }
+    }
+    match parts.peek().copied()? {
+        "crate" => {
+            parts.next();
+            while base.file_name().is_some_and(|name| name != "src") {
+                if !base.pop() {
+                    return None;
+                }
+            }
+        }
+        "self" => {
+            parts.next();
+        }
+        "super" => {
+            while parts.peek() == Some(&"super") {
+                parts.next();
+                base.pop();
+            }
+        }
+        _ => return None,
+    }
+    let mut resolved = None;
+    for part in parts {
+        if part.starts_with('{') || part == "*" {
+            break;
+        }
+        base.push(part.split_whitespace().next()?);
+        for candidate in [base.with_extension("rs"), base.join("mod.rs")] {
+            if files.contains_key(&candidate.to_string_lossy().into_owned()) {
+                resolved = Some(candidate);
+            }
+        }
+    }
+    resolved
+}
+
 /// Trait for providing pre-computed vectors for call-site text.
 pub trait CallSiteVectorProvider {
     fn get_vector(&self, text: &str) -> Option<Vec<f32>>;
@@ -480,11 +550,40 @@ pub fn score_identifiers(
     keyword_weight: f64,
     top_k: usize,
 ) -> Vec<RankedIdentifier> {
+    score_identifier_candidates(
+        docs,
+        query_vec,
+        query_terms,
+        vector_buffer,
+        vector_dims,
+        include_kinds,
+        semantic_weight,
+        keyword_weight,
+        top_k,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_identifier_candidates(
+    docs: &[IdentifierDoc],
+    query_vec: &[f32],
+    query_terms: &HashSet<String>,
+    vector_buffer: &[f32],
+    vector_dims: usize,
+    include_kinds: &Option<HashSet<String>>,
+    semantic_weight: f64,
+    keyword_weight: f64,
+    top_k: usize,
+    candidates: Option<&[usize]>,
+) -> Vec<RankedIdentifier> {
     // Phase 1: Score all docs, collecting only indices + scores (no clone).
-    let mut scored: Vec<(usize, f64, f64, f64)> = docs
-        .par_iter()
-        .enumerate()
-        .filter_map(|(i, doc)| {
+    let mut scored: Vec<(usize, f64, f64, f64)> = (0..candidates
+        .map_or(docs.len(), <[usize]>::len))
+        .into_par_iter()
+        .filter_map(|position| {
+            let i = candidates.map_or(position, |indices| indices[position]);
+            let doc = &docs[i];
             if let Some(kinds) = include_kinds
                 && !kinds.contains(&doc.kind_lower)
             {
@@ -500,7 +599,18 @@ pub fn score_identifiers(
                 crate::core::embeddings::cosine_similarity_simsimd(query_vec, vec_slice).max(0.0)
                     as f64;
 
-            let keyword_score = keyword_coverage(query_terms, &doc.token_set);
+            let name_score = keyword_coverage(query_terms, &doc.name_token_set);
+            let signature_score = keyword_coverage(query_terms, &doc.signature_token_set);
+            let parent_score = keyword_coverage(query_terms, &doc.parent_token_set);
+            let keyword_score = if name_score > 0.0 || signature_score > 0.0 {
+                let evidence = name_score.max(signature_score * 0.6);
+                evidence + (1.0 - evidence) * parent_score * 0.3
+            } else {
+                0.0
+            };
+            if semantic_weight == 0.0 && keyword_weight > 0.0 && keyword_score == 0.0 {
+                return None;
+            }
 
             let total_weight = semantic_weight + keyword_weight;
             let score = if total_weight > 0.0 {
@@ -615,6 +725,7 @@ pub fn format_identifier_results(
 
 /// Run semantic identifier search.
 /// Caller provides pre-built identifier index data and embedding functions.
+#[allow(clippy::too_many_arguments)]
 pub async fn semantic_identifier_search(
     options: SemanticIdentifierSearchOptions,
     embed_fn: &dyn crate::tools::semantic_search::EmbedFn,
@@ -622,6 +733,7 @@ pub async fn semantic_identifier_search(
     vector_buffer: &[f32],
     vector_dims: usize,
     file_content: &HashMap<String, Arc<String>>,
+    candidates: Option<&[usize]>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
     if query.is_empty() {
@@ -651,7 +763,7 @@ pub async fn semantic_identifier_search(
     let query_terms = identifier_terms(query.as_ref());
 
     // Score identifiers
-    let top = score_identifiers(
+    let top = score_identifier_candidates(
         identifier_docs,
         &query_vec,
         &query_terms,
@@ -661,6 +773,7 @@ pub async fn semantic_identifier_search(
         semantic_weight,
         keyword_weight,
         top_k,
+        candidates,
     );
 
     if top.is_empty() {
@@ -812,7 +925,9 @@ mod tests {
             signature: sig.to_string(),
             parent_name: None,
             text: format!("{name} {kind} {sig} {path}"),
-            token_set: IdentifierDoc::build_token_set(name, sig, path, ""),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms(name),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(sig),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
         let docs = vec![
             make_doc(
@@ -842,6 +957,259 @@ mod tests {
         );
         assert_eq!(results[0].doc.name, "selectableScopes");
         assert!(results[0].keyword_score > results[1].keyword_score);
+    }
+
+    fn keyword_test_doc(
+        name: &str,
+        signature: &str,
+        parent_name: Option<&str>,
+        header: &str,
+        text: &str,
+        line: usize,
+    ) -> IdentifierDoc {
+        IdentifierDoc {
+            id: format!("src/grants.ts:{name}:{line}"),
+            path: "src/grants.ts".to_string(),
+            header: header.to_string(),
+            name: name.to_string(),
+            kind: "const".to_string(),
+            kind_lower: "const".to_string(),
+            line,
+            end_line: line,
+            signature: signature.to_string(),
+            parent_name: parent_name.map(str::to_string),
+            text: text.to_string(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms(name),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(signature),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                (parent_name.map(str::to_string)).as_deref().unwrap_or(""),
+            ),
+        }
+    }
+
+    #[test]
+    fn keyword_score_prefers_name_over_signature_and_partial_name() {
+        let docs = vec![
+            keyword_test_doc(
+                "cascadeGrants",
+                "const cascadeGrants = resolve();",
+                None,
+                "",
+                "const cascadeGrants = resolve();",
+                1,
+            ),
+            keyword_test_doc(
+                "applyPolicy",
+                "const applyPolicy = (input: CascadeGrants) => input;",
+                None,
+                "",
+                "const applyPolicy = (input: CascadeGrants) => input;",
+                2,
+            ),
+            keyword_test_doc(
+                "cascadeWorker",
+                "const cascadeWorker = resolve();",
+                None,
+                "",
+                "const cascadeWorker = resolve();",
+                3,
+            ),
+        ];
+        let results = score_identifiers(
+            &docs,
+            &[1.0],
+            &identifier_terms("cascade grants"),
+            &[1.0, 1.0, 1.0],
+            1,
+            &None,
+            0.0,
+            1.0,
+            docs.len(),
+        );
+        let score = |name: &str| {
+            results
+                .iter()
+                .find(|result| result.doc.name == name)
+                .unwrap()
+                .keyword_score
+        };
+
+        assert!(
+            score("cascadeGrants") > score("applyPolicy"),
+            "an exact name match must outrank signature-only evidence: {results:?}"
+        );
+        assert!(
+            score("cascadeGrants") > score("cascadeWorker"),
+            "a full name match must outrank a single-part name match: {results:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_score_requires_name_or_signature_evidence_before_parent_context() {
+        let docs = vec![
+            keyword_test_doc(
+                "execute",
+                "const execute = () => {};",
+                Some("CascadeCoordinator"),
+                "",
+                "const execute = () => {};",
+                1,
+            ),
+            keyword_test_doc(
+                "foreignOrgId",
+                "const foreignOrgId: string;",
+                None,
+                "cascade cleanup helpers",
+                "const foreignOrgId: string;",
+                2,
+            ),
+            keyword_test_doc(
+                "patientId",
+                "const patientId: string;",
+                None,
+                "",
+                "const patientId: string; // cascade cleanup",
+                3,
+            ),
+            keyword_test_doc(
+                "cascadeWorker",
+                "const cascadeWorker = () => {};",
+                Some("GrantCoordinator"),
+                "",
+                "const cascadeWorker = () => {};",
+                4,
+            ),
+            keyword_test_doc(
+                "cascadeTask",
+                "const cascadeTask = () => {};",
+                None,
+                "",
+                "const cascadeTask = () => {};",
+                5,
+            ),
+        ];
+        let results = score_identifiers(
+            &docs,
+            &[1.0],
+            &identifier_terms("cascade grant"),
+            &[1.0; 5],
+            1,
+            &None,
+            1.0,
+            1.0,
+            docs.len(),
+        );
+        let score = |line: usize| {
+            results
+                .iter()
+                .find(|result| result.doc.line == line)
+                .unwrap()
+                .keyword_score
+        };
+
+        assert_eq!(
+            score(1),
+            0.0,
+            "parent-only evidence must not grant execute keyword credit: {results:?}"
+        );
+        assert_eq!(
+            score(2),
+            0.0,
+            "module comments/header text must not contribute keyword evidence"
+        );
+        assert_eq!(
+            score(3),
+            0.0,
+            "identifier body text must not contribute keyword evidence"
+        );
+        assert!(
+            score(4) > score(5),
+            "parent context should improve rank only after name/signature evidence passes the gate: {results:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_only_scoring_excludes_parent_only_candidate() {
+        let docs = vec![
+            keyword_test_doc(
+                "execute",
+                "const execute = () => {};",
+                Some("CascadeCoordinator"),
+                "",
+                "const execute = () => {};",
+                1,
+            ),
+            keyword_test_doc(
+                "cascadeGrants",
+                "const cascadeGrants = () => {};",
+                None,
+                "",
+                "const cascadeGrants = () => {};",
+                2,
+            ),
+        ];
+        let results = score_identifiers(
+            &docs,
+            &[1.0],
+            &identifier_terms("cascade"),
+            &[1.0, 1.0],
+            1,
+            &None,
+            0.0,
+            1.0,
+            docs.len(),
+        );
+
+        assert!(
+            results
+                .iter()
+                .any(|result| result.doc.name == "cascadeGrants"),
+            "name evidence should remain eligible: {results:?}"
+        );
+        assert!(
+            results.iter().all(|result| result.doc.name != "execute"),
+            "parent-only execute must be absent from keyword-only results: {results:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_only_scoring_drops_identifiers_without_identifier_evidence() {
+        let docs = vec![
+            keyword_test_doc(
+                "cascadeGrants",
+                "const cascadeGrants = resolve();",
+                None,
+                "",
+                "const cascadeGrants = resolve();",
+                1,
+            ),
+            keyword_test_doc(
+                "userId",
+                "const userId: string;",
+                None,
+                "",
+                "const userId: string; // cascade grants are recalculated here",
+                2,
+            ),
+        ];
+        let results = score_identifiers(
+            &docs,
+            &[1.0],
+            &identifier_terms("cascade grants"),
+            &[1.0, 1.0],
+            1,
+            &None,
+            0.0,
+            1.0,
+            docs.len(),
+        );
+
+        assert_eq!(
+            results.len(),
+            1,
+            "keyword-only search must omit zero-evidence identifiers: {results:?}"
+        );
+        assert_eq!(results[0].doc.name, "cascadeGrants");
     }
 
     // -- vector_norm tests --
@@ -888,7 +1256,11 @@ mod tests {
                 parent_name: None,
                 text: "getUserById function getUserById(id: string): User src/user.ts user service"
                     .to_string(),
-                token_set: HashSet::new(),
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms("getUserById"),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    "getUserById(id: string): User",
+                ),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
             },
             IdentifierDoc {
                 id: "src/db.ts:connect:5".to_string(),
@@ -902,7 +1274,11 @@ mod tests {
                 signature: "connect(): Connection".to_string(),
                 parent_name: None,
                 text: "connect function connect(): Connection src/db.ts database".to_string(),
-                token_set: HashSet::new(),
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms("connect"),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    "connect(): Connection",
+                ),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
             },
         ];
 
@@ -945,7 +1321,11 @@ mod tests {
                 signature: "class User".to_string(),
                 parent_name: None,
                 text: "User class".to_string(),
-                token_set: HashSet::new(),
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms("User"),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    "class User",
+                ),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
             },
             IdentifierDoc {
                 id: "src/user.ts:getUser:25".to_string(),
@@ -959,7 +1339,11 @@ mod tests {
                 signature: "getUser(): User".to_string(),
                 parent_name: None,
                 text: "getUser function".to_string(),
-                token_set: HashSet::new(),
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms("getUser"),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    "getUser(): User",
+                ),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
             },
         ];
 
@@ -989,25 +1373,29 @@ mod tests {
     #[test]
     fn test_rank_call_sites_basic() {
         let symbol = IdentifierDoc {
-            id: "src/user.ts:getUserById:10".to_string(),
+            id: "src/user.ts:getUserById:3".to_string(),
             path: "src/user.ts".to_string(),
             header: "user service".to_string(),
             name: "getUserById".to_string(),
             kind: "function".to_string(),
             kind_lower: "function".to_string(),
-            line: 10,
-            end_line: 25,
+            line: 3,
+            end_line: 5,
             signature: "getUserById(id: string): User".to_string(),
             parent_name: None,
             text: "getUserById function".to_string(),
-            token_set: HashSet::new(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("getUserById"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                "getUserById(id: string): User",
+            ),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
 
         let file_content: HashMap<String, Arc<String>> = [
             (
                 "src/user.ts".to_string(),
                 Arc::new(
-                    "import something\n// user service\nexport function getUserById(id: string): User {\n  return db.query(id);\n}".to_string(),
+                    "import something from './something';\n// user service\nexport function getUserById(id: string): User {\n  return db.query(id);\n}".to_string(),
                 ),
             ),
             (
@@ -1045,7 +1433,9 @@ mod tests {
             signature: "myFunc()".to_string(),
             parent_name: None,
             text: "myFunc function".to_string(),
-            token_set: HashSet::new(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("myFunc"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms("myFunc()"),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
 
         let file_content: HashMap<String, Arc<String>> = [(
@@ -1076,7 +1466,9 @@ mod tests {
             signature: "noMatch()".to_string(),
             parent_name: None,
             text: "noMatch".to_string(),
-            token_set: HashSet::new(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("noMatch"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms("noMatch()"),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
         let file_content: HashMap<String, Arc<String>> = [(
             "other.ts".to_string(),
@@ -1090,6 +1482,122 @@ mod tests {
         let result = rank_call_sites(&query_terms, &query_vec, &symbol, &file_content, 10, None);
         assert_eq!(result.total, 0);
         assert!(result.sites.is_empty());
+    }
+
+    fn temp_repo_content(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, HashMap<String, Arc<String>>) {
+        let repo = tempfile::tempdir().unwrap();
+        let mut content = HashMap::new();
+        for (path, source) in files {
+            let full_path = repo.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(&full_path, source).unwrap();
+            content.insert((*path).to_string(), Arc::new((*source).to_string()));
+        }
+        (repo, content)
+    }
+
+    #[test]
+    fn local_identifier_calls_stay_within_the_defining_file() {
+        let (_repo, file_content) = temp_repo_content(&[
+            (
+                "src/a.ts",
+                "function run() {\n  const pending = begin();\n  if (pending) consume(pending);\n}\n",
+            ),
+            (
+                "src/b.ts",
+                "// pending is discussed here but is unrelated\n",
+            ),
+            (
+                "src/c.ts",
+                "function other() {\n  const pending = otherWork();\n  return pending;\n}\n",
+            ),
+            ("README.md", "The pending value is documented here.\n"),
+        ]);
+        let symbol = IdentifierDoc {
+            id: "src/a.ts:pending:2".to_string(),
+            path: "src/a.ts".to_string(),
+            header: String::new(),
+            name: "pending".to_string(),
+            kind: "const".to_string(),
+            kind_lower: "const".to_string(),
+            line: 2,
+            end_line: 2,
+            signature: "const pending = begin();".to_string(),
+            parent_name: Some("run".to_string()),
+            text: "pending const const pending = begin(); run".to_string(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("pending"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                "const pending = begin();",
+            ),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                (Some("run".to_string())).as_deref().unwrap_or(""),
+            ),
+        };
+
+        let result = rank_call_sites(
+            &identifier_terms("pending"),
+            &[1.0],
+            &symbol,
+            &file_content,
+            10,
+            None,
+        );
+        let files: HashSet<&str> = result.sites.iter().map(|site| site.file.as_str()).collect();
+
+        assert_eq!(result.total, 1, "resolved calls were {:#?}", result.sites);
+        assert_eq!(files, HashSet::from(["src/a.ts"]));
+    }
+
+    #[test]
+    fn exported_identifier_calls_require_an_import_from_the_defining_module() {
+        let (_repo, file_content) = temp_repo_content(&[
+            (
+                "src/account.ts",
+                "export function loadAccount() { return {}; }\nexport function reload() { return loadAccount(); }\n",
+            ),
+            (
+                "src/consumer.ts",
+                "import { loadAccount } from './account';\nconst account = loadAccount();\n",
+            ),
+            (
+                "src/unrelated.ts",
+                "// loadAccount() is only mentioned here; it is not imported\n",
+            ),
+            ("README.md", "Call loadAccount() to load an account.\n"),
+        ]);
+        let symbol = IdentifierDoc {
+            id: "src/account.ts:loadAccount:1".to_string(),
+            path: "src/account.ts".to_string(),
+            header: String::new(),
+            name: "loadAccount".to_string(),
+            kind: "function".to_string(),
+            kind_lower: "function".to_string(),
+            line: 1,
+            end_line: 1,
+            signature: "export function loadAccount()".to_string(),
+            parent_name: None,
+            text: "loadAccount function export function loadAccount()".to_string(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("loadAccount"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                "export function loadAccount()",
+            ),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
+        };
+
+        let result = rank_call_sites(
+            &identifier_terms("load account"),
+            &[1.0],
+            &symbol,
+            &file_content,
+            10,
+            None,
+        );
+        let files: HashSet<&str> = result.sites.iter().map(|site| site.file.as_str()).collect();
+
+        assert_eq!(result.total, 2, "resolved calls were {:#?}", result.sites);
+        assert_eq!(files, HashSet::from(["src/account.ts", "src/consumer.ts"]));
     }
 
     // -- format output tests --
@@ -1118,7 +1626,13 @@ mod tests {
                 signature: "getUser(id: string): User".to_string(),
                 parent_name: Some("UserService".to_string()),
                 text: "getUser function".to_string(),
-                token_set: HashSet::new(),
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms("getUser"),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    "getUser(id: string): User",
+                ),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    (Some("UserService".to_string())).as_deref().unwrap_or(""),
+                ),
             },
             semantic_score: 0.85,
             keyword_score: 0.65,
@@ -1163,7 +1677,9 @@ mod tests {
             signature: "getUserById(id: string): User".to_string(),
             parent_name: Some("UserService".to_string()),
             text: "getUserById function getUserById(id: string): User src/user.ts user service module UserService".to_string(),
-            token_set: HashSet::new(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("getUserById"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms("getUserById(id: string): User"),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms((Some("UserService".to_string())).as_deref().unwrap_or("")),
         };
         assert!(doc.text.contains("getUserById"));
         assert!(doc.text.contains("function"));
@@ -1187,7 +1703,11 @@ mod tests {
             signature: "connect(): Connection".to_string(),
             parent_name: None,
             text: "connect function connect(): Connection src/db.ts database module ".to_string(),
-            token_set: HashSet::new(),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("connect"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                "connect(): Connection",
+            ),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
         assert!(doc.text.contains("connect"));
         assert!(doc.text.contains("database module"));
@@ -1229,10 +1749,18 @@ mod tests {
         let num_files = 200usize;
         let lines_per_file = 100usize;
         let mut file_content: HashMap<String, Arc<String>> = HashMap::new();
+        file_content.insert(
+            "src/mod_0.ts".to_string(),
+            Arc::new(
+                "export function syncStripeQuantity(orgId: string, seats: number): void {}"
+                    .to_string(),
+            ),
+        );
         for fi in 0..num_files {
             let mut lines = Vec::with_capacity(lines_per_file);
-            for li in 0..lines_per_file {
-                if li % 10 == 0 {
+            lines.push("import { syncStripeQuantity } from './mod_0';".to_string());
+            for li in 1..lines_per_file {
+                if (li - 1) % 10 == 0 {
                     lines.push(format!(
                         "  const result = syncStripeQuantity(orgId_{fi}_{li}, seats);"
                     ));
@@ -1272,12 +1800,11 @@ mod tests {
                     "{name} function {name}(orgId: string, seats: number): void \
                      src/mod_{i}.ts stripe billing"
                 ),
-                token_set: IdentifierDoc::build_token_set(
-                    &name,
-                    &format!("{name}(orgId: string, seats: number): void"),
-                    &format!("src/mod_{i}.ts"),
-                    "stripe billing",
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms(&name),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                    &(format!("{name}(orgId: string, seats: number): void")),
                 ),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
             };
             docs.push(doc);
             // Give syncStripeQuantity (index 0) a high-similarity vector; rest low.
@@ -1347,28 +1874,96 @@ mod tests {
 
     // -- precomputed token-set tests --
 
-    /// The `token_set` stored in an `IdentifierDoc` must be identical to what
-    /// `split_camel_case(format!(...))` would have produced at query time.
-    /// This guards against drift between the build-time helper and the old
-    /// inline tokenization path.
     #[test]
-    fn precomputed_token_set_matches_live_tokenization() {
-        let name = "getUserById";
-        let signature = "getUserById(id: string): User";
-        let path = "src/user.ts";
-        let header = "user service module";
+    fn warm_scoring_uses_separate_precomputed_evidence_without_live_tokenization() {
+        let mut docs = Vec::with_capacity(2_000);
+        let mut vectors = Vec::with_capacity(2_000);
+        for i in 0..2_000 {
+            let (name, signature, parent) = if i == 1_337 {
+                (
+                    "cascadeGrants".to_string(),
+                    "const cascadeGrants = resolve();".to_string(),
+                    Some("GrantCoordinator"),
+                )
+            } else {
+                (
+                    format!("unrelatedIdentifier{i}"),
+                    format!("const unrelatedIdentifier{i} = resolve();"),
+                    None,
+                )
+            };
+            docs.push(keyword_test_doc(
+                &name,
+                &signature,
+                parent,
+                "",
+                &signature,
+                i + 1,
+            ));
+            vectors.push(1.0);
+        }
 
-        // Pre-computed path (new).
-        let precomputed = IdentifierDoc::build_token_set(name, signature, path, header);
+        // This exercises only the already-built index scoring stage: there is
+        // no parser, import resolver, embedder, or startup path in this loop.
+        for _ in 0..3 {
+            let results = score_identifiers(
+                &docs,
+                &[1.0],
+                &identifier_terms("cascade grants"),
+                &vectors,
+                1,
+                &None,
+                0.0,
+                1.0,
+                1,
+            );
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc.name, "cascadeGrants");
+            assert_eq!(results[0].keyword_score, 1.0);
+        }
 
-        // Parts of all four fields plus the whole name.
-        let keyword_input = format!("{name} {signature} {path} {header}");
-        let mut live: HashSet<String> = split_camel_case(&keyword_input).into_iter().collect();
-        live.insert("getuserbyid".to_string());
+        let source = include_str!("semantic_identifiers.rs");
+        let doc_definition = source
+            .split("pub struct IdentifierDoc")
+            .nth(1)
+            .and_then(|tail| tail.split("impl IdentifierDoc").next())
+            .expect("IdentifierDoc source");
+        for field in ["name_token_set", "signature_token_set", "parent_token_set"] {
+            assert!(
+                doc_definition.contains(field),
+                "IdentifierDoc must precompute separate {field} evidence"
+            );
+        }
+        assert!(
+            !doc_definition.contains("pub token_set"),
+            "IdentifierDoc must not retain or clone the obsolete combined token_set"
+        );
 
-        assert_eq!(
-            precomputed, live,
-            "precomputed token_set diverges from live tokenization"
+        let scoring = source
+            .split("pub fn score_identifiers")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn format_identifier_results").next())
+            .expect("score_identifiers source");
+        assert!(
+            !scoring.contains("get_keyword_coverage")
+                && !scoring.contains("identifier_terms")
+                && !scoring.contains("split_camel_case"),
+            "warm score_identifiers must consume precomputed evidence without live tokenization"
+        );
+    }
+
+    #[test]
+    fn identifier_doc_does_not_retain_legacy_combined_token_set() {
+        let source = include_str!("semantic_identifiers.rs");
+        let doc_definition = source
+            .split("pub struct IdentifierDoc")
+            .nth(1)
+            .and_then(|tail| tail.split("impl IdentifierDoc").next())
+            .expect("IdentifierDoc source");
+
+        assert!(
+            !doc_definition.contains("pub token_set"),
+            "the legacy combined token_set wastes memory and permits hot-loop scoring regressions"
         );
     }
 
@@ -1390,7 +1985,9 @@ mod tests {
                 signature: sig.to_string(),
                 parent_name: None,
                 text: format!("{name} {kind} {sig} {path} {header}"),
-                token_set: IdentifierDoc::build_token_set(name, sig, path, header),
+                name_token_set: crate::tools::semantic_identifiers::identifier_terms(name),
+                signature_token_set: crate::tools::semantic_identifiers::identifier_terms(sig),
+                parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
             };
 
         let docs = vec![

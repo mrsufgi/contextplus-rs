@@ -8,7 +8,7 @@ use contextplus_rs::cache::rkyv_store;
 use contextplus_rs::config::Config;
 use contextplus_rs::core::embeddings::{OllamaClient, VectorStore};
 use contextplus_rs::core::parser::{extract_header, flatten_symbols, hash_content};
-use contextplus_rs::core::tree_sitter::{get_supported_extensions, parse_with_tree_sitter};
+use contextplus_rs::core::tree_sitter::{get_supported_extensions, parse_identifier_symbols};
 use contextplus_rs::core::walker;
 use contextplus_rs::server::cache_name;
 use contextplus_rs::tools::semantic_identifiers::IdentifierDoc;
@@ -60,7 +60,8 @@ async fn main() {
                 return None;
             }
             let content = std::fs::read_to_string(&entry.path).ok()?;
-            let symbols = parse_with_tree_sitter(&content, &ext_with_dot).ok()?;
+            let (symbols, keyword_signatures) =
+                parse_identifier_symbols(&content, &ext_with_dot).ok()?;
             let header = extract_header(&content);
             let docs: Vec<IdentifierDoc> = flatten_symbols(&symbols, None)
                 .into_iter()
@@ -70,12 +71,6 @@ async fn main() {
                     let text = format!(
                         "{} {} {} {} {} {}",
                         sym.name, sym.kind, sig, entry.relative_path, header, parent
-                    );
-                    let token_set = IdentifierDoc::build_token_set(
-                        &sym.name,
-                        &sig,
-                        &entry.relative_path,
-                        &header,
                     );
                     IdentifierDoc {
                         id: format!("{}:{}:{}", entry.relative_path, sym.name, sym.line),
@@ -89,7 +84,14 @@ async fn main() {
                         signature: sig,
                         parent_name: sym.parent_name.clone(),
                         text,
-                        token_set,
+                        name_token_set: IdentifierDoc::evidence_tokens(&sym.name),
+                        signature_token_set: IdentifierDoc::evidence_tokens(
+                            keyword_signatures
+                                .get(&(sym.name.clone(), sym.line))
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                        ),
+                        parent_token_set: IdentifierDoc::evidence_tokens(parent),
                     }
                 })
                 .collect();
