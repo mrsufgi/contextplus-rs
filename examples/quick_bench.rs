@@ -187,6 +187,7 @@ export type ProfileService = ReturnType<typeof createProfileService>;
         index.index_with_vectors(docs, vectors);
         let query_vec = generate_query(dims);
         let opts = ResolvedSearchOptions {
+            scope: Default::default(),
             top_k: 5,
             semantic_weight: 0.72,
             keyword_weight: 0.28,

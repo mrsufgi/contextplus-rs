@@ -83,6 +83,33 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Query-relative evidence, measured against the corpus rather than the top hits.
+pub(crate) struct SemanticCalibration {
+    mean: f64,
+    deviation: f64,
+}
+
+impl SemanticCalibration {
+    pub(crate) fn new(similarities: &[f64]) -> Self {
+        let count = similarities.len().max(1) as f64;
+        let mean = similarities.iter().sum::<f64>() / count;
+        let variance = similarities.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / count;
+        Self {
+            mean,
+            deviation: variance.sqrt().max(0.01),
+        }
+    }
+
+    pub(crate) fn relevance(&self, cosine: f64) -> f64 {
+        let z = (cosine - self.mean) / self.deviation;
+        // On embeddinggemma, unrelated-query outliers can still be many standard
+        // deviations above a low corpus mean. Temper that evidence by cosine
+        // strength; 0.60 is the full-strength reference from live code queries.
+        let strength = (cosine / 0.60).clamp(0.0, 1.0);
+        ((z * 25.0).clamp(0.0, 100.0) * strength).round()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

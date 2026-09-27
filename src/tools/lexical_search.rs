@@ -36,6 +36,7 @@ pub(crate) struct PathPriorClassification {
     pub(crate) is_generated: bool,
     pub(crate) is_planning_prose: bool,
     pub(crate) is_lockfile: bool,
+    pub(crate) is_documentation: bool,
 }
 
 pub(crate) fn classify_path_prior(path: &str) -> PathPriorClassification {
@@ -69,6 +70,11 @@ pub(crate) fn classify_path_prior(path: &str) -> PathPriorClassification {
         ]
         .iter()
         .any(|pattern| path.contains(pattern)),
+        is_documentation: path.ends_with(".md")
+            || path.ends_with(".mdx")
+            || path.contains("/docs/")
+            || path.contains("/agent-os/")
+            || (path.contains("/migrations/") && path.ends_with(".sql")),
         is_lockfile: path.ends_with(".lock") || path.ends_with("/package-lock.json"),
     }
 }
@@ -97,6 +103,7 @@ impl PathPriorClassification {
         // Square-root strength keeps semantic priors milder than lexical priors,
         // allowing strong test matches to surface while breaking near ties for source.
         (self.non_test_multiplier() * test_prior).sqrt()
+            * if self.is_documentation { 0.8 } else { 1.0 }
     }
 }
 

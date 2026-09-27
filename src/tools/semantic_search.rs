@@ -132,8 +132,19 @@ pub fn get_max_embed_file_size() -> u64 {
 // Public types
 // ---------------------------------------------------------------------------
 
+const WEAK_SEMANTIC_RELEVANCE_THRESHOLD: f64 = 80.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    #[default]
+    All,
+    Code,
+    Docs,
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticSearchOptions {
+    pub scope: Option<SearchScope>,
     pub root_dir: PathBuf,
     pub query: String,
     pub top_k: Option<usize>,
@@ -160,6 +171,7 @@ pub struct SearchResult {
     pub path: String,
     pub score: f64,
     pub semantic_score: f64,
+    pub semantic_cosine: f64,
     pub keyword_score: f64,
     pub header: String,
     pub matched_symbols: Vec<String>,
@@ -174,6 +186,8 @@ pub struct SearchResult {
 #[derive(Debug, Clone)]
 pub struct SearchDocument {
     pub path: String,
+    /// Preserve repository-relative priors when the walker shortens display paths.
+    pub(crate) path_prior: super::lexical_search::PathPriorClassification,
     pub header: String,
     pub symbols: Vec<String>,
     pub symbol_entries: Vec<SymbolSearchEntry>,
@@ -210,6 +224,7 @@ impl SearchDocument {
             .map(|e| split_camel_case(&e.name).into_iter().collect())
             .collect();
         Self {
+            path_prior: super::lexical_search::classify_path_prior(&path),
             path,
             header,
             symbols,
@@ -238,6 +253,7 @@ pub struct SymbolSearchEntry {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedSearchOptions {
+    pub scope: SearchScope,
     pub top_k: usize,
     pub semantic_weight: f64,
     pub keyword_weight: f64,
@@ -261,6 +277,7 @@ pub struct ResolvedSearchOptions {
 impl Default for ResolvedSearchOptions {
     fn default() -> Self {
         Self {
+            scope: SearchScope::All,
             top_k: DEFAULT_TOP_K,
             semantic_weight: DEFAULT_SEMANTIC_WEIGHT,
             keyword_weight: DEFAULT_KEYWORD_WEIGHT,
@@ -337,6 +354,7 @@ fn normalize_top_k(value: Option<usize>, fallback: usize) -> usize {
 
 fn resolve_search_options(opts: &SemanticSearchOptions) -> ResolvedSearchOptions {
     ResolvedSearchOptions {
+        scope: opts.scope.unwrap_or_default(),
         top_k: normalize_top_k(opts.top_k, DEFAULT_TOP_K),
         semantic_weight: normalize_weight(opts.semantic_weight, DEFAULT_SEMANTIC_WEIGHT),
         keyword_weight: normalize_weight(opts.keyword_weight, DEFAULT_KEYWORD_WEIGHT),
@@ -415,6 +433,16 @@ pub fn glob_to_regex(glob: &str) -> String {
     }
     out.push('$');
     out
+}
+
+fn document_passes_filters(doc: &SearchDocument, opts: &ResolvedSearchOptions) -> bool {
+    let documentation = doc.path_prior.is_documentation;
+    if matches!(opts.scope, SearchScope::Code) && documentation
+        || matches!(opts.scope, SearchScope::Docs) && !documentation
+    {
+        return false;
+    }
+    path_passes_filters(&doc.path, opts)
 }
 
 fn path_passes_filters(path: &str, opts: &ResolvedSearchOptions) -> bool {
@@ -1129,6 +1157,25 @@ impl SearchIndex {
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
         let query_lower = query.trim().to_lowercase();
         let query_kind = detect_query_kind(query);
+        // Sample across the corpus, before ANN and path filters, so the reference
+        // distribution is not biased toward the nearest neighbors.
+        let stride = (self.documents.len() / 4096).max(1);
+        let similarities: Vec<f64> = self
+            .documents
+            .iter()
+            .enumerate()
+            .step_by(stride)
+            .filter(|(i, _)| self.has_vector[*i])
+            .filter_map(|(i, doc)| {
+                let vector = if let Some(store) = &self.ann_store {
+                    store.get_vector(&doc.path)?
+                } else {
+                    &self.vector_buffer[i * self.dims..(i + 1) * self.dims]
+                };
+                Some(cosine(query_vec, vector))
+            })
+            .collect();
+        let calibration = super::scoring::SemanticCalibration::new(&similarities);
 
         // Precompute recency boost for every document ONCE before the parallel
         // scoring loop.  For a 5k-document index this reduces fs::metadata()
@@ -1155,6 +1202,10 @@ impl SearchIndex {
         // Docs without embeddings bypass this filter and go through keyword scoring only.
         let ann_candidate_set: Option<std::collections::HashSet<usize>> =
             self.ann_store.as_ref().and_then(|store| {
+                // A global ANN shortlist can omit the requested document class.
+                if opts.scope != SearchScope::All {
+                    return None;
+                }
                 // Read optional runtime multiplier override.
                 let multiplier = std::env::var("CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER")
                     .ok()
@@ -1198,7 +1249,7 @@ impl SearchIndex {
                 if ann_candidate_set.as_ref().is_some_and(|c| !c.contains(&i)) {
                     return None;
                 }
-                if !path_passes_filters(&doc.path, opts) {
+                if !document_passes_filters(doc, opts) {
                     return None;
                 }
                 // When ann_store owns the vectors (corpus ≥ ANN_THRESHOLD) the
@@ -1300,7 +1351,7 @@ impl SearchIndex {
                 if self.has_vector[i] {
                     return None; // already handled above
                 }
-                if !path_passes_filters(&doc.path, opts) {
+                if !document_passes_filters(doc, opts) {
                     return None;
                 }
                 // Semantic score is 0 for docs with no embedding.
@@ -1371,7 +1422,8 @@ impl SearchIndex {
             .iter()
             .any(|token| super::lexical_search::is_test_intent_token(token));
         for (i, combined_score, ..) in &mut scored {
-            *combined_score *= super::lexical_search::classify_path_prior(&self.documents[*i].path)
+            *combined_score *= self.documents[*i]
+                .path_prior
                 .meaning_multiplier(wants_tests);
         }
 
@@ -1419,7 +1471,12 @@ impl SearchIndex {
                     SearchResult {
                         path: doc.path.clone(),
                         score: (score * 1000.0).round() / 10.0,
-                        semantic_score: (semantic_score.max(0.0) * 1000.0).round() / 10.0,
+                        semantic_score: if self.has_vector[idx] {
+                            calibration.relevance(semantic_score)
+                        } else {
+                            0.0
+                        },
+                        semantic_cosine: semantic_score,
                         keyword_score: (keyword_score * 1000.0).round() / 10.0,
                         header: doc.header.clone(),
                         matched_symbols,
@@ -1458,6 +1515,11 @@ pub fn format_search_results_with_freshness(
     }
 
     let mut lines = Vec::new();
+    if results.iter().map(|r| r.semantic_score).fold(0.0, f64::max)
+        < WEAK_SEMANTIC_RELEVANCE_THRESHOLD
+    {
+        lines.push("Matches are weak; try keywords mode or a narrower path.".to_string());
+    }
     lines.push(format!(
         "Top {} hybrid matches for: \"{}\"\n",
         results.len(),
@@ -1470,8 +1532,8 @@ pub fn format_search_results_with_freshness(
     for (i, r) in results.iter().enumerate() {
         lines.push(format!("{}. {} ({}% total)", i + 1, r.path, r.score));
         lines.push(format!(
-            "   Semantic: {}% | Keyword: {}%",
-            r.semantic_score, r.keyword_score
+            "   Semantic: {}% (cos {:.2}) | Keyword: {}%",
+            r.semantic_score, r.semantic_cosine, r.keyword_score
         ));
         if !r.header.is_empty() {
             lines.push(format!("   Header: {}", r.header));
@@ -2141,6 +2203,262 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_semantic_relevance_separates_outlier_from_bulk() {
+        let mut docs = vec![SearchDocument::new(
+            "src/tenant_context.rs".to_string(),
+            String::new(),
+            vec![],
+            vec![],
+            "request context propagation".to_string(),
+        )];
+        let mut vectors = vec![Some(unit_vector_with_x(0.58))];
+        for i in 0..20 {
+            docs.push(SearchDocument::new(
+                format!("src/background_{i}.rs"),
+                String::new(),
+                vec![],
+                vec![],
+                "generic repository support code".to_string(),
+            ));
+            let similarity = 0.35 + (i % 3) as f32 * 0.002;
+            vectors.push(Some(unit_vector_with_x(similarity)));
+        }
+
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let results = index.search(
+            "semantic needle absent from document text",
+            &[1.0, 0.0],
+            &semantic_only_options(21),
+        );
+
+        assert_eq!(results[0].path, "src/tenant_context.rs", "{results:?}");
+        assert!(
+            results[0].semantic_score >= 80.0,
+            "a cosine far above the corpus bulk should read as high relevance: {results:?}"
+        );
+        assert!(
+            results[1..]
+                .iter()
+                .all(|result| result.semantic_score <= 50.0),
+            "documents near the corpus bulk should read as low relevance: {results:?}"
+        );
+    }
+
+    #[test]
+    fn formatted_semantic_relevance_keeps_raw_cosine() {
+        let docs = vec![SearchDocument::new(
+            "src/tenant_context.rs".to_string(),
+            String::new(),
+            vec![],
+            vec![],
+            "request context propagation".to_string(),
+        )];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vec![Some(unit_vector_with_x(0.58))]);
+
+        let results = index.search(
+            "semantic needle absent from document text",
+            &[1.0, 0.0],
+            &semantic_only_options(1),
+        );
+        let output = format_search_results("semantic needle", &results);
+
+        assert!(
+            (results[0].semantic_cosine - 0.58).abs() < 0.001,
+            "SearchResult should expose the raw cosine separately: {results:?}"
+        );
+        assert!(
+            output.contains("(cos 0.58)"),
+            "formatted semantic evidence should retain the raw cosine: {output}"
+        );
+    }
+
+    #[test]
+    fn uniformly_weak_semantic_results_emit_guidance() {
+        let docs: Vec<SearchDocument> = (0..8)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("src/background_{i}.rs"),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    "generic repository support code".to_string(),
+                )
+            })
+            .collect();
+        let vectors = vec![Some(unit_vector_with_x(0.35)); docs.len()];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let results = index.search(
+            "semantic needle absent from document text",
+            &[1.0, 0.0],
+            &semantic_only_options(5),
+        );
+        let output = format_search_results("semantic needle", &results);
+        let guidance = output.lines().next().unwrap_or_default().to_lowercase();
+
+        assert!(
+            guidance.contains("weak"),
+            "the first output line should label weak matches: {output}"
+        );
+        assert!(
+            guidance.contains("keywords") && guidance.contains("narrower path"),
+            "weak-match guidance should suggest keywords mode or a narrower path: {output}"
+        );
+        assert!(
+            output.contains("src/background_0.rs"),
+            "weak matches should still be returned: {output}"
+        );
+    }
+
+    #[test]
+    fn weak_semantic_relevance_threshold_is_named_and_percentage_scaled() {
+        assert!(
+            (50.0..=80.0).contains(&WEAK_SEMANTIC_RELEVANCE_THRESHOLD),
+            "weak-result threshold should be tuned in calibrated percentage units"
+        );
+    }
+
+    #[test]
+    fn meaning_mode_demotes_documentation_below_equally_similar_code() {
+        let docs = vec![
+            SearchDocument::new(
+                "architecture/phi-redaction.mdx".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "keep protected health information out of logs".to_string(),
+            ),
+            SearchDocument::new(
+                "apps/emr-api/src/logging.ts".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "keep protected health information out of logs".to_string(),
+            ),
+        ];
+        let vectors = vec![
+            Some(unit_vector_with_x(0.51)),
+            Some(unit_vector_with_x(0.51)),
+        ];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+
+        let results = index.search(
+            "protect patient data from telemetry",
+            &[1.0, 0.0],
+            &semantic_only_options(2),
+        );
+
+        assert_eq!(
+            results[0].path, "apps/emr-api/src/logging.ts",
+            "default meaning search should prefer code when raw similarity ties: {results:?}"
+        );
+        assert_eq!(results[1].path, "architecture/phi-redaction.mdx");
+    }
+
+    #[test]
+    fn meaning_scope_code_and_docs_filter_document_classes() {
+        let docs = vec![
+            SearchDocument::new(
+                "architecture/phi-redaction.mdx".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "keep protected health information out of logs".to_string(),
+            ),
+            SearchDocument::new(
+                "apps/emr-api/src/logging.ts".to_string(),
+                String::new(),
+                vec![],
+                vec![],
+                "keep protected health information out of logs".to_string(),
+            ),
+        ];
+        let vectors = vec![
+            Some(unit_vector_with_x(0.51)),
+            Some(unit_vector_with_x(0.51)),
+        ];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let query_vec = [1.0, 0.0];
+
+        let code_results = index.search(
+            "protect patient data from telemetry",
+            &query_vec,
+            &ResolvedSearchOptions {
+                scope: SearchScope::Code,
+                ..semantic_only_options(2)
+            },
+        );
+        assert_eq!(
+            code_results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            ["apps/emr-api/src/logging.ts"]
+        );
+
+        let docs_results = index.search(
+            "protect patient data from telemetry",
+            &query_vec,
+            &ResolvedSearchOptions {
+                scope: SearchScope::Docs,
+                ..semantic_only_options(2)
+            },
+        );
+        assert_eq!(
+            docs_results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<Vec<_>>(),
+            ["architecture/phi-redaction.mdx"]
+        );
+    }
+
+    #[test]
+    fn search_scope_defaults_to_all_and_resolves_explicit_scope() {
+        assert_eq!(ResolvedSearchOptions::default().scope, SearchScope::All);
+
+        let resolved = resolve_search_options(&SemanticSearchOptions {
+            root_dir: PathBuf::new(),
+            query: "protect patient data from telemetry".to_string(),
+            top_k: None,
+            semantic_weight: None,
+            keyword_weight: None,
+            min_semantic_score: None,
+            min_keyword_score: None,
+            min_combined_score: None,
+            require_keyword_match: None,
+            require_semantic_match: None,
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+            scope: Some(SearchScope::Code),
+        });
+
+        assert_eq!(resolved.scope, SearchScope::Code);
+    }
+
+    #[test]
+    fn migration_sql_is_documentation_but_ordinary_sql_is_code() {
+        assert!(
+            super::super::lexical_search::classify_path_prior(
+                "packages/db/migrations/202609260001_add_phi_fields.sql"
+            )
+            .is_documentation
+        );
+        assert!(
+            !super::super::lexical_search::classify_path_prior(
+                "packages/db/queries/reconcile_invoice.sql"
+            )
+            .is_documentation
+        );
+    }
+
+    #[test]
     fn meaning_mode_fixture_prior_applies_only_without_test_intent() {
         let docs = vec![
             SearchDocument::new(
@@ -2597,6 +2915,7 @@ mod tests {
             path: "src/auth.ts".to_string(),
             score: 85.5,
             semantic_score: 90.0,
+            semantic_cosine: 0.90,
             keyword_score: 70.0,
             header: "auth module".to_string(),
             matched_symbols: vec!["verifyToken".to_string()],
@@ -3034,6 +3353,7 @@ mod tests {
             path: path.to_string(),
             score: 100.0,
             semantic_score: 100.0,
+            semantic_cosine: 1.0,
             keyword_score: 100.0,
             header: String::new(),
             matched_symbols: vec![],
@@ -3298,6 +3618,7 @@ mod tests {
             path: "src/x.ts".to_string(),
             score: 50.0,
             semantic_score: 60.0,
+            semantic_cosine: 0.60,
             keyword_score: 40.0,
             header: String::new(),
             matched_symbols: vec![],
@@ -3314,6 +3635,7 @@ mod tests {
             path: "src/x.ts".to_string(),
             score: 50.0,
             semantic_score: 60.0,
+            semantic_cosine: 0.60,
             keyword_score: 40.0,
             header: String::new(),
             matched_symbols: vec![],
@@ -3332,6 +3654,7 @@ mod tests {
             path: "src/x.ts".to_string(),
             score: 50.0,
             semantic_score: 60.0,
+            semantic_cosine: 0.60,
             keyword_score: 40.0,
             header: String::new(),
             matched_symbols: vec![],
@@ -3893,6 +4216,7 @@ mod tests {
             include_globs: None,
             exclude_globs: None,
             recency_window_days: None,
+            scope: None,
         };
 
         // First call — cache miss, index built.
@@ -3996,6 +4320,7 @@ mod tests {
             include_globs: None,
             exclude_globs: None,
             recency_window_days: None,
+            scope: None,
         };
 
         let _ = semantic_code_search(
@@ -4086,6 +4411,7 @@ mod tests {
             include_globs: None,
             exclude_globs: None,
             recency_window_days: None,
+            scope: None,
         };
 
         // Spawn 8 concurrent queries against the same empty cache.
@@ -4153,6 +4479,7 @@ mod tests {
             include_globs: None,
             exclude_globs: None,
             recency_window_days: None,
+            scope: None,
         }
     }
 
