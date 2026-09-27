@@ -3264,10 +3264,16 @@ impl ContextPlusServer {
             return Ok(Self::ok_text("No refs registered.".into()));
         }
         let mut out = format!(
-            "Daemon search config: OLLAMA_EMBED_MODEL={}, OLLAMA_CHAT_MODEL={}, OLLAMA_HOST={}\nRegistered refs:\n",
+            "Daemon search config: OLLAMA_EMBED_MODEL={}, OLLAMA_CHAT_MODEL={}, OLLAMA_HOST={}\nConfig source: {}\nRegistered refs:\n",
             self.state.config.ollama_embed_model,
             self.state.config.ollama_chat_model,
-            self.state.config.ollama_host
+            self.state.config.ollama_host,
+            self.state
+                .config
+                .config_source
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "process environment".into())
         );
         for (id, path, is_primary, sessions, head) in rows {
             let tag = if is_primary { " [primary]" } else { "" };
@@ -7768,6 +7774,59 @@ mod tests {
         assert!(
             text.contains(&format!("OLLAMA_HOST={}", server.state.config.ollama_host)),
             "daemon Ollama host missing: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_worktrees_names_primary_mcp_config_source() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let config_path = root.path().join(".mcp.json");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "mcpServers": {
+                    "contextplus": {
+                        "command": "/opt/contextplus-rs",
+                        "env": {
+                            "OLLAMA_EMBED_MODEL": "model-from-primary-file",
+                            "CONTEXTPLUS_EMBED_TRACKER": "off",
+                            "CONTEXTPLUS_WARMUP_ON_START": "false"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inherited = std::collections::HashMap::from([(
+            "OLLAMA_EMBED_MODEL".to_string(),
+            "model-from-spawning-session".to_string(),
+        )]);
+        let resolved =
+            crate::transport::daemon::resolve_daemon_startup_config(root.path(), &inherited);
+        let server = ContextPlusServer::new(root.path().to_path_buf(), resolved.config);
+
+        let result = server
+            .handle_list_worktrees(serde_json::Map::new())
+            .await
+            .unwrap();
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text"),
+        };
+
+        assert!(
+            text.contains("Config source:"),
+            "source label missing: {text}"
+        );
+        assert!(
+            text.contains(&config_path.display().to_string()),
+            "primary .mcp.json path missing: {text}"
+        );
+        assert!(
+            text.contains("OLLAMA_EMBED_MODEL=model-from-primary-file"),
+            "resolved daemon model missing: {text}"
         );
     }
 
