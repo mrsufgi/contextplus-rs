@@ -159,7 +159,7 @@ const INSTRUCTIONS_RESOURCE_URI: &str = "contextplus://instructions";
 /// etc.) continue to compile and operate on the correct data.
 ///
 /// U11 will mechanically migrate the ~57 call sites to use
-/// `state.ref_index(session.ref_id).embedding_cache` instead.
+/// `state.ref_index(session.ref_id).await.embedding_cache` instead.
 pub struct SharedState {
     pub config: Config,
     pub root_dir: PathBuf,
@@ -212,6 +212,9 @@ pub struct SharedState {
     /// Each `RefIndex` carries its own per-ref caches (U10+).
     /// The registry is `RwLock`-wrapped so attach/detach don't block tool calls.
     pub refs: crate::ref_index::RefRegistry,
+    /// Permanent snapshot of the default ref. The primary ref is never evicted,
+    /// so request-path fallback does not need to contend on the registry lock.
+    default_ref: Arc<crate::ref_index::RefIndex>,
     /// `RefId` of the default (primary) ref. Tool dispatches that don't
     /// carry an explicit `RefId` use this. U4 / U11 will migrate to explicit
     /// per-session routing via `session_ref_id`.
@@ -248,24 +251,18 @@ impl SharedState {
     /// Look up the default ref's index. Today this is the only entry in the
     /// registry; U4 will introduce alternate refs.
     ///
-    /// Returns `None` only if the registry was tampered with externally —
-    /// internal code paths can `expect` it freely.
+    /// The `Option` return type is retained for compatibility; the permanent
+    /// default snapshot always returns `Some`.
     pub fn default_ref(&self) -> Option<Arc<crate::ref_index::RefIndex>> {
-        // Try-read is appropriate: the registry write path (attach/detach)
-        // is bounded and not held long; the only contention would be a
-        // U4-era register_session firing concurrently with a tool call.
-        self.refs
-            .try_read()
-            .ok()
-            .and_then(|r| r.get(&self.default_ref_id).cloned())
+        Some(Arc::clone(&self.default_ref))
     }
 
     /// Look up a ref by id. Reserved for U4's session-scoped dispatch.
-    pub fn ref_index(
+    pub async fn ref_index(
         &self,
         id: crate::ref_index::RefId,
     ) -> Option<Arc<crate::ref_index::RefIndex>> {
-        self.refs.try_read().ok().and_then(|r| r.get(&id).cloned())
+        self.refs.read().await.get(&id).cloned()
     }
 
     /// Attach a session to an existing ref, or insert a new `RefIndex` and
@@ -435,19 +432,21 @@ impl ContextPlusServer {
     ///    fall back to `default_ref` and emit a debug log.
     /// 3. `session_ref_id = None` (stdio mode or no handshake) → `default_ref`.
     ///
-    /// The `default_ref` always exists for the lifetime of the daemon, so the
-    /// `expect` here is guaranteed to succeed under normal operating conditions.
+    /// The `default_ref` always exists for the lifetime of the daemon, so an
+    /// evicted session ref safely falls back to that permanent snapshot.
     ///
     /// **Single-ref behaviour is unchanged:** when `session_ref_id` is `None`
     /// (stdio) or equals `default_ref_id` (daemon, one worktree), this returns
     /// exactly the same `RefIndex` as the `SharedState` backward-compat shims.
     /// No observable difference for existing callers until U12 introduces
     /// per-ref file walkers.
-    pub fn current_ref(&self) -> Arc<crate::ref_index::RefIndex> {
-        self.session_ref_id
-            .and_then(|id| self.state.ref_index(id))
-            .or_else(|| self.state.default_ref())
-            .expect("default_ref always present — registry invariant violated")
+    pub async fn current_ref(&self) -> Arc<crate::ref_index::RefIndex> {
+        if let Some(id) = self.session_ref_id
+            && let Some(ref_index) = self.state.ref_index(id).await
+        {
+            return ref_index;
+        }
+        Arc::clone(&self.state.default_ref)
     }
 }
 
@@ -637,7 +636,8 @@ impl ContextPlusServer {
         let tracker_handle = Arc::clone(&default_ref.tracker_handle);
         let project_cache = Arc::clone(&default_ref.project_cache);
 
-        let refs = crate::ref_index::new_registry_with_default(default_ref_id, default_ref);
+        let refs =
+            crate::ref_index::new_registry_with_default(default_ref_id, Arc::clone(&default_ref));
 
         let state = Arc::new(SharedState {
             config,
@@ -655,6 +655,7 @@ impl ContextPlusServer {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             refs,
+            default_ref,
             default_ref_id,
             ollama_semaphore,
             warmup_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -667,16 +668,21 @@ impl ContextPlusServer {
     }
 
     /// Build a refresh callback for the embedding tracker.
-    pub fn build_tracker_callback(&self) -> RefreshCallback {
+    pub async fn build_tracker_callback(&self) -> RefreshCallback {
+        let root = self.current_ref().await.root_dir.clone();
+        self.build_tracker_callback_for_root(root)
+    }
+
+    fn build_tracker_callback_for_root(&self, root: PathBuf) -> RefreshCallback {
         let server = self.clone();
-        let root = self.current_ref().root_dir.clone();
         Arc::new(move |_root, files| {
             let srv = server.clone();
             let root = root.clone();
             let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
             tokio::spawn(async move {
+                let ref_index = srv.current_ref().await;
                 tracing::debug!(
-                    ref_id = %srv.current_ref().cas_ref_id_hex,
+                    ref_id = %ref_index.cas_ref_id_hex,
                     paths = ?files,
                     "Embedding tracker refresh batch started"
                 );
@@ -692,8 +698,7 @@ impl ContextPlusServer {
                 // Watchers can emit batches for metadata/read activity. Only
                 // invalidate when inspecting the source found a content change.
                 if outcome.content_changed {
-                    let new_gen = srv
-                        .current_ref()
+                    let new_gen = ref_index
                         .cache_generation
                         .fetch_add(1, std::sync::atomic::Ordering::Release)
                         + 1;
@@ -708,8 +713,7 @@ impl ContextPlusServer {
                     );
                 } else {
                     tracing::debug!(
-                        generation = srv
-                            .current_ref()
+                        generation = ref_index
                             .cache_generation
                             .load(std::sync::atomic::Ordering::Acquire),
                         skipped,
@@ -728,7 +732,7 @@ impl ContextPlusServer {
             CachedSearchIndex, SearchDocument, SymbolSearchEntry, extract_plain_text_header,
             is_text_index_candidate, semantic_embedding_content,
         };
-        let owner = self.current_ref();
+        let owner = self.current_ref().await;
         if owner.search_index_cache.read().await.is_none() {
             return;
         }
@@ -815,16 +819,16 @@ impl ContextPlusServer {
     /// and `incremental_reembed` invocations land on that ref's caches
     /// (`embedding_cache`, `search_index_cache`, `cache_generation`) rather
     /// than the default ref's.
-    pub fn ensure_tracker_started_for(&self, ref_id: crate::ref_index::RefId) {
-        self.with_session(ref_id).ensure_tracker_started();
+    pub async fn ensure_tracker_started_for(&self, ref_id: crate::ref_index::RefId) {
+        self.with_session(ref_id).ensure_tracker_started().await;
     }
 
     /// Start the embedding tracker if not already running and mode is not Off.
-    pub fn ensure_tracker_started(&self) {
+    pub async fn ensure_tracker_started(&self) {
         if self.state.config.embed_tracker_mode == TrackerMode::Off {
             return;
         }
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let mut guard = ref_index.tracker_handle.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("tracker_handle mutex was poisoned; recovering inner value");
             poisoned.into_inner()
@@ -837,7 +841,7 @@ impl ContextPlusServer {
             max_files_per_tick: self.state.config.embed_tracker_max_files,
             ignore_dirs: self.state.config.ignore_dirs.clone(),
         };
-        let callback = self.build_tracker_callback();
+        let callback = self.build_tracker_callback_for_root(ref_index.root_dir.clone());
         match crate::core::embedding_tracker::start_tracker(
             ref_index.root_dir.clone(),
             tracker_config,
@@ -946,7 +950,7 @@ impl ContextPlusServer {
                 ref_id,
             };
 
-            let ref_index = match state.ref_index(ref_id) {
+            let ref_index = match state.ref_index(ref_id).await {
                 Some(r) => r,
                 None => {
                     tracing::warn!(ref_id = ref_id.0, "ref_warmup shallow: ref not found");
@@ -1187,7 +1191,7 @@ impl ContextPlusServer {
                 ref_id,
             };
 
-            let ref_index = match state.ref_index(ref_id) {
+            let ref_index = match state.ref_index(ref_id).await {
                 Some(r) => r,
                 None => {
                     tracing::warn!(ref_id = ref_id.0, "ref_warmup full: ref not found");
@@ -1475,7 +1479,7 @@ impl ContextPlusServer {
     /// All filesystem I/O runs inside `spawn_blocking`.
     /// Uses Arc to avoid deep-cloning the entire cache on every tool call.
     async fn ensure_project_cache(&self) -> Result<Arc<ProjectCache>> {
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         self.ensure_project_cache_for(&ref_index).await
     }
 
@@ -1606,7 +1610,7 @@ impl ContextPlusServer {
     }
 
     async fn invalidate_project_cache_with_reason(&self, reason: &'static str) {
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let mut guard = ref_index.project_cache.write().await;
         let project_cache_was_populated = guard.is_some();
         *guard = None;
@@ -1653,7 +1657,7 @@ impl ContextPlusServer {
         let mut content_changed = false;
 
         let max_file_size = self.state.config.max_embed_file_size as u64;
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let project_cache = ref_index.project_cache.read().await.as_ref().cloned();
 
         // CAS setup for diff-only embedding via U6 content-addressed store.
@@ -1919,7 +1923,7 @@ impl ContextPlusServer {
     ) -> bool {
         use std::sync::atomic::Ordering;
 
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let project_guard = ref_index.project_cache.read().await;
         let mut identifier_guard = ref_index.identifier_index.write().await;
         let source_is_current = project_guard
@@ -1948,7 +1952,7 @@ impl ContextPlusServer {
                 .iter()
                 .filter(|e| !e.is_directory)
                 .count();
-            let ref_index = self.current_ref();
+            let ref_index = self.current_ref().await;
             let tracker_running = Self::tracker_is_running(&ref_index);
             let source = ref_index.identifier_source.read().await.as_ref().cloned();
             let source_matches = source.as_ref().is_none_or(|old| Arc::ptr_eq(old, cache));
@@ -2040,7 +2044,7 @@ impl ContextPlusServer {
         &self,
         cache: &Arc<ProjectCache>,
     ) -> Result<Arc<IdentifierIndex>> {
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let update_guard = ref_index.identifier_update.lock().await;
         let source = ref_index.identifier_source.read().await.as_ref().cloned();
         let file_count = cache
@@ -2412,7 +2416,7 @@ impl ContextPlusServer {
         use crate::tools::semantic_search::SearchDocument;
         use std::sync::atomic::Ordering;
 
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let _update = ref_index.lexical_update.lock().await;
         let generation = ref_index.cache_generation.load(Ordering::Acquire);
 
@@ -2658,7 +2662,7 @@ impl ContextPlusServer {
     ) -> Result<CallToolResult> {
         use crate::tools::context_tree as ct;
 
-        let root = self.resolve_root(&args);
+        let root = self.resolve_root(&args).await;
         let cache = self.ensure_project_cache().await?;
 
         // Build entries and analyses in spawn_blocking (tree-sitter parsing is CPU-bound)
@@ -2726,12 +2730,12 @@ impl ContextPlusServer {
             .or_else(|| Self::get_str(&args, "target_path"))
             .ok_or_else(|| ContextPlusError::Other("file_path is required".into()))?;
 
-        let root = self.resolve_root(&args);
+        let root = self.resolve_root(&args).await;
         let full_path = root.join(&file_path);
 
         // Check ProjectCache.file_content first to avoid a disk read on warm cache.
         let cached_content: Option<Arc<String>> = {
-            let ref_index = self.current_ref();
+            let ref_index = self.current_ref().await;
             let cache_guard = ref_index.project_cache.read().await;
             if let Some(ref cache) = *cache_guard {
                 cache.file_content.get(&file_path).map(Arc::clone)
@@ -2788,25 +2792,29 @@ impl ContextPlusServer {
     /// different tree. That silent fallback is exactly what made `get_blast_radius`
     /// and `find_dead_code` report symbols defined on another branch as
     /// "used nowhere" / "dead". `Err` carries a ready-to-return error result.
-    fn resolve_scan_target(
+    async fn resolve_scan_target(
         &self,
         args: &serde_json::Map<String, Value>,
         tool: &str,
     ) -> std::result::Result<Arc<crate::ref_index::RefIndex>, CallToolResult> {
         let Some(path) = Self::get_str(args, "path") else {
-            return Ok(self.current_ref());
+            return Ok(self.current_ref().await);
         };
-        let current_ref = self.current_ref();
+        let current_ref = self.current_ref().await;
         // Dispatch rewrites routed absolute paths relative to the selected ref.
         let canonical = current_ref
             .root_dir
             .join(&path)
             .canonicalize()
             .map_err(|e| Self::err_text(format!("Cannot canonicalize path {path}: {e}")))?;
-        let target = canonical.ancestors().find_map(|root| {
+        let mut target = None;
+        for root in canonical.ancestors() {
             let ref_id = crate::ref_index::RefId::for_canonical_path(root);
-            self.state.ref_index(ref_id)
-        });
+            if let Some(found) = self.state.ref_index(ref_id).await {
+                target = Some(found);
+                break;
+            }
+        }
         if let Some(ref target) = target {
             tracing::debug!(
                 tool,
@@ -2838,7 +2846,7 @@ impl ContextPlusServer {
 
         // Optional `path` targets an attached worktree (e.g. reviewing a feature
         // branch from the primary). Defaults to the session's current ref.
-        let ref_index = match self.resolve_scan_target(&args, "get_blast_radius") {
+        let ref_index = match self.resolve_scan_target(&args, "get_blast_radius").await {
             Ok(r) => r,
             Err(err) => return Ok(err),
         };
@@ -2871,10 +2879,10 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        self.ensure_tracker_started();
+        self.ensure_tracker_started().await;
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
-        let root = self.resolve_root(&args);
+        let root = self.resolve_root(&args).await;
 
         let options = crate::tools::semantic_search::SemanticSearchOptions {
             root_dir: root.clone(),
@@ -2904,7 +2912,7 @@ impl ContextPlusServer {
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());
         let walker = crate::server_adapters::RefWalkerIndexer {
-            ref_index: self.current_ref(),
+            ref_index: self.current_ref().await,
             walker: CachedWalkerIndexer {
                 config: self.state.config.clone(),
                 ollama: self.state.ollama.clone(),
@@ -2916,7 +2924,7 @@ impl ContextPlusServer {
         // `semantic_code_search` can skip the walk on a generation hit.
         // When the tracker is Off the counter stays at 0 and the
         // fingerprint-based fallback is used instead.
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let cache_gen = if self.state.config.embed_tracker_mode != crate::config::TrackerMode::Off {
             Some(&ref_index.cache_generation)
         } else {
@@ -2937,12 +2945,12 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        self.ensure_tracker_started();
+        self.ensure_tracker_started().await;
         use crate::tools::semantic_identifiers::*;
 
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
-        let root = self.resolve_root(&args);
+        let root = self.resolve_root(&args).await;
 
         let cache = self.ensure_project_cache().await?;
 
@@ -2965,7 +2973,7 @@ impl ContextPlusServer {
             include_kinds: Self::get_string_array(&args, "include_kinds"),
         };
 
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         // Symlinked roots (macOS /var -> /private/var) must compare in canonical form.
         let scope = options
             .root_dir
@@ -3002,8 +3010,8 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        self.ensure_tracker_started();
-        let root = self.resolve_root(&args);
+        self.ensure_tracker_started().await;
+        let root = self.resolve_root(&args).await;
 
         let options = crate::tools::semantic_navigate::SemanticNavigateOptions {
             query: Self::get_str(&args, "query"),
@@ -3015,9 +3023,9 @@ impl ContextPlusServer {
             mode: Self::get_str(&args, "mode"),
         };
 
-        let ref_index = self.current_ref();
+        let ref_index = self.current_ref().await;
         let indexer = crate::server_adapters::RefWalkerIndexer {
-            ref_index: self.current_ref(),
+            ref_index: self.current_ref().await,
             walker: CachedWalkerIndexer {
                 config: self.state.config.clone(),
                 ollama: self.state.ollama.clone(),
@@ -3147,7 +3155,10 @@ impl ContextPlusServer {
         {
             let mcp_data = self.state.root_dir.join(".mcp_data");
             let model = self.state.config.document_cache_identity();
-            let parent_ref_opt = parent_ref_id.and_then(|pid| self.state.ref_index(pid));
+            let parent_ref_opt = match parent_ref_id {
+                Some(pid) => self.state.ref_index(pid).await,
+                None => None,
+            };
             if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
                 tracing::warn!(
                     ref_id = ref_id.0,
@@ -3165,7 +3176,7 @@ impl ContextPlusServer {
         // call start it on demand (via `ensure_tracker_started` through the
         // session-scoped server clone).
         if self.state.config.embed_tracker_mode == TrackerMode::Eager {
-            self.ensure_tracker_started_for(ref_id);
+            self.ensure_tracker_started_for(ref_id).await;
         }
 
         let head_display = ref_arc
@@ -3337,7 +3348,7 @@ impl ContextPlusServer {
                 return (ref_root, rel);
             }
         }
-        (self.resolve_root(args), target_path)
+        (self.resolve_root(args).await, target_path)
     }
 
     // --- Facade: the six listed tools, mapped onto the handlers above ---
@@ -3385,7 +3396,7 @@ impl ContextPlusServer {
         let abs = if std::path::Path::new(&path).is_absolute() {
             PathBuf::from(&path)
         } else {
-            self.current_ref().root_dir.join(&path)
+            self.current_ref().await.root_dir.join(&path)
         };
         if abs.is_dir() {
             Self::move_arg(&mut args, "path", "target_path");
@@ -3447,8 +3458,8 @@ impl ContextPlusServer {
         }
     }
 
-    fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
-        let ref_index = self.current_ref();
+    async fn resolve_root(&self, args: &serde_json::Map<String, Value>) -> PathBuf {
+        let ref_index = self.current_ref().await;
         if let Some(requested) = Self::get_str(args, "rootDir") {
             let requested_path = ref_index.root_dir.join(&requested);
             // Use pre-canonicalized root (computed once at construction, not per-request).
@@ -3479,7 +3490,7 @@ impl ContextPlusServer {
         // Optional `path` targets an attached worktree. Defaults to the session's
         // current ref. Routing only via `current_ref()` would let a symbol used
         // on another branch be reported as dead from the wrong tree.
-        let ref_index = match self.resolve_scan_target(&args, "find_dead_code") {
+        let ref_index = match self.resolve_scan_target(&args, "find_dead_code").await {
             Ok(r) => r,
             Err(err) => return Ok(err),
         };
@@ -3558,7 +3569,7 @@ impl ContextPlusServer {
             .min(MAX_FILES_CAP);
 
         let cache = self.ensure_project_cache().await?;
-        let root = self.current_ref().root_dir.clone();
+        let root = self.current_ref().await.root_dir.clone();
 
         let formatted = tokio::task::spawn_blocking(move || {
             let symbols_by_file: HashMap<String, Vec<crate::core::parser::CodeSymbol>> =
@@ -3615,7 +3626,7 @@ impl ContextPlusServer {
         use crate::tools::dependency_loop_detect::{find_cycles, format_cycles};
 
         let cache = self.ensure_project_cache().await?;
-        let root = self.current_ref().root_dir.clone();
+        let root = self.current_ref().await.root_dir.clone();
 
         let formatted = tokio::task::spawn_blocking(move || {
             let all_abs_paths: Vec<PathBuf> = cache
@@ -3665,7 +3676,7 @@ impl ContextPlusServer {
         let requested_dim = Self::get_usize(&args, "expected_dim").filter(|&d| d > 0);
 
         let vectors: Vec<(PathBuf, Vec<f32>)> = {
-            let ref_index = self.current_ref();
+            let ref_index = self.current_ref().await;
             let guard = ref_index.embedding_cache.read().await;
             guard
                 .iter()
@@ -3713,7 +3724,7 @@ impl ContextPlusServer {
         &self,
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
-        self.ensure_tracker_started();
+        self.ensure_tracker_started().await;
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         // top_k=0 would silently return zero hits (LexicalIndex::search short-
@@ -3927,7 +3938,8 @@ impl ContextPlusServer {
         // is still identity in single-ref mode. Cross-ref leakage protection
         // (listing other refs' roots as `foreign_roots`) is reserved for U10+.
         let caller_root_opt =
-            crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id);
+            crate::transport::dispatch::caller_root_for_session(&self.state, self.session_ref_id)
+                .await;
         let result = match caller_root_opt {
             Some(caller_root) => {
                 crate::transport::dispatch::dispatch_with_translation(
@@ -4079,7 +4091,7 @@ async fn import_baseline_for_ref(
     use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
     use crate::tools::semantic_search::{CachedSearchIndex, IndexFingerprint, SearchDocument};
 
-    let ref_index = match state.ref_index(ref_id) {
+    let ref_index = match state.ref_index(ref_id).await {
         Some(r) => r,
         None => {
             tracing::warn!(ref_id = ref_id.0, "import_baseline_for_ref: ref not found");
@@ -4251,7 +4263,7 @@ async fn embed_diff_chunks(
         return;
     }
 
-    let ref_index = match state.ref_index(ref_id) {
+    let ref_index = match state.ref_index(ref_id).await {
         Some(r) => r,
         None => {
             tracing::warn!(ref_id = ref_id.0, "embed_diff_chunks: ref not found");
@@ -4397,7 +4409,7 @@ async fn warmup_ref_search_cache(state: &Arc<SharedState>, ref_id: crate::ref_in
     use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
     use crate::tools::semantic_search::{SemanticSearchOptions, semantic_code_search};
 
-    let ref_index = match state.ref_index(ref_id) {
+    let ref_index = match state.ref_index(ref_id).await {
         Some(r) => r,
         None => {
             tracing::warn!(ref_id = ref_id.0, "warmup_ref_search_cache: ref not found");
@@ -5084,6 +5096,7 @@ mod tests {
         );
         let index_before = server
             .current_ref()
+            .await
             .identifier_index
             .read()
             .await
@@ -5106,6 +5119,7 @@ mod tests {
         );
         let index_after = server
             .current_ref()
+            .await
             .identifier_index
             .read()
             .await
@@ -5177,7 +5191,7 @@ mod tests {
         );
 
         std::fs::remove_file(repo.path().join("000_deleted.rs")).unwrap();
-        let callback = server.build_tracker_callback();
+        let callback = server.build_tracker_callback().await;
         callback(
             repo.path().to_path_buf(),
             vec!["000_deleted.rs".to_string()],
@@ -5231,7 +5245,7 @@ mod tests {
             "pub fn load_account_v2() { /* refreshed account loader */ }\n",
         )
         .unwrap();
-        let callback = server.build_tracker_callback();
+        let callback = server.build_tracker_callback().await;
         callback(
             repo.path().to_path_buf(),
             vec!["src/account.rs".to_string()],
@@ -5264,7 +5278,7 @@ mod tests {
         let before = explore_identifier(&server, "stable_identifier_499", None).await;
         assert!(before.contains("stable_identifier_499"), "{before}");
 
-        let owner = server.current_ref();
+        let owner = server.current_ref().await;
         let segments_before = owner
             .identifier_index
             .read()
@@ -5280,7 +5294,7 @@ mod tests {
             "pub fn changed_after() {}\n",
         )
         .unwrap();
-        server.build_tracker_callback()(
+        server.build_tracker_callback().await(
             repo.path().to_path_buf(),
             vec!["src/changed.rs".to_string()],
         )
@@ -5538,7 +5552,7 @@ mod tests {
             "pub fn lexical_replacement() {}\n",
         )
         .unwrap();
-        server.build_tracker_callback()(
+        server.build_tracker_callback().await(
             repo.path().to_path_buf(),
             vec!["src/file_0.rs".to_string()],
         )
@@ -5557,7 +5571,7 @@ mod tests {
         .await
         .expect("lexical delta did not reach the update seam");
 
-        let cache = Arc::clone(&server.current_ref().lexical_search_cache);
+        let cache = Arc::clone(&server.current_ref().await.lexical_search_cache);
         let reader_available =
             tokio::time::timeout(std::time::Duration::from_millis(100), cache.read())
                 .await
@@ -6167,20 +6181,20 @@ mod tests {
         assert_eq!(ContextPlusServer::get_bool(&args, "missing"), None);
     }
 
-    #[test]
-    fn resolve_root_uses_server_root_when_no_arg() {
+    #[tokio::test]
+    async fn resolve_root_uses_server_root_when_no_arg() {
         let server = test_server();
         let args = serde_json::Map::new();
-        let root = server.resolve_root(&args);
+        let root = server.resolve_root(&args).await;
         assert_eq!(root, server.state.root_dir);
     }
 
-    #[test]
-    fn resolve_root_rejects_path_outside_server_root() {
+    #[tokio::test]
+    async fn resolve_root_rejects_path_outside_server_root() {
         let server = test_server();
         let mut args = serde_json::Map::new();
         args.insert("rootDir".to_string(), json!("/etc/passwd"));
-        let root = server.resolve_root(&args);
+        let root = server.resolve_root(&args).await;
         // Should fall back to server root since /etc/passwd is outside
         assert_eq!(root, server.state.root_dir);
     }
@@ -6348,10 +6362,11 @@ mod tests {
         config.embed_tracker_mode = TrackerMode::Lazy;
         config.ref_warmup_mode = RefWarmupMode::Off;
         let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
-        server.ensure_tracker_started();
+        server.ensure_tracker_started().await;
         assert!(
             server
                 .current_ref()
+                .await
                 .tracker_handle
                 .lock()
                 .unwrap()
@@ -6428,7 +6443,7 @@ mod tests {
         args.insert("query".to_string(), json!("hello"));
 
         server.handle_lexical_search(args.clone()).await.unwrap();
-        let ref_index = server.current_ref();
+        let ref_index = server.current_ref().await;
         let first = ref_index
             .lexical_search_cache
             .read()
@@ -6512,7 +6527,7 @@ mod tests {
         config.embed_tracker_mode = TrackerMode::Lazy;
         config.ref_warmup_mode = RefWarmupMode::Off;
         let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
-        server.ensure_tracker_started();
+        server.ensure_tracker_started().await;
         let cache = server.ensure_project_cache().await.unwrap();
         let file_count = cache
             .file_entries
@@ -6520,7 +6535,7 @@ mod tests {
             .filter(|entry| !entry.is_directory)
             .count();
         let expired = expired_empty_identifier_index(file_count);
-        *server.current_ref().identifier_index.write().await = Some(Arc::clone(&expired));
+        *server.current_ref().await.identifier_index.write().await = Some(Arc::clone(&expired));
 
         let actual = server.ensure_identifier_index(&cache).await.unwrap();
 
@@ -6545,7 +6560,7 @@ mod tests {
             .filter(|entry| !entry.is_directory)
             .count();
         let expired = expired_empty_identifier_index(file_count);
-        *server.current_ref().identifier_index.write().await = Some(Arc::clone(&expired));
+        *server.current_ref().await.identifier_index.write().await = Some(Arc::clone(&expired));
 
         let actual = server.ensure_identifier_index(&cache).await.unwrap();
 
@@ -6717,6 +6732,7 @@ mod tests {
         let ref_index = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("attached ref present");
         assert!(
             ref_index.tracker_handle.lock().unwrap().is_some(),
@@ -6729,7 +6745,7 @@ mod tests {
 
         let created = canonical.join("created.rs");
         std::fs::write(&created, format!("fn {symbol}() {{}}\n")).unwrap();
-        let callback = server.with_session(ref_id).build_tracker_callback();
+        let callback = server.with_session(ref_id).build_tracker_callback().await;
         let create_refresh = callback(canonical.clone(), vec!["created.rs".to_string()]);
         wait_for_embed_request_count(&ollama, 1).await;
         let created_impact = attached_impact(&server, &canonical, symbol).await;
@@ -6812,7 +6828,7 @@ mod tests {
             changed_paths.push(relative);
         }
 
-        let callback = server.with_session(ref_id).build_tracker_callback();
+        let callback = server.with_session(ref_id).build_tracker_callback().await;
         let refresh = callback(canonical.clone(), changed_paths);
         wait_for_embed_request_count(&ollama, 1).await;
         let impact = attached_impact(&server, &canonical, symbol).await;
@@ -6836,6 +6852,7 @@ mod tests {
         let ref_index = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("attached ref present");
         assert!(ref_index.tracker_handle.lock().unwrap().is_none());
 
@@ -6852,7 +6869,7 @@ mod tests {
             "an attached ref without a tracker must refresh through its TTL fallback:\n{refreshed}"
         );
 
-        server.ensure_tracker_started_for(ref_id);
+        server.ensure_tracker_started_for(ref_id).await;
         assert!(ref_index.tracker_handle.lock().unwrap().is_some());
         let first = server.ensure_project_cache_for(&ref_index).await.unwrap();
         let second = server.ensure_project_cache_for(&ref_index).await.unwrap();
@@ -6866,7 +6883,7 @@ mod tests {
             "fn baseline() {}\nfn ttlFallbackSymbol() {}\nfn afterTrackerStart() {}\n",
         )
         .unwrap();
-        let callback = server.with_session(ref_id).build_tracker_callback();
+        let callback = server.with_session(ref_id).build_tracker_callback().await;
         let refresh = callback(canonical.clone(), vec!["base.rs".to_string()]);
         wait_for_embed_request_count(&ollama, 1).await;
         let impact = attached_impact(&server, &canonical, "afterTrackerStart").await;
@@ -6885,6 +6902,7 @@ mod tests {
         let ref_index = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("attached ref present");
         assert!(ref_index.tracker_handle.lock().unwrap().is_none());
 
@@ -6966,6 +6984,7 @@ mod tests {
         let ref_index = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("attached ref present");
         let initial = server.ensure_project_cache_for(&ref_index).await.unwrap();
 
@@ -7044,15 +7063,21 @@ mod tests {
         config.embed_tracker_mode = TrackerMode::Off;
         config.ref_warmup_mode = RefWarmupMode::Off;
         let server = ContextPlusServer::new(tmp.path().to_path_buf(), config);
-        server.current_ref().embedding_cache.write().await.insert(
-            "unchanged.rs".to_string(),
-            CacheEntry {
-                hash: crate::core::parser::hash_content(content),
-                vector: vec![1.0, 0.0],
-            },
-        );
-        let generation = Arc::clone(&server.current_ref().cache_generation);
-        let callback = server.build_tracker_callback();
+        server
+            .current_ref()
+            .await
+            .embedding_cache
+            .write()
+            .await
+            .insert(
+                "unchanged.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::parser::hash_content(content),
+                    vector: vec![1.0, 0.0],
+                },
+            );
+        let generation = Arc::clone(&server.current_ref().await.cache_generation);
+        let callback = server.build_tracker_callback().await;
 
         let result = callback(tmp.path().to_path_buf(), vec!["unchanged.rs".to_string()])
             .await
@@ -7079,11 +7104,13 @@ mod tests {
         server.ensure_project_cache().await.unwrap();
 
         std::fs::write(&path, "fn after() { let value = 67890; }\n").unwrap();
-        let generation = Arc::clone(&server.current_ref().cache_generation);
-        let result =
-            server.build_tracker_callback()(tmp.path().to_path_buf(), vec!["large.rs".to_string()])
-                .await
-                .unwrap();
+        let generation = Arc::clone(&server.current_ref().await.cache_generation);
+        let result = server.build_tracker_callback().await(
+            tmp.path().to_path_buf(),
+            vec!["large.rs".to_string()],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result, (0, 1));
         assert_eq!(
@@ -7092,7 +7119,13 @@ mod tests {
             "a changed oversized source file must invalidate search caches"
         );
         assert!(
-            server.current_ref().project_cache.read().await.is_none(),
+            server
+                .current_ref()
+                .await
+                .project_cache
+                .read()
+                .await
+                .is_none(),
             "a changed oversized source file must invalidate the project cache"
         );
     }
@@ -7131,8 +7164,8 @@ mod tests {
         walker.walk_and_index(tmp.path()).await.unwrap();
         let requests_before = ollama.received_requests().await.unwrap_or_default().len();
 
-        let generation = Arc::clone(&server.current_ref().cache_generation);
-        let result = server.build_tracker_callback()(
+        let generation = Arc::clone(&server.current_ref().await.cache_generation);
+        let result = server.build_tracker_callback().await(
             tmp.path().to_path_buf(),
             vec!["unchanged.rs".to_string()],
         )
@@ -7204,6 +7237,7 @@ mod tests {
         std::fs::write(&path, "fn after_change() {}\n").unwrap();
         server
             .current_ref()
+            .await
             .cache_generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         server
@@ -7237,14 +7271,15 @@ mod tests {
                 file_content: current.file_content.clone(),
                 last_refresh: Instant::now() - std::time::Duration::from_secs(2),
             });
-            *server.current_ref().project_cache.write().await = Some(Arc::clone(&expired));
-            server.ensure_tracker_started();
+            *server.current_ref().await.project_cache.write().await = Some(Arc::clone(&expired));
+            server.ensure_tracker_started().await;
 
             server.spawn_ref_warmup(server.state.default_ref_id);
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             let actual = server
                 .current_ref()
+                .await
                 .project_cache
                 .read()
                 .await
@@ -7493,8 +7528,8 @@ mod tests {
     // resolve_root edge cases
     // ---------------------------------------------------------------
 
-    #[test]
-    fn resolve_root_accepts_subdirectory_inside_root() {
+    #[tokio::test]
+    async fn resolve_root_accepts_subdirectory_inside_root() {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let sub = tmp.path().join("subdir");
         std::fs::create_dir_all(&sub).unwrap();
@@ -7506,28 +7541,28 @@ mod tests {
             json!(sub.to_string_lossy().to_string()),
         );
 
-        let root = server.resolve_root(&args);
+        let root = server.resolve_root(&args).await;
         // Should accept the subdirectory since it's inside the server root
         let canonical_sub = sub.canonicalize().unwrap();
         assert_eq!(root, canonical_sub);
     }
 
-    #[test]
-    fn resolve_root_rejects_nonexistent_path() {
+    #[tokio::test]
+    async fn resolve_root_rejects_nonexistent_path() {
         let server = test_server();
         let mut args = serde_json::Map::new();
         args.insert("rootDir".to_string(), json!("/nonexistent/path/xyz123"));
-        let root = server.resolve_root(&args);
+        let root = server.resolve_root(&args).await;
         // Should fall back to server root since path doesn't exist (canonicalize fails)
         assert_eq!(root, server.state.root_dir);
     }
 
-    #[test]
-    fn resolve_root_rejects_empty_string() {
+    #[tokio::test]
+    async fn resolve_root_rejects_empty_string() {
         let server = test_server();
         let mut args = serde_json::Map::new();
         args.insert("rootDir".to_string(), json!(""));
-        let root = server.resolve_root(&args);
+        let root = server.resolve_root(&args).await;
         // Empty string can't be canonicalized to a path inside root
         assert_eq!(
             root.canonicalize().unwrap(),
@@ -7535,12 +7570,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_root_rejects_relative_path_outside_root() {
+    #[tokio::test]
+    async fn resolve_root_rejects_relative_path_outside_root() {
         let server = test_server();
         let mut args = serde_json::Map::new();
         args.insert("rootDir".to_string(), json!("../../etc"));
-        let root = server.resolve_root(&args);
+        let root = server.resolve_root(&args).await;
         assert_eq!(root, server.state.root_dir);
     }
 
@@ -7655,7 +7690,7 @@ mod tests {
         let _ = server.handle_attach_worktree(args).await.unwrap();
 
         let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_wt);
-        let ref_arc = server.state.ref_index(ref_id).expect("ref attached");
+        let ref_arc = server.state.ref_index(ref_id).await.expect("ref attached");
         let mcp_data = server.state.root_dir.join(".mcp_data");
         let ref_dir = mcp_data.join("refs").join(&ref_arc.cas_ref_id_hex);
         assert!(
@@ -7944,6 +7979,7 @@ mod tests {
         let wt_ref = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("worktree ref attached");
 
         assert!(
@@ -7983,6 +8019,7 @@ mod tests {
         let wt_ref = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("worktree ref attached");
         assert!(
             wt_ref.tracker_handle.lock().unwrap().is_none(),
@@ -7990,7 +8027,7 @@ mod tests {
         );
 
         // First tool-style invocation through a session-scoped clone starts it.
-        server.ensure_tracker_started_for(ref_id);
+        server.ensure_tracker_started_for(ref_id).await;
         assert!(
             wt_ref.tracker_handle.lock().unwrap().is_some(),
             "ensure_tracker_started_for(ref_id) must start the worktree's tracker"
@@ -8020,9 +8057,10 @@ mod tests {
         let wt_ref = server
             .state
             .ref_index(ref_id)
+            .await
             .expect("worktree ref attached");
         // Even an explicit call must be a no-op under Off mode.
-        server.ensure_tracker_started_for(ref_id);
+        server.ensure_tracker_started_for(ref_id).await;
         assert!(
             wt_ref.tracker_handle.lock().unwrap().is_none(),
             "Off mode must never start a tracker"
@@ -8634,13 +8672,13 @@ mod tests {
     // ContextPlusServer::new
     // ---------------------------------------------------------------
 
-    #[test]
-    fn server_new_initializes_with_correct_root() {
+    #[tokio::test]
+    async fn server_new_initializes_with_correct_root() {
         let root = PathBuf::from("/tmp/test-root");
         let config = Config::from_env();
         let server = ContextPlusServer::new(root.clone(), config);
         assert_eq!(
-            server.current_ref().root_dir,
+            server.current_ref().await.root_dir,
             PathBuf::from("/tmp/test-root")
         );
         assert_eq!(server.state.root_dir, root);
@@ -9459,8 +9497,8 @@ mod tests {
     // ── U11: current_ref() routing ───────────────────────────────────────────
 
     /// `current_ref()` with `session_ref_id = None` returns the default ref.
-    #[test]
-    fn current_ref_with_no_session_returns_default_ref() {
+    #[tokio::test]
+    async fn current_ref_with_no_session_returns_default_ref() {
         let server = test_server();
         assert!(
             server.session_ref_id.is_none(),
@@ -9471,7 +9509,7 @@ mod tests {
             .state
             .default_ref()
             .expect("default ref always present");
-        let current = server.current_ref();
+        let current = server.current_ref().await;
 
         assert!(
             Arc::ptr_eq(&default_ref, &current),
@@ -9502,7 +9540,7 @@ mod tests {
 
         // Build a session-scoped server clone and check current_ref().
         let session_server = server.with_session(wt_ref_id);
-        let current = session_server.current_ref();
+        let current = session_server.current_ref().await;
 
         assert!(
             Arc::ptr_eq(&wt_ref_arc, &current),
@@ -9511,8 +9549,8 @@ mod tests {
     }
 
     /// `current_ref()` with an unregistered `session_ref_id` falls back to `default_ref`.
-    #[test]
-    fn current_ref_with_unknown_session_falls_back_to_default_ref() {
+    #[tokio::test]
+    async fn current_ref_with_unknown_session_falls_back_to_default_ref() {
         use crate::ref_index::RefId;
 
         let server = test_server();
@@ -9525,12 +9563,171 @@ mod tests {
             .state
             .default_ref()
             .expect("default ref always present");
-        let current = session_server.current_ref();
+        let current = session_server.current_ref().await;
 
         assert!(
             Arc::ptr_eq(&default_ref, &current),
             "current_ref() with unknown session_ref_id must fall back to default_ref"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_ref_does_not_treat_registry_write_contention_as_absence() {
+        let server = test_server();
+        let state = Arc::clone(&server.state);
+        let lookup_state = Arc::clone(&state);
+        let expected_id = state.default_ref_id;
+        let writer = state.refs.write().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let lookup = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            lookup_state.default_ref()
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        drop(writer);
+
+        let found = tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
+            .await
+            .expect("default_ref did not complete after the registry writer released")
+            .expect("default_ref panicked while the registry writer was held")
+            .expect("default_ref treated registry contention as absence");
+        assert_eq!(
+            crate::ref_index::RefId::for_canonical_path(&found.canonical_root),
+            expected_id
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_ref_does_not_panic_or_fall_back_during_registry_write_contention() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+        let worktree = tempfile::tempdir().unwrap();
+        let canonical = worktree.path().canonicalize().unwrap();
+        let ref_id = RefId::for_canonical_path(&canonical);
+        let expected = server
+            .state
+            .attach_ref(ref_id, || {
+                Arc::new(RefIndex::new(
+                    canonical.clone(),
+                    canonical.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let session = server.with_session(ref_id);
+        let writer = server.state.refs.write().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let lookup = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            session.current_ref().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        drop(writer);
+
+        let found = tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
+            .await
+            .expect("current_ref did not complete after the registry writer released")
+            .expect("current_ref panicked while the registry writer was held");
+        assert!(
+            Arc::ptr_eq(&found, &expected),
+            "current_ref fell back to the default ref during registry contention"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_ref_waits_for_registry_writer_on_current_thread_runtime() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+        let worktree = tempfile::tempdir().unwrap();
+        let canonical = worktree.path().canonicalize().unwrap();
+        let ref_id = RefId::for_canonical_path(&canonical);
+        let expected = server
+            .state
+            .attach_ref(ref_id, || {
+                Arc::new(RefIndex::new(
+                    canonical.clone(),
+                    canonical.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let session = server.with_session(ref_id);
+        let writer = server.state.refs.write().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let lookup = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            session.current_ref().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        drop(writer);
+
+        let found = tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
+            .await
+            .expect("current_ref did not complete after the registry writer released")
+            .expect("current_ref panicked while the registry writer was held");
+        assert!(
+            Arc::ptr_eq(&found, &expected),
+            "current_ref fell back to the default ref during registry contention"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_attach_and_tool_calls_do_not_panic_on_registry_contention() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        const CALLS: usize = 32;
+        let server = test_server();
+        let writer = server.state.refs.write().await;
+
+        let mut attaches = Vec::with_capacity(CALLS);
+        let mut tools = Vec::with_capacity(CALLS);
+        for i in 0..CALLS {
+            let attaching = server.clone();
+            attaches.push(tokio::spawn(async move {
+                let root = std::env::temp_dir().join(format!("contextplus-contention-{i}"));
+                let ref_id = RefId::for_canonical_path(&root);
+                attaching
+                    .state
+                    .attach_ref(ref_id, || {
+                        Arc::new(RefIndex::new(
+                            root.clone(),
+                            root,
+                            Some(attaching.state.default_ref_id),
+                        ))
+                    })
+                    .await;
+            }));
+
+            let calling = server.clone();
+            tools.push(tokio::spawn(async move {
+                let mut args = serde_json::Map::new();
+                args.insert("path".into(), serde_json::Value::String(".".into()));
+                calling.dispatch("outline", args).await
+            }));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for attach in attaches {
+                attach.await.expect("attach task panicked");
+            }
+            for tool in tools {
+                tool.await
+                    .expect("tool call panicked during concurrent registry writes");
+            }
+        })
+        .await
+        .expect("concurrent attach/tool race exceeded its bounded budget");
     }
 
     /// Cross-ref isolation: writing to one ref's `embedding_cache` does NOT
@@ -9792,7 +9989,7 @@ mod tests {
             parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
         {
-            let ref_index = server.current_ref();
+            let ref_index = server.current_ref().await;
             let mut guard = ref_index.identifier_index.write().await;
             *guard = Some(Arc::new(IdentifierIndex {
                 docs: vec![doc].into(),
@@ -9914,7 +10111,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             {
-                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let ref_index = server.state.ref_index(ref_id).await.unwrap();
                 let cache = ref_index.project_cache.read().await;
                 if cache.is_some() {
                     break;
@@ -9928,7 +10125,7 @@ mod tests {
 
         // Verify project_cache fields.
         {
-            let ref_index = server.state.ref_index(ref_id).unwrap();
+            let ref_index = server.state.ref_index(ref_id).await.unwrap();
             let cache_guard = ref_index.project_cache.read().await;
             let cache = cache_guard.as_ref().unwrap();
             assert!(
@@ -9946,7 +10143,7 @@ mod tests {
         let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             {
-                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let ref_index = server.state.ref_index(ref_id).await.unwrap();
                 let guard = ref_index.identifier_index.read().await;
                 if guard.is_some() {
                     break;
@@ -9960,7 +10157,7 @@ mod tests {
 
         // Verify identifier_index.docs was populated (tree-sitter ran).
         {
-            let ref_index = server.state.ref_index(ref_id).unwrap();
+            let ref_index = server.state.ref_index(ref_id).await.unwrap();
             let idx_guard = ref_index.identifier_index.read().await;
             let idx = idx_guard.as_ref().expect("identifier_index should be set");
             // hello.rs has one function; docs should be non-empty.
@@ -10007,7 +10204,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             {
-                let ref_index = server.state.ref_index(ref_id).unwrap();
+                let ref_index = server.state.ref_index(ref_id).await.unwrap();
                 let cache = ref_index.project_cache.read().await;
                 if cache.is_some() {
                     break;
@@ -10066,7 +10263,7 @@ mod tests {
             })
             .await;
         // Undo the session-count side-effect from attach_ref.
-        if let Some(r) = server.state.ref_index(ref_id_b) {
+        if let Some(r) = server.state.ref_index(ref_id_b).await {
             r.session_count.fetch_sub(1, Ordering::AcqRel);
         }
 
@@ -10077,7 +10274,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             {
-                let ref_a = server.state.ref_index(ref_id_a).unwrap();
+                let ref_a = server.state.ref_index(ref_id_a).await.unwrap();
                 let cache = ref_a.project_cache.read().await;
                 if cache.is_some() {
                     break;
@@ -10090,7 +10287,7 @@ mod tests {
         }
 
         // ref_b's project_cache must still be None.
-        let ref_b = server.state.ref_index(ref_id_b).unwrap();
+        let ref_b = server.state.ref_index(ref_id_b).await.unwrap();
         let cache_b = ref_b.project_cache.read().await;
         assert!(
             cache_b.is_none(),
@@ -10098,7 +10295,7 @@ mod tests {
         );
 
         // ref_a's cache must contain only its own files.
-        let ref_a = server.state.ref_index(ref_id_a).unwrap();
+        let ref_a = server.state.ref_index(ref_id_a).await.unwrap();
         let cache_a = ref_a.project_cache.read().await;
         let cache_a = cache_a.as_ref().unwrap();
         assert!(
@@ -10564,7 +10761,16 @@ mod tests {
             "primary ranking must establish the reusable vector: {}",
             text_of(&primary_result)
         );
-        assert_eq!(server.current_ref().embedding_cache.read().await.len(), 2);
+        assert_eq!(
+            server
+                .current_ref()
+                .await
+                .embedding_cache
+                .read()
+                .await
+                .len(),
+            2
+        );
 
         add_linked_worktree(&primary, &worktree);
         std::fs::write(
@@ -10584,7 +10790,7 @@ mod tests {
         let attached = server.handle_attach_worktree(attach_args).await.unwrap();
         assert_eq!(attached.is_error, Some(false), "{}", text_of(&attached));
         let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
-        let worktree_ref = server.state.ref_index(ref_id).unwrap();
+        let worktree_ref = server.state.ref_index(ref_id).await.unwrap();
         assert!(
             worktree_ref.embedding_cache.read().await.is_empty(),
             "attach must begin with an empty per-ref cache in this regression setup"
@@ -10694,7 +10900,7 @@ mod tests {
         let attached = server.handle_attach_worktree(attach_args).await.unwrap();
         assert_eq!(attached.is_error, Some(false), "{}", text_of(&attached));
         let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
-        let worktree_ref = server.state.ref_index(ref_id).unwrap();
+        let worktree_ref = server.state.ref_index(ref_id).await.unwrap();
         let worktree_server = server.with_session(ref_id);
 
         let first = worktree_server
@@ -10726,6 +10932,7 @@ mod tests {
         assert!(
             !server
                 .current_ref()
+                .await
                 .embedding_cache
                 .read()
                 .await
@@ -10923,7 +11130,15 @@ mod tests {
             .unwrap();
         assert_eq!(first.is_error, Some(false), "{}", text_of(&first));
 
-        while server.current_ref().embedding_cache.read().await.len() != 2 {
+        while server
+            .current_ref()
+            .await
+            .embedding_cache
+            .read()
+            .await
+            .len()
+            != 2
+        {
             tokio::task::yield_now().await;
         }
 
@@ -11044,7 +11259,7 @@ mod tests {
 
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let current_ref = server.current_ref();
+            let current_ref = server.current_ref().await;
             let cache = current_ref.embedding_cache.read().await;
             if cache.contains_key("a.rs") && cache.contains_key("b.rs") {
                 assert!(
@@ -11146,7 +11361,7 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            let current_ref = server.current_ref();
+            let current_ref = server.current_ref().await;
             let cache = current_ref.embedding_cache.read().await;
             if cache
                 .get("failure.rs")
@@ -11202,7 +11417,7 @@ mod tests {
             root.path().to_path_buf(),
             semantic_fill_config(&ollama.uri(), 20, 500),
         );
-        let owner = server.current_ref();
+        let owner = server.current_ref().await;
         for (path, content) in [("old.rs", old), ("changed.rs", changed)] {
             owner.embedding_cache.write().await.insert(
                 path.into(),
@@ -11298,13 +11513,19 @@ mod tests {
             root.path().to_path_buf(),
             semantic_fill_config(&ollama.uri(), 20, 500),
         );
-        server.current_ref().embedding_cache.write().await.insert(
-            "decoy.rs".to_string(),
-            CacheEntry {
-                hash: crate::core::embeddings::content_hash(decoy_content),
-                vector: vec![0.0, 1.0],
-            },
-        );
+        server
+            .current_ref()
+            .await
+            .embedding_cache
+            .write()
+            .await
+            .insert(
+                "decoy.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash(decoy_content),
+                    vector: vec![0.0, 1.0],
+                },
+            );
 
         let before = server
             .handle_semantic_code_search(semantic_args("needle"))
@@ -11316,6 +11537,7 @@ mod tests {
         );
         let warm = server
             .current_ref()
+            .await
             .search_index_cache
             .read()
             .await
@@ -11328,12 +11550,13 @@ mod tests {
         loop {
             let vector_ready = server
                 .current_ref()
+                .await
                 .embedding_cache
                 .read()
                 .await
                 .contains_key("target.rs");
-            let fill_finished =
-                !crate::server_adapters::test_seams::fill_running(&server.current_ref()).await;
+            let ref_index = server.current_ref().await;
+            let fill_finished = !crate::server_adapters::test_seams::fill_running(&ref_index).await;
             if vector_ready && fill_finished {
                 break;
             }
@@ -11346,6 +11569,7 @@ mod tests {
 
         let after_fill = server
             .current_ref()
+            .await
             .search_index_cache
             .read()
             .await
@@ -11360,6 +11584,7 @@ mod tests {
 
         let walks_before = server
             .current_ref()
+            .await
             .semantic_walks
             .load(std::sync::atomic::Ordering::Relaxed);
         let after = server
@@ -11369,6 +11594,7 @@ mod tests {
         assert_eq!(
             server
                 .current_ref()
+                .await
                 .semantic_walks
                 .load(std::sync::atomic::Ordering::Relaxed),
             walks_before,
@@ -11382,6 +11608,7 @@ mod tests {
         assert_eq!(
             server
                 .current_ref()
+                .await
                 .search_index_cache
                 .read()
                 .await
@@ -11424,7 +11651,7 @@ mod tests {
         std::fs::create_dir(&unrelated).unwrap();
         std::fs::write(unrelated.join("fresh.rs"), "fn fresh() {}\n").unwrap();
         ollama.release_fill.add_permits(1);
-        let ref_index = server.current_ref();
+        let ref_index = server.current_ref().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while crate::server_adapters::test_seams::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
@@ -11466,7 +11693,7 @@ mod tests {
         ollama.fill_started.acquire().await.unwrap().forget();
         std::fs::write(&file, "fn changed_to_h2() {}\n").unwrap();
         ollama.release_fill.add_permits(1);
-        let ref_index = server.current_ref();
+        let ref_index = server.current_ref().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while crate::server_adapters::test_seams::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
@@ -11533,6 +11760,7 @@ mod tests {
             loop {
                 if server
                     .current_ref()
+                    .await
                     .embedding_cache
                     .read()
                     .await
@@ -11706,6 +11934,7 @@ mod tests {
             loop {
                 if server
                     .current_ref()
+                    .await
                     .embedding_cache
                     .read()
                     .await
@@ -11748,7 +11977,7 @@ mod tests {
             root.path().to_path_buf(),
             semantic_fill_config(&ollama.uri(), 300, 1_000),
         );
-        let ref_index = server.current_ref();
+        let ref_index = server.current_ref().await;
         let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(root.path());
 
         let query_server = server.clone();
@@ -11795,13 +12024,19 @@ mod tests {
             semantic_fill_config(&ollama.uri(), 1_000, 1_000),
         );
         let old_hash = crate::core::embeddings::content_hash(old_content);
-        server.current_ref().embedding_cache.write().await.insert(
-            path.to_string(),
-            CacheEntry {
-                hash: old_hash.clone(),
-                vector: vec![1.0, 0.0],
-            },
-        );
+        server
+            .current_ref()
+            .await
+            .embedding_cache
+            .write()
+            .await
+            .insert(
+                path.to_string(),
+                CacheEntry {
+                    hash: old_hash.clone(),
+                    vector: vec![1.0, 0.0],
+                },
+            );
 
         let canonical_child = child.path().canonicalize().unwrap();
         let child_id = crate::ref_index::RefId::for_canonical_path(&canonical_child);
@@ -11894,13 +12129,19 @@ mod tests {
             semantic_fill_config(&ollama.uri(), 1_000, 1_000),
         );
         let hash = crate::core::embeddings::content_hash(content);
-        server.current_ref().embedding_cache.write().await.insert(
-            path.to_string(),
-            CacheEntry {
-                hash: hash.clone(),
-                vector: vec![1.0, 0.0],
-            },
-        );
+        server
+            .current_ref()
+            .await
+            .embedding_cache
+            .write()
+            .await
+            .insert(
+                path.to_string(),
+                CacheEntry {
+                    hash: hash.clone(),
+                    vector: vec![1.0, 0.0],
+                },
+            );
 
         let canonical_child = child.path().canonicalize().unwrap();
         let child_id = crate::ref_index::RefId::for_canonical_path(&canonical_child);
@@ -12033,6 +12274,7 @@ mod tests {
 
         let cached = server
             .current_ref()
+            .await
             .embedding_cache
             .read()
             .await
@@ -12127,6 +12369,7 @@ mod tests {
         assert_eq!(
             server
                 .current_ref()
+                .await
                 .embedding_cache
                 .read()
                 .await
@@ -12141,6 +12384,7 @@ mod tests {
 
         let cached = server
             .current_ref()
+            .await
             .embedding_cache
             .read()
             .await
@@ -12253,6 +12497,7 @@ mod tests {
         assert!(
             !server
                 .current_ref()
+                .await
                 .embedding_cache
                 .read()
                 .await
@@ -12331,7 +12576,13 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let worktree_count = worktree_ref.embedding_cache.read().await.len();
-            let default_count = server.current_ref().embedding_cache.read().await.len();
+            let default_count = server
+                .current_ref()
+                .await
+                .embedding_cache
+                .read()
+                .await
+                .len();
             if worktree_count + default_count >= 2 {
                 break;
             }
@@ -12351,6 +12602,7 @@ mod tests {
             .contains_key("scope/target.rs");
         let default_has_target = server
             .current_ref()
+            .await
             .embedding_cache
             .read()
             .await

@@ -685,10 +685,31 @@ fn spawn_daemon(root_dir: &Path) -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| daemon::daemon_log_path(root_dir));
     let log = daemon::open_log_file(&log_path)?;
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = daemon_spawn_command(&exe, root_dir, &log_path, log);
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn daemon: {}", exe.display()))?;
+
+    tracing::debug!("spawned daemon pid={}", child.id());
+    // Reap the detached daemon without blocking bridge shutdown.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn daemon_spawn_command(
+    exe: &Path,
+    root_dir: &Path,
+    log_path: &Path,
+    log: std::fs::File,
+) -> std::process::Command {
+    let primary_root = crate::core::git_worktree::resolve_primary_worktree(root_dir);
+    let mut cmd = std::process::Command::new(exe);
     cmd.env("CONTEXTPLUS_DAEMON_LOG", log_path);
     cmd.arg("--root-dir")
-        .arg(root_dir)
+        .arg(primary_root)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -711,16 +732,7 @@ fn spawn_daemon(root_dir: &Path) -> Result<()> {
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn daemon: {}", exe.display()))?;
-
-    tracing::debug!("spawned daemon pid={}", child.id());
-    // Reap the detached daemon without blocking bridge shutdown.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    cmd
 }
 
 /// Pump bytes between our stdio and the daemon socket. Returns when either
@@ -776,6 +788,7 @@ pub async fn bridge(stream: UnixStream) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use std::path::PathBuf;
     use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::sync::oneshot;
@@ -1355,6 +1368,36 @@ mod tests {
             std::path::PathBuf::from(format!("{} (deleted)", dir.path().join("gone").display()));
         assert_eq!(daemon_executable(missing.clone()), missing);
         assert_eq!(daemon_executable(installed.clone()), installed);
+    }
+
+    #[test]
+    fn daemon_spawn_command_passes_primary_root_for_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let linked = temp.path().join("linked");
+        let linked_gitdir = primary.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&linked_gitdir).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked_gitdir.join("commondir"), "../..").unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_gitdir.display()),
+        )
+        .unwrap();
+        let log_path = temp.path().join("daemon.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+
+        let command =
+            daemon_spawn_command(Path::new("/opt/contextplus-rs"), &linked, &log_path, log);
+        let args: Vec<_> = command.get_args().collect();
+
+        assert_eq!(args[0], std::ffi::OsStr::new("--root-dir"));
+        assert_eq!(
+            PathBuf::from(args[1]),
+            primary.canonicalize().unwrap(),
+            "spawned daemon must receive the primary checkout as --root-dir"
+        );
+        assert_eq!(args[2], std::ffi::OsStr::new("daemon"));
     }
 
     #[tokio::test]

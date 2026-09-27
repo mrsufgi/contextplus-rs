@@ -20,7 +20,7 @@
 //! The `dispatch_with_translation` function implements this boundary.
 //! Today it uses `SharedState.default_ref().root_dir` as the caller's worktree
 //! root.  When U4 lands and introduces `session.ref_id`, replace the
-//! `default_ref()` call with `state.ref_index(session.ref_id)` — the
+//! `default_ref()` call with `state.ref_index(session.ref_id).await` — the
 //! primitives in `crate::core::path_translation` don't change.
 //!
 //! ## Single-ref / stdio no-op
@@ -170,7 +170,7 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
     use crate::config::TrackerMode;
     tracing::info!(mode = %config.embed_tracker_mode, "Embedding tracker mode");
     if config.embed_tracker_mode == TrackerMode::Eager {
-        server.ensure_tracker_started();
+        server.ensure_tracker_started().await;
     }
 
     if config.warmup_on_start {
@@ -286,7 +286,7 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
 ///
 /// **U4 seam:** `caller_root` today comes from `SharedState.default_ref()`.
 /// When U4 introduces `session.ref_id`, replace the call site with
-/// `state.ref_index(session.ref_id).root_dir`.
+/// `state.ref_index(session.ref_id).await.root_dir`.
 ///
 /// **Stdio no-op:** when `caller_root` equals the server's own `root_dir`
 /// the translation is transparent — inputs are typically relative and
@@ -389,7 +389,7 @@ pub async fn dispatch_with_translation(
     if bypass_input_translation {
         return raw_result;
     }
-    let foreign_root_bufs = foreign_roots_for_session(&server.state, caller_ref_id);
+    let foreign_root_bufs = foreign_roots_for_session(&server.state, caller_ref_id).await;
     let foreign_root_refs: Vec<&Path> = foreign_root_bufs.iter().map(|p| p.as_path()).collect();
     path_translation::translate_output_result(raw_result, caller_root, &foreign_root_refs)
 }
@@ -417,13 +417,13 @@ pub fn caller_root_from_default_ref(state: &crate::server::SharedState) -> Optio
 ///
 /// Returns `None` only when both the session ref and the default ref are
 /// absent from the registry — an internal invariant violation.
-pub fn caller_root_for_session(
+pub async fn caller_root_for_session(
     state: &crate::server::SharedState,
     session_ref_id: Option<crate::ref_index::RefId>,
 ) -> Option<PathBuf> {
     match session_ref_id {
         Some(id) => {
-            if let Some(r) = state.ref_index(id) {
+            if let Some(r) = state.ref_index(id).await {
                 return Some(r.root_dir.clone());
             }
             // Registry no longer contains the ref this session was assigned to.
@@ -520,7 +520,7 @@ pub async fn route_to_worktree_ref(
     if manages_worktrees(tool_name) {
         return (None, args);
     }
-    let session_root = server.current_ref().canonical_root.clone();
+    let session_root = server.current_ref().await.canonical_root.clone();
     let absolute_args: Vec<PathBuf> = PATH_ARG_KEYS
         .iter()
         .filter_map(|key| {
@@ -566,6 +566,7 @@ pub async fn route_to_worktree_ref(
     let Some(target_root) = server
         .state
         .ref_index(target)
+        .await
         .map(|r| r.canonical_root.clone())
     else {
         return (None, args);
@@ -598,23 +599,15 @@ pub async fn route_to_worktree_ref(
 /// Used to populate `foreign_roots` for path translation at the dispatch
 /// boundary. Any absolute prefix from a foreign ref that leaks into a cached
 /// tool result will be rewritten to the caller's root before being returned.
-///
-/// **On contention:** uses `try_read` so that an in-progress attach/detach
-/// write does not block dispatch. On contention the function returns an empty
-/// `Vec`, making output rewriting a no-op — translation degrades gracefully to
-/// identity rather than deadlocking or delaying the tool call.
-pub fn foreign_roots_for_session(
+pub async fn foreign_roots_for_session(
     state: &crate::server::SharedState,
     caller_ref_id: Option<crate::ref_index::RefId>,
 ) -> Vec<PathBuf> {
-    // try_read: attach/detach may be writing; on contention return empty
-    // (translation no-ops — leakage *risk* exists only when two refs are
-    // simultaneously attached, which is exactly when a write lock might be
-    // held; the window is bounded to the duration of attach/detach).
-    let Ok(refs) = state.refs.try_read() else {
-        return Vec::new();
-    };
-    refs.iter()
+    state
+        .refs
+        .read()
+        .await
+        .iter()
         .filter(|(id, _)| Some(**id) != caller_ref_id)
         .map(|(_, ref_arc)| ref_arc.canonical_root.clone())
         .collect()
@@ -1568,11 +1561,11 @@ mod tests {
 
     /// `None` session_ref_id falls back to default_ref — preserves pre-U9
     /// behaviour for stdio mode and non-handshaked clients.
-    #[test]
-    fn caller_root_for_session_none_returns_default_ref_root() {
+    #[tokio::test]
+    async fn caller_root_for_session_none_returns_default_ref_root() {
         let tmp = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp.path());
-        let resolved = caller_root_for_session(&server.state, None);
+        let resolved = caller_root_for_session(&server.state, None).await;
         assert_eq!(
             resolved,
             Some(tmp.path().to_path_buf()),
@@ -1581,12 +1574,12 @@ mod tests {
     }
 
     /// `Some(default_ref_id)` resolves to the same root as `None`.
-    #[test]
-    fn caller_root_for_session_default_ref_id_returns_server_root() {
+    #[tokio::test]
+    async fn caller_root_for_session_default_ref_id_returns_server_root() {
         let tmp = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp.path());
         let ref_id = server.state.default_ref_id;
-        let resolved = caller_root_for_session(&server.state, Some(ref_id));
+        let resolved = caller_root_for_session(&server.state, Some(ref_id)).await;
         assert_eq!(
             resolved,
             Some(tmp.path().to_path_buf()),
@@ -1596,8 +1589,8 @@ mod tests {
 
     /// `Some(unknown_id)` (not in registry) falls back to default_ref and
     /// does not panic.
-    #[test]
-    fn caller_root_for_session_unknown_id_falls_back_to_default() {
+    #[tokio::test]
+    async fn caller_root_for_session_unknown_id_falls_back_to_default() {
         use crate::ref_index::RefId;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1605,9 +1598,9 @@ mod tests {
         // Construct an id that is definitely not in the registry.
         let bogus_id = RefId(0xffffffffffffffff);
         // Confirm it's really not there.
-        assert!(server.state.ref_index(bogus_id).is_none());
+        assert!(server.state.ref_index(bogus_id).await.is_none());
         // Must fall back gracefully.
-        let resolved = caller_root_for_session(&server.state, Some(bogus_id));
+        let resolved = caller_root_for_session(&server.state, Some(bogus_id)).await;
         assert_eq!(
             resolved,
             Some(tmp.path().to_path_buf()),
@@ -1648,7 +1641,7 @@ mod tests {
             .await;
 
         // Now caller_root_for_session should resolve to the worktree root.
-        let resolved = caller_root_for_session(&server.state, Some(wt_ref_id));
+        let resolved = caller_root_for_session(&server.state, Some(wt_ref_id)).await;
         assert_eq!(
             resolved,
             Some(wt_root.clone()),
@@ -1669,25 +1662,25 @@ mod tests {
     /// Helper: insert a second ref into an existing server's registry.
     /// Returns the RefId that was inserted so tests can pass it as the
     /// caller id or verify exclusion.
-    fn insert_foreign_ref(
+    async fn insert_foreign_ref(
         server: &crate::server::ContextPlusServer,
         canonical_root: PathBuf,
     ) -> crate::ref_index::RefId {
         use crate::ref_index::{RefId, RefIndex};
         let id = RefId::for_canonical_path(&canonical_root);
         let ref_index = Arc::new(RefIndex::new(canonical_root.clone(), canonical_root, None));
-        // blocking_write is safe in synchronous test context (not inside async).
-        server.state.refs.blocking_write().insert(id, ref_index);
+        server.state.refs.write().await.insert(id, ref_index);
         id
     }
 
     /// Single-ref registry: caller is the only ref → `foreign_roots` empty.
-    #[test]
-    fn foreign_roots_single_ref_returns_empty() {
+    #[tokio::test]
+    async fn foreign_roots_single_ref_returns_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp.path());
         // Caller is the default ref — nothing else is attached.
-        let roots = foreign_roots_for_session(&server.state, Some(server.state.default_ref_id));
+        let roots =
+            foreign_roots_for_session(&server.state, Some(server.state.default_ref_id)).await;
         assert!(
             roots.is_empty(),
             "single-ref: expected empty foreign_roots, got: {roots:?}"
@@ -1695,8 +1688,8 @@ mod tests {
     }
 
     /// Two refs attached; caller is ref A → `foreign_roots` contains B's root.
-    #[test]
-    fn foreign_roots_two_refs_excludes_caller() {
+    #[tokio::test]
+    async fn foreign_roots_two_refs_excludes_caller() {
         let tmp_a = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp_a.path());
         let caller_id = server.state.default_ref_id;
@@ -1707,9 +1700,9 @@ mod tests {
             .path()
             .canonicalize()
             .unwrap_or(tmp_b.path().to_path_buf());
-        let _ref_b_id = insert_foreign_ref(&server, canonical_b.clone());
+        let _ref_b_id = insert_foreign_ref(&server, canonical_b.clone()).await;
 
-        let roots = foreign_roots_for_session(&server.state, Some(caller_id));
+        let roots = foreign_roots_for_session(&server.state, Some(caller_id)).await;
 
         // B's canonical root must be in foreign_roots; caller's root must NOT be.
         let canonical_a = tmp_a
@@ -1732,8 +1725,8 @@ mod tests {
     }
 
     /// Three refs attached; caller is ref A → `foreign_roots` contains B and C.
-    #[test]
-    fn foreign_roots_three_refs_returns_multiple_peers() {
+    #[tokio::test]
+    async fn foreign_roots_three_refs_returns_multiple_peers() {
         let tmp_a = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp_a.path());
         let caller_id = server.state.default_ref_id;
@@ -1750,10 +1743,10 @@ mod tests {
             .canonicalize()
             .unwrap_or(tmp_c.path().to_path_buf());
 
-        insert_foreign_ref(&server, canonical_b.clone());
-        insert_foreign_ref(&server, canonical_c.clone());
+        insert_foreign_ref(&server, canonical_b.clone()).await;
+        insert_foreign_ref(&server, canonical_c.clone()).await;
 
-        let roots = foreign_roots_for_session(&server.state, Some(caller_id));
+        let roots = foreign_roots_for_session(&server.state, Some(caller_id)).await;
 
         assert_eq!(roots.len(), 2, "two foreign roots for three-ref registry");
         assert!(
@@ -1777,8 +1770,8 @@ mod tests {
     /// This test documents the behaviour rather than asserting a specific set
     /// (the key invariant is that it never panics and returns at least as many
     /// roots as real foreign refs present).
-    #[test]
-    fn foreign_roots_none_caller_ref_returns_all_refs() {
+    #[tokio::test]
+    async fn foreign_roots_none_caller_ref_returns_all_refs() {
         let tmp = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp.path());
 
@@ -1787,10 +1780,10 @@ mod tests {
             .path()
             .canonicalize()
             .unwrap_or(tmp_b.path().to_path_buf());
-        insert_foreign_ref(&server, canonical_b.clone());
+        insert_foreign_ref(&server, canonical_b.clone()).await;
 
         // caller_ref_id = None → no filter, all refs returned
-        let roots = foreign_roots_for_session(&server.state, None);
+        let roots = foreign_roots_for_session(&server.state, None).await;
         // Must include at least B's root (the known foreign ref).
         assert!(
             roots.contains(&canonical_b),
@@ -1798,24 +1791,11 @@ mod tests {
         );
     }
 
-    /// Drain does not break: holding a write lock on refs while calling
-    /// `foreign_roots_for_session` causes `try_read` to fail, and the function
-    /// must return empty without panicking.
-    ///
-    /// Simulates the race between a concurrent attach/detach write and a
-    /// dispatch: degraded gracefully to identity translation (no leakage
-    /// protection during the brief window, but no deadlock or panic either).
-    ///
-    /// Note: this must be a `#[tokio::test]` so we are inside a tokio runtime
-    /// that owns the lock — `tokio::sync::RwLock::write()` is async, so we
-    /// hold it across the `foreign_roots_for_session` call without blocking.
-    #[tokio::test]
-    async fn foreign_roots_returns_empty_when_registry_write_locked() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreign_roots_does_not_treat_registry_write_contention_as_no_foreign_refs() {
         let tmp_a = tempfile::tempdir().unwrap();
         let server = make_test_server(tmp_a.path());
 
-        // Add a second ref so that, if try_read succeeded, we'd get a non-empty result.
-        // We must use the async write lock here (inside async context), not blocking_write.
         let tmp_b = tempfile::tempdir().unwrap();
         let canonical_b = tmp_b
             .path()
@@ -1832,14 +1812,26 @@ mod tests {
             server.state.refs.write().await.insert(id, ref_index);
         }
 
-        // Hold the write lock — simulates an in-progress attach/detach.
-        let _write_guard = server.state.refs.write().await;
+        let state = Arc::clone(&server.state);
+        let lookup_state = Arc::clone(&state);
+        let caller = state.default_ref_id;
+        let writer = state.refs.write().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let lookup = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            foreign_roots_for_session(&lookup_state, Some(caller)).await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        drop(writer);
 
-        // try_read must fail (lock is exclusively held), so the function returns empty.
-        let roots = foreign_roots_for_session(&server.state, Some(server.state.default_ref_id));
+        let roots = tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
+            .await
+            .expect("foreign-root lookup did not finish after the writer released")
+            .expect("foreign-root lookup panicked during registry contention");
         assert!(
-            roots.is_empty(),
-            "must return empty when registry is write-locked; got: {roots:?}"
+            roots.contains(&canonical_b),
+            "registry contention was treated as no foreign refs: {roots:?}"
         );
     }
 
@@ -1851,8 +1843,8 @@ mod tests {
     //   - A's dispatch session calls foreign_roots_for_session → gets B's root.
     //   - Output translation replaces B's prefix with A's root.
 
-    #[test]
-    fn e2e_cross_ref_leakage_protection_via_registry() {
+    #[tokio::test]
+    async fn e2e_cross_ref_leakage_protection_via_registry() {
         use crate::core::path_translation::translate_output_result;
 
         let tmp_a = tempfile::tempdir().unwrap();
@@ -1866,14 +1858,14 @@ mod tests {
             .path()
             .canonicalize()
             .unwrap_or(tmp_b.path().to_path_buf());
-        insert_foreign_ref(&server, canonical_b.clone());
+        insert_foreign_ref(&server, canonical_b.clone()).await;
 
         // Simulate a cached tool result built under B's root.
         let b_abs = canonical_b.join("src/shared/utils.rs");
         let shared_output = format!("1. {} (88% total)\n   Snippet: helper fn", b_abs.display());
 
         // A's session uses foreign_roots_for_session to find B's root.
-        let foreign_roots = foreign_roots_for_session(&server.state, Some(caller_a_id));
+        let foreign_roots = foreign_roots_for_session(&server.state, Some(caller_a_id)).await;
         assert!(
             foreign_roots.contains(&canonical_b),
             "B must be in A's foreign_roots"

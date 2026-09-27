@@ -54,6 +54,9 @@ pub(crate) type WalkAndIndexFuture<'a> = std::pin::Pin<
     >,
 >;
 
+pub(crate) type VectorGenerationFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + 'a>>;
+
 // ---------------------------------------------------------------------------
 // Constants (matching TS reference)
 // ---------------------------------------------------------------------------
@@ -1983,7 +1986,7 @@ pub(crate) async fn semantic_code_search_owned(
                 let build_generation = generation.load(Ordering::Acquire);
                 tokio::spawn(async move {
                     let _reset = RebuildGuard(Arc::clone(&previous));
-                    let vector_generation = walker.vector_generation(&root);
+                    let vector_generation = walker.vector_generation(&root).await;
                     match walker.walk_and_index(&root).await {
                         Ok((docs, vectors)) => {
                             let base = Arc::clone(&previous);
@@ -2112,7 +2115,7 @@ pub async fn semantic_code_search(
     // Obtain the SearchIndex — from cache if available and still fresh, otherwise rebuild.
     let search_root =
         std::fs::canonicalize(&options.root_dir).unwrap_or_else(|_| options.root_dir.clone());
-    let vector_generation = walk_and_index_fn.vector_generation(&options.root_dir);
+    let vector_generation = walk_and_index_fn.vector_generation(&options.root_dir).await;
     let cached_arc: Arc<CachedSearchIndex> = match index_cache {
         None => {
             // No cache slot provided — always rebuild (unit-test / legacy path).
@@ -2435,8 +2438,8 @@ pub trait EmbedFn: Send + Sync {
 
 /// Trait for walking files and producing indexed documents with vectors.
 pub trait WalkAndIndexFn: Send + Sync {
-    fn vector_generation(&self, _root: &Path) -> u64 {
-        0
+    fn vector_generation(&self, _root: &Path) -> VectorGenerationFuture<'_> {
+        Box::pin(async { 0 })
     }
     fn metadata_fingerprint(&self, _root_dir: &Path) -> MetadataFingerprintFuture<'_> {
         Box::pin(async { Ok(None) })

@@ -711,7 +711,10 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     {
         let mcp_data = server.state.root_dir.join(paths::MCP_DATA_DIR);
         let model = server.state.config.document_cache_identity();
-        let parent_ref_opt = parent_ref_id.and_then(|pid| server.state.ref_index(pid));
+        let parent_ref_opt = match parent_ref_id {
+            Some(pid) => server.state.ref_index(pid).await,
+            None => None,
+        };
         if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
             tracing::warn!(ref_id = ref_id.0, "CAS fork_from failed (non-fatal): {e}");
         }
@@ -730,7 +733,7 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     // resolves to this ref via `session_ref_id` and calls
     // `ensure_tracker_started` automatically.
     if server.state.config.embed_tracker_mode == crate::config::TrackerMode::Eager {
-        server.ensure_tracker_started_for(ref_id);
+        server.ensure_tracker_started_for(ref_id).await;
     }
 
     // ── Step 3: send session_ready ───────────────────────────────────────────
@@ -823,6 +826,11 @@ fn spawn_signal_listener(draining: Arc<AtomicBool>) {
 /// Top-level entry called from `main`. Acquire lock → bind → write pid → run.
 /// Returns `Ok(false)` if another daemon is already running (caller falls
 /// back to client mode).
+fn daemon_server(root_dir: &Path, config: Config) -> ContextPlusServer {
+    let primary_root = crate::core::git_worktree::resolve_primary_worktree(root_dir);
+    ContextPlusServer::new(primary_root, config)
+}
+
 pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     let lock = match acquire_lock(&root_dir)? {
         AcquireOutcome::Acquired(l) => l,
@@ -837,11 +845,11 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     let pid_path = paths::daemon_pid_path(&root_dir);
     let idle_secs = idle_secs_from_env();
 
-    let server = ContextPlusServer::new(root_dir.clone(), config.clone());
+    let server = daemon_server(&root_dir, config.clone());
 
     use crate::config::TrackerMode;
     if config.embed_tracker_mode == TrackerMode::Eager {
-        server.ensure_tracker_started();
+        server.ensure_tracker_started().await;
     }
     if config.warmup_on_start {
         server.spawn_warmup_task();
@@ -855,6 +863,22 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let linked = temp.path().join("linked");
+        let linked_gitdir = primary.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&linked_gitdir).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked_gitdir.join("commondir"), "../..").unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_gitdir.display()),
+        )
+        .unwrap();
+        (temp, primary, linked)
+    }
 
     fn env_map(values: &[(&str, &str)]) -> HashMap<String, String> {
         values
@@ -873,6 +897,80 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_started_from_linked_worktree_uses_primary_and_registers_linked_child() {
+        let (_temp, primary, linked) = linked_worktree_fixture();
+        let primary = primary.canonicalize().unwrap();
+        let linked = linked.canonicalize().unwrap();
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = crate::config::TrackerMode::Off;
+        config.ref_warmup_mode = crate::config::RefWarmupMode::Off;
+
+        let server = daemon_server(&linked, config);
+        let inspection = server.clone();
+        let (mut bridge_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let connection = tokio::spawn(serve_connection(server, daemon_stream));
+
+        write_frame(
+            &mut bridge_stream,
+            &RegisterSession {
+                client_root: linked.clone(),
+                head_sha: "linked-head".into(),
+                client_pid: 42,
+                search_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: SessionReady =
+            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut bridge_stream))
+                .await
+                .expect("daemon did not register the linked-worktree session")
+                .unwrap();
+        assert!(matches!(ready, SessionReady::Ready { .. }));
+
+        let default_ref = inspection
+            .state
+            .default_ref()
+            .expect("daemon default ref must exist");
+        assert_eq!(default_ref.canonical_root, primary);
+        assert_eq!(inspection.state.root_dir, primary);
+
+        let linked_id = RefId::for_canonical_path(&linked);
+        let refs = inspection.state.refs.read().await;
+        let linked_ref = refs.get(&linked_id).expect("linked ref was not registered");
+        assert_eq!(linked_ref.canonical_root, linked);
+        assert_eq!(
+            linked_ref.parent_ref_id,
+            Some(inspection.state.default_ref_id)
+        );
+        assert_ne!(linked_id, inspection.state.default_ref_id);
+
+        drop(refs);
+        drop(bridge_stream);
+        connection.abort();
+    }
+
+    #[test]
+    fn daemon_root_keeps_primary_repo_and_non_git_directory_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let non_git = temp.path().join("non-git");
+        std::fs::create_dir_all(primary.join(".git")).unwrap();
+        std::fs::create_dir_all(&non_git).unwrap();
+
+        for root in [primary, non_git] {
+            let canonical = root.canonicalize().unwrap();
+            let server = daemon_server(&root, Config::from_env());
+            let default_ref = server
+                .state
+                .default_ref()
+                .expect("daemon default ref must exist");
+            assert_eq!(server.state.root_dir, canonical);
+            assert_eq!(default_ref.canonical_root, canonical);
+        }
     }
 
     #[cfg(unix)]
