@@ -11168,7 +11168,7 @@ mod tests {
             let mut cache = owner.search_index_cache.write().await;
             CachedSearchIndex::refresh_ref_paths(
                 cache.as_mut().unwrap(),
-                root.path(),
+                &root.path().canonicalize().unwrap(),
                 vec![SearchDocument::new(
                     "changed.rs".into(),
                     String::new(),
