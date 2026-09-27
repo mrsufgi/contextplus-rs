@@ -36,7 +36,13 @@ fn generate_docs(n: usize) -> Vec<IdentifierDoc> {
                     None
                 },
                 text: format!("{kind} {name} {sig} {path} {header}"),
-                token_set: IdentifierDoc::build_token_set(&name, &sig, &path, &header),
+                name_token_set: IdentifierDoc::evidence_tokens(&name),
+                signature_token_set: IdentifierDoc::evidence_tokens(&sig),
+                parent_token_set: IdentifierDoc::evidence_tokens(&if i % 3 == 0 {
+                    format!("Service_{}", i / 10)
+                } else {
+                    String::new()
+                }),
             }
         })
         .collect()
@@ -66,7 +72,7 @@ fn bench_score_identifiers(c: &mut Criterion) {
 
     let dims = 384; // Common embedding dimension for small models
 
-    for &count in &[1000, 5000, 10000] {
+    for &count in &[1000, 5000, 10000, 113515] {
         let docs = generate_docs(count);
         let vector_buffer = generate_vector_buffer(count, dims);
         let query_vec = generate_query(dims);
@@ -112,6 +118,26 @@ fn bench_score_identifiers(c: &mut Criterion) {
                         0.78,
                         0.22,
                         20,
+                    ))
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("keywords", format!("{}_ids", count)),
+            &count,
+            |bench, _| {
+                bench.iter(|| {
+                    black_box(score_identifiers(
+                        black_box(&docs),
+                        black_box(&query_vec),
+                        black_box(&query_terms),
+                        black_box(&vector_buffer),
+                        dims,
+                        &None,
+                        0.0,
+                        1.0,
+                        5,
                     ))
                 });
             },

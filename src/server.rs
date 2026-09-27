@@ -900,7 +900,7 @@ impl ContextPlusServer {
                             let content =
                                 cache_for_parse.file_content.get(&entry.relative_path)?;
                             let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                            let symbols = parse_with_tree_sitter(content, ext).ok()?;
+                            let (symbols, keyword_signatures) = crate::core::tree_sitter::parse_identifier_symbols(content, ext).ok()?;
                             let header = crate::core::parser::extract_header(content);
                             let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
                                 crate::core::parser::flatten_symbols(&symbols, None)
@@ -915,12 +915,6 @@ impl ContextPlusServer {
                                             entry.relative_path,
                                             header,
                                             sym.parent_name.as_deref().unwrap_or("")
-                                        );
-                                        let token_set = crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
-                                            &sym.name,
-                                            &sig,
-                                            &entry.relative_path,
-                                            &header,
                                         );
                                         crate::tools::semantic_identifiers::IdentifierDoc {
                                             id: format!(
@@ -937,7 +931,9 @@ impl ContextPlusServer {
                                             signature: sig,
                                             parent_name: sym.parent_name.clone(),
                                             text,
-                                            token_set,
+                                            name_token_set: crate::tools::semantic_identifiers::identifier_terms(&sym.name),
+                                            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(keyword_signatures.get(&(sym.name.clone(), sym.line)).map(String::as_str).unwrap_or("")),
+                                            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(sym.parent_name.as_deref().unwrap_or("")),
                                         }
                                     })
                                     .collect();
@@ -1139,7 +1135,7 @@ impl ContextPlusServer {
                             let content =
                                 cache_for_parse.file_content.get(&entry.relative_path)?;
                             let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                            let symbols = parse_with_tree_sitter(content, ext).ok()?;
+                            let (symbols, keyword_signatures) = crate::core::tree_sitter::parse_identifier_symbols(content, ext).ok()?;
                             let header = crate::core::parser::extract_header(content);
                             let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
                                 crate::core::parser::flatten_symbols(&symbols, None)
@@ -1154,12 +1150,6 @@ impl ContextPlusServer {
                                             entry.relative_path,
                                             header,
                                             sym.parent_name.as_deref().unwrap_or("")
-                                        );
-                                        let token_set = crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
-                                            &sym.name,
-                                            &sig,
-                                            &entry.relative_path,
-                                            &header,
                                         );
                                         crate::tools::semantic_identifiers::IdentifierDoc {
                                             id: format!(
@@ -1176,7 +1166,9 @@ impl ContextPlusServer {
                                             signature: sig,
                                             parent_name: sym.parent_name.clone(),
                                             text,
-                                            token_set,
+                                            name_token_set: crate::tools::semantic_identifiers::identifier_terms(&sym.name),
+                                            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(keyword_signatures.get(&(sym.name.clone(), sym.line)).map(String::as_str).unwrap_or("")),
+                                            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(sym.parent_name.as_deref().unwrap_or("")),
                                         }
                                     })
                                     .collect();
@@ -1853,7 +1845,8 @@ impl ContextPlusServer {
                     let content = cache_clone.file_content.get(&entry.relative_path)?;
                     let content = Arc::clone(content);
                     let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                    let symbols = parse_with_tree_sitter(&content, ext).ok()?;
+                    let (symbols, keyword_signatures) =
+                        crate::core::tree_sitter::parse_identifier_symbols(&content, ext).ok()?;
                     let header = crate::core::parser::extract_header(&content);
                     let local_docs: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
                         crate::core::parser::flatten_symbols(&symbols, None)
@@ -1863,20 +1856,8 @@ impl ContextPlusServer {
                                 let parent = sym.parent_name.as_deref().unwrap_or("");
                                 let text = format!(
                                     "{} {} {} {} {} {}",
-                                    sym.name,
-                                    sym.kind,
-                                    sig,
-                                    entry.relative_path,
-                                    header,
-                                    parent
+                                    sym.name, sym.kind, sig, entry.relative_path, header, parent
                                 );
-                                let token_set =
-                                    crate::tools::semantic_identifiers::IdentifierDoc::build_token_set(
-                                        &sym.name,
-                                        &sig,
-                                        &entry.relative_path,
-                                        &header,
-                                    );
                                 crate::tools::semantic_identifiers::IdentifierDoc {
                                     id: format!(
                                         "{}:{}:{}",
@@ -1892,7 +1873,21 @@ impl ContextPlusServer {
                                     signature: sig,
                                     parent_name: sym.parent_name.clone(),
                                     text,
-                                    token_set,
+                                    name_token_set:
+                                        crate::tools::semantic_identifiers::identifier_terms(
+                                            &sym.name,
+                                        ),
+                                    signature_token_set:
+                                        crate::tools::semantic_identifiers::identifier_terms(
+                                            keyword_signatures
+                                                .get(&(sym.name.clone(), sym.line))
+                                                .map(String::as_str)
+                                                .unwrap_or(""),
+                                        ),
+                                    parent_token_set:
+                                        crate::tools::semantic_identifiers::identifier_terms(
+                                            sym.parent_name.as_deref().unwrap_or(""),
+                                        ),
                                 }
                             })
                             .collect();
@@ -2541,6 +2536,26 @@ impl ContextPlusServer {
             include_kinds: Self::get_string_array(&args, "include_kinds"),
         };
 
+        let ref_index = self.current_ref();
+        // Symlinked roots (macOS /var -> /private/var) must compare in canonical form.
+        let scope = options
+            .root_dir
+            .canonicalize()
+            .unwrap_or_else(|_| options.root_dir.clone());
+        let candidates = (scope != ref_index.canonical_root).then(|| {
+            idx.docs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, doc)| {
+                    ref_index
+                        .canonical_root
+                        .join(&doc.path)
+                        .starts_with(&scope)
+                        .then_some(i)
+                })
+                .collect::<Vec<_>>()
+        });
+
         let result = semantic_identifier_search(
             options,
             &OllamaEmbedder(self.state.ollama.clone()),
@@ -2548,6 +2563,7 @@ impl ContextPlusServer {
             &idx.vector_buffer,
             idx.dims,
             &cache.file_content,
+            candidates.as_deref(),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -4394,6 +4410,328 @@ mod tests {
             RawContent::Text(t) => t.text.clone(),
             _ => panic!("expected text content"),
         }
+    }
+
+    async fn identifier_server(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let repo = tempfile::tempdir().unwrap();
+        for &(path, source) in files {
+            let full_path = repo.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
+        (repo, ollama, server)
+    }
+
+    async fn explore_scoped_identifier(server: &ContextPlusServer, matching: &str) -> String {
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("idempotencyKey"));
+        args.insert("kind".into(), json!("identifiers"));
+        args.insert("match".into(), json!(matching));
+        args.insert("path".into(), json!("packages/domains/payments"));
+        args.insert("top_k".into(), json!(10));
+        let result = server.dispatch("explore", args).await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        text_of(&result)
+    }
+
+    async fn explore_identifier(
+        server: &ContextPlusServer,
+        query: &str,
+        path: Option<&str>,
+    ) -> String {
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!(query));
+        args.insert("kind".into(), json!("identifiers"));
+        args.insert("match".into(), json!("keywords"));
+        args.insert("top_k".into(), json!(10));
+        args.insert("top_calls_per_identifier".into(), json!(10));
+        if let Some(path) = path {
+            args.insert("path".into(), json!(path));
+        }
+        let result = server.dispatch("explore", args).await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        text_of(&result)
+    }
+
+    fn identifier_block_for_path<'a>(output: &'a str, path: &str) -> &'a str {
+        let definition_marker = format!(" - {path} (");
+        output
+            .split("\n\n")
+            .find(|block| block.contains(&definition_marker))
+            .unwrap_or_else(|| panic!("missing identifier result for {path}:\n{output}"))
+    }
+
+    #[tokio::test]
+    async fn explore_identifier_private_top_level_const_stays_file_local() {
+        let files = [
+            (
+                "src/a.ts",
+                "const pending = begin();\nexport function start() {\n  return pending;\n}\n",
+            ),
+            (
+                "src/b.ts",
+                "import { start } from './a';\nconst pending = other();\nexport function run() {\n  start();\n  return pending;\n}\n",
+            ),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let output = explore_identifier(&server, "pending", None).await;
+        let a = identifier_block_for_path(&output, "src/a.ts");
+        let b = identifier_block_for_path(&output, "src/b.ts");
+
+        assert!(
+            a.contains("Calls (1/1)"),
+            "A's private pending leaked:\n{a}"
+        );
+        assert!(a.contains("src/a.ts:L3"), "A's local use is missing:\n{a}");
+        assert!(
+            b.contains("Calls (1/1)"),
+            "B's private pending leaked:\n{b}"
+        );
+        assert!(b.contains("src/b.ts:L5"), "B's local use is missing:\n{b}");
+    }
+
+    #[tokio::test]
+    async fn explore_identifier_counts_typescript_type_only_import_consumer() {
+        let files = [
+            (
+                "src/a.ts",
+                "export type ResolveActorGrantsFn = (input: string) => boolean;\n",
+            ),
+            (
+                "src/b.ts",
+                "import type { ResolveActorGrantsFn } from './a';\nexport const run = (resolve: ResolveActorGrantsFn) => resolve('x');\n",
+            ),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let output = explore_identifier(&server, "ResolveActorGrantsFn", None).await;
+        let result = identifier_block_for_path(&output, "src/a.ts");
+
+        assert!(
+            result.contains("Calls (1/1)"),
+            "type-only consumer must count exactly once:\n{result}"
+        );
+        assert!(
+            result.contains("src/b.ts:L2"),
+            "type-only consumer location is missing:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_identifier_counts_local_rust_use_consumer() {
+        let files = [
+            (
+                "src/account.rs",
+                "pub fn load_account() -> usize { 1 }\npub fn reload() -> usize {\n    load_account()\n}\n",
+            ),
+            (
+                "src/consumer.rs",
+                "use crate::account::load_account;\npub fn run() -> usize {\n    load_account()\n}\n",
+            ),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let output = explore_identifier(&server, "load_account", None).await;
+        let result = identifier_block_for_path(&output, "src/account.rs");
+
+        assert!(
+            result.contains("Calls (2/2)"),
+            "local Rust definition and imported consumer must total exactly two:\n{result}"
+        );
+        assert!(
+            result.contains("src/account.rs:L3") && result.contains("src/consumer.rs:L3"),
+            "expected Rust call locations are missing:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_identifier_keywords_honors_path_scope() {
+        let files = [
+            (
+                "packages/domains/payments/idempotency.ts",
+                "export const idempotencyKey = 'payments-key';\n",
+            ),
+            (
+                "packages/platform/orchestrate/idempotency.ts",
+                "export const idempotencyKey = 'orchestrate-key';\n",
+            ),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let text = explore_scoped_identifier(&server, "keywords").await;
+
+        assert!(
+            text.contains("packages/domains/payments/idempotency.ts"),
+            "scoped definition missing:\n{text}"
+        );
+        assert!(
+            !text.contains("packages/platform/orchestrate/idempotency.ts"),
+            "identifier outside path leaked into keyword results:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_identifier_meaning_honors_path_scope() {
+        let files = [
+            (
+                "packages/domains/payments/idempotency.ts",
+                "export const idempotencyKey = 'payments-key';\n",
+            ),
+            (
+                "packages/platform/orchestrate/idempotency.ts",
+                "export const idempotencyKey = 'orchestrate-key';\n",
+            ),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let text = explore_scoped_identifier(&server, "meaning").await;
+
+        assert!(
+            text.contains("packages/domains/payments/idempotency.ts"),
+            "scoped definition missing:\n{text}"
+        );
+        assert!(
+            !text.contains("packages/platform/orchestrate/idempotency.ts"),
+            "identifier outside path leaked into meaning results:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_cached_identifier_index_preserves_scoped_and_unscoped_search_without_copying() {
+        let mut inside = String::new();
+        let mut outside = String::new();
+        for i in 0..300 {
+            inside.push_str(&format!("export const insideNoise{i} = {i};\n"));
+            outside.push_str(&format!("export const outsideNoise{i} = {i};\n"));
+        }
+        inside.push_str("export const needleTarget = 'inside';\n");
+        outside.push_str("export const needleTarget = 'outside';\n");
+        let files = [
+            ("src/inside/large.ts", inside.as_str()),
+            ("src/outside/large.ts", outside.as_str()),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+
+        let unscoped = explore_identifier(&server, "needleTarget", None).await;
+        assert!(
+            unscoped.contains("src/inside/large.ts") && unscoped.contains("src/outside/large.ts"),
+            "unscoped search lost a cached-index result:\n{unscoped}"
+        );
+        let index_before = server
+            .current_ref()
+            .identifier_index
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("identifier index should be cached after the first search");
+        assert!(
+            index_before.docs.len() >= 600,
+            "fixture was not large enough"
+        );
+
+        let scoped = explore_identifier(&server, "needleTarget", Some("src/inside")).await;
+        assert!(
+            scoped.contains("src/inside/large.ts"),
+            "scoped search lost the in-scope result:\n{scoped}"
+        );
+        assert!(
+            !scoped.contains("src/outside/large.ts"),
+            "scoped search leaked the out-of-scope result:\n{scoped}"
+        );
+        let index_after = server
+            .current_ref()
+            .identifier_index
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("identifier index should remain cached");
+        assert!(
+            Arc::ptr_eq(&index_before, &index_after),
+            "scoped lookup unexpectedly replaced the cached index"
+        );
+
+        let source = include_str!("server.rs");
+        let handler = source
+            .split("async fn handle_semantic_identifier_search")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn handle_semantic_navigate").next())
+            .expect("identifier search handler source");
+        assert!(
+            !handler.contains("scoped_docs")
+                && !handler.contains("scoped_vectors")
+                && !handler.contains("doc.clone()")
+                && !handler.contains("extend_from_slice"),
+            "identifier search handler must borrow cached docs/vectors or select by index; it must not deep-copy the corpus"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_identifier_keywords_rejects_context_only_matches() {
+        let files = [
+            (
+                "src/grants.ts",
+                "export const cascadeGrants = () => true;\n",
+            ),
+            (
+                "src/foreign.ts",
+                "// cascade is discussed here\nexport const foreignOrgId = 'foreign';\n",
+            ),
+            (
+                "src/notes.ts",
+                "export function clearNoteTranscriptions() {\n  // cascade cleanup\n  return true;\n}\n",
+            ),
+            (
+                "src/one-line.ts",
+                "export function unrelated() { return cascade(); }\nexport const arrowBody = () => cascade();\nexport const arrowComment = () => true; // cascade cleanup\n",
+            ),
+        ];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("cascade"));
+        args.insert("kind".into(), json!("identifiers"));
+        args.insert("match".into(), json!("keywords"));
+        args.insert("top_k".into(), json!(10));
+        let result = server.dispatch("explore", args).await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        let text = text_of(&result);
+
+        assert!(
+            text.contains("cascadeGrants"),
+            "named match missing:\n{text}"
+        );
+        assert!(
+            !text.contains("foreignOrgId")
+                && !text.contains("clearNoteTranscriptions")
+                && !text.contains("unrelated")
+                && !text.contains("arrowBody")
+                && !text.contains("arrowComment"),
+            "comment/body-only identifiers leaked into parser-backed keyword results:\n{text}"
+        );
     }
 
     #[tokio::test]
@@ -8513,7 +8851,11 @@ mod tests {
             signature: "fn hello() {}".into(),
             parent_name: None,
             text: "hello function fn hello() {} hello.rs".into(),
-            token_set: IdentifierDoc::build_token_set("hello", "fn hello() {}", "hello.rs", ""),
+            name_token_set: crate::tools::semantic_identifiers::identifier_terms("hello"),
+            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(
+                "fn hello() {}",
+            ),
+            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
         {
             let ref_index = server.current_ref();
