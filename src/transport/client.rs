@@ -1278,9 +1278,10 @@ mod tests {
                 .await;
             let initialized = first.read_json().await;
             drop(first);
-            dropped_tx.send(()).unwrap();
 
             let _draining = accept_session(&listener, SessionReady::RejectedDraining).await;
+            // The bridge is reconnecting now, so the next host request is buffered, not in flight.
+            dropped_tx.send(()).unwrap();
             let mut ready_daemon = accept_session(&listener, ready("daemon-c")).await;
             assert_eq!(ready_daemon.read_json().await, initialize);
             ready_daemon
