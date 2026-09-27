@@ -5408,8 +5408,10 @@ mod tests {
         });
         let cache = Arc::new(RwLock::new(None));
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The index keys on the canonical root (macOS /tmp is a symlink to /private/tmp).
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let options = SemanticSearchOptions {
-            root_dir: std::path::PathBuf::from("/tmp"),
+            root_dir: root.clone(),
             query: "blocked mass refresh needle".to_string(),
             top_k: Some(5),
             semantic_weight: Some(0.0),
@@ -5447,7 +5449,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!CachedSearchIndex::refresh_paths(
             cache.write().await.as_mut().unwrap(),
-            std::path::Path::new("/tmp"),
+            &root,
             mass_docs,
             vec![Some(vec![1.0, 0.0]); 6],
             &[],
@@ -5464,10 +5466,12 @@ mod tests {
         )
         .await
         .unwrap();
-        started.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
+            .await
+            .expect("the pending mass delta did not start a background rebuild");
         assert!(CachedSearchIndex::refresh_paths(
             cache.write().await.as_mut().unwrap(),
-            std::path::Path::new("/tmp"),
+            &root,
             vec![SearchDocument::new(
                 "src/file_24.rs".to_string(),
                 String::new(),

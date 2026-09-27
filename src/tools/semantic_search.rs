@@ -6102,7 +6102,12 @@ mod tests {
             )
             .await
         });
-        rebuild_started.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rebuild_started.notified(),
+        )
+        .await
+        .expect("the full rebuild did not start");
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), query)
             .await
