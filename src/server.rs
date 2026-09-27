@@ -2537,7 +2537,12 @@ impl ContextPlusServer {
         };
 
         let ref_index = self.current_ref();
-        let candidates = (options.root_dir != ref_index.canonical_root).then(|| {
+        // Symlinked roots (macOS /var -> /private/var) must compare in canonical form.
+        let scope = options
+            .root_dir
+            .canonicalize()
+            .unwrap_or_else(|_| options.root_dir.clone());
+        let candidates = (scope != ref_index.canonical_root).then(|| {
             idx.docs
                 .iter()
                 .enumerate()
@@ -2545,7 +2550,7 @@ impl ContextPlusServer {
                     ref_index
                         .canonical_root
                         .join(&doc.path)
-                        .starts_with(&options.root_dir)
+                        .starts_with(&scope)
                         .then_some(i)
                 })
                 .collect::<Vec<_>>()
