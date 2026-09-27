@@ -1208,7 +1208,7 @@ mod tests {
         );
         assert_eq!(
             resolved.config.config_source.as_deref(),
-            Some(config_path.as_path())
+            Some(config_path.canonicalize().unwrap().as_path())
         );
     }
 
