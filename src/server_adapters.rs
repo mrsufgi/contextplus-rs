@@ -210,21 +210,24 @@ pub struct CachedWalkerIndexer {
 }
 
 impl WalkAndIndexFn for CachedWalkerIndexer {
-    fn vector_generation(&self, root: &Path) -> u64 {
+    fn vector_generation(
+        &self,
+        root: &Path,
+    ) -> crate::tools::semantic_search::VectorGenerationFuture<'_> {
         let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        self.state
-            .refs
-            .try_read()
-            .ok()
-            .and_then(|refs| {
-                refs.values()
-                    .find(|r| r.canonical_root == canonical)
-                    .map(|r| {
-                        r.semantic_vector_generation
-                            .load(std::sync::atomic::Ordering::Acquire)
-                    })
-            })
-            .unwrap_or(0)
+        Box::pin(async move {
+            self.state
+                .refs
+                .read()
+                .await
+                .values()
+                .find(|r| r.canonical_root == canonical)
+                .map(|r| {
+                    r.semantic_vector_generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+                })
+                .unwrap_or(0)
+        })
     }
 
     fn metadata_fingerprint(
@@ -313,10 +316,15 @@ impl RefWalkerIndexer {
 }
 
 impl WalkAndIndexFn for RefWalkerIndexer {
-    fn vector_generation(&self, _root: &Path) -> u64 {
-        self.ref_index
-            .semantic_vector_generation
-            .load(std::sync::atomic::Ordering::Acquire)
+    fn vector_generation(
+        &self,
+        _root: &Path,
+    ) -> crate::tools::semantic_search::VectorGenerationFuture<'_> {
+        Box::pin(async {
+            self.ref_index
+                .semantic_vector_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     fn metadata_fingerprint(
