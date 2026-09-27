@@ -162,7 +162,7 @@ pub struct RefIndex {
     pub(crate) identifier_vectors: tokio::sync::OnceCell<RwLock<HashMap<String, CacheEntry>>>,
     pub(crate) identifier_persist_generation: AtomicU64,
     #[cfg(test)]
-    pub(crate) identifier_unchanged_records_copied: AtomicUsize,
+    pub(crate) semantic_walks: AtomicUsize,
     #[cfg(test)]
     pub(crate) identifier_resident_vector_elements_copied: AtomicUsize,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
@@ -228,7 +228,7 @@ impl RefIndex {
             identifier_vectors: tokio::sync::OnceCell::new(),
             identifier_persist_generation: AtomicU64::new(0),
             #[cfg(test)]
-            identifier_unchanged_records_copied: AtomicUsize::new(0),
+            semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
             identifier_resident_vector_elements_copied: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
@@ -270,7 +270,7 @@ impl RefIndex {
             identifier_vectors: tokio::sync::OnceCell::new(),
             identifier_persist_generation: AtomicU64::new(0),
             #[cfg(test)]
-            identifier_unchanged_records_copied: AtomicUsize::new(0),
+            semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
             identifier_resident_vector_elements_copied: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
@@ -314,7 +314,7 @@ impl RefIndex {
             identifier_vectors: tokio::sync::OnceCell::new(),
             identifier_persist_generation: AtomicU64::new(0),
             #[cfg(test)]
-            identifier_unchanged_records_copied: AtomicUsize::new(0),
+            semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
             identifier_resident_vector_elements_copied: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),

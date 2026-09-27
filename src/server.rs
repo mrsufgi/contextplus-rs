@@ -792,6 +792,7 @@ impl ContextPlusServer {
                 entries,
                 text,
             ));
+            docs.last_mut().unwrap().source_hash = crate::core::embeddings::content_hash(&content);
             vectors.push(vector);
         }
         let mut guard = owner.search_index_cache.write().await;
@@ -5258,9 +5259,13 @@ mod tests {
         assert!(before.contains("stable_identifier_499"), "{before}");
 
         let owner = server.current_ref();
-        owner
-            .identifier_unchanged_records_copied
-            .store(0, Ordering::Relaxed);
+        let segments_before = owner
+            .identifier_index
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .clone();
         owner
             .identifier_resident_vector_elements_copied
             .store(0, Ordering::Relaxed);
@@ -5278,12 +5283,46 @@ mod tests {
 
         let after = explore_identifier(&server, "changed_after", None).await;
         assert!(after.contains("changed_after"), "{after}");
-        assert_eq!(
-            owner
-                .identifier_unchanged_records_copied
-                .load(Ordering::Relaxed),
-            0,
-            "one-file refresh cloned unchanged identifier records"
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let ready = owner
+                    .identifier_index
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|index| {
+                        index.docs.files["src/changed.rs"]
+                            .iter()
+                            .any(|doc| doc.name == "changed_after")
+                    });
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("identifier update never published changed_after");
+        let segments_after = owner
+            .identifier_index
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            Arc::ptr_eq(
+                &segments_before.docs.files["src/stable.rs"],
+                &segments_after.docs.files["src/stable.rs"]
+            ),
+            "unchanged document segment was deep-copied"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &segments_before.vector_buffer.files["src/stable.rs"],
+                &segments_after.vector_buffer.files["src/stable.rs"]
+            ),
+            "unchanged vector segment was deep-copied"
         );
         assert!(
             owner
@@ -11068,6 +11107,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r3_dimension_rebuild_reembeds_retained_documents() {
+        use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument, WalkAndIndexFn};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &wiremock::Request| {
+                let vectors: Vec<Vec<f32>> = embed_request_inputs(request)
+                    .iter()
+                    .map(|text| {
+                        if text == "needle" {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![1.0, 0.0, 0.0]
+                        }
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }))
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let old = "fn retained() {}\n";
+        let changed = "fn changed() {}\n";
+        std::fs::write(root.path().join("old.rs"), old).unwrap();
+        std::fs::write(root.path().join("changed.rs"), changed).unwrap();
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 20, 500),
+        );
+        let owner = server.current_ref();
+        for (path, content) in [("old.rs", old), ("changed.rs", changed)] {
+            owner.embedding_cache.write().await.insert(
+                path.into(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash(content),
+                    vector: vec![1.0, 0.0],
+                },
+            );
+        }
+        server
+            .handle_semantic_code_search(semantic_args("needle"))
+            .await
+            .unwrap();
+        owner
+            .embedding_cache
+            .write()
+            .await
+            .get_mut("changed.rs")
+            .unwrap()
+            .vector = vec![1.0, 0.0, 0.0];
+        {
+            let mut cache = owner.search_index_cache.write().await;
+            CachedSearchIndex::refresh_ref_paths(
+                cache.as_mut().unwrap(),
+                root.path(),
+                vec![SearchDocument::new(
+                    "changed.rs".into(),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    changed.into(),
+                )],
+                vec![Some(vec![1.0, 0.0, 0.0])],
+                &[],
+                1,
+            );
+        }
+        let walker = crate::server_adapters::RefWalkerIndexer {
+            ref_index: owner.clone(),
+            walker: CachedWalkerIndexer {
+                config: server.state.config.clone(),
+                ollama: server.state.ollama.clone(),
+                state: server.state.clone(),
+            },
+        };
+        let (docs, vectors) = walker.walk_and_index(root.path()).await.unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(
+            vectors
+                .iter()
+                .all(|v| v.as_ref().is_some_and(|v| v.len() == 3)),
+            "background shape rebuild must obtain replacements for retained vectors"
+        );
+    }
+
+    #[tokio::test]
     async fn semantic_background_fill_updates_warm_index_without_full_rebuild() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -11167,10 +11295,22 @@ mod tests {
             "a one-file fill must be routed through an incremental delta"
         );
 
+        let walks_before = server
+            .current_ref()
+            .semantic_walks
+            .load(std::sync::atomic::Ordering::Relaxed);
         let after = server
             .handle_semantic_code_search(semantic_args("needle"))
             .await
             .unwrap();
+        assert_eq!(
+            server
+                .current_ref()
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            walks_before,
+            "next query reread and reparsed unchanged files after fill"
+        );
         assert!(
             text_of(&after).contains("1. target.rs"),
             "the incrementally updated index must rank the newly filled vector: {}",
@@ -11223,13 +11363,16 @@ mod tests {
         ollama.release_fill.add_permits(1);
         let ref_index = server.current_ref();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while ref_index
-                .semantic_vector_generation
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-            {
+            while crate::server_adapters::test_seams::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
             }
+            assert_eq!(
+                ref_index
+                    .semantic_vector_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "rejected fills must not advance the vector generation"
+            );
             walker.walk_and_index(&unrelated).await.unwrap();
             let cache = ref_index.embedding_cache.read().await;
             assert!(
@@ -11262,13 +11405,16 @@ mod tests {
         ollama.release_fill.add_permits(1);
         let ref_index = server.current_ref();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while ref_index
-                .semantic_vector_generation
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-            {
+            while crate::server_adapters::test_seams::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
             }
+            assert_eq!(
+                ref_index
+                    .semantic_vector_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "rejected fills must not advance the vector generation"
+            );
             let _admission = ref_index.semantic_fill.lock().await;
             let cache = ref_index.embedding_cache.read().await;
             assert!(

@@ -192,6 +192,7 @@ pub struct SearchDocument {
     pub symbols: Vec<String>,
     pub symbol_entries: Vec<SymbolSearchEntry>,
     pub content: String,
+    pub(crate) source_hash: String,
     /// Pre-computed lowercase searchable text for keyword scoring.
     /// Built once at index time to avoid `format!()` + `to_lowercase()` per query.
     pub search_text: String,
@@ -229,6 +230,7 @@ impl SearchDocument {
             header,
             symbols,
             symbol_entries,
+            source_hash: crate::core::embeddings::content_hash(&content),
             content,
             search_text,
             search_terms,
@@ -941,6 +943,7 @@ struct RefreshBatch {
     vectors: Vec<Option<Vec<f32>>>,
     deleted: Vec<String>,
     generation: u64,
+    vector_generation: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1033,6 +1036,7 @@ impl CachedSearchIndex {
                     vectors,
                     deleted: deleted.to_vec(),
                     generation,
+                    vector_generation: None,
                 });
                 return !large;
             }
@@ -1090,6 +1094,18 @@ impl CachedSearchIndex {
         Self::refresh_paths(entry, &scope, docs, vectors, &deleted, generation)
     }
 
+    pub(crate) fn pending_vector_dimensions(&self) -> Option<usize> {
+        self.pending
+            .lock()
+            .unwrap()
+            .batches
+            .iter()
+            .rev()
+            .flat_map(|batch| batch.vectors.iter().flatten())
+            .map(Vec::len)
+            .find(|dims| *dims != self.index.dims)
+    }
+
     pub(crate) fn has_vector_shape(&self) -> bool {
         self.index.dims != 0
     }
@@ -1098,9 +1114,11 @@ impl CachedSearchIndex {
         entry: &mut Arc<Self>,
         root: &Path,
         updates: Vec<(String, String, Vec<f32>)>,
+        vector_generation: u64,
     ) {
         let mut docs = Vec::new();
         let mut vectors = Vec::new();
+        let mut represented = true;
         let prefix = entry
             .search_root
             .strip_prefix(root)
@@ -1109,17 +1127,45 @@ impl CachedSearchIndex {
             let Ok(path) = Path::new(&path).strip_prefix(prefix) else {
                 continue;
             };
-            if let Some(doc) = entry.index.documents.iter().find(|doc| {
-                Path::new(&doc.path) == path
-                    && crate::core::embeddings::content_hash(&doc.content) == hash
-            }) {
+            let pending = entry.pending.lock().unwrap();
+            let doc = pending
+                .batches
+                .iter()
+                .rev()
+                .flat_map(|batch| &batch.docs)
+                .chain(&entry.index.documents)
+                .find(|doc| Path::new(&doc.path) == path && doc.source_hash == hash);
+            if let Some(doc) = doc {
                 docs.push(doc.clone());
                 vectors.push(Some(vector));
+            } else {
+                represented = false;
             }
         }
         let root = entry.search_root.clone();
-        let generation = entry.generation.load(std::sync::atomic::Ordering::Acquire);
+        let generation = entry
+            .pending
+            .lock()
+            .unwrap()
+            .batches
+            .iter()
+            .map(|batch| batch.generation)
+            .max()
+            .unwrap_or_else(|| entry.generation.load(std::sync::atomic::Ordering::Acquire));
+        let metadata = entry.metadata.read().unwrap().clone();
         Self::refresh_paths(entry, &root, docs, vectors, &[], generation);
+        if !represented {
+            return;
+        }
+        let mut pending = entry.pending.lock().unwrap();
+        if let Some(batch) = pending.batches.last_mut() {
+            batch.vector_generation = Some(vector_generation);
+        } else {
+            drop(pending);
+            let fresh = Arc::get_mut(entry).unwrap();
+            fresh.vector_generation = vector_generation;
+            *fresh.metadata.write().unwrap() = metadata;
+        }
     }
 
     /// Increment and return the reuse counter.
@@ -1168,6 +1214,7 @@ pub enum IndexUpdateKind {
 #[derive(Clone)]
 pub struct SearchIndex {
     full_rebuilds: u64,
+    ann_dirty_paths: HashSet<String>,
     vector_updates: std::collections::HashMap<String, Vec<f32>>,
     documents: Vec<SearchDocument>,
     /// Flat buffer: `vector_buffer[i * dims .. (i+1) * dims]` is the vector for doc `i`.
@@ -1201,6 +1248,7 @@ impl SearchIndex {
     pub fn new() -> Self {
         Self {
             full_rebuilds: 0,
+            ann_dirty_paths: HashSet::new(),
             vector_updates: Default::default(),
             documents: Vec::new(),
             vector_buffer: Vec::new(),
@@ -1236,6 +1284,7 @@ impl SearchIndex {
     ) {
         self.full_rebuilds += 1;
         self.vector_updates.clear();
+        self.ann_dirty_paths.clear();
         debug_assert_eq!(docs.len(), vectors.len());
         // Determine dims from first non-None vector
         let dims = vectors
@@ -1336,7 +1385,17 @@ impl SearchIndex {
                 })
             })
             .count();
-        (content_changes + deleted.len()) as f64
+        let dirty_count = self
+            .ann_dirty_paths
+            .iter()
+            .map(String::as_str)
+            .chain(docs.iter().map(|d| d.path.as_str()))
+            .chain(deleted.iter().map(String::as_str))
+            .collect::<HashSet<_>>()
+            .len();
+        self.ann_store.as_ref().is_some_and(|store| {
+            dirty_count as f64 > store.count() as f64 * FULL_REBUILD_CHANGE_FRACTION
+        }) || (content_changes + deleted.len()) as f64
             > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
             || vectors.iter().flatten().any(|v| v.len() != self.dims)
     }
@@ -1349,6 +1408,12 @@ impl SearchIndex {
     ) -> IndexUpdateKind {
         let rebuild = self.requires_full_rebuild(&changed_docs, &changed_vectors, deleted_paths);
         if rebuild {
+            let replacement_dims = changed_vectors
+                .iter()
+                .flatten()
+                .map(Vec::len)
+                .find(|dims| *dims != self.dims)
+                .unwrap_or(self.dims);
             let affected: HashSet<&str> = deleted_paths
                 .iter()
                 .map(String::as_str)
@@ -1359,17 +1424,30 @@ impl SearchIndex {
             for (i, doc) in self.documents.iter().enumerate() {
                 if !affected.contains(doc.path.as_str()) {
                     docs.push(doc.clone());
-                    vectors.push(self.vector_at(i).map(<[f32]>::to_vec));
+                    vectors.push(
+                        self.vector_at(i)
+                            .filter(|v| v.len() == replacement_dims)
+                            .map(<[f32]>::to_vec),
+                    );
                 }
             }
             docs.extend(changed_docs);
-            vectors.extend(changed_vectors);
+            vectors.extend(
+                changed_vectors
+                    .into_iter()
+                    .map(|v| v.filter(|v| v.len() == replacement_dims)),
+            );
             self.index_with_vectors_and_tuning(
                 docs,
                 vectors,
                 crate::core::embeddings::HnswTuning::global(),
             );
             return IndexUpdateKind::FullRebuild;
+        }
+        if self.ann_store.is_some() {
+            self.ann_dirty_paths.extend(deleted_paths.iter().cloned());
+            self.ann_dirty_paths
+                .extend(changed_docs.iter().map(|d| d.path.clone()));
         }
         for path in deleted_paths {
             if let Some(i) = self.documents.iter().position(|d| &d.path == path) {
@@ -1435,6 +1513,7 @@ impl SearchIndex {
         for (doc, vector) in docs.into_iter().zip(vectors) {
             let same = old.get(doc.path.as_str()).is_some_and(|&i| {
                 self.documents[i].content == doc.content
+                    && self.documents[i].source_hash == doc.source_hash
                     && self.documents[i].search_text == doc.search_text
                     && self.vector_at(i) == vector.as_deref()
             });
@@ -1453,6 +1532,10 @@ impl SearchIndex {
         query_vec: &[f32],
         opts: &ResolvedSearchOptions,
     ) -> Vec<SearchResult> {
+        if self.dims != 0 && query_vec.len() != self.dims {
+            // The previous model cannot score queries from the replacement vector space.
+            return Vec::new();
+        }
         let query_terms: HashSet<String> = split_camel_case(query).into_iter().collect();
         let query_lower = query.trim().to_lowercase();
         let query_kind = detect_query_kind(query);
@@ -1522,7 +1605,15 @@ impl SearchIndex {
                 let mut indices: std::collections::HashSet<usize> = hits
                     .iter()
                     .filter_map(|(path, _)| path_to_idx.get(path.as_str()).copied())
+                    .filter(|&i| {
+                        self.has_vector[i]
+                            && !self.vector_updates.contains_key(&self.documents[i].path)
+                    })
                     .collect();
+                if indices.len() < candidate_count {
+                    // Tombstones must not consume the live-neighbor budget.
+                    return None;
+                }
                 indices.extend(
                     self.vector_updates
                         .keys()
@@ -1873,7 +1964,8 @@ pub(crate) async fn semantic_code_search_owned(
     if let (Some(lock), Some(generation)) = (&index_cache, &cache_generation) {
         let stale = lock.read().await.as_ref().cloned();
         if let Some(stale) = stale
-            && stale.generation.load(Ordering::Acquire) != generation.load(Ordering::Acquire)
+            && (stale.generation.load(Ordering::Acquire) != generation.load(Ordering::Acquire)
+                || !stale.pending.lock().unwrap().batches.is_empty())
             && !stale.scoped_refresh.load(Ordering::Acquire)
             && stale.search_root
                 == std::fs::canonicalize(&options.root_dir)
@@ -1903,11 +1995,13 @@ pub(crate) async fn semantic_code_search_owned(
                                     .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
                                     .collect();
                                 let mut ready_generation = build_generation;
+                                let mut ready_vector_generation = vector_generation;
                                 for RefreshBatch {
                                     docs,
                                     vectors,
                                     deleted,
                                     generation,
+                                    vector_generation: batch_vector_generation,
                                 } in &pending.batches
                                 {
                                     if *generation < build_generation {
@@ -1923,6 +2017,8 @@ pub(crate) async fn semantic_code_search_owned(
                                         );
                                     }
                                     ready_generation = ready_generation.max(*generation);
+                                    ready_vector_generation = ready_vector_generation
+                                        .max(batch_vector_generation.unwrap_or(0));
                                 }
                                 let consumed = pending.batches.len();
                                 drop(pending);
@@ -1932,10 +2028,22 @@ pub(crate) async fn semantic_code_search_owned(
                                 let mut index = base.index.clone();
                                 index.apply_delta(changed, vectors, &deleted);
                                 index.prepare_ann();
-                                (index, ready_generation, consumed)
+                                (index, ready_generation, ready_vector_generation, consumed)
                             })
                             .await;
-                            if let Ok((index, ready_generation, consumed)) = built {
+                            if let Ok((
+                                index,
+                                ready_generation,
+                                ready_vector_generation,
+                                consumed,
+                            )) = built
+                            {
+                                if index.dims != previous.index.dims
+                                    && index.has_vector.iter().any(|ready| !ready)
+                                {
+                                    // A newer shape batch may have arrived after the walker snapshot.
+                                    return;
+                                }
                                 let mut guard = lock.write().await;
                                 if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
                                     let fp = IndexFingerprint::from_docs(&index.documents);
@@ -1945,7 +2053,7 @@ pub(crate) async fn semantic_code_search_owned(
                                         previous.pending.lock().unwrap().batches[consumed..]
                                             .to_vec();
                                     entry.search_root = previous.search_root.clone();
-                                    entry.vector_generation = vector_generation;
+                                    entry.vector_generation = ready_vector_generation;
                                     *guard = Some(Arc::new(entry));
                                 }
                             }
@@ -2189,11 +2297,13 @@ pub async fn semantic_code_search(
                                 let mut deleted: HashSet<_> = deleted.into_iter().collect();
                                 let pending = base.pending.lock().unwrap();
                                 let mut ready_generation = current_gen;
+                                let mut ready_vector_generation = vector_generation;
                                 for RefreshBatch {
                                     docs,
                                     vectors,
                                     deleted: removed,
                                     generation,
+                                    vector_generation: batch_vector_generation,
                                 } in &pending.batches
                                 {
                                     if *generation < current_gen {
@@ -2211,6 +2321,8 @@ pub async fn semantic_code_search(
                                         );
                                     }
                                     ready_generation = ready_generation.max(*generation);
+                                    ready_vector_generation = ready_vector_generation
+                                        .max(batch_vector_generation.unwrap_or(0));
                                 }
                                 let consumed = pending.batches.len();
                                 drop(pending);
@@ -2222,10 +2334,22 @@ pub async fn semantic_code_search(
                                     &deleted.into_iter().collect::<Vec<_>>(),
                                 );
                                 index.prepare_ann();
-                                (index, ready_generation, consumed)
+                                (index, ready_generation, ready_vector_generation, consumed)
                             })
                             .await;
-                            if let Ok((index, ready_generation, consumed)) = built {
+                            if let Ok((
+                                index,
+                                ready_generation,
+                                ready_vector_generation,
+                                consumed,
+                            )) = built
+                            {
+                                if index.dims != previous.index.dims
+                                    && index.has_vector.iter().any(|ready| !ready)
+                                {
+                                    // A newer shape batch may have arrived after the walker snapshot.
+                                    return;
+                                }
                                 let mut guard = lock.write().await;
                                 if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
                                     let fp = IndexFingerprint::from_docs(&index.documents);
@@ -2235,7 +2359,7 @@ pub async fn semantic_code_search(
                                         previous.pending.lock().unwrap().batches[consumed..]
                                             .to_vec();
                                     entry.search_root = search_root;
-                                    entry.vector_generation = vector_generation;
+                                    entry.vector_generation = ready_vector_generation;
                                     *entry.metadata.write().unwrap() = metadata;
                                     *guard = Some(Arc::new(entry));
                                 }
@@ -4086,6 +4210,131 @@ mod tests {
             })
             .collect();
         (docs, vectors)
+    }
+
+    #[test]
+    fn r3_pending_fill_keeps_vector_generation_with_its_batch() {
+        let docs = vec![make_doc("old.rs", "old"), make_doc("changed.rs", "before")];
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs.clone(), vec![Some(vec![1.0, 0.0]); 2]);
+        let mut entry = Arc::new(CachedSearchIndex::new(
+            index,
+            IndexFingerprint::from_docs(&docs),
+            0,
+        ));
+        CachedSearchIndex::refresh_vectors(
+            &mut entry,
+            Path::new(""),
+            vec![(
+                "changed.rs".into(),
+                crate::core::embeddings::content_hash("before"),
+                vec![1.0, 0.0, 0.0],
+            )],
+            1,
+        );
+        assert_eq!(
+            entry.vector_generation, 0,
+            "pending vectors are not yet represented"
+        );
+        let pending = entry.pending.lock().unwrap();
+        assert_eq!(pending.batches.len(), 1);
+        assert_eq!(pending.batches[0].vector_generation, Some(1));
+    }
+
+    #[test]
+    fn r3_dimension_transition_keeps_changed_vector_searchable() {
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(
+            vec![make_doc("old.rs", "old"), make_doc("changed.rs", "before")],
+            vec![Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0])],
+        );
+        assert_eq!(
+            index.apply_delta(
+                vec![make_doc("changed.rs", "after")],
+                vec![Some(vec![1.0, 0.0, 0.0])],
+                &[]
+            ),
+            IndexUpdateKind::FullRebuild
+        );
+        assert_eq!(
+            index.dims, 3,
+            "replacement shape must come from the new vector"
+        );
+        let i = index
+            .documents
+            .iter()
+            .position(|d| d.path == "changed.rs")
+            .unwrap();
+        assert_eq!(index.vector_at(i), Some([1.0, 0.0, 0.0].as_slice()));
+        assert!(
+            index
+                .documents
+                .iter()
+                .enumerate()
+                .all(|(i, _)| index.vector_at(i).is_none_or(|v| v.len() == 3))
+        );
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+        assert!(
+            index
+                .search("after", &[1.0, 0.0, 0.0], &opts)
+                .iter()
+                .any(|r| r.path == "changed.rs")
+        );
+    }
+
+    #[test]
+    fn r3_deleted_ann_shortlist_replenishes_survivors() {
+        let (docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let query = unit_vec(1.0, 0.001);
+        let deleted: Vec<_> = index
+            .ann_store
+            .as_ref()
+            .unwrap()
+            .find_nearest(&query, 5 * ANN_CANDIDATE_MULTIPLIER)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            index.apply_delta(vec![], vec![], &deleted),
+            IndexUpdateKind::Incremental
+        );
+        let opts = ResolvedSearchOptions {
+            top_k: 5,
+            semantic_weight: 1.0,
+            keyword_weight: 0.0,
+            min_semantic_score: 0.0,
+            min_keyword_score: 0.0,
+            min_combined_score: 0.0,
+            require_keyword_match: false,
+            require_semantic_match: false,
+            ..Default::default()
+        };
+        let results = index.search("file", &query, &opts);
+        assert_eq!(results.len(), 5, "deleted ANN shortlist hid live matches");
+        assert!(results.iter().all(|r| !deleted.contains(&r.path)));
+        for _ in 0..9 {
+            let deleted: Vec<_> = index
+                .documents
+                .iter()
+                .take(50)
+                .map(|d| d.path.clone())
+                .collect();
+            index.apply_delta(vec![], vec![], &deleted);
+        }
+        assert!(
+            index.full_rebuild_count() > 1,
+            "accumulated tombstones never compacted"
+        );
     }
 
     #[test]
