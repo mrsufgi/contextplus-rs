@@ -706,26 +706,11 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::core::clustering::ClusterResult;
+    use crate::test_logs::{captured_info_logs, logs_as_string};
     use crate::tools::semantic_navigate;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[derive(Clone)]
-    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
 
     fn config_with_host(host: &str) -> Config {
         let mut config = Config::from_env();
@@ -803,23 +788,6 @@ mod tests {
         })
         .await
         .is_ok()
-    }
-
-    fn captured_info_logs() -> (Arc<Mutex<Vec<u8>>>, impl tracing::Subscriber) {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let writer_logs = Arc::clone(&logs);
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(move || CapturedWriter(Arc::clone(&writer_logs)))
-            .finish();
-        (logs, subscriber)
-    }
-
-    fn logs_as_string(logs: &Arc<Mutex<Vec<u8>>>) -> String {
-        String::from_utf8(logs.lock().unwrap().clone()).unwrap()
     }
 
     #[tokio::test]
@@ -995,8 +963,7 @@ mod tests {
             },
         ];
         let (_server, client) = mock_chat(r#"["Zebra Handler", "Falcon Handler"]"#).await;
-        let (logs, subscriber) = captured_info_logs();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (logs, _guard) = captured_info_logs();
 
         run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
 
@@ -1087,8 +1054,7 @@ mod tests {
             parent_label: "payments".to_string(),
             files: vec![file],
         }];
-        let (logs, subscriber) = captured_info_logs();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (logs, _guard) = captured_info_logs();
 
         run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
 
@@ -1133,8 +1099,7 @@ mod tests {
             parent_label: "payments".to_string(),
             files: vec![file],
         }];
-        let (logs, subscriber) = captured_info_logs();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (logs, _guard) = captured_info_logs();
         run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
         assert_eq!(
             semantic_navigate::load_label_cache_full(tempdir.path())[&key].quality,
@@ -1171,8 +1136,7 @@ mod tests {
             parent_label: "payments".to_string(),
             files: vec![file],
         }];
-        let (logs, subscriber) = captured_info_logs();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (logs, _guard) = captured_info_logs();
 
         run_subcluster_llm_heal(&queue, &client, tempdir.path()).await;
 
@@ -1210,8 +1174,7 @@ mod tests {
         let claimed = claim_in_flight_keys(&keys);
         assert_eq!(claimed.len(), 2);
         let client = OllamaClient::new(&config_with_host("http://127.0.0.1:9"));
-        let (logs, subscriber) = captured_info_logs();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (logs, _guard) = captured_info_logs();
 
         let labels = label_subclusters_with_llm(&pending, &files, &client, tempdir.path()).await;
         release_in_flight_keys(&keys);
