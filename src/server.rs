@@ -2466,6 +2466,16 @@ impl ContextPlusServer {
             include_globs: Self::get_string_array(&args, "include_globs"),
             exclude_globs: Self::get_string_array(&args, "exclude_globs"),
             recency_window_days: Self::get_u32(&args, "recency_window_days"),
+            scope: match Self::get_str(&args, "scope").as_deref() {
+                None | Some("all") => None,
+                Some("code") => Some(crate::tools::semantic_search::SearchScope::Code),
+                Some("docs") => Some(crate::tools::semantic_search::SearchScope::Docs),
+                Some(_) => {
+                    return Err(ContextPlusError::Other(
+                        "scope must be code, docs, or all".into(),
+                    ));
+                }
+            },
         };
 
         let embedder = OllamaEmbedder(self.state.ollama.clone());
@@ -3964,6 +3974,7 @@ async fn warmup_ref_search_cache(state: &Arc<SharedState>, ref_id: crate::ref_in
         include_globs: None,
         exclude_globs: None,
         recency_window_days: None,
+        scope: None,
     };
 
     let embedder = OllamaEmbedder(state.ollama.clone());
@@ -4034,6 +4045,7 @@ pub async fn warmup_semantic_search_cache(state: &Arc<SharedState>) {
         include_globs: None,
         exclude_globs: None,
         recency_window_days: None,
+        scope: None,
     };
 
     let embedder = OllamaEmbedder(state.ollama.clone());
@@ -10126,6 +10138,100 @@ mod tests {
         .expect("a released filler response must install while the fresh query is embedding");
 
         slow_query.abort();
+    }
+
+    #[tokio::test]
+    async fn scoped_walker_preserves_documentation_scope_and_prior() {
+        use crate::tools::semantic_search::{ResolvedSearchOptions, SearchIndex, SearchScope};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; embed_request_inputs(request).len()]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        for (directory, filename) in [
+            (
+                "docs",
+                "observability/betterstack-dashboards/14-phi-scrub-verification.json",
+            ),
+            ("packages/db/migrations", "202609260001_add_phi_fields.sql"),
+            ("packages/db/queries", "phi_fields.sql"),
+        ] {
+            let file = root.path().join(directory).join(filename);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "{}\n").unwrap();
+        }
+        let server = ContextPlusServer::new(
+            root.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 1_000, 3_000),
+        );
+        let walker = CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        };
+        for (directory, filename, documentation) in [
+            (
+                "docs",
+                "observability/betterstack-dashboards/14-phi-scrub-verification.json",
+                true,
+            ),
+            (
+                "packages/db/migrations",
+                "202609260001_add_phi_fields.sql",
+                true,
+            ),
+            ("packages/db/queries", "phi_fields.sql", false),
+        ] {
+            let (docs, _) = walker
+                .walk_and_index(&root.path().join(directory))
+                .await
+                .unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].path, filename);
+            let mut index = SearchIndex::new();
+            index.index_with_vectors(docs, vec![Some(vec![1.0, 0.0])]);
+            let opts = ResolvedSearchOptions {
+                semantic_weight: 1.0,
+                keyword_weight: 0.0,
+                min_semantic_score: 0.0,
+                min_keyword_score: 0.0,
+                min_combined_score: 0.0,
+                ..Default::default()
+            };
+            let results = index.search("unrelated", &[1.0, 0.0], &opts);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].path, filename);
+            let expected = if documentation { 80.0 } else { 100.0 };
+            assert!(
+                (results[0].score - expected).abs() < 1e-6,
+                "{directory}: expected prior {expected}, got {:?}",
+                results[0]
+            );
+            for scope in [SearchScope::Code, SearchScope::Docs] {
+                let results = index.search(
+                    "unrelated",
+                    &[1.0, 0.0],
+                    &ResolvedSearchOptions {
+                        scope,
+                        ..opts.clone()
+                    },
+                );
+                assert_eq!(
+                    results.len(),
+                    usize::from((scope == SearchScope::Docs) == documentation),
+                    "{directory}: scope {scope:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

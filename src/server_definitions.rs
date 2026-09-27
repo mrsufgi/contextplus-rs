@@ -46,6 +46,12 @@ fn build_tool_definitions() -> Vec<Tool> {
                     "Cluster output budget (default 5000 tokens, approximately 20000 characters).",
                 ),
                 (
+                    "scope",
+                    "string",
+                    false,
+                    "Meaning files: all (default): code and docs, with docs demoted; code: code only; docs: documentation only.",
+                ),
+                (
                     "top_k",
                     "integer",
                     false,
