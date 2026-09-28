@@ -102,6 +102,30 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn child_lookup_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next worktree vector lookup of the ref rooted at `root`
+    /// after it reads the worktrees' caches.
+    pub(crate) fn pause_after_child_lookup(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        child_lookup_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_child_lookup(root: &Path) {
+        let pause = child_lookup_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     pub(crate) async fn seed_pending(
         ref_index: &crate::ref_index::RefIndex,
         path: &str,
@@ -691,6 +715,31 @@ impl CachedWalkerIndexer {
                     }
                 }
             }
+            let (miss_indices, misses): (Vec<usize>, Vec<VectorMiss>) = uncached_indices
+                .iter()
+                .filter(|&&idx| current[idx] && vectors[idx].is_none())
+                .map(|&idx| {
+                    let (path, hash) = &content_hashes[idx];
+                    let miss = VectorMiss {
+                        path: path.clone(),
+                        hash: hash.clone(),
+                        observed: observed[idx].clone(),
+                    };
+                    (idx, miss)
+                })
+                .unzip();
+            let adopted = adopt_worktree_vectors(
+                &self.state,
+                &ref_index,
+                &misses,
+                config.max_embed_file_size,
+            )
+            .await;
+            for (idx, vector) in miss_indices.into_iter().zip(adopted) {
+                if vector.is_some() {
+                    vectors[idx] = vector;
+                }
+            }
             uncached_indices.retain(|&idx| vectors[idx].is_none());
 
             #[cfg(test)]
@@ -1248,6 +1297,109 @@ fn walk_document(
             false,
         ),
     }
+}
+
+/// A file whose vector a ref lacks: its path, content hash, and the ref's
+/// cached and pending hashes for the path when the miss was seen.
+pub(crate) struct VectorMiss {
+    pub(crate) path: String,
+    pub(crate) hash: String,
+    pub(crate) observed: (Option<String>, Option<String>),
+}
+
+impl VectorMiss {
+    pub(crate) async fn observe(
+        ref_index: &crate::ref_index::RefIndex,
+        path: String,
+        hash: String,
+    ) -> Self {
+        let fill = ref_index.semantic_fill.lock().await;
+        let cache = ref_index.embedding_cache.read().await;
+        let observed = (
+            cache.get(&path).map(|entry| entry.hash.clone()),
+            fill.pending.get(&path).map(|doc| doc.hash.clone()),
+        );
+        Self {
+            path,
+            hash,
+            observed,
+        }
+    }
+}
+
+/// Vectors that `ref_index`'s attached worktrees hold for `misses` at the same
+/// path and content hash, copied into its cache. A vector is taken only while
+/// the file still has that hash, the worktree still holds it, and the ref's
+/// cached and pending hashes for the path are as observed.
+pub(crate) async fn adopt_worktree_vectors(
+    state: &SharedState,
+    ref_index: &crate::ref_index::RefIndex,
+    misses: &[VectorMiss],
+    max_size: usize,
+) -> Vec<Option<Vec<f32>>> {
+    let mut vectors = vec![None; misses.len()];
+    if misses.is_empty() {
+        return vectors;
+    }
+    let children = state.attached_children(ref_index).await;
+    let mut found: Vec<Option<(usize, CacheEntry)>> = vec![None; misses.len()];
+    for (child_idx, child) in children.iter().enumerate() {
+        let cache = child.embedding_cache.read().await;
+        for (slot, miss) in found.iter_mut().zip(misses) {
+            if slot.is_none() {
+                *slot = cache
+                    .get(&miss.path)
+                    .filter(|entry| entry.hash == miss.hash)
+                    .map(|entry| (child_idx, entry.clone()));
+            }
+        }
+    }
+    #[cfg(test)]
+    test_seams::after_child_lookup(&ref_index.canonical_root).await;
+    let mut current = vec![false; misses.len()];
+    for ((current, slot), miss) in current.iter_mut().zip(&found).zip(misses) {
+        let Some((child_idx, _)) = slot else {
+            continue;
+        };
+        *current = FillDocument {
+            path: miss.path.clone(),
+            hash: miss.hash.clone(),
+            text: String::new(),
+            owner: None,
+        }
+        .is_current(&ref_index.canonical_root, max_size)
+        .await
+            && children[*child_idx]
+                .embedding_cache
+                .read()
+                .await
+                .get(&miss.path)
+                .is_some_and(|entry| entry.hash == miss.hash);
+    }
+    if current.contains(&true) {
+        let fill = ref_index.semantic_fill.lock().await;
+        let mut cache = ref_index.embedding_cache.write().await;
+        for (i, (slot, miss)) in found.into_iter().zip(misses).enumerate() {
+            if let Some((_, entry)) = slot.filter(|_| {
+                current[i]
+                    && cache.get(&miss.path).map(|entry| &entry.hash) == miss.observed.0.as_ref()
+                    && fill.pending.get(&miss.path).map(|doc| &doc.hash) == miss.observed.1.as_ref()
+            }) {
+                vectors[i] = Some(entry.vector.clone());
+                cache.insert(miss.path.clone(), entry);
+            }
+        }
+    }
+    if !children.is_empty() {
+        tracing::info!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            worktrees = children.len(),
+            misses = misses.len(),
+            adopted = vectors.iter().flatten().count(),
+            "semantic worktree cache lookup"
+        );
+    }
+    vectors
 }
 
 /// A worktree's semantic slot and generations when its walk began.

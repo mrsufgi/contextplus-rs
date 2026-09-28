@@ -420,6 +420,25 @@ impl SharedState {
         self.refs.read().await.get(&id).cloned()
     }
 
+    /// Refs attached as worktrees of `parent`.
+    pub(crate) async fn attached_children(
+        &self,
+        parent: &crate::ref_index::RefIndex,
+    ) -> Vec<Arc<crate::ref_index::RefIndex>> {
+        let refs = self.refs.read().await;
+        let Some(parent_id) = refs
+            .iter()
+            .find(|(_, candidate)| std::ptr::eq(candidate.as_ref(), parent))
+            .map(|(id, _)| *id)
+        else {
+            return Vec::new();
+        };
+        refs.values()
+            .filter(|child| child.parent_ref_id == Some(parent_id))
+            .cloned()
+            .collect()
+    }
+
     /// Attach a session to an existing ref, or insert a new `RefIndex` and
     /// attach. Returns the `RefId` that the caller should use for subsequent
     /// tool dispatches.
@@ -2603,6 +2622,7 @@ impl ContextPlusServer {
         let mut updated = 0usize;
         let mut skipped = 0usize;
         let mut content_changed = false;
+        let mut adopted = 0usize;
 
         let max_file_size = self.state.config.max_embed_file_size as u64;
         let ref_index = self.current_ref().await;
@@ -2675,6 +2695,25 @@ impl ContextPlusServer {
                 continue;
             }
 
+            let miss = crate::server_adapters::VectorMiss::observe(
+                &ref_index,
+                rel_path.clone(),
+                hash.clone(),
+            )
+            .await;
+            if let [Some(_)] = crate::server_adapters::adopt_worktree_vectors(
+                &self.state,
+                &ref_index,
+                &[miss],
+                self.state.config.max_embed_file_size,
+            )
+            .await[..]
+            {
+                adopted += 1;
+                updated += 1;
+                continue;
+            }
+
             let text =
                 build_embedding_document(&rel_path, &content, self.state.config.embed_doc_shape);
 
@@ -2738,7 +2777,7 @@ impl ContextPlusServer {
             {
                 tracing::warn!("CAS manifest update failed (non-fatal): {e}");
             }
-            if cas_hit_entries.is_empty() {
+            if cas_hit_entries.is_empty() && adopted == 0 {
                 return IncrementalReembedOutcome {
                     updated,
                     skipped,
@@ -14280,6 +14319,269 @@ mod tests {
             matching_embed_input_count(&ollama, "WORKTREE_FILL_TARGET").await,
             document_requests_before_next_query,
             "the next query must use the cached fill instead of re-embedding"
+        );
+    }
+
+    const MERGED_PRIMARY: &str = "fn merged() {}\n// primary original\n";
+    const MERGED_WORKTREE: &str = "fn merged() {}\n// WORKTREE_MERGED_BODY\n";
+    const WORKTREE_VECTOR: [f32; 3] = [7.0, 7.0, 7.0];
+
+    /// The vector `ref_index` caches for `path` once it holds `content`'s hash.
+    async fn cached_vector(
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        path: &str,
+        content: &str,
+    ) -> Vec<f32> {
+        let hash = crate::core::embeddings::content_hash(content);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(entry) = ref_index
+                    .embedding_cache
+                    .read()
+                    .await
+                    .get(path)
+                    .filter(|entry| entry.hash == hash)
+                {
+                    return entry.vector.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{path} was never cached at its current content"))
+    }
+
+    /// The vector a walk of `root` gives `path`, if any.
+    async fn walked_vector(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+        path: &str,
+    ) -> Option<Vec<f32>> {
+        let (docs, vectors) = CachedWalkerIndexer {
+            config: server.state.config.clone(),
+            ollama: server.state.ollama.clone(),
+            state: Arc::clone(&server.state),
+        }
+        .walk_and_index(root)
+        .await
+        .unwrap();
+        let idx = docs.iter().position(|doc| doc.path == path)?;
+        vectors[idx].clone()
+    }
+
+    /// A primary holding `merged.rs` at [`MERGED_PRIMARY`], and an attached
+    /// worktree that has embedded `worktree_path` at `worktree_content`, its
+    /// vector then marked [`WORKTREE_VECTOR`].
+    async fn primary_with_worktree_vector(
+        ollama: &wiremock::MockServer,
+        worktree_path: &str,
+        worktree_content: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+        Arc<crate::ref_index::RefIndex>,
+    ) {
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(primary.path().join("merged.rs"), MERGED_PRIMARY).unwrap();
+        std::fs::write(worktree.path().join(worktree_path), worktree_content).unwrap();
+        let server = identifier_test_server(ollama, primary.path()).await;
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+        cached_vector(&server.current_ref().await, "merged.rs", MERGED_PRIMARY).await;
+
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+        worktree_server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+        let worktree_ref = worktree_server.current_ref().await;
+        cached_vector(&worktree_ref, worktree_path, worktree_content).await;
+        worktree_ref.embedding_cache.write().await.insert(
+            worktree_path.to_string(),
+            CacheEntry {
+                hash: crate::core::embeddings::content_hash(worktree_content),
+                vector: WORKTREE_VECTOR.to_vec(),
+            },
+        );
+        (primary, worktree, server, worktree_ref)
+    }
+
+    /// A primary file changed to content an attached worktree has embedded at
+    /// the same path takes the worktree's vector on its next query walk.
+    #[tokio::test]
+    async fn primary_walk_reuses_attached_worktree_vector_of_same_path_and_content() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _worktree, server, _) =
+            primary_with_worktree_vector(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1
+        );
+
+        std::fs::write(primary.path().join("merged.rs"), MERGED_WORKTREE).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            vector, WORKTREE_VECTOR,
+            "the primary takes the worktree's vector"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1,
+            "the primary must not re-embed content the worktree embedded"
+        );
+    }
+
+    /// The tracker's re-embed of a primary file changed to content an attached
+    /// worktree has embedded at the same path takes the worktree's vector.
+    #[tokio::test]
+    async fn primary_tracker_reuses_attached_worktree_vector_of_same_path_and_content() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _worktree, server, _) =
+            primary_with_worktree_vector(&ollama, "merged.rs", MERGED_WORKTREE).await;
+
+        let merged = primary.path().join("merged.rs");
+        std::fs::write(&merged, MERGED_WORKTREE).unwrap();
+        let (updated, _) = server.incremental_reembed(&[merged]).await;
+
+        assert_eq!(updated, 1);
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            vector, WORKTREE_VECTOR,
+            "the primary takes the worktree's vector"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1,
+            "the tracker must not re-embed content the worktree embedded"
+        );
+    }
+
+    /// The embedded text carries the path, so a worktree's vector of the same
+    /// content at another path is not the primary's.
+    #[tokio::test]
+    async fn primary_walk_embeds_worktree_content_held_at_another_path() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _worktree, server, _) =
+            primary_with_worktree_vector(&ollama, "moved.rs", MERGED_WORKTREE).await;
+
+        std::fs::write(primary.path().join("merged.rs"), MERGED_WORKTREE).unwrap();
+        let walked = walked_vector(&server, primary.path(), "merged.rs").await;
+        assert_ne!(walked.as_deref(), Some(&WORKTREE_VECTOR[..]));
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            2,
+            "the primary embeds the content the worktree holds at another path"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_tracker_embeds_content_the_worktree_holds_at_another_hash() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _worktree, server, _) =
+            primary_with_worktree_vector(&ollama, "merged.rs", MERGED_WORKTREE).await;
+
+        let primary_content = "fn merged() {}\n// PRIMARY_MERGED_BODY\n";
+        let merged = primary.path().join("merged.rs");
+        std::fs::write(&merged, primary_content).unwrap();
+        server.incremental_reembed(&[merged]).await;
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", primary_content).await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(
+            matching_embed_input_count(&ollama, "PRIMARY_MERGED_BODY").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_walk_embeds_after_the_worktree_is_detached() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, worktree, server, _) =
+            primary_with_worktree_vector(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        let worktree_id =
+            crate::ref_index::RefId::for_canonical_path(&worktree.path().canonicalize().unwrap());
+        server
+            .state
+            .detach_ref(worktree_id, std::time::Duration::ZERO)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.state.ref_index(worktree_id).await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached worktree leaves the registry");
+
+        std::fs::write(primary.path().join("merged.rs"), MERGED_WORKTREE).unwrap();
+        let walked = walked_vector(&server, primary.path(), "merged.rs").await;
+        assert_ne!(walked.as_deref(), Some(&WORKTREE_VECTOR[..]));
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            2
+        );
+    }
+
+    /// A worktree entry replaced between the lookup and the copy is not
+    /// taken; the primary embeds instead.
+    #[tokio::test]
+    async fn primary_walk_embeds_when_the_worktree_entry_is_replaced_during_lookup() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _worktree, server, worktree_ref) =
+            primary_with_worktree_vector(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        std::fs::write(primary.path().join("merged.rs"), MERGED_WORKTREE).unwrap();
+
+        let pause = crate::server_adapters::test_seams::pause_after_child_lookup(
+            &primary.path().canonicalize().unwrap(),
+        );
+        let walk_state = Arc::clone(&server.state);
+        let walk_root = primary.path().to_path_buf();
+        let walk = tokio::spawn(async move {
+            CachedWalkerIndexer {
+                config: walk_state.config.clone(),
+                ollama: walk_state.ollama.clone(),
+                state: walk_state,
+            }
+            .walk_and_index(&walk_root)
+            .await
+            .unwrap()
+        });
+        pause.wait_until_entered().await;
+        worktree_ref.embedding_cache.write().await.insert(
+            "merged.rs".to_string(),
+            CacheEntry {
+                hash: crate::core::embeddings::content_hash("fn replaced() {}\n"),
+                vector: vec![8.0, 8.0, 8.0],
+            },
+        );
+        pause.resume();
+        let (docs, vectors) = walk.await.unwrap();
+
+        let idx = docs.iter().position(|doc| doc.path == "merged.rs").unwrap();
+        assert_ne!(vectors[idx].as_deref(), Some(&WORKTREE_VECTOR[..]));
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_ne!(
+            vector, WORKTREE_VECTOR,
+            "a replaced worktree entry is not taken"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            2,
+            "the primary embeds instead"
         );
     }
 
