@@ -57,6 +57,10 @@ Three independent cache layers minimize redundant work:
 - **Worktrees:** a linked worktree's semantic index forks the primary's (`SearchIndex::fork`),
   sharing its `VectorStore` and HNSW graph and overlaying only the files that differ; past a 20%
   change, or while the primary's index is scoped, queued or rebuilding, the worktree builds its own.
+- **Exact scoring:** below `CONTEXTPLUS_HNSW_MIN_VECTORS` (50,000) embedded files, every query
+  scores every document on the blended score (cosine, keywords, recency, path prior) and no HNSW
+  graph is built. From that size, the graph's cosine shortlist of `top_k ×
+  CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` documents is re-ranked instead.
 
 ### Identifier Index
 
@@ -206,7 +210,8 @@ All runtime knobs are read from environment variables by `Config::from_env()` (`
 |----------|---------|-------------|
 | `CONTEXTPLUS_HNSW_EF_CONSTRUCTION` | `100` | HNSW `efConstruction` — index build quality vs. time |
 | `CONTEXTPLUS_HNSW_EF_SEARCH` | `32` | HNSW `ef_search` — recall vs. query latency |
-| `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` | `10` | ANN candidate pool = `top_k × N`; applies when corpus > 2,000 files |
+| `CONTEXTPLUS_HNSW_MIN_VECTORS` | `50000` | Embedded files from which semantic search builds the HNSW graph and re-ranks its shortlist; below it every file is scored |
+| `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` | `10` | ANN candidate pool = `top_k × N`; applies from `CONTEXTPLUS_HNSW_MIN_VECTORS` embedded files |
 
 ### Warmup
 

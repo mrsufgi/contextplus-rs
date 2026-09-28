@@ -186,6 +186,10 @@ pub struct Config {
     /// HNSW `ef_search` — recall/latency trade-off at query time.
     /// Controlled by `CONTEXTPLUS_HNSW_EF_SEARCH` (default: 100).
     pub hnsw_ef_search: usize,
+    /// Embedded vectors from which semantic search builds the HNSW graph and
+    /// prunes with it; below it every document is scored.
+    /// Controlled by `CONTEXTPLUS_HNSW_MIN_VECTORS` (default: 50000).
+    pub hnsw_min_vectors: usize,
     /// How aggressively to warm caches when a new worktree ref attaches.
     /// Controlled by `CONTEXTPLUS_REF_WARMUP_MODE` (default: `shallow`).
     pub ref_warmup_mode: RefWarmupMode,
@@ -664,6 +668,11 @@ impl Config {
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
                 DEFAULT_HNSW_EF_SEARCH,
             ),
+            hnsw_min_vectors: parse_usize_env_warn(
+                env,
+                "CONTEXTPLUS_HNSW_MIN_VECTORS",
+                crate::tools::semantic_search::HNSW_MIN_VECTORS,
+            ),
             ref_warmup_mode: parse_ref_warmup_mode(
                 env.get("CONTEXTPLUS_REF_WARMUP_MODE").map(String::as_str),
             ),
@@ -793,6 +802,7 @@ mod tests {
                 assert_eq!(cfg.embed_chunk_chars, 2000);
                 assert_eq!(cfg.hnsw_ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
                 assert_eq!(cfg.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
+                assert_eq!(cfg.hnsw_min_vectors, 50_000);
                 // U16: new defaults
                 assert_eq!(cfg.ref_warmup_mode, RefWarmupMode::Shallow);
                 assert_eq!(cfg.ollama_max_concurrent, 4);
@@ -1416,11 +1426,13 @@ mod tests {
             &[
                 "CONTEXTPLUS_HNSW_EF_CONSTRUCTION",
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
+                "CONTEXTPLUS_HNSW_MIN_VECTORS",
             ],
             || {
                 let c = Config::from_env();
                 assert_eq!(c.hnsw_ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
                 assert_eq!(c.hnsw_ef_search, DEFAULT_HNSW_EF_SEARCH);
+                assert_eq!(c.hnsw_min_vectors, 50_000);
             },
         );
     }
@@ -1431,11 +1443,13 @@ mod tests {
             &[
                 ("CONTEXTPLUS_HNSW_EF_CONSTRUCTION", "200"),
                 ("CONTEXTPLUS_HNSW_EF_SEARCH", "256"),
+                ("CONTEXTPLUS_HNSW_MIN_VECTORS", "3000"),
             ],
             || {
                 let c = Config::from_env();
                 assert_eq!(c.hnsw_ef_construction, 200);
                 assert_eq!(c.hnsw_ef_search, 256);
+                assert_eq!(c.hnsw_min_vectors, 3000);
             },
         );
     }

@@ -30,10 +30,16 @@ const MAX_RECENCY_BOOST: f64 = 0.05;
 // ANN pre-filter constants
 // ---------------------------------------------------------------------------
 
-/// Corpus size at which `SearchIndex::search` switches from O(N) brute-force
-/// cosine scan to an HNSW approximate-nearest-neighbor pre-filter. Must match
-/// `HNSW_THRESHOLD` in `core/embeddings.rs` (both guard the same boundary).
+/// Embedded docs from which a `SearchIndex` keeps its vectors in a
+/// `VectorStore` that worktree forks share. Must match `HNSW_THRESHOLD` in
+/// `core/embeddings.rs` (both guard the same boundary).
 const ANN_THRESHOLD: usize = 2_000;
+
+/// Embedded vectors from which `SearchIndex::search` builds the HNSW graph and
+/// prunes to its shortlist. Below it every document is scored on the blended
+/// score, since the shortlist is taken on cosine alone. Override with
+/// `CONTEXTPLUS_HNSW_MIN_VECTORS`.
+pub(crate) const HNSW_MIN_VECTORS: usize = 50_000;
 
 /// How many ANN candidates to fetch per top-k result. The candidate pool is
 /// `top_k * ANN_CANDIDATE_MULTIPLIER`, capped at the corpus size. Larger
@@ -1479,7 +1485,8 @@ impl CachedSearchIndex {
 /// In-memory search index holding documents and their embedding vectors.
 /// Vectors are stored in a flat contiguous buffer for cache-friendly SIMD access.
 /// For corpora larger than `ANN_THRESHOLD`, a `VectorStore` is also built so
-/// `search()` can use HNSW ANN pre-filtering instead of a full cosine scan.
+/// forks can share it; from `HNSW_MIN_VECTORS` `search()` also uses its HNSW
+/// graph to pre-filter instead of scoring every document.
 ///
 /// Memory optimisation: when `ann_store` is `Some` (corpus ≥ `ANN_THRESHOLD`),
 /// `vector_buffer` is released (`capacity() == 0`) because the `VectorStore`
@@ -1513,6 +1520,8 @@ pub struct SearchIndex {
     /// `ANN_THRESHOLD`. Maps relative file path → embedding vector.
     /// `None` when the corpus is below threshold or no vectors are available.
     ann_store: Option<Arc<VectorStore>>,
+    /// Store size from which `search()` builds and prunes with the graph.
+    hnsw_min_vectors: usize,
 }
 
 impl Default for SearchIndex {
@@ -1567,8 +1576,16 @@ impl SearchIndex {
                 .sum::<usize>()
     }
 
+    /// The store whose graph `search()` prunes with; `None` below
+    /// `hnsw_min_vectors`, where every document is scored.
+    fn graph_store(&self) -> Option<&Arc<VectorStore>> {
+        self.ann_store
+            .as_ref()
+            .filter(|store| store.count() >= self.hnsw_min_vectors)
+    }
+
     fn prepare_ann(&self) {
-        if let Some(store) = &self.ann_store {
+        if let Some(store) = self.graph_store() {
             store.find_nearest_hnsw(&vec![0.0; self.dims], 1);
         }
     }
@@ -1583,6 +1600,7 @@ impl SearchIndex {
             has_vector: Vec::new(),
             dims: 0,
             ann_store: None,
+            hnsw_min_vectors: HNSW_MIN_VECTORS,
         }
     }
 
@@ -1677,6 +1695,7 @@ impl SearchIndex {
         self.has_vector = has_vec;
         self.dims = dims;
         self.ann_store = ann_store;
+        self.hnsw_min_vectors = hnsw_tuning.min_vectors;
     }
 
     pub(crate) fn documents(&self) -> &[SearchDocument] {
@@ -1772,7 +1791,10 @@ impl SearchIndex {
             self.index_with_vectors_and_tuning(
                 docs,
                 vectors,
-                crate::core::embeddings::HnswTuning::global(),
+                crate::core::embeddings::HnswTuning {
+                    min_vectors: self.hnsw_min_vectors,
+                    ..crate::core::embeddings::HnswTuning::global()
+                },
             );
             return IndexUpdateKind::FullRebuild;
         }
@@ -1976,11 +1998,12 @@ impl SearchIndex {
                     .collect()
             };
 
-        // ANN pre-filter: when the corpus is large and we have an HNSW index,
-        // restrict the cosine scan to a small candidate set instead of O(N).
-        // Docs without embeddings bypass this filter and go through keyword scoring only.
+        // ANN pre-filter: from `hnsw_min_vectors`, restrict scoring to the
+        // graph's candidate set instead of O(N). Below it no graph is built and
+        // every document is scored. Docs without embeddings bypass this filter
+        // and go through keyword scoring only.
         let ann_candidate_set: Option<std::collections::HashSet<usize>> =
-            self.ann_store.as_ref().and_then(|store| {
+            self.graph_store().and_then(|store| {
                 // A global ANN shortlist can omit the requested document class.
                 if opts.scope != SearchScope::All {
                     return None;
@@ -4606,6 +4629,15 @@ mod tests {
         vec![x / norm, y / norm, 0.0, 0.0]
     }
 
+    /// Tuning that prunes with the graph from `ANN_THRESHOLD`, so test-sized
+    /// corpora reach the graph path.
+    fn graph_tuning() -> crate::core::embeddings::HnswTuning {
+        crate::core::embeddings::HnswTuning {
+            min_vectors: ANN_THRESHOLD,
+            ..Default::default()
+        }
+    }
+
     /// Build `n` SearchDocuments with synthetic embeddings in R^4.
     fn make_ann_corpus(n: usize) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>) {
         let docs: Vec<SearchDocument> = (0..n)
@@ -4712,7 +4744,7 @@ mod tests {
     fn r3_deleted_ann_shortlist_replenishes_survivors() {
         let (docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
         let mut index = SearchIndex::new();
-        index.index_with_vectors(docs, vectors);
+        index.index_with_vectors_and_tuning(docs, vectors, graph_tuning());
         let query = unit_vec(1.0, 0.001);
         let deleted: Vec<_> = index
             .ann_store
@@ -4772,8 +4804,8 @@ mod tests {
             docs,
             vectors,
             crate::core::embeddings::HnswTuning {
-                ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
                 ef_search: 256,
+                ..graph_tuning()
             },
         );
 
@@ -5116,7 +5148,7 @@ mod tests {
         let n = ANN_THRESHOLD + 50;
         let (docs, vectors) = make_ann_corpus(n);
         let mut index = SearchIndex::new();
-        index.index_with_vectors(docs, vectors);
+        index.index_with_vectors_and_tuning(docs, vectors, graph_tuning());
 
         // Buffer must be gone.
         assert_eq!(index.vector_buffer.capacity(), 0);
@@ -5140,6 +5172,214 @@ mod tests {
         assert_eq!(
             results[0].path, "src/file_0.ts",
             "nearest doc must be file_0.ts after buffer drop"
+        );
+    }
+
+    // -- Exact blended scoring tests --
+
+    const NEEDLE_DOCS: [usize; 3] = [300, 900, 1500];
+    const NEEDLE_UNEMBEDDED_DOC: usize = 2000;
+
+    /// Above `ANN_THRESHOLD`, so the index holds a vector store. The only
+    /// keyword matches for "needle" sit far below cosine rank 50, and one of
+    /// them has no embedding.
+    fn needle_corpus() -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>) {
+        let (mut docs, mut vectors) = make_ann_corpus(ANN_THRESHOLD + 600);
+        for i in NEEDLE_DOCS.into_iter().chain([NEEDLE_UNEMBEDDED_DOC]) {
+            docs[i] = SearchDocument::new(
+                format!("src/file_{i}.ts"),
+                format!("file {i}"),
+                vec![format!("sym_{i}")],
+                vec![],
+                format!("needle content {i}"),
+            );
+        }
+        vectors[NEEDLE_UNEMBEDDED_DOC] = None;
+        (docs, vectors)
+    }
+
+    fn needle_query() -> Vec<f32> {
+        unit_vec(1.0, 0.001)
+    }
+
+    fn blended_opts(top_k: usize) -> ResolvedSearchOptions {
+        ResolvedSearchOptions {
+            top_k,
+            min_combined_score: 0.0,
+            recency_window_days: None,
+            ..Default::default()
+        }
+    }
+
+    /// The same index scored over every document: the flat buffer holds each
+    /// live vector and there is no store to shortlist from.
+    fn exhaustive_oracle(index: &SearchIndex) -> SearchIndex {
+        let mut oracle = index.clone();
+        let dims = index.dims;
+        let mut buffer = vec![0.0; index.documents.len() * dims];
+        for i in 0..index.documents.len() {
+            if let Some(vector) = index.vector_at(i) {
+                buffer[i * dims..(i + 1) * dims].copy_from_slice(vector);
+            }
+        }
+        oracle.vector_buffer = buffer;
+        oracle.vector_updates.clear();
+        oracle.ann_store = None;
+        oracle
+    }
+
+    /// Ordered (path, score) equal to the oracle's; paths within a run of
+    /// equal scores compare as sets, except the run cut by `top_k`.
+    fn assert_matches_oracle(index: &SearchIndex, opts: &ResolvedSearchOptions, state: &str) {
+        let ranked = |results: Vec<SearchResult>| -> Vec<(String, f64)> {
+            results.into_iter().map(|r| (r.path, r.score)).collect()
+        };
+        let got = ranked(index.search("needle", &needle_query(), opts));
+        let want = ranked(exhaustive_oracle(index).search("needle", &needle_query(), opts));
+        let scores = |r: &[(String, f64)]| r.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+        assert_eq!(
+            scores(&got),
+            scores(&want),
+            "{state}, top_k {}: got {got:?}, want {want:?}",
+            opts.top_k
+        );
+        let cut = want.last().map(|(_, s)| *s);
+        for (_, score) in &want {
+            if Some(*score) == cut && want.len() == opts.top_k {
+                continue;
+            }
+            let paths = |r: &[(String, f64)]| {
+                r.iter()
+                    .filter(|(_, s)| s == score)
+                    .map(|(p, _)| p.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            assert_eq!(paths(&got), paths(&want), "{state}, top_k {}", opts.top_k);
+        }
+    }
+
+    fn assert_all_top_k_match_oracle(index: &SearchIndex, state: &str) {
+        for top_k in [1, 3, 5, 50] {
+            assert_matches_oracle(index, &blended_opts(top_k), state);
+            let mut filtered = blended_opts(top_k);
+            filtered.exclude_globs = vec![Regex::new(&glob_to_regex("src/file_1*.ts")).unwrap()];
+            assert_matches_oracle(index, &filtered, &format!("{state}, filtered"));
+        }
+    }
+
+    #[test]
+    fn exact_scoring_matches_the_exhaustive_oracle_below_the_graph_threshold() {
+        let (docs, vectors) = needle_corpus();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        assert!(index.ann_store.is_some(), "the corpus holds a vector store");
+
+        let top = exhaustive_oracle(&index).search("needle", &needle_query(), &blended_opts(1));
+        let cosine_rank = index.documents.iter().position(|d| d.path == top[0].path);
+        assert!(
+            top[0].path == format!("src/file_{}.ts", NEEDLE_DOCS[0])
+                && cosine_rank.is_some_and(|rank| rank >= 50),
+            "the blended winner must sit below cosine rank 50: {:?}",
+            top[0].path
+        );
+
+        assert_all_top_k_match_oracle(&index, "no graph");
+        assert!(
+            !index.graph_is_built(),
+            "a query below the threshold built a graph"
+        );
+
+        let changed = SearchDocument::new(
+            "src/file_2200.ts".into(),
+            "file 2200".into(),
+            vec!["sym_2200".into()],
+            vec![],
+            "needle needle content 2200".into(),
+        );
+        let unembedded = SearchDocument::new(
+            "src/file_2300.ts".into(),
+            "file 2300".into(),
+            vec!["sym_2300".into()],
+            vec![],
+            "needle content 2300".into(),
+        );
+        let deleted: Vec<String> = (0..5).map(|i| format!("src/file_{i}.ts")).collect();
+        assert_eq!(
+            index.apply_delta(
+                vec![changed, unembedded],
+                vec![Some(unit_vec(0.6, 0.8)), None],
+                &deleted,
+            ),
+            IndexUpdateKind::Incremental
+        );
+        assert_all_top_k_match_oracle(&index, "after updates and deletions");
+
+        crate::core::embeddings::hnsw_test_seam::unpaused(|| {
+            index
+                .ann_store
+                .as_ref()
+                .unwrap()
+                .find_nearest_hnsw(&needle_query(), 1)
+        });
+        assert!(index.graph_is_built());
+        assert_all_top_k_match_oracle(&index, "graph ready");
+    }
+
+    #[test]
+    fn below_the_graph_threshold_queries_and_warmup_build_no_graph() {
+        let (docs, vectors) = needle_corpus();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        for top_k in [1, 3, 5, 50] {
+            index.search("needle", &needle_query(), &blended_opts(top_k));
+        }
+        crate::core::embeddings::hnsw_test_seam::unpaused(|| index.prepare_ann());
+        assert!(
+            !index.graph_is_built(),
+            "a graph was built below the threshold"
+        );
+    }
+
+    #[test]
+    fn below_the_graph_threshold_results_do_not_shift_when_a_graph_is_ready() {
+        let (docs, vectors) = needle_corpus();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(docs, vectors);
+        let ranked = |index: &SearchIndex| -> Vec<(String, f64)> {
+            index
+                .search("needle", &needle_query(), &blended_opts(5))
+                .into_iter()
+                .map(|r| (r.path, r.score))
+                .collect()
+        };
+        let before = ranked(&index);
+        crate::core::embeddings::hnsw_test_seam::unpaused(|| {
+            index
+                .ann_store
+                .as_ref()
+                .unwrap()
+                .find_nearest_hnsw(&needle_query(), 1)
+        });
+        assert_eq!(
+            before,
+            ranked(&index),
+            "results shifted once the graph was ready"
+        );
+    }
+
+    #[test]
+    fn above_the_graph_threshold_warmup_builds_the_graph_and_search_prunes_with_it() {
+        let (docs, vectors) = needle_corpus();
+        let mut index = SearchIndex::new();
+        index.index_with_vectors_and_tuning(docs, vectors, graph_tuning());
+        crate::core::embeddings::hnsw_test_seam::unpaused(|| index.prepare_ann());
+        assert!(index.graph_is_built(), "warmup built no graph");
+        let exact = exhaustive_oracle(&index).search("needle", &needle_query(), &blended_opts(1));
+        let pruned = index.search("needle", &needle_query(), &blended_opts(1));
+        assert_eq!(exact[0].path, format!("src/file_{}.ts", NEEDLE_DOCS[0]));
+        assert_ne!(
+            pruned[0].path, exact[0].path,
+            "above the threshold the cosine shortlist no longer prunes"
         );
     }
 

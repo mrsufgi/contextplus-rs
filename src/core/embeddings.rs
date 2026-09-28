@@ -1425,6 +1425,9 @@ pub struct HnswTuning {
     pub ef_construction: usize,
     /// `ef_search` — recall/latency trade-off at query time.
     pub ef_search: usize,
+    /// Store size from which semantic search builds the graph and prunes
+    /// with it.
+    pub min_vectors: usize,
 }
 
 impl Default for HnswTuning {
@@ -1432,6 +1435,7 @@ impl Default for HnswTuning {
         Self {
             ef_construction: crate::config::DEFAULT_HNSW_EF_CONSTRUCTION,
             ef_search: crate::config::DEFAULT_HNSW_EF_SEARCH,
+            min_vectors: crate::tools::semantic_search::HNSW_MIN_VECTORS,
         }
     }
 }
@@ -1445,6 +1449,7 @@ impl HnswTuning {
         Self {
             ef_construction: config.hnsw_ef_construction,
             ef_search: config.hnsw_ef_search,
+            min_vectors: config.hnsw_min_vectors,
         }
     }
 
@@ -1455,7 +1460,12 @@ impl HnswTuning {
     /// `HnswTuning::default()` or pass an explicit tuning.
     pub fn global() -> Self {
         static GLOBAL: std::sync::OnceLock<HnswTuning> = std::sync::OnceLock::new();
-        *GLOBAL.get_or_init(|| HnswTuning::from_config(&crate::config::Config::from_env()))
+        *GLOBAL.get_or_init(|| HnswTuning {
+            // Test servers index a few thousand files; keep their graph path.
+            #[cfg(test)]
+            min_vectors: HNSW_THRESHOLD,
+            ..HnswTuning::from_config(&crate::config::Config::from_env())
+        })
     }
 }
 
@@ -1528,7 +1538,22 @@ pub(crate) mod hnsw_test_seam {
         PauseGuard(pause)
     }
 
+    thread_local! {
+        static UNPAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Runs `f` with builds on this thread leaving other tests' pauses alone.
+    pub(crate) fn unpaused<T>(f: impl FnOnce() -> T) -> T {
+        UNPAUSED.with(|unpaused| unpaused.set(true));
+        let result = f();
+        UNPAUSED.with(|unpaused| unpaused.set(false));
+        result
+    }
+
     pub(crate) fn before_build() {
+        if UNPAUSED.with(std::cell::Cell::get) {
+            return;
+        }
         let pause = slot().lock().unwrap().take();
         if let Some(pause) = pause {
             pause.entered.store(true, Ordering::Release);
@@ -3924,6 +3949,7 @@ mod tests {
         let tuning = HnswTuning {
             ef_construction: 50,
             ef_search: 256,
+            ..HnswTuning::default()
         };
         let (store, _) = {
             let n = 2001_usize;

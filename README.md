@@ -161,7 +161,8 @@ Embedding batching, adaptive context-length retries, chunk-and-merge, prefixes, 
 |----------|---------|-------------|
 | `CONTEXTPLUS_HNSW_EF_CONSTRUCTION` | `100` | HNSW `efConstruction` — higher values improve index quality at the cost of build time |
 | `CONTEXTPLUS_HNSW_EF_SEARCH` | `32` | HNSW `ef_search` — higher values improve recall at the cost of query latency. Set explicitly when higher recall is needed |
-| `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` | `10` | ANN candidate pool multiplier: fetches `top_k × N` HNSW candidates before re-ranking. Larger values improve recall; only applies when corpus exceeds 2,000 files |
+| `CONTEXTPLUS_HNSW_MIN_VECTORS` | `50000` | Embedded files from which semantic search builds the HNSW graph and re-ranks its shortlist. Below it every file is scored exactly and no graph is built |
+| `CONTEXTPLUS_ANN_CANDIDATE_MULTIPLIER` | `10` | ANN candidate pool multiplier: fetches `top_k × N` HNSW candidates before re-ranking. Larger values improve recall; only applies from `CONTEXTPLUS_HNSW_MIN_VECTORS` embedded files |
 
 ### Warmup
 
