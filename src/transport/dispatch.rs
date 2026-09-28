@@ -175,7 +175,7 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
 
     if config.warmup_on_start {
         tracing::info!("Spawning SearchIndex warmup task (CONTEXTPLUS_WARMUP_ON_START=true)");
-        server.spawn_warmup_task();
+        server.spawn_warmup_task(false);
     }
 
     let idle_timeout_ms = config.idle_timeout_ms;
@@ -255,6 +255,7 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
     }
 
     state_for_shutdown.ollama.flush_query_cache();
+    state_for_shutdown.flush_snapshots().await;
 
     idle_monitor.stop();
     #[cfg(unix)]

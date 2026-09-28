@@ -168,6 +168,7 @@ Embedding batching, adaptive context-length retries, chunk-and-merge, prefixes, 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONTEXTPLUS_WARMUP_ON_START` | `true` | Warm the `SearchIndex` cache at server startup. Set to `false` / `0` / `no` / `off` to disable |
+| `CONTEXTPLUS_SNAPSHOTS` | `true` | Persist the primary checkout's built indexes under `.mcp_data/snapshots/` and load them on the next start, indexing only the files changed since. Set to `false` / `0` / `no` / `off` to disable |
 | `CONTEXTPLUS_WARMUP_CONCURRENCY` | `1` | Number of parallel Ollama embed requests during `warmup_embeddings` / `warmup_identifiers`. Set to match `OLLAMA_NUM_PARALLEL` on the host |
 
 ### Tracker (file-watcher)

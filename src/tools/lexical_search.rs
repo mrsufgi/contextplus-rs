@@ -389,7 +389,10 @@ impl<'a> From<&'a SearchDocument> for LexicalFields<'a> {
 }
 
 /// Per-field term counts of one document and its per-field lengths.
-fn document_term_counts(doc: &LexicalFields<'_>) -> (HashMap<String, [u32; 4]>, [u32; 4]) {
+pub(crate) type DocumentTermCounts = (HashMap<String, [u32; 4]>, [u32; 4]);
+
+/// Per-field term counts of one document and its per-field lengths.
+pub(crate) fn document_term_counts(doc: &LexicalFields<'_>) -> DocumentTermCounts {
     let symbols = doc.symbols.join(" ");
     let mut terms: HashMap<String, [u32; 4]> = HashMap::new();
     let mut lengths = [0_u32; 4];
@@ -405,6 +408,73 @@ fn document_term_counts(doc: &LexicalFields<'_>) -> (HashMap<String, [u32; 4]>, 
     (terms, lengths)
 }
 
+/// Term counts of the document of `path`.
+pub(crate) fn lexical_term_counts(
+    path: &str,
+    files: &crate::core::walker::FileContents,
+) -> DocumentTermCounts {
+    let content = files.get(path).map_or("", |content| content.as_str());
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let symbols: Vec<String> = crate::core::tree_sitter::parse_with_tree_sitter(content, ext)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect();
+    let header = crate::core::parser::extract_header(content);
+    document_term_counts(&LexicalFields {
+        path,
+        symbols: &symbols,
+        header: &header,
+        content,
+    })
+}
+
+/// Keyword-index updates for `changed` files, each at its document's slot or
+/// at a slot appended to `document_paths` for a new file.
+pub(crate) fn lexical_updates<'a>(
+    document_paths: &mut Vec<String>,
+    changed: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(usize, SearchDocument)> {
+    let mut slots: HashMap<&str, usize> = HashMap::new();
+    let changed: Vec<_> = changed.into_iter().collect();
+    for (i, path) in document_paths.iter().enumerate() {
+        slots.entry(path.as_str()).or_insert(i);
+    }
+    let mut placed: Vec<Option<usize>> = changed
+        .iter()
+        .map(|(path, _)| slots.get(path).copied())
+        .collect();
+    drop(slots);
+    for (slot, (path, _)) in placed.iter_mut().zip(&changed) {
+        if slot.is_none() {
+            document_paths.push((*path).to_owned());
+            *slot = Some(document_paths.len() - 1);
+        }
+    }
+    changed
+        .into_iter()
+        .zip(placed)
+        .map(|((path, content), slot)| {
+            let ext = path.rsplit('.').next().unwrap_or("");
+            let symbols = crate::core::tree_sitter::parse_with_tree_sitter(content, ext)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            (
+                slot.expect("every changed file has a slot"),
+                SearchDocument::new(
+                    path.to_owned(),
+                    crate::core::parser::extract_header(content),
+                    symbols,
+                    vec![],
+                    content.to_owned(),
+                ),
+            )
+        })
+        .collect()
+}
+
 fn document_fields(path: &str, lengths: [u32; 4]) -> DocumentFields {
     let classification = classify_path_prior(path);
     DocumentFields {
@@ -415,6 +485,21 @@ fn document_fields(path: &str, lengths: [u32; 4]) -> DocumentFields {
 }
 
 impl LexicalIndex {
+    /// Document slots, live or deleted.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.documents.len()
+    }
+
+    /// Terms in the dictionary, used or not.
+    pub(crate) fn term_count(&self) -> usize {
+        self.posting.len()
+    }
+
+    /// Terms no document contains any more.
+    pub(crate) fn dead_term_count(&self) -> usize {
+        self.posting.iter().filter(|list| list.len() == 0).count()
+    }
+
     #[cfg(test)]
     fn posting_count(&self) -> usize {
         self.posting.iter().map(PostingList::len).sum()
@@ -500,13 +585,19 @@ impl LexicalIndex {
 
     /// Adds the next document of a build.
     pub(crate) fn push_document(&mut self, doc: LexicalFields<'_>) {
-        let (terms, lengths) = document_term_counts(&doc);
+        self.push_counted(doc.path, document_term_counts(&doc));
+    }
+
+    /// Adds the next document of a build from its
+    /// [`document_term_counts`], which may be computed on another thread.
+    pub(crate) fn push_counted(&mut self, path: &str, counts: DocumentTermCounts) {
+        let (terms, lengths) = counts;
         for (total, length) in self.total_lengths.iter_mut().zip(lengths) {
             *total += f64::from(length);
         }
         let ids = self.add_postings(self.documents.len(), terms);
         self.document_terms.push(ids);
-        self.documents.push(document_fields(doc.path, lengths));
+        self.documents.push(document_fields(path, lengths));
         self.doc_count += 1;
     }
 
@@ -587,6 +678,255 @@ impl LexicalIndex {
         {
             self.last_update_work.postings_visited = postings_visited;
         }
+    }
+
+    /// A copy that holds only the slots marked in `live`, renumbered in
+    /// order, and only the terms those slots contain. It ranks every query
+    /// as this index does.
+    pub(crate) fn compacted(&self, live: &[bool]) -> Self {
+        let mut slots = vec![u32::MAX; self.documents.len()];
+        let kept = slots
+            .iter_mut()
+            .zip(live)
+            .filter(|(_, live)| **live)
+            .map(|(slot, _)| slot);
+        for (next, slot) in (0_u32..).zip(kept) {
+            *slot = next;
+        }
+        let mut terms = TermDictionary::default();
+        let mut term_ids = vec![u32::MAX; self.posting.len()];
+        let mut posting = Vec::new();
+        for (id, list) in self.posting.iter().enumerate() {
+            let postings: Vec<Posting> = list
+                .as_slice()
+                .iter()
+                .filter_map(|(doc, counts)| {
+                    let slot = slots[*doc as usize];
+                    (slot != u32::MAX).then_some((slot, *counts))
+                })
+                .collect();
+            if postings.is_empty() {
+                continue;
+            }
+            term_ids[id] = terms.intern(term_at(&self.terms.text, &self.terms.ends, id as u32));
+            posting.push(match postings.as_slice() {
+                [only] => PostingList::One(*only),
+                _ => PostingList::Many(postings),
+            });
+        }
+        let (documents, document_terms): (Vec<_>, Vec<_>) = self
+            .documents
+            .iter()
+            .zip(&self.document_terms)
+            .zip(live)
+            .filter(|(_, live)| **live)
+            .map(|((fields, ids), _)| {
+                let ids: Box<[u32]> = ids
+                    .iter()
+                    .map(|&id| term_ids[id as usize])
+                    .filter(|&id| id != u32::MAX)
+                    .collect();
+                (fields.clone(), ids)
+            })
+            .unzip();
+        let mut index = Self {
+            terms,
+            posting,
+            documents,
+            average_lengths: self.average_lengths,
+            total_lengths: self.total_lengths,
+            document_terms,
+            doc_count: self.doc_count,
+            #[cfg(test)]
+            last_update_work: UpdateWork::default(),
+        };
+        index.terms.shrink_to_fit();
+        index.posting.shrink_to_fit();
+        index
+    }
+
+    /// Writes the whole index, read back by [`read_snapshot`](Self::read_snapshot).
+    pub(crate) fn write_snapshot(
+        &self,
+        out: &mut crate::cache::snapshot::SnapshotWriter,
+    ) -> std::io::Result<()> {
+        out.str(&self.terms.text)?;
+        out.u32s(&self.terms.ends)?;
+        out.usize(self.posting.len())?;
+        let posting_values = self
+            .posting
+            .iter()
+            .map(|list| 1 + 5 * list.len())
+            .sum::<usize>();
+        out.u32_seq(
+            posting_values,
+            self.posting.iter().flat_map(|list| {
+                let postings = list.as_slice();
+                std::iter::once(postings.len() as u32).chain(
+                    postings
+                        .iter()
+                        .flat_map(|(doc, counts)| std::iter::once(*doc).chain(*counts)),
+                )
+            }),
+        )?;
+        out.usize(self.documents.len())?;
+        for fields in &self.documents {
+            for length in fields.lengths {
+                out.u32(length)?;
+            }
+            out.f64(fields.prior)?;
+            out.bool(fields.is_test)?;
+        }
+        for value in self.average_lengths.iter().chain(&self.total_lengths) {
+            out.f64(*value)?;
+        }
+        let term_values = self
+            .document_terms
+            .iter()
+            .map(|terms| 1 + terms.len())
+            .sum::<usize>();
+        out.u32_seq(
+            term_values,
+            self.document_terms
+                .iter()
+                .flat_map(|terms| std::iter::once(terms.len() as u32).chain(terms.iter().copied())),
+        )?;
+        out.usize(self.doc_count)
+    }
+
+    /// An index written by [`write_snapshot`](Self::write_snapshot), or `None`
+    /// when the payload is inconsistent.
+    pub(crate) fn read_snapshot(
+        input: &mut crate::cache::snapshot::SnapshotReader<'_>,
+    ) -> Option<Self> {
+        let text = input.str()?.to_owned();
+        let ends = input.u32s()?;
+        let mut start = 0;
+        for &end in &ends {
+            let end = end as usize;
+            if end < start || !text.is_char_boundary(end) {
+                return None;
+            }
+            start = end;
+        }
+        if start != text.len() {
+            return None;
+        }
+        let terms_len = ends.len();
+        let mut terms = TermDictionary {
+            text,
+            ends,
+            ids: hashbrown::HashTable::with_capacity(terms_len),
+            hasher: std::hash::RandomState::new(),
+        };
+        {
+            let TermDictionary {
+                text,
+                ends,
+                ids,
+                hasher,
+            } = &mut terms;
+            for id in 0..terms_len as u32 {
+                let hash = std::hash::BuildHasher::hash_one(&*hasher, term_at(text, ends, id));
+                ids.insert_unique(hash, id, |&other| {
+                    std::hash::BuildHasher::hash_one(&*hasher, term_at(text, ends, other))
+                });
+            }
+        }
+
+        let posting_len = input.usize()?;
+        if posting_len != terms_len {
+            return None;
+        }
+        let mut values = input.u32_seq()?;
+        let mut posting = Vec::with_capacity(posting_len);
+        let mut max_doc = None::<u32>;
+        for _ in 0..posting_len {
+            let len = values.next_value()? as usize;
+            if len > values.len() / 5 {
+                return None;
+            }
+            let mut read = || -> Option<Posting> {
+                let doc = values.next_value()?;
+                max_doc = max_doc.max(Some(doc));
+                Some((
+                    doc,
+                    [
+                        values.next_value()?,
+                        values.next_value()?,
+                        values.next_value()?,
+                        values.next_value()?,
+                    ],
+                ))
+            };
+            posting.push(match len {
+                0 => PostingList::default(),
+                1 => PostingList::One(read()?),
+                _ => {
+                    let mut postings = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        postings.push(read()?);
+                    }
+                    PostingList::Many(postings)
+                }
+            });
+        }
+        if !values.is_empty() {
+            return None;
+        }
+
+        let documents_len = input.usize()?;
+        let mut documents = Vec::with_capacity(documents_len);
+        for _ in 0..documents_len {
+            let lengths = [input.u32()?, input.u32()?, input.u32()?, input.u32()?];
+            documents.push(DocumentFields {
+                lengths,
+                prior: input.f64()?,
+                is_test: input.bool()?,
+            });
+        }
+        if max_doc.is_some_and(|doc| doc as usize >= documents_len) {
+            return None;
+        }
+        let mut lengths = [0.0; 8];
+        for value in &mut lengths {
+            *value = input.f64()?;
+        }
+        let mut values = input.u32_seq()?;
+        let mut document_terms = Vec::with_capacity(documents_len);
+        for _ in 0..documents_len {
+            let len = values.next_value()? as usize;
+            if len > values.len() {
+                return None;
+            }
+            let mut ids = Vec::with_capacity(len);
+            for _ in 0..len {
+                ids.push(
+                    values
+                        .next_value()
+                        .filter(|&id| (id as usize) < terms_len)?,
+                );
+            }
+            document_terms.push(ids.into_boxed_slice());
+        }
+        if !values.is_empty() {
+            return None;
+        }
+        let doc_count = input.usize_value()?;
+        if doc_count > documents_len {
+            return None;
+        }
+        Some(Self {
+            terms,
+            posting,
+            documents,
+            average_lengths: lengths[..4].try_into().unwrap(),
+            total_lengths: lengths[4..].try_into().unwrap(),
+            document_terms,
+            doc_count,
+            #[cfg(test)]
+            last_update_work: UpdateWork::default(),
+        })
     }
 
     #[cfg(test)]

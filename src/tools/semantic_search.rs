@@ -252,6 +252,136 @@ pub struct SymbolSearchEntry {
     pub signature: Option<String>,
 }
 
+/// The fields of a file document that come from parsing the file, kept in a
+/// snapshot so that an unchanged file is not parsed again after a restart.
+pub(crate) struct DocumentSeed {
+    /// [`crate::core::embeddings::content_hash`] of the whole file.
+    pub(crate) source_hash: String,
+    /// Digest of the document's indexed content.
+    pub(crate) content_digest: crate::cache::snapshot::Digest,
+    pub(crate) header: String,
+    pub(crate) symbols: Vec<String>,
+    pub(crate) symbol_entries: Vec<SymbolSearchEntry>,
+}
+
+/// Document seeds by repository-relative path.
+pub(crate) type DocumentSeeds = std::collections::HashMap<String, DocumentSeed>;
+
+impl DocumentSeed {
+    /// This seed's document when `source_hash` and the indexed `content`
+    /// are the ones it was parsed from.
+    pub(crate) fn document(
+        &self,
+        path: String,
+        source_hash: &str,
+        content: String,
+    ) -> std::result::Result<SearchDocument, String> {
+        if self.source_hash != source_hash
+            || self.content_digest != crate::cache::snapshot::digest(content.as_bytes())
+        {
+            return Err(content);
+        }
+        Ok(SearchDocument::new(
+            path,
+            self.header.clone(),
+            self.symbols.clone(),
+            self.symbol_entries.clone(),
+            content,
+        ))
+    }
+}
+
+/// The search document of the file at `path`, parsed from `source`, with
+/// `content` as its indexed content: a text file takes its first lines as
+/// its header, a code file its symbols and header from the parser.
+pub(crate) fn file_document(path: String, source: &str, content: String) -> SearchDocument {
+    if is_text_index_candidate(&path) {
+        let header = extract_plain_text_header(&content);
+        return SearchDocument::new(path, header, vec![], vec![], content);
+    }
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let symbols = crate::core::tree_sitter::parse_with_tree_sitter(source, ext).unwrap_or_default();
+    let header = crate::core::parser::extract_header(source);
+    let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    let symbol_entries: Vec<SymbolSearchEntry> = symbols
+        .iter()
+        .map(|s| SymbolSearchEntry {
+            name: s.name.clone(),
+            kind: Some(s.kind.clone()),
+            line: s.line,
+            end_line: Some(s.end_line),
+            signature: s.signature.clone(),
+        })
+        .collect();
+    SearchDocument::new(path, header, symbol_names, symbol_entries, content)
+}
+
+/// Writes the parsed fields of `docs`, read back by [`read_document_seeds`].
+pub(crate) fn write_document_seeds(
+    out: &mut crate::cache::snapshot::SnapshotWriter,
+    docs: &[SearchDocument],
+) -> io::Result<()> {
+    out.usize(docs.len())?;
+    for doc in docs {
+        out.str(&doc.path)?;
+        out.str(&doc.source_hash)?;
+        out.digest(&crate::cache::snapshot::digest(doc.content.as_bytes()))?;
+        out.str(&doc.header)?;
+        out.strs(doc.symbols.iter().map(String::as_str))?;
+        out.usize(doc.symbol_entries.len())?;
+        for entry in &doc.symbol_entries {
+            out.str(&entry.name)?;
+            out.opt_str(entry.kind.as_deref())?;
+            out.usize(entry.line)?;
+            out.bool(entry.end_line.is_some())?;
+            out.usize(entry.end_line.unwrap_or(0))?;
+            out.opt_str(entry.signature.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn read_document_seeds(
+    input: &mut crate::cache::snapshot::SnapshotReader<'_>,
+) -> Option<DocumentSeeds> {
+    let len = input.usize()?;
+    let mut seeds = DocumentSeeds::with_capacity(len);
+    for _ in 0..len {
+        let path = input.str()?.to_owned();
+        let source_hash = input.str()?.to_owned();
+        let content_digest = input.digest()?;
+        let header = input.str()?.to_owned();
+        let symbols = input.strings()?;
+        let entries = input.usize()?;
+        let symbol_entries = (0..entries)
+            .map(|_| {
+                Some(SymbolSearchEntry {
+                    name: input.str()?.to_owned(),
+                    kind: input.opt_str()?.map(str::to_owned),
+                    line: input.usize_value()?,
+                    end_line: {
+                        let present = input.bool()?;
+                        let end = input.usize_value()?;
+                        present.then_some(end)
+                    },
+                    signature: input.opt_str()?.map(str::to_owned),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        seeds.insert(
+            path,
+            DocumentSeed {
+                source_hash,
+                content_digest,
+                header,
+                symbols,
+                symbol_entries,
+            },
+        );
+    }
+    Some(seeds)
+}
+
 // ---------------------------------------------------------------------------
 // Resolved options (internal)
 // ---------------------------------------------------------------------------
@@ -1044,6 +1174,11 @@ impl CachedSearchIndex {
         self.index.estimated_resident_bytes()
     }
 
+    /// The canonical root this index was walked from.
+    pub(crate) fn search_root(&self) -> &Path {
+        &self.search_root
+    }
+
     #[cfg(feature = "memory-profile")]
     pub(crate) fn resident_file_vector_bytes(&self) -> usize {
         self.index.resident_file_vector_bytes()
@@ -1449,6 +1584,10 @@ impl SearchIndex {
         self.ann_store = ann_store;
     }
 
+    pub(crate) fn documents(&self) -> &[SearchDocument] {
+        &self.documents
+    }
+
     pub fn full_rebuild_count(&self) -> u64 {
         self.full_rebuilds
     }
@@ -1692,7 +1831,7 @@ impl SearchIndex {
                 if candidate_count == 0 {
                     return None;
                 }
-                let hits = store.find_nearest(query_vec, candidate_count);
+                let hits = store.find_nearest_without_waiting(query_vec, candidate_count);
                 // Build a set of *document* indices from the path→doc lookup.
                 let path_to_idx: std::collections::HashMap<&str, usize> = self
                     .documents
@@ -2277,9 +2416,15 @@ pub async fn semantic_code_search(
                 // Generation mismatch (or no cache yet) — fall through to walk + fingerprint.
             }
 
+            let started = std::time::Instant::now();
             let metadata = walk_and_index_fn
                 .metadata_fingerprint(&options.root_dir)
                 .await?;
+            tracing::info!(
+                phase = "semantic_metadata_fingerprint",
+                elapsed_ms = started.elapsed().as_millis(),
+                "cold-start phase"
+            );
             {
                 let guard = lock.read().await;
                 if let Some(cached) = guard.as_ref()
@@ -2486,11 +2631,18 @@ pub async fn semantic_code_search(
                 *guard = Some(Arc::clone(&entry));
                 break 'cache entry;
             }
+            let started = std::time::Instant::now();
             let mut idx = SearchIndex::new();
             idx.index_with_vectors_and_tuning(
                 docs,
                 vectors,
                 crate::core::embeddings::HnswTuning::global(),
+            );
+            tracing::info!(
+                phase = "semantic_index_build",
+                elapsed_ms = started.elapsed().as_millis(),
+                documents = idx.document_count(),
+                "cold-start phase"
             );
             let mut entry = CachedSearchIndex::new(idx, fp, current_gen);
             entry.vector_generation = vector_generation;
@@ -2502,9 +2654,15 @@ pub async fn semantic_code_search(
         }
     };
 
+    let started = std::time::Instant::now();
     let mut results = cached_arc
         .index
         .search(query.as_ref(), &query_vec, &resolved);
+    tracing::info!(
+        phase = "semantic_search",
+        elapsed_ms = started.elapsed().as_millis(),
+        "cold-start phase"
+    );
     let root_dir = options.root_dir.clone();
     let results = tokio::task::spawn_blocking(move || {
         fill_result_snippets(&root_dir, &mut results);
@@ -6458,15 +6616,21 @@ mod tests {
         .await
         .unwrap();
         let previous = cache.read().await.as_ref().cloned().unwrap();
-        assert!(
-            previous
+        // The first generation's graph builds in the background while exact
+        // search answers; wait for it.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !previous
                 .index
                 .ann_store
                 .as_ref()
                 .unwrap()
-                .hnsw_is_initialized(),
-            "the warm generation must have an initialized ANN graph"
-        );
+                .hnsw_is_initialized()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the warm generation must get an initialized ANN graph");
 
         generation.store(1, Ordering::Release);
         let graph_pause = crate::core::embeddings::hnsw_test_seam::pause_next_build();

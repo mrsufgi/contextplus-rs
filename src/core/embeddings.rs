@@ -1377,6 +1377,19 @@ unsafe impl Sync for VectorData {}
 // VectorStore
 // ---------------------------------------------------------------------------
 
+/// Threads that build HNSW graphs in the background.
+static HNSW_BUILD_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZeroUsize::get)
+                .div_ceil(4),
+        )
+        .thread_name(|index| format!("hnsw-{index}"))
+        .build()
+        .expect("failed to create HNSW build thread pool")
+});
+
 /// Threshold above which `find_nearest` dispatches to HNSW instead of brute force.
 const HNSW_THRESHOLD: usize = 2000;
 
@@ -1460,6 +1473,8 @@ pub struct VectorStore {
     hnsw_index: OnceLock<HnswIndex>,
     /// HNSW build/search tuning knobs (from env-var config).
     hnsw_tuning: HnswTuning,
+    /// Set once a background build of `hnsw_index` has been started.
+    hnsw_building: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -1574,6 +1589,7 @@ impl VectorStore {
             key_index,
             hnsw_index: OnceLock::new(),
             hnsw_tuning,
+            hnsw_building: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1653,6 +1669,7 @@ impl VectorStore {
             key_index,
             hnsw_index: OnceLock::new(),
             hnsw_tuning,
+            hnsw_building: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1844,6 +1861,48 @@ impl VectorStore {
         // Ensure descending similarity order (HNSW returns ascending distance, i.e. descending sim)
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
+    }
+
+    /// Like [`find_nearest`](Self::find_nearest), without waiting for the
+    /// HNSW graph: until it is built, an exact scan answers while the graph is
+    /// built on a background thread. The exact scan returns the true nearest
+    /// neighbours, which the graph approximates.
+    pub fn find_nearest_without_waiting(
+        self: &Arc<Self>,
+        query: &[f32],
+        top_k: usize,
+    ) -> Vec<(String, f32)> {
+        if self.count as usize <= HNSW_THRESHOLD || self.hnsw_index.get().is_some() {
+            return self.find_nearest(query, top_k);
+        }
+        if query.len() != self.dims as usize || top_k == 0 {
+            return Vec::new();
+        }
+        if !self
+            .hnsw_building
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let store = Arc::clone(self);
+            let spawned = std::thread::Builder::new()
+                .name("hnsw-build".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    // Its own few threads, so searches on the shared pool are
+                    // not queued behind the build.
+                    HNSW_BUILD_POOL
+                        .install(|| store.find_nearest_hnsw(&vec![0.0; store.dims as usize], 1));
+                    tracing::info!(
+                        phase = "hnsw_build",
+                        elapsed_ms = started.elapsed().as_millis(),
+                        vectors = store.count,
+                        "cold-start phase"
+                    );
+                });
+            if spawned.is_err() {
+                return self.find_nearest(query, top_k);
+            }
+        }
+        self.find_nearest_brute_force(query, top_k)
     }
 
     #[cfg(test)]
@@ -2220,6 +2279,50 @@ mod tests {
         let input = "a";
         let shrunk = shrink_input(input);
         assert_eq!(shrunk, "a");
+    }
+
+    #[test]
+    fn cold_start_nearest_neighbours_do_not_wait_for_the_graph() {
+        let dims = 8;
+        let count = HNSW_THRESHOLD + 10;
+        let keys = (0..count).map(|i| format!("k{i}")).collect();
+        let vectors = (0..count * dims)
+            .map(|i| ((i * 7919) % 101) as f32 / 101.0 + 0.01)
+            .collect();
+        let store = Arc::new(VectorStore::new(
+            dims as u32,
+            keys,
+            vec![String::new(); count],
+            vectors,
+        ));
+        let query = vec![0.5; dims];
+        let exact = store.find_nearest_brute_force(&query, 5);
+        let graph = hnsw_test_seam::pause_next_build();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let searching = Arc::clone(&store);
+        let searched = query.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(searching.find_nearest_without_waiting(&searched, 5));
+        });
+        let answer = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the search waited for the graph");
+        assert_eq!(
+            answer, exact,
+            "before the graph, the answer is the exact one"
+        );
+        assert!(!store.hnsw_is_initialized());
+
+        graph.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !store.hnsw_is_initialized() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the graph was never built"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // -- hash_content for cache invalidation --

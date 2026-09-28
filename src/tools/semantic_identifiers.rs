@@ -81,6 +81,85 @@ impl IdentifierDoc {
     pub fn evidence_tokens(text: &str) -> HashSet<String> {
         identifier_terms(text)
     }
+
+    /// A document from its parsed fields; the id, the lowercased kind and the
+    /// embedded text follow from them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble(
+        path: &str,
+        header: &str,
+        name: String,
+        kind: String,
+        line: usize,
+        end_line: usize,
+        signature: String,
+        parent_name: Option<String>,
+        name_token_set: HashSet<String>,
+        signature_token_set: HashSet<String>,
+        parent_token_set: HashSet<String>,
+    ) -> Self {
+        let text = format!(
+            "{} {} {} {} {} {}",
+            name,
+            kind,
+            signature,
+            path,
+            header,
+            parent_name.as_deref().unwrap_or("")
+        );
+        Self {
+            id: format!("{path}:{name}:{line}"),
+            path: path.to_owned(),
+            header: header.to_owned(),
+            kind_lower: kind.to_lowercase(),
+            name,
+            kind,
+            line,
+            end_line,
+            signature,
+            parent_name,
+            text,
+            name_token_set,
+            signature_token_set,
+            parent_token_set,
+        }
+    }
+}
+
+/// The identifier documents of one file, or `None` when its language is not
+/// parsed.
+pub fn identifier_docs_for_file(path: &str, content: &str) -> Option<Vec<IdentifierDoc>> {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let (symbols, keyword_signatures) =
+        crate::core::tree_sitter::parse_identifier_symbols(content, ext).ok()?;
+    let header = crate::core::parser::extract_header(content);
+    Some(
+        crate::core::parser::flatten_symbols(&symbols, None)
+            .into_iter()
+            .map(|sym| {
+                let keyword_signature = keyword_signatures
+                    .get(&(sym.name.clone(), sym.line))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let name_token_set = identifier_terms(&sym.name);
+                let signature_token_set = identifier_terms(keyword_signature);
+                let parent_token_set = identifier_terms(sym.parent_name.as_deref().unwrap_or(""));
+                IdentifierDoc::assemble(
+                    path,
+                    &header,
+                    sym.name,
+                    sym.kind,
+                    sym.line,
+                    sym.end_line,
+                    sym.signature.unwrap_or_default(),
+                    sym.parent_name,
+                    name_token_set,
+                    signature_token_set,
+                    parent_token_set,
+                )
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone)]
