@@ -496,18 +496,7 @@ impl CachedWalkerIndexer {
                 tokio::task::spawn_blocking(move || {
                     use rayon::prelude::*;
                     let seeds = crate::server::snapshots::file_seed(&seed_config, &seed_ref);
-                    let parent_documents: std::collections::HashMap<&str, &SearchDocument> =
-                        parent_index
-                            .as_ref()
-                            .map(|cached| {
-                                cached
-                                    .index
-                                    .documents()
-                                    .iter()
-                                    .map(|doc| (doc.path.as_str(), doc))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                    let parent_documents = documents_by_path(parent_index.as_deref());
                     let built: Vec<(SearchDocument, (String, String), String, bool)> =
                         file_contents
                             .into_par_iter()
@@ -516,35 +505,13 @@ impl CachedWalkerIndexer {
                                 let hash = content_hash(&content);
                                 let embedding_text =
                                     build_embedding_document(&rel_path, &content, doc_shape);
-                                let doc_content = semantic_embedding_content(&rel_path, &content);
-                                let seeded = match seeds.as_ref().and_then(|s| s.get(&rel_path)) {
-                                    Some(seed) => {
-                                        seed.document(rel_path.clone(), &hash, doc_content)
-                                    }
-                                    None => Err(doc_content),
-                                };
-                                let seeded = seeded.or_else(|doc_content| {
-                                    match parent_documents.get(rel_path.as_str()) {
-                                        Some(doc)
-                                            if doc.source_hash == hash
-                                                && doc.content == doc_content =>
-                                        {
-                                            Ok((*doc).clone())
-                                        }
-                                        _ => Err(doc_content),
-                                    }
-                                });
-                                let (doc, reused) = match seeded {
-                                    Ok(doc) => (doc, true),
-                                    Err(doc_content) => (
-                                        crate::tools::semantic_search::file_document(
-                                            rel_path.clone(),
-                                            &content,
-                                            doc_content,
-                                        ),
-                                        false,
-                                    ),
-                                };
+                                let (doc, reused) = walk_document(
+                                    &rel_path,
+                                    &content,
+                                    &hash,
+                                    seeds.as_deref(),
+                                    &parent_documents,
+                                );
                                 Some((doc, (rel_path, hash), embedding_text, reused))
                             })
                             .collect();
@@ -938,10 +905,10 @@ impl CachedWalkerIndexer {
                 }
             }
             match fork_parent {
-                Some(parent) => {
-                    self.seed_fork(&ref_index, &parent, canonical, docs, vectors, walk_start)
-                        .await
-                }
+                Some(parent) => self
+                    .seed_fork(&ref_index, &parent, canonical, docs, vectors, walk_start)
+                    .await
+                    .map(|(docs, vectors, _)| (docs, vectors)),
                 None => Ok((docs, vectors)),
             }
         })
@@ -1025,10 +992,10 @@ impl CachedWalkerIndexer {
         docs: Vec<SearchDocument>,
         vectors: Vec<Option<Vec<f32>>>,
         start: WalkStart,
-    ) -> Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)> {
+    ) -> Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>, bool)> {
         let base = parent.search_index_cache.read().await.clone();
         let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
-            return Ok((docs, vectors));
+            return Ok((docs, vectors, false));
         };
         if let Some(store) = base.index.vector_store() {
             *ref_index.fork_base.lock().unwrap() = Arc::downgrade(store);
@@ -1040,7 +1007,7 @@ impl CachedWalkerIndexer {
             .as_ref()
             .is_some_and(|current| current.index.shares_vector_store(&base.index))
         {
-            return Ok((docs, vectors));
+            return Ok((docs, vectors, false));
         }
         let started = std::time::Instant::now();
         let (generation, vector_generation) = (start.generation, start.vector_generation);
@@ -1050,21 +1017,236 @@ impl CachedWalkerIndexer {
         })
         .await
         .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
-        if let Some(fork) = fork {
-            let installed = fork.install(
-                &mut *ref_index.search_index_cache.write().await,
-                start.seen.as_ref(),
-            );
-            tracing::info!(
-                phase = "semantic_fork",
-                ref_id = %ref_index.cas_ref_id_hex,
-                parent_ref_id = %parent.cas_ref_id_hex,
-                installed,
-                elapsed_ms = started.elapsed().as_millis(),
-                "cold-start phase"
-            );
+        let Some(fork) = fork else {
+            return Ok((docs, vectors, false));
+        };
+        let installed = fork.install(
+            &mut *ref_index.search_index_cache.write().await,
+            start.seen.as_ref(),
+        );
+        tracing::info!(
+            phase = "semantic_fork",
+            ref_id = %ref_index.cas_ref_id_hex,
+            parent_ref_id = %parent.cas_ref_id_hex,
+            installed,
+            elapsed_ms = started.elapsed().as_millis(),
+            "cold-start phase"
+        );
+        Ok((docs, vectors, installed))
+    }
+
+    /// Forks the parent's semantic index over a worktree's warmup `files`, one
+    /// generation behind so its first query serves the fork while a background
+    /// walk queues the changed files for fill. `false` when the worktree holds
+    /// no fork of the parent's store.
+    pub(crate) async fn fork_warmup(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        files: &crate::server::ProjectCache,
+    ) -> bool {
+        let Some(parent_id) = ref_index.parent_ref_id else {
+            return false;
+        };
+        let Some(parent) = self.state.ref_index(parent_id).await else {
+            return false;
+        };
+        self.build_parent_index(&parent, ref_index).await;
+        let base = parent.search_index_cache.read().await.clone();
+        let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
+            return false;
+        };
+        let start = WalkStart {
+            generation: ref_index
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            vector_generation: ref_index
+                .semantic_vector_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            seen: ref_index
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .map(Arc::downgrade),
+        };
+        let Some((docs, vectors)) = self
+            .warmup_documents(ref_index, files, Some(Arc::clone(&base)))
+            .await
+        else {
+            return false;
+        };
+        let root = ref_index.canonical_root.clone();
+        if let Ok((.., true)) = self
+            .seed_fork(ref_index, &parent, root, docs, vectors, start)
+            .await
+        {
+            ref_index
+                .cache_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
-        Ok((docs, vectors))
+        ref_index
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|entry| entry.index.shares_vector_store(&base.index))
+    }
+
+    /// Installs a primary's index of its whole root from its warmup `files`,
+    /// one generation behind so its first query walks and updates it, unless
+    /// the primary already holds one.
+    pub(crate) async fn primary_warmup(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        files: &crate::server::ProjectCache,
+    ) {
+        let seen = {
+            let current = ref_index.search_index_cache.read().await;
+            if current
+                .as_ref()
+                .is_some_and(|entry| entry.search_root() == ref_index.canonical_root)
+            {
+                return;
+            }
+            current.as_ref().map(Arc::downgrade)
+        };
+        let generation = ref_index
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let vector_generation = ref_index
+            .semantic_vector_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let Some((docs, vectors)) = self.warmup_documents(ref_index, files, None).await else {
+            return;
+        };
+        if vectors.iter().all(Option::is_none) {
+            return;
+        }
+        let root = ref_index.canonical_root.clone();
+        let Ok(entry) = tokio::task::spawn_blocking(move || {
+            CachedSearchIndex::build(&root, docs, vectors, generation, vector_generation, None)
+        })
+        .await
+        else {
+            return;
+        };
+        if entry.install(
+            &mut *ref_index.search_index_cache.write().await,
+            seen.as_ref(),
+        ) {
+            ref_index
+                .cache_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// The walk's documents of `files`, reusing `parent`'s, with vectors from
+    /// this ref's or its ancestors' caches and no Ollama call.
+    async fn warmup_documents(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        files: &crate::server::ProjectCache,
+        parent: Option<Arc<CachedSearchIndex>>,
+    ) -> Option<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)> {
+        let max_size = self.config.max_embed_file_size;
+        let files: Vec<(String, Arc<String>)> = files
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .filter_map(|entry| {
+                let content = files.file_content.get(&entry.relative_path)?;
+                (content.len() <= max_size)
+                    .then(|| (entry.relative_path.clone(), Arc::clone(content)))
+            })
+            .collect();
+        let config = self.config.clone();
+        let seed_ref = Arc::clone(ref_index);
+        let docs = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let seeds = crate::server::snapshots::file_seed(&config, &seed_ref);
+            let parent_documents = documents_by_path(parent.as_deref());
+            files
+                .par_iter()
+                .map(|(path, content)| {
+                    let hash = content_hash(content);
+                    let (mut doc, _) =
+                        walk_document(path, content, &hash, seeds.as_deref(), &parent_documents);
+                    doc.source_hash = hash;
+                    doc
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .ok()?;
+        let mut vectors = vec![None; docs.len()];
+        let mut caches = vec![Arc::clone(&ref_index.embedding_cache)];
+        let mut ancestor_id = ref_index.parent_ref_id;
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = ancestor_id.filter(|id| visited.insert(*id)) {
+            let Some(ancestor) = self.state.ref_index(id).await else {
+                break;
+            };
+            caches.push(Arc::clone(&ancestor.embedding_cache));
+            ancestor_id = ancestor.parent_ref_id;
+        }
+        for cache in caches {
+            let cache = cache.read().await;
+            for (vector, doc) in vectors.iter_mut().zip(&docs) {
+                if vector.is_none()
+                    && let Some(entry) = cache
+                        .get(&doc.path)
+                        .filter(|entry| entry.hash == doc.source_hash)
+                {
+                    *vector = Some(entry.vector.clone());
+                }
+            }
+        }
+        Some((docs, vectors))
+    }
+}
+
+/// Documents of `index` by path.
+fn documents_by_path(index: Option<&CachedSearchIndex>) -> HashMap<&str, &SearchDocument> {
+    index
+        .map(|cached| {
+            cached
+                .index
+                .documents()
+                .iter()
+                .map(|doc| (doc.path.as_str(), doc))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A walked file's document: its snapshot seed's or its parent's when the
+/// content matches, else a fresh parse; `true` when reused.
+fn walk_document(
+    rel_path: &str,
+    content: &str,
+    hash: &str,
+    seeds: Option<&crate::tools::semantic_search::DocumentSeeds>,
+    parent_documents: &HashMap<&str, &SearchDocument>,
+) -> (SearchDocument, bool) {
+    let doc_content = semantic_embedding_content(rel_path, content);
+    let seeded = match seeds.and_then(|s| s.get(rel_path)) {
+        Some(seed) => seed.document(rel_path.to_string(), hash, doc_content),
+        None => Err(doc_content),
+    };
+    let seeded = seeded.or_else(|doc_content| match parent_documents.get(rel_path) {
+        Some(doc) if doc.source_hash == hash && doc.content == doc_content => Ok((*doc).clone()),
+        _ => Err(doc_content),
+    });
+    match seeded {
+        Ok(doc) => (doc, true),
+        Err(doc_content) => (
+            crate::tools::semantic_search::file_document(
+                rel_path.to_string(),
+                content,
+                doc_content,
+            ),
+            false,
+        ),
     }
 }
 

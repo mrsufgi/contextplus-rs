@@ -5278,6 +5278,8 @@ pub struct BaselineImportReport {
 /// Walk every file in `project_cache`, compute chunk hashes, look up the CAS
 /// parent chain, and register any hits into the ref's in-memory
 /// `embedding_cache` and `search_index_cache` — without any Ollama calls.
+/// A primary's index covers its whole root; a worktree forks its parent's
+/// when it can, and otherwise indexes its hits.
 ///
 /// Called by **both** Shallow and Full warmup so neither duplicates logic:
 /// - Shallow invokes this and discards the misses.
@@ -5379,8 +5381,22 @@ async fn import_baseline_for_ref(
         }
     }
 
+    let walker = CachedWalkerIndexer {
+        config: state.config.clone(),
+        ollama: state.ollama.clone(),
+        state: Arc::clone(state),
+    };
+    let files = &*project_cache_for_idx;
+    let indexed = match ref_index.parent_ref_id {
+        None => {
+            walker.primary_warmup(&ref_index, files).await;
+            true
+        }
+        Some(_) => walker.fork_warmup(&ref_index, files).await,
+    };
+
     // Build search_index_cache from the inherited blobs.
-    if !hits_raw.is_empty() {
+    if !indexed && !hits_raw.is_empty() {
         let project_snap = project_cache_for_idx;
         let hits_snap: Vec<(String, Vec<f32>)> = hits_raw
             .iter()
@@ -17484,6 +17500,208 @@ mod tests {
             "the worktree did not re-fork onto the rebuilt store"
         );
         assert_eq!(semantic_fork_hits(&fork), expected);
+    }
+
+    /// Runs the shallow warmup's baseline import for `server`'s ref.
+    async fn semantic_fork_warmup(server: &ContextPlusServer) {
+        let owner = server.current_ref().await;
+        let cache = server.ensure_project_cache().await.unwrap();
+        let id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
+        import_baseline_for_ref(&server.state, id, cache).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_shallow_warmup_forks_the_primary_index() {
+        let (_ollama, _primary, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        let primary = semantic_fork_index(&server).await;
+
+        semantic_fork_warmup(&session).await;
+        let fork = semantic_fork_index(&session).await;
+        assert!(
+            fork.index.shares_vector_store(&primary.index),
+            "the warmup built its own index instead of forking the primary's"
+        );
+        assert_eq!(fork.search_root(), worktree.path().canonicalize().unwrap());
+        assert_eq!(fork.index.document_count(), SEMANTIC_FORK_FILES);
+    }
+
+    /// The first tracked query after the warmup answers from the fork, builds
+    /// no index or graph, and embeds only the worktree's changed files.
+    #[tokio::test]
+    async fn semantic_fork_first_query_after_warmup_serves_the_fork_and_fills_its_changes() {
+        let (ollama, primary_root, worktree, untracked, _) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        // A copy, so the reference persists no vectors the worktree could load.
+        let reference = tempfile::tempdir().unwrap();
+        lexdelta_corpus(reference.path(), SEMANTIC_FORK_FILES);
+        lexdelta_edit_worktree(reference.path());
+        let expected = semantic_fork_standalone_hits(&untracked, reference.path()).await;
+        let mut config = untracked.state.config.clone();
+        config.embed_tracker_mode = crate::config::TrackerMode::Lazy;
+        let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
+        let session = attached_worktree(&server, worktree.path()).await;
+        semantic_fork_query(&server).await;
+        let primary = semantic_fork_index(&server).await;
+        // A tracker started during the warmup leaves no generation bump to come.
+        session.ensure_tracker_started().await;
+        semantic_fork_warmup(&session).await;
+        let embedded = ollama.received_requests().await.unwrap().len();
+
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        semantic_fork_query(&session).await;
+        drop(capture);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert!(
+            !logs.contains("semantic_index_build") && !logs.contains("hnsw_build"),
+            "the first query after the warmup built an index:\n{logs}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let entry = semantic_fork_index(&session).await;
+                if entry.index.shares_vector_store(&primary.index)
+                    && semantic_fork_hits(&entry) == expected
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                semantic_fork_query(&session).await;
+            }
+        })
+        .await
+        .expect("the fork fills the worktree's changed files");
+        let requests = ollama.received_requests().await.unwrap();
+        let documents: Vec<String> = requests[embedded..]
+            .iter()
+            .flat_map(embed_request_inputs)
+            .filter(|input| input.contains(".rs"))
+            .collect();
+        assert!(!documents.is_empty());
+        assert!(
+            documents
+                .iter()
+                .all(|input| input.contains("file_1.rs") || input.contains("worktree_added.rs")),
+            "the worktree embedded files it shares with the primary: {documents:?}"
+        );
+    }
+
+    /// After a restart the primary holds only an index walked from no root; the
+    /// worktree's warmup builds the primary's index once and forks it.
+    #[tokio::test]
+    async fn semantic_fork_shallow_warmup_builds_the_primary_index_and_forks_it() {
+        use crate::tools::semantic_search::{CachedSearchIndex, IndexFingerprint, SearchIndex};
+
+        let (_ollama, primary_root, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let primary = server.state.default_ref().unwrap();
+        *primary.search_index_cache.write().await = Some(Arc::new(CachedSearchIndex::new(
+            SearchIndex::new(),
+            IndexFingerprint::from_docs(&[]),
+            0,
+        )));
+
+        semantic_fork_warmup(&session).await;
+        let primary_index = semantic_fork_index(&server).await;
+        assert_eq!(
+            primary_index.search_root(),
+            primary_root.path().canonicalize().unwrap(),
+            "the warmup did not build the primary's index of its whole root"
+        );
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&primary_index.index),
+            "the warmup did not fork the primary's index"
+        );
+        semantic_fork_query(&server).await;
+        assert_eq!(
+            primary
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the primary's index was built more than once"
+        );
+    }
+
+    /// The primary's warmup index covers its whole root, so a worktree's warmup
+    /// forks it without walking the primary, and the primary's first query
+    /// updates it in place.
+    #[tokio::test]
+    async fn semantic_fork_primary_warmup_index_is_forkable() {
+        let (_ollama, primary_root, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let before = semantic_fork_query(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let walks = || {
+            primary
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let walked = walks();
+        *primary.search_index_cache.write().await = None;
+
+        semantic_fork_warmup(&server).await;
+        let warm = semantic_fork_index(&server).await;
+        assert_eq!(
+            warm.search_root(),
+            primary_root.path().canonicalize().unwrap()
+        );
+        assert!(warm.forkable_at(&primary.canonical_root));
+        semantic_fork_warmup(&session).await;
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&warm.index),
+            "the worktree's warmup did not fork the primary's warmup index"
+        );
+        assert_eq!(walks(), walked, "the worktree's warmup walked the primary");
+
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        let after = semantic_fork_query(&server).await;
+        drop(capture);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert!(
+            !logs.contains("semantic_index_build"),
+            "the primary's first query rebuilt its warmup index:\n{logs}"
+        );
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_shallow_warmup_over_the_change_threshold_forks_nothing() {
+        let (_ollama, _primary, worktree, server, session) =
+            semantic_fork_servers(semantic_fork_rewrite_a_third).await;
+        semantic_fork_query(&server).await;
+        let primary = semantic_fork_index(&server).await;
+        let owner = session.current_ref().await;
+        let generation = || {
+            owner
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let before = generation();
+
+        semantic_fork_warmup(&session).await;
+        let root = worktree.path().canonicalize().unwrap();
+        assert!(
+            owner
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .is_none_or(|entry| !entry.index.shares_vector_store(&primary.index)
+                    && entry.search_root() != root),
+            "a worktree past the threshold took an index from its warmup"
+        );
+        assert_eq!(generation(), before);
+        assert_eq!(
+            semantic_fork_query(&session).await,
+            semantic_fork_standalone(&server, worktree.path()).await
+        );
     }
 }
 
