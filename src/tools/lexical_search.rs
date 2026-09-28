@@ -9,7 +9,6 @@
 //! No external dependencies — pure Rust, no I/O, no async.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::tools::semantic_search::{SearchDocument, split_camel_case};
 
@@ -112,16 +111,170 @@ pub(crate) fn is_test_intent_token(token: &str) -> bool {
     matches!(token, "test" | "spec" | "fixture")
 }
 
-type PostingList = HashMap<usize, [u32; 4]>;
+type Posting = (u32, [u32; 4]);
+
+/// Documents containing one term with its per-field counts, sorted by
+/// document. Most terms of a large corpus occur in one document only, so a
+/// single posting is stored inline instead of in its own allocation.
+#[derive(Clone)]
+enum PostingList {
+    One(Posting),
+    Many(Vec<Posting>),
+}
+
+impl Default for PostingList {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl PostingList {
+    fn as_slice(&self) -> &[Posting] {
+        match self {
+            Self::One(posting) => std::slice::from_ref(posting),
+            Self::Many(postings) => postings,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn contains(&self, doc: usize) -> bool {
+        self.as_slice()
+            .binary_search_by_key(&doc, |posting| posting.0 as usize)
+            .is_ok()
+    }
+
+    fn insert(&mut self, doc: u32, counts: [u32; 4]) {
+        match self {
+            Self::Many(postings) if postings.is_empty() => *self = Self::One((doc, counts)),
+            Self::One(posting) if posting.0 == doc => posting.1 = counts,
+            Self::One(posting) => {
+                let mut postings = vec![*posting, (doc, counts)];
+                postings.sort_unstable_by_key(|posting| posting.0);
+                *self = Self::Many(postings);
+            }
+            Self::Many(postings) => {
+                match postings.binary_search_by_key(&doc, |posting| posting.0) {
+                    Ok(i) => postings[i].1 = counts,
+                    Err(i) => postings.insert(i, (doc, counts)),
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, doc: u32) {
+        match self {
+            Self::One(posting) if posting.0 == doc => *self = Self::default(),
+            Self::One(_) => {}
+            Self::Many(postings) => {
+                if let Ok(i) = postings.binary_search_by_key(&doc, |posting| posting.0) {
+                    postings.remove(i);
+                }
+                if let [only] = postings.as_slice() {
+                    *self = Self::One(*only);
+                }
+            }
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        if let Self::Many(postings) = self {
+            postings.shrink_to_fit();
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::One(_) => 0,
+            Self::Many(postings) => postings.capacity() * std::mem::size_of::<Posting>(),
+        }
+    }
+}
+
+/// Every term of the index, stored once: the texts back to back in one
+/// buffer and a hash table of term ids keyed by text.
+#[derive(Clone, Default)]
+struct TermDictionary {
+    text: String,
+    ends: Vec<u32>,
+    ids: hashbrown::HashTable<u32>,
+    hasher: std::hash::RandomState,
+}
+
+fn term_at<'a>(text: &'a str, ends: &[u32], id: u32) -> &'a str {
+    let id = id as usize;
+    let start = if id == 0 { 0 } else { ends[id - 1] as usize };
+    &text[start..ends[id] as usize]
+}
+
+impl TermDictionary {
+    fn get(&self, term: &str) -> Option<u32> {
+        let hash = std::hash::BuildHasher::hash_one(&self.hasher, term);
+        self.ids
+            .find(hash, |&id| term_at(&self.text, &self.ends, id) == term)
+            .copied()
+    }
+
+    fn intern(&mut self, term: &str) -> u32 {
+        if let Some(id) = self.get(term) {
+            return id;
+        }
+        let Self {
+            text,
+            ends,
+            ids,
+            hasher,
+        } = self;
+        let id = u32::try_from(ends.len()).expect("lexical index holds at most u32::MAX terms");
+        text.push_str(term);
+        ends.push(u32::try_from(text.len()).expect("lexical term text exceeds 4 GiB"));
+        let hash = std::hash::BuildHasher::hash_one(&*hasher, term);
+        ids.insert_unique(hash, id, |&other| {
+            std::hash::BuildHasher::hash_one(&*hasher, term_at(text, ends, other))
+        });
+        id
+    }
+
+    #[cfg(feature = "memory-profile")]
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn shrink_to_fit(&mut self) {
+        let Self {
+            text,
+            ends,
+            ids,
+            hasher,
+        } = self;
+        ids.shrink_to_fit(|&id| {
+            std::hash::BuildHasher::hash_one(&*hasher, term_at(text, ends, id))
+        });
+        text.shrink_to_fit();
+        ends.shrink_to_fit();
+    }
+
+    fn heap_bytes(&self) -> usize {
+        // A table bucket is one control byte and a u32, at 7/8 load at most.
+        self.text.capacity()
+            + self.ends.capacity() * std::mem::size_of::<u32>()
+            + self.ids.capacity() * 8 / 7 * (1 + std::mem::size_of::<u32>())
+    }
+}
 
 /// In-process inverted index over a [`SearchDocument`] slice.
 #[derive(Clone)]
 pub struct LexicalIndex {
-    posting: HashMap<String, Arc<PostingList>>,
+    terms: TermDictionary,
+    /// Indexed by term id.
+    posting: Vec<PostingList>,
     documents: Vec<DocumentFields>,
     average_lengths: [f64; 4],
     total_lengths: [f64; 4],
-    document_terms: Vec<Arc<Vec<String>>>,
+    /// Term ids of each document.
+    document_terms: Vec<Box<[u32]>>,
     doc_count: usize,
     #[cfg(test)]
     last_update_work: UpdateWork,
@@ -216,79 +369,160 @@ fn token_counts(text: &str) -> HashMap<String, u32> {
     counts
 }
 
+/// The fields of one document the index reads.
+pub(crate) struct LexicalFields<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) symbols: &'a [String],
+    pub(crate) header: &'a str,
+    pub(crate) content: &'a str,
+}
+
+impl<'a> From<&'a SearchDocument> for LexicalFields<'a> {
+    fn from(doc: &'a SearchDocument) -> Self {
+        Self {
+            path: &doc.path,
+            symbols: &doc.symbols,
+            header: &doc.header,
+            content: &doc.content,
+        }
+    }
+}
+
+/// Per-field term counts of one document and its per-field lengths.
+fn document_term_counts(doc: &LexicalFields<'_>) -> (HashMap<String, [u32; 4]>, [u32; 4]) {
+    let symbols = doc.symbols.join(" ");
+    let mut terms: HashMap<String, [u32; 4]> = HashMap::new();
+    let mut lengths = [0_u32; 4];
+    for (field, text) in [doc.path, &symbols, doc.header, doc.content]
+        .into_iter()
+        .enumerate()
+    {
+        for (token, count) in token_counts(text) {
+            lengths[field] = lengths[field].saturating_add(count);
+            terms.entry(token).or_default()[field] = count;
+        }
+    }
+    (terms, lengths)
+}
+
+fn document_fields(path: &str, lengths: [u32; 4]) -> DocumentFields {
+    let classification = classify_path_prior(path);
+    DocumentFields {
+        lengths,
+        prior: classification.non_test_multiplier(),
+        is_test: classification.is_test_like,
+    }
+}
+
 impl LexicalIndex {
+    #[cfg(test)]
+    fn posting_count(&self) -> usize {
+        self.posting.iter().map(PostingList::len).sum()
+    }
+
+    #[cfg(feature = "memory-profile")]
+    pub(crate) fn profile_stats(&self) -> String {
+        let postings: usize = self.posting.iter().map(PostingList::len).sum();
+        let singletons = self.posting.iter().filter(|list| list.len() == 1).count();
+        let document_terms: usize = self.document_terms.iter().map(|terms| terms.len()).sum();
+        format!(
+            "terms={} singleton_terms={singletons} postings={postings} documents={} document_terms={document_terms} estimated_bytes={}",
+            self.terms.len(),
+            self.documents.len(),
+            self.estimated_resident_bytes(),
+        )
+    }
+
     pub(crate) fn estimated_resident_bytes(&self) -> usize {
-        self.posting
-            .iter()
-            .map(|(term, list)| {
-                term.capacity()
-                    + list.capacity()
-                        * (std::mem::size_of::<usize>() + 4 * std::mem::size_of::<u32>())
-            })
-            .sum::<usize>()
+        self.terms.heap_bytes()
+            + self.posting.capacity() * std::mem::size_of::<PostingList>()
+            + self
+                .posting
+                .iter()
+                .map(PostingList::heap_bytes)
+                .sum::<usize>()
             + self.documents.capacity() * std::mem::size_of::<DocumentFields>()
+            + self.document_terms.capacity() * std::mem::size_of::<Box<[u32]>>()
             + self
                 .document_terms
                 .iter()
-                .flat_map(|terms| terms.iter())
-                .map(String::capacity)
+                .map(|terms| terms.len() * std::mem::size_of::<u32>())
                 .sum::<usize>()
+    }
+
+    fn postings(&self, term: &str) -> Option<&PostingList> {
+        self.terms.get(term).map(|id| &self.posting[id as usize])
+    }
+
+    /// Records `terms` as the terms of document `doc` and returns their ids.
+    fn add_postings(&mut self, doc: usize, terms: HashMap<String, [u32; 4]>) -> Box<[u32]> {
+        let doc = u32::try_from(doc).expect("lexical index holds at most u32::MAX documents");
+        terms
+            .into_iter()
+            .map(|(term, counts)| {
+                let id = self.terms.intern(&term);
+                if id as usize == self.posting.len() {
+                    self.posting.push(PostingList::default());
+                }
+                self.posting[id as usize].insert(doc, counts);
+                id
+            })
+            .collect()
     }
 
     /// Build an index from a slice of [`SearchDocument`]s.
     ///
     /// Records separate path, definition-name, header and body frequencies.
     pub fn build(docs: &[SearchDocument]) -> Self {
-        let mut posting: HashMap<String, Arc<PostingList>> = HashMap::new();
-        let mut documents = Vec::with_capacity(docs.len());
-        let mut average_lengths = [0.0; 4];
-        let mut document_terms = Vec::with_capacity(docs.len());
+        let mut index = Self::with_capacity(docs.len());
+        for doc in docs {
+            index.push_document(doc.into());
+        }
+        index.finish_build();
+        index
+    }
 
-        for (idx, doc) in docs.iter().enumerate() {
-            let symbols = doc.symbols.join(" ");
-            let mut terms: HashMap<String, [u32; 4]> = HashMap::new();
-            let mut lengths = [0_u32; 4];
-            for (field, text) in [doc.path.as_str(), &symbols, &doc.header, &doc.content]
-                .into_iter()
-                .enumerate()
-            {
-                for (token, count) in token_counts(text) {
-                    lengths[field] = lengths[field].saturating_add(count);
-                    terms.entry(token).or_default()[field] = count;
-                }
-                average_lengths[field] += f64::from(lengths[field]);
-            }
-            document_terms.push(Arc::new(terms.keys().cloned().collect()));
-            for (token, counts) in terms {
-                Arc::make_mut(posting.entry(token).or_default()).insert(idx, counts);
-            }
-            let classification = classify_path_prior(&doc.path);
-            let is_test = classification.is_test_like;
-            let prior = classification.non_test_multiplier();
-            documents.push(DocumentFields {
-                lengths,
-                prior,
-                is_test,
-            });
-        }
-        let total_lengths = average_lengths;
-        for length in &mut average_lengths {
-            *length = if docs.is_empty() {
-                1.0
-            } else {
-                (*length / docs.len() as f64).max(f64::EPSILON)
-            };
-        }
+    /// An empty index to [`push_document`](Self::push_document) into, then
+    /// [`finish_build`](Self::finish_build).
+    pub(crate) fn with_capacity(documents: usize) -> Self {
         Self {
-            posting,
-            documents,
-            average_lengths,
-            total_lengths,
-            document_terms,
-            doc_count: docs.len(),
+            terms: TermDictionary::default(),
+            posting: Vec::new(),
+            documents: Vec::with_capacity(documents),
+            average_lengths: [1.0; 4],
+            total_lengths: [0.0; 4],
+            document_terms: Vec::with_capacity(documents),
+            doc_count: 0,
             #[cfg(test)]
             last_update_work: UpdateWork::default(),
         }
+    }
+
+    /// Adds the next document of a build.
+    pub(crate) fn push_document(&mut self, doc: LexicalFields<'_>) {
+        let (terms, lengths) = document_term_counts(&doc);
+        for (total, length) in self.total_lengths.iter_mut().zip(lengths) {
+            *total += f64::from(length);
+        }
+        let ids = self.add_postings(self.documents.len(), terms);
+        self.document_terms.push(ids);
+        self.documents.push(document_fields(doc.path, lengths));
+        self.doc_count += 1;
+    }
+
+    /// Releases build slack and sets the average field lengths.
+    pub(crate) fn finish_build(&mut self) {
+        self.terms.shrink_to_fit();
+        self.posting.shrink_to_fit();
+        self.posting.iter_mut().for_each(PostingList::shrink_to_fit);
+        self.documents.shrink_to_fit();
+        self.document_terms.shrink_to_fit();
+        self.average_lengths = if self.doc_count == 0 {
+            [1.0; 4]
+        } else {
+            self.total_lengths
+                .map(|total| (total / self.doc_count as f64).max(f64::EPSILON))
+        };
     }
 
     pub(crate) fn update_documents(
@@ -314,17 +548,12 @@ impl LexicalIndex {
                 {
                     self.last_update_work.documents_visited += 1;
                 }
-                for term in Arc::make_mut(&mut self.document_terms[i]).drain(..) {
-                    if let Some(entries) = self.posting.get_mut(&term) {
-                        #[cfg(test)]
-                        {
-                            postings_visited += 1;
-                        }
-                        Arc::make_mut(entries).remove(&i);
-                        if entries.is_empty() {
-                            self.posting.remove(&term);
-                        }
+                for &id in std::mem::take(&mut self.document_terms[i]).iter() {
+                    #[cfg(test)]
+                    {
+                        postings_visited += 1;
                     }
+                    self.posting[id as usize].remove(i as u32);
                 }
                 for (total, length) in self.total_lengths.iter_mut().zip(self.documents[i].lengths)
                 {
@@ -335,21 +564,19 @@ impl LexicalIndex {
         }
         self.doc_count -= deleted.len();
         for (i, doc) in updates {
-            let mut single = Self::build(&[doc]);
-            for (total, length) in self.total_lengths.iter_mut().zip(single.total_lengths) {
-                *total += length;
+            let (terms, lengths) = document_term_counts(&(&doc).into());
+            for (total, length) in self.total_lengths.iter_mut().zip(lengths) {
+                *total += f64::from(length);
             }
-            let terms = single.document_terms.remove(0);
+            let ids = self.add_postings(i, terms);
+            let fields = document_fields(&doc.path, lengths);
             if i >= self.documents.len() {
-                self.document_terms.push(terms);
+                self.document_terms.push(ids);
                 self.doc_count += 1;
-                self.documents.push(single.documents.remove(0));
+                self.documents.push(fields);
             } else {
-                self.document_terms[i] = terms;
-                self.documents[i] = single.documents.remove(0);
-            }
-            for (term, entries) in single.posting {
-                Arc::make_mut(self.posting.entry(term).or_default()).insert(i, entries[&0]);
+                self.document_terms[i] = ids;
+                self.documents[i] = fields;
             }
         }
         self.average_lengths = self.total_lengths;
@@ -384,7 +611,7 @@ impl LexicalIndex {
         let tokens = query_tokens(query);
         let df: Vec<f64> = tokens
             .iter()
-            .map(|token| self.posting.get(token).map_or(0.0, |p| p.len() as f64))
+            .map(|token| self.postings(token).map_or(0.0, |p| p.len() as f64))
             .collect();
         let mut ranked = self.scored(
             &tokens,
@@ -416,9 +643,10 @@ impl LexicalIndex {
         let wants_tests = tokens.iter().any(|token| is_test_intent_token(token));
         let mut scores: HashMap<usize, (f64, usize)> = HashMap::new();
         for (token, &df) in tokens.iter().zip(df) {
-            if let Some(postings) = self.posting.get(token) {
+            if let Some(postings) = self.postings(token) {
                 let idf = (1.0 + (doc_count - df + 0.5) / (df + 0.5)).ln();
-                for (&doc_idx, counts) in postings.iter() {
+                for (doc_idx, counts) in postings.as_slice() {
+                    let doc_idx = *doc_idx as usize;
                     if skip(doc_idx) {
                         continue;
                     }
@@ -475,15 +703,15 @@ impl LexicalIndex {
         let df: Vec<f64> = tokens
             .iter()
             .map(|token| {
-                let in_base = base.posting.get(token).map_or(0, |postings| {
+                let in_base = base.postings(token).map_or(0, |postings| {
                     postings.len()
                         - mask
                             .masked
                             .iter()
-                            .filter(|doc| postings.contains_key(doc))
+                            .filter(|&&doc| postings.contains(doc))
                             .count()
                 });
-                let in_delta = self.posting.get(token).map_or(0, |p| p.len());
+                let in_delta = self.postings(token).map_or(0, |p| p.len());
                 (in_base + in_delta) as f64
             })
             .collect();
@@ -913,6 +1141,28 @@ mod tests {
         ];
         let idx = LexicalIndex::build(&docs);
         assert_eq!(idx.document_count(), 3);
+    }
+
+    fn corpus_of_rare_terms() -> Vec<SearchDocument> {
+        (0..400)
+            .map(|i| {
+                let body: Vec<String> = (0..250).map(|j| format!("rare{i}term{j}")).collect();
+                make_doc(&format!("src/file_{i}.rs"), "", &[], &body.join(" "))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn index_holds_each_rare_term_in_a_few_dozen_bytes() {
+        let docs = corpus_of_rare_terms();
+        let (index, bytes) = crate::alloc_probe::retained_bytes(|| LexicalIndex::build(&docs));
+        let postings = index.posting_count();
+        assert!(postings >= 100_000, "corpus too small: {postings}");
+        assert!(
+            bytes / postings <= 64,
+            "{} bytes per posting ({bytes} bytes for {postings} postings)",
+            bytes / postings
+        );
     }
 
     #[test]

@@ -140,6 +140,14 @@ impl CacheData {
         if dim == 0 || self.keys.is_empty() {
             return 0;
         }
+        let all_kept = self.keys.iter().enumerate().all(|(i, key)| {
+            self.hashes.get(i).is_some()
+                && (i + 1) * dim <= self.vectors.len()
+                && crate::core::walker::should_keep_cache_key(key)
+        });
+        if all_kept {
+            return 0;
+        }
 
         // A well-formed CacheData has keys.len() == hashes.len() and
         // vectors.len() == keys.len() * dim. If these invariants are violated
@@ -263,7 +271,34 @@ pub fn save_cache_with_deletions(
     data: &CacheData,
     deletions: &[String],
 ) -> Result<()> {
+    save_merged(root_dir, name, data, deletions, || None)
+}
+
+/// Same as [`save_cache`] for a caller that saves only its new entries: when
+/// no readable cache is on disk (missing, or rotated aside as corrupt), the
+/// file is rebuilt from `full()`, the caller's whole in-memory set, with
+/// `data` over it.
+pub fn save_cache_rebuilding(
+    root_dir: &Path,
+    name: &str,
+    data: &CacheData,
+    full: impl FnOnce() -> Option<CacheData>,
+) -> Result<()> {
+    save_merged(root_dir, name, data, &[], full)
+}
+
+fn save_merged(
+    root_dir: &Path,
+    name: &str,
+    data: &CacheData,
+    deletions: &[String],
+    full: impl FnOnce() -> Option<CacheData>,
+) -> Result<()> {
     ensure_cache_dir(root_dir)?;
+    let without_disk = |full: Option<CacheData>| match full {
+        Some(full) => merge_cache_data(full, data),
+        None => clone_cache_data(data),
+    };
 
     // Acquire an exclusive advisory lock on the sentinel file before the
     // load-merge-write sequence to prevent TOCTOU lost-update races between
@@ -294,7 +329,7 @@ pub fn save_cache_with_deletions(
     // snapshot — refusing to write forever is strictly worse than rotating.
     let mut merged = match read_cache(root_dir, name, false) {
         Ok(Some(disk)) => merge_cache_data(disk, data),
-        Ok(None) => clone_cache_data(data),
+        Ok(None) => without_disk(full()),
         Err(e) => {
             let rotated = rotate_corrupt_cache(root_dir, name);
             match rotated {
@@ -317,7 +352,7 @@ pub fn save_cache_with_deletions(
                     "save_cache: on-disk cache unreadable and rotation failed; overwriting with incoming snapshot"
                 ),
             }
-            clone_cache_data(data)
+            without_disk(full())
         }
     };
 
@@ -325,8 +360,21 @@ pub fn save_cache_with_deletions(
         apply_deletions(&mut merged, deletions);
     }
 
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&merged)
-        .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
+    // Sized up front so the buffer does not double past the archive.
+    let archive_estimate = merged.vectors.len() * std::mem::size_of::<f32>()
+        + merged
+            .keys
+            .iter()
+            .chain(&merged.hashes)
+            .map(|text| text.len() + 8)
+            .sum::<usize>()
+        + 64;
+    let bytes = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(
+        &merged,
+        rkyv::util::AlignedVec::<16>::with_capacity(archive_estimate),
+    )
+    .map_err(|e| ContextPlusError::Serialization(format!("rkyv serialize: {}", e)))?;
+    drop(merged);
 
     let path = cache_path(root_dir, name);
     let tmp_path = cache_dir(root_dir).join(format!(
@@ -337,12 +385,15 @@ pub fn save_cache_with_deletions(
     ));
 
     // Write: 16-byte aligned header (version + padding) + rkyv data
-    let mut buf = Vec::with_capacity(HEADER_SIZE + bytes.len());
-    buf.resize(HEADER_SIZE, 0);
-    buf[0] = CACHE_VERSION;
-    buf.extend_from_slice(&bytes);
+    let mut header = [0_u8; HEADER_SIZE];
+    header[0] = CACHE_VERSION;
+    let written = fs::File::create(&tmp_path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(&header)?;
+        file.write_all(&bytes)
+    });
 
-    if let Err(e) = fs::write(&tmp_path, &buf) {
+    if let Err(e) = written {
         let _ = fs::remove_file(&tmp_path);
         return Err(e.into());
     }
@@ -445,45 +496,65 @@ fn merge_cache_data(disk: CacheData, incoming: &CacheData) -> CacheData {
         return clone_cache_data(incoming);
     }
 
-    let mut map: HashMap<String, (String, Vec<f32>)> =
-        HashMap::with_capacity(disk.keys.len() + incoming.keys.len());
-
-    let mut insert = |keys: Vec<String>, hashes: Vec<String>, vectors: Vec<f32>| {
-        for (i, key) in keys.into_iter().enumerate() {
-            let off = i * dim;
-            if off + dim > vectors.len() {
-                continue;
+    // The last complete entry of each key wins, and an incoming entry wins
+    // over the disk's. Entries are copied straight into the result.
+    let last_complete = |data: &CacheData| {
+        let mut last: HashMap<String, usize> = HashMap::with_capacity(data.keys.len());
+        for (i, key) in data.keys.iter().enumerate() {
+            if (i + 1) * dim <= data.vectors.len() {
+                last.insert(key.clone(), i);
             }
-            let hash = hashes.get(i).cloned().unwrap_or_default();
-            let vec = vectors[off..off + dim].to_vec();
-            map.insert(key, (hash, vec));
         }
+        last
     };
-
-    insert(disk.keys, disk.hashes, disk.vectors);
-    // Incoming overwrites by key (newer embed wins for shared keys)
-    insert(
-        incoming.keys.clone(),
-        incoming.hashes.clone(),
-        incoming.vectors.clone(),
-    );
-
-    let n = map.len();
-    let mut keys = Vec::with_capacity(n);
-    let mut hashes = Vec::with_capacity(n);
-    let mut vectors = Vec::with_capacity(n * dim);
-    for (key, (hash, vec)) in map {
-        keys.push(key);
-        hashes.push(hash);
-        vectors.extend_from_slice(&vec);
-    }
-
-    CacheData {
+    let from_incoming = last_complete(incoming);
+    let from_disk = last_complete(&disk);
+    let n = from_incoming.len()
+        + from_disk
+            .keys()
+            .filter(|key| !from_incoming.contains_key(*key))
+            .count();
+    let mut merged = CacheData {
         dims: dim as u32,
-        keys,
-        hashes,
-        vectors,
+        keys: Vec::with_capacity(n),
+        hashes: Vec::with_capacity(n),
+        vectors: Vec::with_capacity(n * dim),
+    };
+    let CacheData {
+        keys: disk_keys,
+        hashes: mut disk_hashes,
+        vectors: disk_vectors,
+        ..
+    } = disk;
+    for (i, key) in disk_keys.into_iter().enumerate() {
+        if from_disk.get(&key) != Some(&i) || from_incoming.contains_key(&key) {
+            continue;
+        }
+        merged.keys.push(key);
+        merged.hashes.push(
+            disk_hashes
+                .get_mut(i)
+                .map(std::mem::take)
+                .unwrap_or_default(),
+        );
+        merged
+            .vectors
+            .extend_from_slice(&disk_vectors[i * dim..(i + 1) * dim]);
     }
+    drop(disk_vectors);
+    for (i, key) in incoming.keys.iter().enumerate() {
+        if from_incoming.get(key) != Some(&i) {
+            continue;
+        }
+        merged.keys.push(key.clone());
+        merged
+            .hashes
+            .push(incoming.hashes.get(i).cloned().unwrap_or_default());
+        merged
+            .vectors
+            .extend_from_slice(&incoming.vectors[i * dim..(i + 1) * dim]);
+    }
+    merged
 }
 
 /// Load a CacheData from disk.
@@ -1628,6 +1699,41 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_few_entries_into_a_large_cache_holds_two_copies_at_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let dims = 256;
+        let keys: Vec<String> = (0..2_000).map(|i| format!("src/file_{i}.rs")).collect();
+        let disk = CacheData {
+            dims: dims as u32,
+            hashes: keys.iter().map(|key| format!("hash-{key}")).collect(),
+            vectors: vec![0.25; keys.len() * dims],
+            keys,
+        };
+        save_cache(dir.path(), "large", &disk).unwrap();
+        let file_bytes = fs::metadata(cache_path(dir.path(), "large")).unwrap().len() as usize;
+        drop(disk);
+        let incoming = CacheData {
+            dims: dims as u32,
+            keys: (0..10).map(|i| format!("src/new_{i}.rs")).collect(),
+            hashes: (0..10).map(|i| format!("new-{i}")).collect(),
+            vectors: vec![0.5; 10 * dims],
+        };
+
+        let (saved, peak) =
+            crate::alloc_probe::peak_bytes(|| save_cache(dir.path(), "large", &incoming));
+
+        saved.unwrap();
+        assert_eq!(
+            load_cache(dir.path(), "large").unwrap().unwrap().keys.len(),
+            2_010
+        );
+        assert!(
+            peak <= file_bytes * 5 / 2,
+            "saving peaked at {peak} bytes over a {file_bytes}-byte cache"
+        );
+    }
+
+    #[test]
     fn merge_skips_entries_with_truncated_vector_buffer() {
         // disk advertises two keys at dims=3 but only carries one vector's
         // worth of floats. The bounds-check inside merge must skip the
@@ -1756,9 +1862,10 @@ mod tests {
             vectors: vec![1.0, 1.1, 2.0, 2.1],
         };
 
-        let removed = data.sweep_excluded_keys();
+        let (removed, peak) = crate::alloc_probe::peak_bytes(|| data.sweep_excluded_keys());
 
         assert_eq!(removed, 0);
+        assert_eq!(peak, 0, "a sweep that removes nothing copied the cache");
         assert_eq!(data.keys.len(), 2);
         assert_eq!(data.vectors.len(), 4);
     }

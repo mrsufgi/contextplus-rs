@@ -102,6 +102,9 @@ instant-distance = "0.6.1"
 # O(1)-promotion LRU cache (indexmap already transitive; adding as direct dep)
 indexmap = "2"
 
+# Lexical term dictionary: a table of term ids keyed by text held in one buffer
+hashbrown = { version = "0.16", default-features = false }
+
 # Content-addressed chunk store (CAS) — U6 multi-worktree CoW cache
 blake3 = "1"
 
