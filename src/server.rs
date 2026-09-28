@@ -785,6 +785,7 @@ const MEMORY_BUDGET_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 const MEMORY_BUDGET_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Resident set size of this process, from `/proc/self/statm`.
+#[cfg(any(not(test), target_os = "linux"))]
 fn process_resident_bytes() -> Option<usize> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
