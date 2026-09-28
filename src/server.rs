@@ -2999,10 +2999,50 @@ impl ContextPlusServer {
         })
     }
 
+    /// The identifier index of a linked worktree's parent, built first when
+    /// missing, paired with the project cache it was built from.
+    async fn parent_identifier_index(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
+        let parent_id = ref_index.parent_ref_id?;
+        let parent = self.state.ref_index(parent_id).await?;
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return None;
+        }
+        let parent_server = self.with_session(parent_id);
+        let parent_cache = parent_server.ensure_project_cache().await.ok()?;
+        parent_server
+            .ensure_identifier_index(&parent_cache)
+            .await
+            .ok()?;
+        let index = parent.identifier_index.read().await;
+        let source = parent.identifier_source.read().await;
+        match (index.as_ref(), source.as_ref()) {
+            (Some(index), Some(source)) if index.dims > 0 => {
+                Some((Arc::clone(index), Arc::clone(source)))
+            }
+            _ => None,
+        }
+    }
+
     async fn build_identifier_index(
         &self,
         cache: &Arc<ProjectCache>,
         background: bool,
+    ) -> Result<Arc<IdentifierIndex>> {
+        self.build_identifier_index_seeded(cache, background, true)
+            .await
+    }
+
+    /// Builds the identifier index of the current ref. A first build of a
+    /// linked worktree, when `seed_from_parent`, starts from its parent's
+    /// index and parses only the files whose content differs.
+    async fn build_identifier_index_seeded(
+        &self,
+        cache: &Arc<ProjectCache>,
+        background: bool,
+        seed_from_parent: bool,
     ) -> Result<Arc<IdentifierIndex>> {
         let ref_index = self.current_ref().await;
         let update_guard = ref_index.identifier_update.lock().await;
@@ -3028,7 +3068,21 @@ impl ContextPlusServer {
             .load(std::sync::atomic::Ordering::Acquire);
         let cache_clone = cache.clone();
         let previous = ref_index.identifier_index.read().await.as_ref().cloned();
-        let incremental = previous.as_ref().is_some_and(|index| index.dims > 0) && source.is_some();
+        let mut incremental =
+            previous.as_ref().is_some_and(|index| index.dims > 0) && source.is_some();
+        let parent_seed = if incremental || !seed_from_parent {
+            None
+        } else {
+            self.parent_identifier_index(&ref_index).await
+        };
+        let from_parent = parent_seed.is_some();
+        let (previous, source) = match parent_seed {
+            Some((parent_index, parent_source)) => {
+                incremental = true;
+                (Some(parent_index), Some(parent_source))
+            }
+            None => (previous, source),
+        };
         let changed_paths: std::collections::HashSet<String> = if incremental {
             let old = source.as_ref().unwrap();
             cache
@@ -3322,7 +3376,12 @@ impl ContextPlusServer {
         if incremental && dims != 0 && dims != previous_dims {
             *ref_index.identifier_source.write().await = None;
             drop(update_guard);
-            return Box::pin(self.build_identifier_index(cache, background)).await;
+            return Box::pin(self.build_identifier_index_seeded(
+                cache,
+                background,
+                seed_from_parent && !from_parent,
+            ))
+            .await;
         }
         let dims = if incremental { previous_dims } else { dims };
         let idx = Arc::new(IdentifierIndex {
@@ -3335,6 +3394,7 @@ impl ContextPlusServer {
         tracing::info!(
             phase = "identifier_build",
             incremental,
+            from_parent,
             from_snapshot,
             parsed_files,
             parse_ms,
@@ -11779,6 +11839,189 @@ mod tests {
             paths.iter().any(|path| path.starts_with("worktree_only_")),
             "worktree's first identifiers index misses its own files: {paths:?}"
         );
+    }
+
+    async fn identifier_test_server(
+        ollama: &wiremock::MockServer,
+        root: &std::path::Path,
+    ) -> ContextPlusServer {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, Request, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let vectors: Vec<Vec<f32>> = embed_request_inputs(request)
+                    .iter()
+                    .map(|input| vec![input.len() as f32, 1.0, 0.0])
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }))
+            })
+            .mount(ollama)
+            .await;
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        ContextPlusServer::new(root.to_path_buf(), config)
+    }
+
+    async fn attached_worktree(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+    ) -> ContextPlusServer {
+        let canonical = root.canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical))
+    }
+
+    /// After a restart a worktree may query before the primary has built its
+    /// identifier index; its build then shares the primary's documents of
+    /// every identical file and parses only the files that differ.
+    #[tokio::test]
+    async fn worktree_identifier_build_reuses_primary_documents_of_identical_files() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            std::fs::write(dir.join("same_a.rs"), "fn same_a() {}\n").unwrap();
+            std::fs::write(dir.join("same_b.rs"), "fn same_b() {}\n").unwrap();
+        }
+        std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let index = worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        let primary_index = server
+            .state
+            .default_ref()
+            .unwrap()
+            .identifier_index
+            .read()
+            .await
+            .clone()
+            .expect("the worktree build seeds from the primary's identifier index");
+        for path in ["same_a.rs", "same_b.rs"] {
+            assert!(
+                Arc::ptr_eq(&index.docs.files[path], &primary_index.docs.files[path]),
+                "{path} is identical, so its documents are the primary's"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &index.vectors.file_segments()[path],
+                    &primary_index.vectors.file_segments()[path]
+                ),
+                "{path} is identical, so its vectors are the primary's"
+            );
+        }
+        assert!(!Arc::ptr_eq(
+            &index.docs.files["differs.rs"],
+            &primary_index.docs.files["differs.rs"]
+        ));
+        assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
+    }
+
+    /// A worktree build seeded from the primary's identifier index answers
+    /// exactly as a full parse of the worktree does, whether its files are
+    /// identical, changed, added or deleted.
+    #[tokio::test]
+    async fn worktree_identifier_build_from_primary_equals_full_parse() {
+        fn documents(index: &IdentifierIndex) -> Vec<String> {
+            let sorted = |tokens: &std::collections::HashSet<String>| {
+                let mut tokens: Vec<_> = tokens.iter().cloned().collect();
+                tokens.sort();
+                tokens
+            };
+            index
+                .docs
+                .iter()
+                .map(|doc| {
+                    format!(
+                        "{} {} {} {} {} {} {} {} {:?} {} {:?} {:?} {:?}",
+                        doc.id,
+                        doc.path,
+                        doc.header,
+                        doc.name,
+                        doc.kind,
+                        doc.line,
+                        doc.end_line,
+                        doc.signature,
+                        doc.parent_name,
+                        doc.text,
+                        sorted(&doc.name_token_set),
+                        sorted(&doc.signature_token_set),
+                        sorted(&doc.parent_token_set),
+                    )
+                })
+                .collect()
+        }
+        fn vectors(index: &IdentifierIndex) -> Vec<(String, Vec<Vec<f32>>)> {
+            index
+                .vectors
+                .file_segments()
+                .iter()
+                .map(|(path, vectors)| {
+                    (
+                        path.clone(),
+                        vectors.iter().map(|vector| vector.to_vec()).collect(),
+                    )
+                })
+                .collect()
+        }
+
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        std::fs::write(
+            primary.path().join("same.rs"),
+            "struct Kept;\nimpl Kept {\n    fn kept(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(primary.path().join("changed.rs"), "fn before() {}\n").unwrap();
+        std::fs::write(primary.path().join("deleted.rs"), "fn deleted() {}\n").unwrap();
+        for dir in [worktree.path(), reference.path()] {
+            std::fs::copy(primary.path().join("same.rs"), dir.join("same.rs")).unwrap();
+            std::fs::write(
+                dir.join("changed.rs"),
+                "fn after() {}\nfn after_too(x: u8) {}\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("added.rs"), "fn added() {}\n").unwrap();
+        }
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let seeded = worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        let full_server = identifier_test_server(&ollama, reference.path()).await;
+        let full_cache = full_server.ensure_project_cache().await.unwrap();
+        let full = full_server
+            .ensure_identifier_index(&full_cache)
+            .await
+            .unwrap();
+
+        assert!(!seeded.docs.files.contains_key("deleted.rs"));
+        assert_eq!(documents(&seeded), documents(&full));
+        assert_eq!(vectors(&seeded), vectors(&full));
+        assert_eq!(seeded.dims, full.dims);
+        assert_eq!(seeded.file_count, full.file_count);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
