@@ -424,10 +424,35 @@ impl CachedWalkerIndexer {
             let doc_shape = config.embed_doc_shape;
             let seed_config = config.clone();
             let seed_ref = Arc::clone(&ref_index);
+            // A worktree takes the documents of files identical to its parent's.
+            let parent_index = match ref_index.parent_ref_id {
+                Some(parent_id) => match self.state.ref_index(parent_id).await {
+                    Some(parent) => parent
+                        .search_index_cache
+                        .read()
+                        .await
+                        .clone()
+                        .filter(|cached| cached.search_root() == parent.canonical_root),
+                    None => None,
+                },
+                None => None,
+            };
             let (mut docs, content_hashes, embedding_texts, reused) =
                 tokio::task::spawn_blocking(move || {
                     use rayon::prelude::*;
                     let seeds = crate::server::snapshots::file_seed(&seed_config, &seed_ref);
+                    let parent_documents: std::collections::HashMap<&str, &SearchDocument> =
+                        parent_index
+                            .as_ref()
+                            .map(|cached| {
+                                cached
+                                    .index
+                                    .documents()
+                                    .iter()
+                                    .map(|doc| (doc.path.as_str(), doc))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                     let built: Vec<(SearchDocument, (String, String), String, bool)> =
                         file_contents
                             .into_par_iter()
@@ -443,6 +468,17 @@ impl CachedWalkerIndexer {
                                     }
                                     None => Err(doc_content),
                                 };
+                                let seeded = seeded.or_else(|doc_content| {
+                                    match parent_documents.get(rel_path.as_str()) {
+                                        Some(doc)
+                                            if doc.source_hash == hash
+                                                && doc.content == doc_content =>
+                                        {
+                                            Ok((*doc).clone())
+                                        }
+                                        _ => Err(doc_content),
+                                    }
+                                });
                                 let (doc, reused) = match seeded {
                                     Ok(doc) => (doc, true),
                                     Err(doc_content) => (

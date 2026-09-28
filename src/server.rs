@@ -13776,6 +13776,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_walk_reuses_primary_documents_of_identical_files() {
+        let (_ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        let (logs, _guard) = crate::test_logs::captured_info_logs();
+        server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let walk = logs
+            .lines()
+            .find(|line| line.contains("phase=\"semantic_walk\""))
+            .unwrap_or_else(|| panic!("no semantic walk logged:\n{logs}"));
+        assert!(
+            walk.contains("documents=2 reused=1"),
+            "the worktree parsed a file the primary had already parsed: {walk}"
+        );
+    }
+
+    #[tokio::test]
     async fn evicted_worktree_reuses_its_persisted_vectors_instead_of_reembedding() {
         let (ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
         let worktree_server = server.with_session(ref_id);
