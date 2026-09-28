@@ -13727,13 +13727,23 @@ mod tests {
 
         // What an earlier daemon's background fill persisted for this worktree.
         let config = semantic_fill_config(&ollama.uri(), 1_000, 1_000);
-        let persisted = HashMap::from([(
-            "src/changed.rs".to_string(),
-            CacheEntry {
-                hash: crate::core::embeddings::content_hash(changed),
-                vector: vec![1.0, 0.0],
-            },
-        )]);
+        // An older binary also persisted the vector the worktree inherited.
+        let persisted = HashMap::from([
+            (
+                "src/changed.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash(changed),
+                    vector: vec![1.0, 0.0],
+                },
+            ),
+            (
+                "src/shared.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash("fn shared_helper() {}\n"),
+                    vector: vec![0.6, 0.8],
+                },
+            ),
+        ]);
         rkyv_store::save_vector_store_merged(
             &worktree,
             &cache_name("embeddings", &config),
@@ -13797,6 +13807,70 @@ mod tests {
         assert!(
             walk.contains("documents=2 reused=1"),
             "the worktree parsed a file the primary had already parsed: {walk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_worktree_reloads_only_vectors_its_parent_lacks() {
+        let (_ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        let worktree_ref = server.state.ref_index(ref_id).await.unwrap();
+        let cache = worktree_ref.embedding_cache.read().await;
+        assert_eq!(
+            cache.get("src/shared.rs").map(|entry| entry.vector.clone()),
+            Some(vec![0.0, 1.0]),
+            "the worktree reloaded its own copy of a vector its parent holds"
+        );
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn worktree_fill_persists_only_vectors_its_parent_lacks() {
+        let (_ollama, temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        let worktree = temp.path().join("worktree");
+        std::fs::write(worktree.join("src/fresh.rs"), "fn WORKTREE_FRESH() {}\n").unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        let name = cache_name("embeddings", &server.state.config);
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let persisted = rkyv_store::mmap_vector_store(&worktree, &name)
+                    .unwrap()
+                    .map(|store| store.to_cache())
+                    .unwrap_or_default();
+                if persisted.contains_key("src/fresh.rs") {
+                    return persisted;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worktree fill never persisted its new vector");
+        let mut keys: Vec<_> = persisted.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["src/changed.rs", "src/fresh.rs"],
+            "the worktree persisted vectors its parent holds"
         );
     }
 

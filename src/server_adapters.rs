@@ -1,7 +1,7 @@
 // Adapter structs that bridge shared server state to tool function traits.
 // Extracted from server.rs (Round 11D) to reduce server.rs line count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -546,18 +546,36 @@ impl CachedWalkerIndexer {
                 return Ok((docs, Vec::new()));
             }
 
+            let parent_vectors = match ref_index.parent_ref_id {
+                Some(parent_id) => self
+                    .state
+                    .ref_index(parent_id)
+                    .await
+                    .map(|parent| Arc::clone(&parent.embedding_cache)),
+                None => None,
+            };
             // A worktree starts, and restarts after an eviction, from the
-            // vectors it persisted.
-            if ref_index.parent_ref_id.is_some() && embedding_cache.read().await.is_empty() {
+            // vectors it persisted that its parent lacks.
+            if let Some(parent_vectors) = &parent_vectors
+                && embedding_cache.read().await.is_empty()
+            {
                 let root = ref_index.root_dir.clone();
                 let name = cache_name("embeddings", &config);
                 if let Ok(Ok(Some(store))) =
                     tokio::task::spawn_blocking(move || rkyv_store::mmap_vector_store(&root, &name))
                         .await
                 {
+                    let own: HashMap<String, CacheEntry> = {
+                        let parent = parent_vectors.read().await;
+                        store
+                            .to_cache()
+                            .into_iter()
+                            .filter(|(path, entry)| !inherits(&parent, path, entry))
+                            .collect()
+                    };
                     let mut cache = embedding_cache.write().await;
                     if cache.is_empty() {
-                        *cache = store.to_cache();
+                        *cache = own;
                     }
                 }
             }
@@ -718,8 +736,9 @@ impl CachedWalkerIndexer {
                 let owner = ref_index.clone();
                 let ollama = ollama.clone();
                 let config = config.clone();
+                let parent_vectors = parent_vectors.clone();
                 let task = tokio::spawn(async move {
-                    run_fill(owner, ollama, config).await;
+                    run_fill(owner, ollama, config, parent_vectors).await;
                 });
                 ref_index.track_background_task(&task);
             }
@@ -947,14 +966,50 @@ impl SemanticFill {
     }
 }
 
-async fn persist_fill(ref_index: &crate::ref_index::RefIndex, config: &Config) {
-    let store =
-        crate::core::embeddings::VectorStore::from_cache(&*ref_index.embedding_cache.read().await);
+type FileVectors = tokio::sync::RwLock<HashMap<String, CacheEntry>>;
+
+/// Whether `parent` holds the vector of `entry`, the content of `path`.
+fn inherits(parent: &HashMap<String, CacheEntry>, path: &str, entry: &CacheEntry) -> bool {
+    parent.get(path).is_some_and(|held| held.hash == entry.hash)
+}
+
+/// Persists the vectors of `ref_index`; a worktree's only those its parent
+/// lacks, dropping the rest from disk.
+async fn persist_fill(
+    ref_index: &crate::ref_index::RefIndex,
+    config: &Config,
+    parent_vectors: Option<&FileVectors>,
+) {
+    let (store, inherited) = {
+        let cache = ref_index.embedding_cache.read().await;
+        match parent_vectors {
+            Some(parent) => {
+                let parent = parent.read().await;
+                let mut own = HashMap::new();
+                let mut inherited = Vec::new();
+                for (path, entry) in cache.iter() {
+                    if inherits(&parent, path, entry) {
+                        inherited.push(path.clone());
+                    } else {
+                        own.insert(path.clone(), entry.clone());
+                    }
+                }
+                (
+                    crate::core::embeddings::VectorStore::from_cache(&own),
+                    inherited,
+                )
+            }
+            None => (
+                crate::core::embeddings::VectorStore::from_cache(&cache),
+                Vec::new(),
+            ),
+        }
+    };
     if let Some(store) = store {
         let root = ref_index.root_dir.clone();
         let name = cache_name("embeddings", config);
         match tokio::task::spawn_blocking(move || {
-            rkyv_store::save_vector_store_merged(&root, &name, &store)
+            rkyv_store::save_vector_store_merged_with_deletions(&root, &name, &store, &inherited)
         })
         .await
         {
@@ -968,6 +1023,7 @@ async fn run_fill(
     ref_index: Arc<crate::ref_index::RefIndex>,
     ollama: OllamaClient,
     config: Config,
+    parent_vectors: Option<Arc<FileVectors>>,
 ) {
     let mut completed = 0usize;
     loop {
@@ -989,7 +1045,7 @@ async fn run_fill(
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             }
-            persist_fill(&ref_index, &config).await;
+            persist_fill(&ref_index, &config, parent_vectors.as_deref()).await;
             let mut fill = ref_index.semantic_fill.lock().await;
             if fill.pending.is_empty() {
                 fill.running = false;
@@ -1096,7 +1152,7 @@ async fn run_fill(
             }
             drop(fill);
             if completed >= 64 {
-                persist_fill(&ref_index, &config).await;
+                persist_fill(&ref_index, &config, parent_vectors.as_deref()).await;
                 completed = 0;
             }
         }
