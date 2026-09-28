@@ -1191,6 +1191,17 @@ impl CachedSearchIndex {
                 .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_paths(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .batches
+            .iter()
+            .flat_map(|batch| batch.docs.iter().map(|doc| doc.path.clone()))
+            .collect()
+    }
+
     /// An entry built from a full walk of `root`.
     pub(crate) fn build(
         root: &Path,
@@ -1215,7 +1226,8 @@ impl CachedSearchIndex {
     }
 
     /// Installs this entry in `slot` if the slot still holds `seen`, keeping
-    /// the batches queued there since this entry's walk began.
+    /// the batches queued there since this entry's walk began when both
+    /// entries index the same root.
     pub(crate) fn install(
         mut self,
         slot: &mut Option<Arc<Self>>,
@@ -1229,7 +1241,10 @@ impl CachedSearchIndex {
         if !unchanged {
             return false;
         }
-        if let Some(current) = slot.as_ref() {
+        if let Some(current) = slot
+            .as_ref()
+            .filter(|current| current.search_root == self.search_root)
+        {
             let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
             self.pending.get_mut().unwrap().batches = current
                 .pending

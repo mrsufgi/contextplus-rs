@@ -350,8 +350,7 @@ impl RefWalkerIndexer {
         let Some(parent) = self.walker.state.ref_index(parent_id).await else {
             return;
         };
-        let base = parent.search_index_cache.read().await.clone();
-        let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
+        let Some(base) = forkable_base(&parent).await else {
             return;
         };
         if base.index.vector_store().is_some_and(|store| {
@@ -440,20 +439,7 @@ impl CachedWalkerIndexer {
             if let Some(parent) = &fork_parent {
                 self.build_parent_index(parent, &ref_index).await;
             }
-            let walk_start = WalkStart {
-                generation: ref_index
-                    .cache_generation
-                    .load(std::sync::atomic::Ordering::Acquire),
-                vector_generation: ref_index
-                    .semantic_vector_generation
-                    .load(std::sync::atomic::Ordering::Acquire),
-                seen: ref_index
-                    .search_index_cache
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(Arc::downgrade),
-            };
+            let walk_start = WalkStart::capture(&ref_index).await;
             #[cfg(test)]
             ref_index
                 .semantic_walks
@@ -723,7 +709,8 @@ impl CachedWalkerIndexer {
                     let miss = VectorMiss {
                         path: path.clone(),
                         hash: hash.clone(),
-                        observed: observed[idx].clone(),
+                        cached_hash: observed[idx].0.clone(),
+                        pending_hash: observed[idx].1.clone(),
                     };
                     (idx, miss)
                 })
@@ -973,16 +960,9 @@ impl CachedWalkerIndexer {
         if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
             return;
         }
-        let seen = {
-            let current = parent.search_index_cache.read().await;
-            if current
-                .as_ref()
-                .is_some_and(|entry| entry.search_root() == parent.canonical_root)
-            {
-                return;
-            }
-            current.as_ref().map(Arc::downgrade)
-        };
+        if parent.search_index_cache.read().await.is_some() {
+            return;
+        }
         let generation = parent
             .cache_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1021,7 +1001,7 @@ impl CachedWalkerIndexer {
         else {
             return;
         };
-        let installed = entry.install(&mut *parent.search_index_cache.write().await, seen.as_ref());
+        let installed = entry.install(&mut *parent.search_index_cache.write().await, None);
         tracing::info!(
             phase = "semantic_parent_index",
             ref_id = %parent.cas_ref_id_hex,
@@ -1042,13 +1022,16 @@ impl CachedWalkerIndexer {
         vectors: Vec<Option<Vec<f32>>>,
         start: WalkStart,
     ) -> Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>, bool)> {
-        let base = parent.search_index_cache.read().await.clone();
-        let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
+        let Some(base) = forkable_base(parent).await else {
             return Ok((docs, vectors, false));
         };
-        if let Some(store) = base.index.vector_store() {
-            *ref_index.fork_base.lock().unwrap() = Arc::downgrade(store);
-        }
+        // Recorded once forked or refused, so a fork dropped by a changed slot is retried.
+        let store = base.index.vector_store().map(Arc::downgrade);
+        let record = || {
+            if let Some(store) = &store {
+                *ref_index.fork_base.lock().unwrap() = store.clone();
+            }
+        };
         if ref_index
             .search_index_cache
             .read()
@@ -1056,6 +1039,7 @@ impl CachedWalkerIndexer {
             .as_ref()
             .is_some_and(|current| current.index.shares_vector_store(&base.index))
         {
+            record();
             return Ok((docs, vectors, false));
         }
         let started = std::time::Instant::now();
@@ -1067,12 +1051,16 @@ impl CachedWalkerIndexer {
         .await
         .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
         let Some(fork) = fork else {
+            record();
             return Ok((docs, vectors, false));
         };
         let installed = fork.install(
             &mut *ref_index.search_index_cache.write().await,
             start.seen.as_ref(),
         );
+        if installed {
+            record();
+        }
         tracing::info!(
             phase = "semantic_fork",
             ref_id = %ref_index.cas_ref_id_hex,
@@ -1099,25 +1087,18 @@ impl CachedWalkerIndexer {
         let Some(parent) = self.state.ref_index(parent_id).await else {
             return false;
         };
-        self.build_parent_index(&parent, ref_index).await;
-        let base = parent.search_index_cache.read().await.clone();
-        let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
+        // Only from the parent's cached vectors: the warmup makes no Ollama call.
+        if parent.parent_ref_id.is_none()
+            && parent.canonical_root != ref_index.canonical_root
+            && parent.search_index_cache.read().await.is_none()
+            && let Some(files) = parent.project_cache.read().await.clone()
+        {
+            self.primary_warmup(&parent, &files).await;
+        }
+        let Some(base) = forkable_base(&parent).await else {
             return false;
         };
-        let start = WalkStart {
-            generation: ref_index
-                .cache_generation
-                .load(std::sync::atomic::Ordering::Acquire),
-            vector_generation: ref_index
-                .semantic_vector_generation
-                .load(std::sync::atomic::Ordering::Acquire),
-            seen: ref_index
-                .search_index_cache
-                .read()
-                .await
-                .as_ref()
-                .map(Arc::downgrade),
-        };
+        let start = WalkStart::capture(ref_index).await;
         let Some((docs, vectors)) = self
             .warmup_documents(ref_index, files, Some(Arc::clone(&base)))
             .await
@@ -1132,7 +1113,9 @@ impl CachedWalkerIndexer {
             ref_index
                 .cache_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return true;
         }
+        // A concurrent walk may have installed a fork of `base`.
         ref_index
             .search_index_cache
             .read()
@@ -1250,6 +1233,8 @@ impl CachedWalkerIndexer {
                 }
             }
         }
+        #[cfg(test)]
+        test_seams::after_cache_snapshot(&ref_index.root_dir).await;
         Some((docs, vectors))
     }
 }
@@ -1304,7 +1289,8 @@ fn walk_document(
 pub(crate) struct VectorMiss {
     pub(crate) path: String,
     pub(crate) hash: String,
-    pub(crate) observed: (Option<String>, Option<String>),
+    pub(crate) cached_hash: Option<String>,
+    pub(crate) pending_hash: Option<String>,
 }
 
 impl VectorMiss {
@@ -1315,14 +1301,13 @@ impl VectorMiss {
     ) -> Self {
         let fill = ref_index.semantic_fill.lock().await;
         let cache = ref_index.embedding_cache.read().await;
-        let observed = (
-            cache.get(&path).map(|entry| entry.hash.clone()),
-            fill.pending.get(&path).map(|doc| doc.hash.clone()),
-        );
+        let cached_hash = cache.get(&path).map(|entry| entry.hash.clone());
+        let pending_hash = fill.pending.get(&path).map(|doc| doc.hash.clone());
         Self {
             path,
             hash,
-            observed,
+            cached_hash,
+            pending_hash,
         }
     }
 }
@@ -1382,8 +1367,9 @@ pub(crate) async fn adopt_worktree_vectors(
         for (i, (slot, miss)) in found.into_iter().zip(misses).enumerate() {
             if let Some((_, entry)) = slot.filter(|_| {
                 current[i]
-                    && cache.get(&miss.path).map(|entry| &entry.hash) == miss.observed.0.as_ref()
-                    && fill.pending.get(&miss.path).map(|doc| &doc.hash) == miss.observed.1.as_ref()
+                    && cache.get(&miss.path).map(|entry| &entry.hash) == miss.cached_hash.as_ref()
+                    && fill.pending.get(&miss.path).map(|doc| &doc.hash)
+                        == miss.pending_hash.as_ref()
             }) {
                 vectors[i] = Some(entry.vector.clone());
                 cache.insert(miss.path.clone(), entry);
@@ -1407,6 +1393,31 @@ struct WalkStart {
     generation: u64,
     vector_generation: u64,
     seen: Option<std::sync::Weak<CachedSearchIndex>>,
+}
+
+impl WalkStart {
+    async fn capture(ref_index: &crate::ref_index::RefIndex) -> Self {
+        Self {
+            generation: ref_index
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            vector_generation: ref_index
+                .semantic_vector_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            seen: ref_index
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .map(Arc::downgrade),
+        }
+    }
+}
+
+/// The parent's semantic index when a worktree can fork it.
+async fn forkable_base(parent: &crate::ref_index::RefIndex) -> Option<Arc<CachedSearchIndex>> {
+    let base = parent.search_index_cache.read().await.clone();
+    base.filter(|base| base.forkable_at(&parent.canonical_root))
 }
 
 #[derive(Clone)]
