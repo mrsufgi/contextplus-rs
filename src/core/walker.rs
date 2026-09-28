@@ -202,11 +202,157 @@ pub fn group_by_directory(
     groups
 }
 
+pub type ContentMap = std::collections::HashMap<String, std::sync::Arc<String>>;
+
+/// Relative path to file content: this tree's own files over an optional
+/// read-only base shared with another tree. `masked` holds the base paths this
+/// tree changed or removed, so lookups resolve own, then masked, then base.
+#[derive(Clone, Default)]
+pub struct FileContents {
+    own: std::sync::Arc<ContentMap>,
+    base: Option<std::sync::Arc<ContentMap>>,
+    masked: HashSet<String>,
+}
+
+impl FileContents {
+    pub fn layered(
+        own: ContentMap,
+        base: std::sync::Arc<ContentMap>,
+        mut masked: HashSet<String>,
+    ) -> Self {
+        masked.extend(own.keys().filter(|path| base.contains_key(*path)).cloned());
+        masked.retain(|path| base.contains_key(path));
+        Self {
+            own: std::sync::Arc::new(own),
+            base: Some(base),
+            masked,
+        }
+    }
+
+    pub fn get(&self, path: &str) -> Option<&std::sync::Arc<String>> {
+        self.own.get(path).or_else(|| {
+            self.base
+                .as_ref()
+                .filter(|_| !self.masked.contains(path))?
+                .get(path)
+        })
+    }
+
+    pub fn contains_key(&self, path: &str) -> bool {
+        self.get(path).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.own.len() + self.base.as_ref().map_or(0, |base| base.len()) - self.masked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (&String, &std::sync::Arc<String>)> + '_> {
+        let base = self
+            .base
+            .iter()
+            .flat_map(|base| base.iter())
+            .filter(|(path, _)| !self.masked.contains(*path));
+        Box::new(self.own.iter().chain(base))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.iter().map(|(path, _)| path)
+    }
+
+    /// This tree's own files: all of them when there is no base.
+    pub fn own(&self) -> &std::sync::Arc<ContentMap> {
+        &self.own
+    }
+
+    pub fn base(&self) -> Option<&std::sync::Arc<ContentMap>> {
+        self.base.as_ref()
+    }
+
+    /// Whether `path` of the base is shadowed: changed or removed in this tree.
+    pub fn shadows(&self, path: &str) -> bool {
+        self.masked.contains(path)
+    }
+
+    /// Bytes this tree holds on its own, excluding the shared base.
+    pub fn own_resident_bytes(&self) -> usize {
+        content_map_bytes(&self.own) + self.masked.iter().map(String::capacity).sum::<usize>()
+    }
+}
+
+pub fn content_map_bytes(map: &ContentMap) -> usize {
+    map.iter()
+        .map(|(path, content)| path.capacity() + content.capacity())
+        .sum()
+}
+
+impl From<ContentMap> for FileContents {
+    fn from(own: ContentMap) -> Self {
+        Self {
+            own: std::sync::Arc::new(own),
+            base: None,
+            masked: HashSet::new(),
+        }
+    }
+}
+
+impl FromIterator<(String, std::sync::Arc<String>)> for FileContents {
+    fn from_iter<I: IntoIterator<Item = (String, std::sync::Arc<String>)>>(iter: I) -> Self {
+        ContentMap::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Index<&str> for FileContents {
+    type Output = std::sync::Arc<String>;
+    fn index(&self, path: &str) -> &Self::Output {
+        self.get(path).expect("no content for path")
+    }
+}
+
+impl<'a> IntoIterator for &'a FileContents {
+    type Item = (&'a String, &'a std::sync::Arc<String>);
+    type IntoIter = Box<dyn Iterator<Item = Self::Item> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn layered_contents_resolve_own_then_mask_then_base() {
+        let content = |text: &str| std::sync::Arc::new(text.to_string());
+        let base = std::sync::Arc::new(ContentMap::from([
+            ("same.rs".to_string(), content("same")),
+            ("changed.rs".to_string(), content("old")),
+            ("deleted.rs".to_string(), content("gone")),
+        ]));
+        let files = FileContents::layered(
+            ContentMap::from([
+                ("changed.rs".to_string(), content("new")),
+                ("added.rs".to_string(), content("added")),
+            ]),
+            std::sync::Arc::clone(&base),
+            HashSet::from(["deleted.rs".to_string()]),
+        );
+        assert_eq!(files["same.rs"].as_str(), "same");
+        assert_eq!(files["changed.rs"].as_str(), "new");
+        assert_eq!(files["added.rs"].as_str(), "added");
+        assert!(!files.contains_key("deleted.rs"));
+        assert_eq!(files.len(), 3);
+        let mut paths: Vec<_> = files.keys().cloned().collect();
+        paths.sort();
+        assert_eq!(paths, ["added.rs", "changed.rs", "same.rs"]);
+        assert!(files.shadows("changed.rs") && files.shadows("deleted.rs"));
+        assert!(!files.shadows("same.rs"));
+    }
 
     fn make_ignore_set(dirs: &[&str]) -> HashSet<String> {
         dirs.iter().map(|s| (*s).to_string()).collect()

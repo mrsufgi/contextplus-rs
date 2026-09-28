@@ -215,19 +215,13 @@ async fn component_report(session: &ProfileSession) {
         .read()
         .await
         .as_ref()
-        .map_or(0, |cache| {
-            cache
-                .file_content
-                .iter()
-                .map(|(path, content)| path.capacity() + content.capacity())
-                .sum::<usize>()
-        });
+        .map_or(0, |cache| cache.file_content.own_resident_bytes());
     let lexical = owner
         .lexical_search_cache
         .read()
         .await
         .as_ref()
-        .map_or(0, |entry| entry.index.estimated_resident_bytes());
+        .map_or(0, |entry| entry.own_resident_bytes());
     println!(
         "components ref={} file_vectors={} identifier_base={} identifier_overlay={} identifier_index_vectors={} hnsw={} lexical={} project={} search_documents={}",
         session.name,

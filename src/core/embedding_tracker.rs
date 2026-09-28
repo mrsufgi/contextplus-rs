@@ -295,6 +295,10 @@ impl EmbeddingTrackerHandle {
         self.source_dirty.swap(false, Ordering::AcqRel)
     }
 
+    pub(crate) fn is_source_dirty(&self) -> bool {
+        self.source_dirty.load(Ordering::Acquire)
+    }
+
     /// Gracefully stops the embedding tracker.
     pub async fn stop(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {

@@ -5,13 +5,13 @@
 //! - Ranks identifiers by hybrid semantic + keyword score
 //! - Finds and ranks call-sites for each top identifier
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use rayon::prelude::*;
 use regex::Regex;
 
+use crate::core::walker::FileContents;
 use crate::error::{ContextPlusError, Result};
 use crate::tools::scoring::{
     DEFAULT_TOP_K, clamp01, keyword_coverage, normalize_weight, truncate_on_char_boundary,
@@ -295,7 +295,7 @@ pub fn rank_call_sites(
     query_terms: &HashSet<String>,
     query_vec: &[f32],
     symbol: &IdentifierDoc,
-    file_content: &HashMap<String, Arc<String>>,
+    file_content: &FileContents,
     limit: usize,
     // Optional: pre-computed vectors for call-site text. If None, only keyword score is used.
     callsite_vectors: Option<&dyn CallSiteVectorProvider>,
@@ -463,7 +463,7 @@ fn imports_definition(
     content: &str,
     ext: &str,
     symbol: &IdentifierDoc,
-    files: &HashMap<String, Arc<String>>,
+    files: &FileContents,
 ) -> bool {
     crate::core::tree_sitter::extract_identifier_imports(content, ext)
         .iter()
@@ -472,7 +472,7 @@ fn imports_definition(
                 return resolve_rust_identifier_import(import, file, files);
             }
             crate::core::import_resolver::resolve_import_with(import, Path::new(file), |path| {
-                files.contains_key(&path.to_string_lossy().into_owned())
+                files.contains_key(&path.to_string_lossy())
             })
         })
         .any(|path| path == Path::new(&symbol.path))
@@ -481,7 +481,7 @@ fn imports_definition(
 fn resolve_rust_identifier_import(
     import: &str,
     file: &str,
-    files: &HashMap<String, Arc<String>>,
+    files: &FileContents,
 ) -> Option<PathBuf> {
     let mut parts = import.split("::").peekable();
     let mut base = Path::new(file).parent()?.to_path_buf();
@@ -518,7 +518,7 @@ fn resolve_rust_identifier_import(
         }
         base.push(part.split_whitespace().next()?);
         for candidate in [base.with_extension("rs"), base.join("mod.rs")] {
-            if files.contains_key(&candidate.to_string_lossy().into_owned()) {
+            if files.contains_key(&candidate.to_string_lossy()) {
                 resolved = Some(candidate);
             }
         }
@@ -765,7 +765,7 @@ pub async fn semantic_identifier_search(
     identifier_docs: &(impl IndexData<IdentifierDoc> + ?Sized),
     vector_buffer: &(impl IndexData<f32> + ?Sized),
     vector_dims: usize,
-    file_content: &HashMap<String, Arc<String>>,
+    file_content: &FileContents,
     candidates: Option<&[usize]>,
 ) -> Result<String> {
     let query = sanitize_query(&options.query);
@@ -845,6 +845,8 @@ pub async fn semantic_identifier_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// Compute the vector norm (L2) of a vector.
     /// Only used in tests — moved here to eliminate dead code warning.
@@ -1424,7 +1426,7 @@ mod tests {
             parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
 
-        let file_content: HashMap<String, Arc<String>> = [
+        let file_content: FileContents = [
             (
                 "src/user.ts".to_string(),
                 Arc::new(
@@ -1471,7 +1473,7 @@ mod tests {
             parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
 
-        let file_content: HashMap<String, Arc<String>> = [(
+        let file_content: FileContents = [(
             "src/user.ts".to_string(),
             Arc::new("function myFunc() {\n  return 42;\n}".to_string()),
         )]
@@ -1503,7 +1505,7 @@ mod tests {
             signature_token_set: crate::tools::semantic_identifiers::identifier_terms("noMatch()"),
             parent_token_set: crate::tools::semantic_identifiers::identifier_terms(""),
         };
-        let file_content: HashMap<String, Arc<String>> = [(
+        let file_content: FileContents = [(
             "other.ts".to_string(),
             Arc::new("const x = 42;".to_string()),
         )]
@@ -1517,9 +1519,7 @@ mod tests {
         assert!(result.sites.is_empty());
     }
 
-    fn temp_repo_content(
-        files: &[(&str, &str)],
-    ) -> (tempfile::TempDir, HashMap<String, Arc<String>>) {
+    fn temp_repo_content(files: &[(&str, &str)]) -> (tempfile::TempDir, FileContents) {
         let repo = tempfile::tempdir().unwrap();
         let mut content = HashMap::new();
         for (path, source) in files {
@@ -1528,7 +1528,7 @@ mod tests {
             std::fs::write(&full_path, source).unwrap();
             content.insert((*path).to_string(), Arc::new((*source).to_string()));
         }
-        (repo, content)
+        (repo, content.into())
     }
 
     #[test]
@@ -1805,6 +1805,7 @@ mod tests {
             }
             file_content.insert(format!("src/module_{fi}.ts"), Arc::new(lines.join("\n")));
         }
+        let file_contents: FileContents = file_content.into();
 
         // Build 500 fake identifier docs (only a handful will be top-ranked,
         // but we need enough to simulate a real corpus size for score_identifiers).
@@ -1877,7 +1878,14 @@ mod tests {
         let call_results: Vec<CallSiteResult> = top
             .par_iter()
             .map(|item| {
-                rank_call_sites(&query_terms, &query_vec, &item.doc, &file_content, 10, None)
+                rank_call_sites(
+                    &query_terms,
+                    &query_vec,
+                    &item.doc,
+                    &file_contents,
+                    10,
+                    None,
+                )
             })
             .collect();
         let elapsed = start.elapsed();

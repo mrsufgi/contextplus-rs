@@ -63,10 +63,10 @@ impl BlastRadiusResult {
 /// Search for all usages of a symbol across provided file content.
 /// `file_content` maps relative_path -> raw file content (`Arc<String>`).
 /// Returns usages grouped by file.
-pub fn find_symbol_usages(
+pub fn find_symbol_usages<'a>(
     symbol_name: &str,
     file_context: Option<&str>,
-    file_content: &HashMap<String, Arc<String>>,
+    file_content: impl IntoIterator<Item = (&'a String, &'a Arc<String>)>,
 ) -> BlastRadiusResult {
     let escaped = escape_regex(symbol_name);
     // \b only works at word-character boundaries. For symbols with non-word

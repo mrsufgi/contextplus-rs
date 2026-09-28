@@ -381,25 +381,54 @@ impl LexicalIndex {
         if top_k == 0 || self.doc_count == 0 {
             return Vec::new();
         }
-        let mut tokens: Vec<String> = token_counts(query)
-            .into_keys()
-            .filter(|token| !STOPWORDS.contains(&token.as_str()))
+        let tokens = query_tokens(query);
+        let df: Vec<f64> = tokens
+            .iter()
+            .map(|token| self.posting.get(token).map_or(0.0, |p| p.len() as f64))
             .collect();
-        tokens.sort_unstable();
+        let mut ranked = self.scored(
+            &tokens,
+            &df,
+            self.doc_count as f64,
+            &self.average_lengths,
+            |_| false,
+        );
+        // Sort descending by score; ties → ascending by doc_idx.
+        ranked.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(top_k);
+        ranked
+    }
+
+    /// BM25F score of every document matching `tokens`, given the corpus
+    /// statistics to score against. `df` is aligned with `tokens`.
+    fn scored(
+        &self,
+        tokens: &[String],
+        df: &[f64],
+        doc_count: f64,
+        average_lengths: &[f64; 4],
+        skip: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, f64)> {
         let wants_tests = tokens.iter().any(|token| is_test_intent_token(token));
         let mut scores: HashMap<usize, (f64, usize)> = HashMap::new();
-        for token in &tokens {
+        for (token, &df) in tokens.iter().zip(df) {
             if let Some(postings) = self.posting.get(token) {
-                let df = postings.len() as f64;
-                let idf = (1.0 + (self.doc_count as f64 - df + 0.5) / (df + 0.5)).ln();
+                let idf = (1.0 + (doc_count - df + 0.5) / (df + 0.5)).ln();
                 for (&doc_idx, counts) in postings.iter() {
+                    if skip(doc_idx) {
+                        continue;
+                    }
                     let doc = &self.documents[doc_idx];
                     let tf: f64 = (0..4)
                         .map(|field| {
                             FIELD_WEIGHTS[field] * f64::from(counts[field])
                                 / (1.0 - FIELD_B[field]
                                     + FIELD_B[field] * f64::from(doc.lengths[field])
-                                        / self.average_lengths[field])
+                                        / average_lengths[field])
                         })
                         .sum();
                     let score = scores.entry(doc_idx).or_default();
@@ -408,7 +437,7 @@ impl LexicalIndex {
                 }
             }
         }
-        let mut ranked: Vec<(usize, f64)> = scores
+        scores
             .into_iter()
             .map(|(idx, (score, matched))| {
                 let doc = &self.documents[idx];
@@ -420,15 +449,93 @@ impl LexicalIndex {
                 };
                 (idx, score * coverage.powi(2) * doc.prior * test_prior)
             })
+            .collect()
+    }
+
+    /// Searches this index as the delta over `base` without its `mask`ed
+    /// documents, scoring with the statistics of that combined corpus: its
+    /// document count, average field lengths and per-term document frequency.
+    /// Hits are unsorted `(in_delta, doc_idx, score)`.
+    pub(crate) fn search_over(
+        &self,
+        base: &LexicalIndex,
+        mask: &BaseMask,
+        query: &str,
+    ) -> Vec<(bool, usize, f64)> {
+        let doc_count = base.doc_count + self.doc_count - mask.masked.len();
+        if doc_count == 0 {
+            return Vec::new();
+        }
+        let mut average_lengths = [0.0; 4];
+        for (field, average) in average_lengths.iter_mut().enumerate() {
+            let total = base.total_lengths[field] - mask.lengths[field] + self.total_lengths[field];
+            *average = (total / doc_count as f64).max(f64::EPSILON);
+        }
+        let tokens = query_tokens(query);
+        let df: Vec<f64> = tokens
+            .iter()
+            .map(|token| {
+                let in_base = base.posting.get(token).map_or(0, |postings| {
+                    postings.len()
+                        - mask
+                            .masked
+                            .iter()
+                            .filter(|doc| postings.contains_key(doc))
+                            .count()
+                });
+                let in_delta = self.posting.get(token).map_or(0, |p| p.len());
+                (in_base + in_delta) as f64
+            })
             .collect();
-        // Sort descending by score; ties → ascending by doc_idx.
-        ranked.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        ranked.truncate(top_k);
-        ranked
+        let doc_count = doc_count as f64;
+        let mut hits: Vec<(bool, usize, f64)> = base
+            .scored(&tokens, &df, doc_count, &average_lengths, |doc| {
+                mask.masked.contains(&doc)
+            })
+            .into_iter()
+            .map(|(doc, score)| (false, doc, score))
+            .collect();
+        hits.extend(
+            self.scored(&tokens, &df, doc_count, &average_lengths, |_| false)
+                .into_iter()
+                .map(|(doc, score)| (true, doc, score)),
+        );
+        hits
+    }
+}
+
+fn query_tokens(query: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = token_counts(query)
+        .into_keys()
+        .filter(|token| !STOPWORDS.contains(&token.as_str()))
+        .collect();
+    tokens.sort_unstable();
+    tokens
+}
+
+/// Live documents of a base index hidden from a delta built over it, with
+/// their summed field lengths.
+#[derive(Clone, Default)]
+pub(crate) struct BaseMask {
+    masked: std::collections::HashSet<usize>,
+    lengths: [f64; 4],
+}
+
+impl BaseMask {
+    /// `masked` must name live documents of `base`.
+    pub(crate) fn new(base: &LexicalIndex, mut masked: std::collections::HashSet<usize>) -> Self {
+        masked.retain(|&doc| doc < base.documents.len());
+        let mut lengths = [0.0; 4];
+        for &doc in &masked {
+            for (total, length) in lengths.iter_mut().zip(base.documents[doc].lengths) {
+                *total += f64::from(length);
+            }
+        }
+        Self { masked, lengths }
+    }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        self.masked.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -891,5 +998,163 @@ mod tests {
         let ranking: Vec<usize> = (0..20).collect();
         let merged = rrf_merge(&[ranking], 60.0, 5);
         assert_eq!(merged.len(), 5);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    const WORDS: &[&str] = &[
+        "alpha", "beta", "scope", "mode", "resolve", "account", "record", "hydrate", "profile",
+        "status", "numeric", "invoice", "payment", "worker", "queue", "token", "parser", "cache",
+        "test", "fixture",
+    ];
+
+    fn random_words(rng: &mut Rng, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|_| {
+                let word = WORDS[rng.below(WORDS.len())];
+                if rng.below(4) == 0 {
+                    let next = WORDS[rng.below(WORDS.len())];
+                    format!("{word}{}{}", next[..1].to_uppercase(), &next[1..])
+                } else {
+                    word.to_string()
+                }
+            })
+            .collect()
+    }
+
+    fn random_doc(rng: &mut Rng, path: String) -> SearchDocument {
+        let symbol_count = rng.below(3);
+        let symbols = random_words(rng, symbol_count);
+        let header_len = rng.below(5);
+        let header = random_words(rng, header_len).join(" ");
+        let body_len = 1 + rng.below(40);
+        let body = random_words(rng, body_len).join(" ");
+        SearchDocument::new(path, header, symbols, vec![], body)
+    }
+
+    fn random_path(rng: &mut Rng, i: usize) -> String {
+        match rng.below(5) {
+            0 => format!("tests/case_{i}.test.ts"),
+            1 => format!("docs/note_{i}.md"),
+            2 => format!("src/generated/gen_{i}.rs"),
+            _ => format!("src/module_{i}.rs"),
+        }
+    }
+
+    fn by_score_then_path(hits: &mut [(String, f64)]) {
+        hits.sort_by(|a, b| {
+            let key = |score: f64| (score * 1e9).round() as i64;
+            key(b.1).cmp(&key(a.1)).then_with(|| a.0.cmp(&b.0))
+        });
+    }
+
+    /// A delta index over a masked base answers like one index built over the
+    /// worktree's whole corpus: same files, same order, same scores.
+    #[test]
+    fn delta_over_masked_base_matches_standalone_index_of_random_edits() {
+        for seed in 1..=60_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let base_len = 8 + rng.below(30);
+            let mut base_docs: Vec<SearchDocument> = (0..base_len)
+                .map(|i| {
+                    let path = random_path(&mut rng, i);
+                    random_doc(&mut rng, path)
+                })
+                .collect();
+            let (base, mut base_paths) = if seed % 2 == 0 {
+                (LexicalIndex::build(&base_docs), Vec::new())
+            } else {
+                // A base kept current incrementally carries a tombstone.
+                base_docs.push(random_doc(&mut rng, "src/removed.rs".into()));
+                let mut index = LexicalIndex::build(&base_docs);
+                index.update_documents(vec![], &[base_docs.len() - 1]);
+                base_docs.pop();
+                (index, vec![String::new()])
+            };
+            base_paths.splice(0..0, base_docs.iter().map(|doc| doc.path.clone()));
+
+            let mut worktree: Vec<Option<SearchDocument>> =
+                base_docs.iter().cloned().map(Some).collect();
+            let mut masked = std::collections::HashSet::new();
+            let mut added = Vec::new();
+            let op_count = 1 + rng.below(8);
+            for op in 0..op_count {
+                let target = rng.below(base_docs.len());
+                match rng.below(3) {
+                    0 => {
+                        worktree[target] = None;
+                        masked.insert(target);
+                    }
+                    1 => {
+                        let path = base_docs[target].path.clone();
+                        worktree[target] = Some(random_doc(&mut rng, path));
+                        masked.insert(target);
+                    }
+                    _ => added.push(random_doc(&mut rng, format!("src/added_{op}.rs"))),
+                }
+            }
+            let mut delta_docs = added.clone();
+            delta_docs.extend(masked.iter().filter_map(|&i| worktree[i].clone()));
+            let mut standalone_docs: Vec<SearchDocument> =
+                worktree.iter().flatten().cloned().collect();
+            standalone_docs.extend(added);
+            let standalone = LexicalIndex::build(&standalone_docs);
+            let delta = LexicalIndex::build(&delta_docs);
+            let mask = BaseMask::new(&base, masked.iter().copied().collect());
+            let deleted: Vec<&String> = masked
+                .iter()
+                .filter(|&&i| worktree[i].is_none())
+                .map(|&i| &base_docs[i].path)
+                .collect();
+
+            for _ in 0..6 {
+                let query_len = 1 + rng.below(3);
+                let query = random_words(&mut rng, query_len).join(" ");
+                let mut layered: Vec<(String, f64)> = delta
+                    .search_over(&base, &mask, &query)
+                    .into_iter()
+                    .map(|(in_delta, i, score)| {
+                        let path = if in_delta {
+                            delta_docs[i].path.clone()
+                        } else {
+                            base_paths[i].clone()
+                        };
+                        (path, score)
+                    })
+                    .collect();
+                let mut expected: Vec<(String, f64)> = standalone
+                    .search(&query, usize::MAX)
+                    .into_iter()
+                    .map(|(i, score)| (standalone_docs[i].path.clone(), score))
+                    .collect();
+                by_score_then_path(&mut layered);
+                by_score_then_path(&mut expected);
+                assert!(!expected.is_empty() || layered.is_empty());
+                assert_eq!(
+                    layered.iter().map(|hit| &hit.0).collect::<Vec<_>>(),
+                    expected.iter().map(|hit| &hit.0).collect::<Vec<_>>(),
+                    "seed {seed} query {query:?}"
+                );
+                for (got, want) in layered.iter().zip(&expected) {
+                    assert!(
+                        (got.1 - want.1).abs() <= 1e-9 * want.1.abs().max(1.0),
+                        "seed {seed} query {query:?}: {got:?} vs {want:?}"
+                    );
+                }
+                assert!(
+                    !layered.iter().any(|(path, _)| deleted.contains(&path)),
+                    "seed {seed}: a deleted file was returned"
+                );
+            }
+        }
     }
 }

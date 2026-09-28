@@ -37,17 +37,81 @@ pub struct ProjectCache {
     pub file_entries: Vec<crate::core::walker::FileEntry>,
     /// Maps relative_path → raw file content. Clone the Arc (pointer-sized)
     /// at each call-site; do not reconstruct from lines.
-    pub file_content: HashMap<String, Arc<String>>,
+    pub file_content: crate::core::walker::FileContents,
+    /// The files git showed clean, with their blobs, both before and after
+    /// the walk that read `file_content`. Recorded for a primary: a linked
+    /// worktree skips reading its files that have the same clean blob.
+    pub clean_blobs: Option<Arc<crate::core::git_worktree::CleanBlobs>>,
     pub last_refresh: Instant,
 }
 
 /// Cached lexical index and the document paths used to format its results.
 #[derive(Clone)]
 pub(crate) struct CachedLexicalIndex {
+    /// The whole corpus, or with `base` only this ref's changed and added files.
     pub index: crate::tools::lexical_search::LexicalIndex,
     pub document_paths: Vec<String>,
     pub project_cache: Arc<ProjectCache>,
     pub generation: u64,
+    pub base: Option<LexicalBase>,
+}
+
+/// The parent ref's shared index with the documents this ref changed or removed masked.
+#[derive(Clone)]
+pub(crate) struct LexicalBase {
+    pub cached: Arc<CachedLexicalIndex>,
+    pub mask: crate::tools::lexical_search::BaseMask,
+}
+
+impl CachedLexicalIndex {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.document_paths.is_empty()
+            && self
+                .base
+                .as_ref()
+                .is_none_or(|base| base.cached.document_paths.is_empty())
+    }
+
+    /// Top `top_k` `(path, score)` hits, best first, equal scores by path.
+    pub(crate) fn search(&self, query: &str, top_k: usize) -> Vec<(&str, f64)> {
+        let path = |in_delta: bool, i: usize| {
+            let paths = match &self.base {
+                Some(base) if !in_delta => &base.cached.document_paths,
+                _ => &self.document_paths,
+            };
+            Some(paths.get(i)?.as_str())
+        };
+        let mut hits: Vec<(&str, f64)> = match &self.base {
+            Some(base) => self
+                .index
+                .search_over(&base.cached.index, &base.mask, query)
+                .into_iter()
+                .filter_map(|(in_delta, i, score)| Some((path(in_delta, i)?, score)))
+                .collect(),
+            None => self
+                .index
+                .search(query, usize::MAX)
+                .into_iter()
+                .filter_map(|(i, score)| Some((path(true, i)?, score)))
+                .collect(),
+        };
+        hits.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(b.0))
+        });
+        hits.truncate(top_k);
+        hits
+    }
+
+    /// Bytes this entry holds on its own, excluding a shared base.
+    pub(crate) fn own_resident_bytes(&self) -> usize {
+        self.index.estimated_resident_bytes()
+            + self
+                .base
+                .as_ref()
+                .map_or(0, |base| base.mask.estimated_resident_bytes())
+    }
 }
 
 /// Cached identifier index: parsed symbols + their embedding vectors.
@@ -623,21 +687,40 @@ impl ResidentSnapshot {
                 index.estimated_resident_bytes(),
             ));
         }
-        if let Some(cache) = &self.project_cache {
+        // Shared bases are keyed by the base's own pointer, so a base counts once
+        // however many refs layer over it.
+        // Keyword entries keep the file contents they were built from alive, which
+        // can be older caches than the current one.
+        let mut contents = |cache: &ProjectCache| {
+            let files = &cache.file_content;
             components.push((
-                Arc::as_ptr(cache) as usize,
-                cache
-                    .file_content
-                    .iter()
-                    .map(|(path, content)| path.capacity() + content.capacity())
-                    .sum(),
+                Arc::as_ptr(files.own()) as usize,
+                files.own_resident_bytes(),
             ));
+            if let Some(base) = files.base() {
+                components.push((
+                    Arc::as_ptr(base) as usize,
+                    crate::core::walker::content_map_bytes(base),
+                ));
+            }
+        };
+        if let Some(cache) = &self.project_cache {
+            contents(cache);
         }
         if let Some(cache) = &self.lexical {
-            components.push((
-                Arc::as_ptr(cache) as usize,
-                cache.index.estimated_resident_bytes(),
-            ));
+            contents(&cache.project_cache);
+            if let Some(base) = &cache.base {
+                contents(&base.cached.project_cache);
+            }
+        }
+        if let Some(cache) = &self.lexical {
+            components.push((Arc::as_ptr(cache) as usize, cache.own_resident_bytes()));
+            if let Some(base) = &cache.base {
+                components.push((
+                    Arc::as_ptr(&base.cached) as usize,
+                    base.cached.own_resident_bytes(),
+                ));
+            }
         }
         components.retain(|(_, bytes)| *bytes > 0);
         components
@@ -653,6 +736,153 @@ fn cache_entry_bytes(cache: &HashMap<String, CacheEntry>) -> usize {
                 + entry.hash.capacity()
                 + entry.vector.capacity() * std::mem::size_of::<f32>())
     })
+}
+
+fn lexical_document(
+    path: &str,
+    content: Option<&Arc<String>>,
+) -> crate::tools::semantic_search::SearchDocument {
+    let content = content
+        .map(|content| content.as_str().to_owned())
+        .unwrap_or_default();
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let symbols = parse_with_tree_sitter(&content, ext)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect();
+    let header = crate::core::parser::extract_header(&content);
+    crate::tools::semantic_search::SearchDocument::new(
+        path.to_string(),
+        header,
+        symbols,
+        vec![],
+        content,
+    )
+}
+
+/// A cache layered over a base stays valid only while that base is still the
+/// parent's current cache.
+fn base_is_current(cache: &ProjectCache, base: &Option<Arc<ProjectCache>>) -> bool {
+    match (cache.file_content.base(), base) {
+        (None, _) => true,
+        (Some(ours), Some(parent)) => Arc::ptr_eq(ours, parent.file_content.own()),
+        (Some(_), None) => false,
+    }
+}
+
+/// Walks `root` and reads its files. Given the parent's flat `base`, keeps only
+/// the files that differ from it, layered over it; a file clean here with the
+/// blob the base recorded in `clean_blobs`, and of the same size, is not read.
+/// Past `FULL_REBUILD_CHANGE_FRACTION` of the base, builds flat. With
+/// `record_clean_blobs` and no base, records `clean_blobs` for worktrees.
+fn load_project_cache(
+    root: &std::path::Path,
+    config: &Config,
+    base: Option<Arc<ProjectCache>>,
+    record_clean_blobs: bool,
+) -> ProjectCache {
+    use crate::core::git_worktree::{clean_blobs, common_blobs};
+    use crate::core::walker::{ContentMap, FileContents};
+    use rayon::prelude::*;
+
+    // git runs here, not on a structural worker.
+    let base = base.map(|base| {
+        let unchanged: std::collections::HashSet<String> =
+            match (&base.clean_blobs, clean_blobs(root)) {
+                (Some(snapshot), Some(current)) => {
+                    common_blobs(snapshot, &current).into_keys().collect()
+                }
+                _ => Default::default(),
+            };
+        (Arc::clone(base.file_content.own()), unchanged)
+    });
+    let clean_before = (base.is_none() && record_clean_blobs)
+        .then(|| clean_blobs(root))
+        .flatten();
+
+    let (file_entries, file_content) = STRUCTURAL_POOL.install(|| {
+        let file_entries = walk_with_config(root, config);
+        let read = |path: &String| std::fs::read_to_string(root.join(path)).ok().map(Arc::new);
+        let layered = base.map(|(base, unchanged)| {
+            // Same clean blob is not same bytes under a smudge filter or eol
+            // conversion that differs between the trees; a size check catches most.
+            let same_as_base = |path: &String| {
+                unchanged.contains(path)
+                    && base.get(path).is_some_and(|content| {
+                        std::fs::metadata(root.join(path))
+                            .is_ok_and(|meta| meta.len() == content.len() as u64)
+                    })
+            };
+            let changed: Vec<(String, Option<Arc<String>>)> = file_entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory && !same_as_base(&entry.relative_path))
+                .filter_map(|entry| {
+                    let content = read(&entry.relative_path);
+                    (content.as_deref() != base.get(&entry.relative_path).map(|c| &**c))
+                        .then(|| (entry.relative_path.clone(), content))
+                })
+                .collect();
+            let present: std::collections::HashSet<&str> = file_entries
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .map(|entry| entry.relative_path.as_str())
+                .collect();
+            let mut masked: std::collections::HashSet<String> = base
+                .keys()
+                .filter(|path| !present.contains(path.as_str()))
+                .cloned()
+                .collect();
+            let mut own = ContentMap::new();
+            for (path, content) in changed {
+                match content {
+                    Some(content) => {
+                        own.insert(path, content);
+                    }
+                    None => {
+                        masked.insert(path);
+                    }
+                }
+            }
+            let delta = own.len()
+                + masked
+                    .iter()
+                    .filter(|path| !own.contains_key(*path))
+                    .count();
+            let within = delta as f64
+                <= base.len() as f64 * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION;
+            let files = FileContents::layered(own, base, masked);
+            if within {
+                files
+            } else {
+                // Flat, sharing the base's content where it matched instead of reading it again.
+                files
+                    .iter()
+                    .map(|(path, content)| (path.clone(), Arc::clone(content)))
+                    .collect()
+            }
+        });
+        let file_content = layered.unwrap_or_else(|| {
+            file_entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory)
+                .filter_map(|entry| {
+                    Some((entry.relative_path.clone(), read(&entry.relative_path)?))
+                })
+                .collect::<ContentMap>()
+                .into()
+        });
+        (file_entries, file_content)
+    });
+    let clean_blobs = clean_before
+        .and_then(|before| Some(common_blobs(&before, &clean_blobs(root)?)))
+        .map(Arc::new);
+    ProjectCache {
+        file_entries,
+        file_content,
+        clean_blobs,
+        last_refresh: Instant::now(),
+    }
 }
 
 async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_name: &str) {
@@ -1285,6 +1515,7 @@ impl ContextPlusServer {
     /// Idempotent: skips if `project_cache` is already populated and fresh.
     fn spawn_shallow_warmup_task(&self, ref_id: crate::ref_index::RefId) {
         let state = Arc::clone(&self.state);
+        let server = self.clone();
         tokio::spawn(async move {
             // --- Idempotency guard ---
             {
@@ -1339,26 +1570,10 @@ impl ContextPlusServer {
             let build_generation = ref_index
                 .cache_generation
                 .load(std::sync::atomic::Ordering::Acquire);
+            let base = server.project_cache_base(&ref_index).await;
+            let record = ref_index.parent_ref_id.is_none();
             let new_cache = tokio::task::spawn_blocking(move || {
-                STRUCTURAL_POOL.install(|| {
-                    use rayon::prelude::*;
-                    let entries = walk_with_config(&root, &config);
-                    let file_content: HashMap<String, Arc<String>> = entries
-                        .par_iter()
-                        .filter(|e| !e.is_directory)
-                        .filter_map(|e| {
-                            let full = root.join(&e.relative_path);
-                            std::fs::read_to_string(&full)
-                                .ok()
-                                .map(|c| (e.relative_path.clone(), Arc::new(c)))
-                        })
-                        .collect();
-                    ProjectCache {
-                        file_entries: entries,
-                        file_content,
-                        last_refresh: std::time::Instant::now(),
-                    }
-                })
+                load_project_cache(&root, &config, base, record)
             })
             .await;
 
@@ -1527,6 +1742,7 @@ impl ContextPlusServer {
     /// Idempotent: skips if `project_cache` is already warm.
     fn spawn_full_warmup_task(&self, ref_id: crate::ref_index::RefId) {
         let state = Arc::clone(&self.state);
+        let server = self.clone();
         tokio::spawn(async move {
             // --- Idempotency guard ---
             {
@@ -1578,26 +1794,10 @@ impl ContextPlusServer {
             let build_generation = ref_index
                 .cache_generation
                 .load(std::sync::atomic::Ordering::Acquire);
+            let base = server.project_cache_base(&ref_index).await;
+            let record = ref_index.parent_ref_id.is_none();
             let new_cache = tokio::task::spawn_blocking(move || {
-                STRUCTURAL_POOL.install(|| {
-                    use rayon::prelude::*;
-                    let entries = walk_with_config(&root, &config);
-                    let file_content: HashMap<String, Arc<String>> = entries
-                        .par_iter()
-                        .filter(|e| !e.is_directory)
-                        .filter_map(|e| {
-                            let full = root.join(&e.relative_path);
-                            std::fs::read_to_string(&full)
-                                .ok()
-                                .map(|c| (e.relative_path.clone(), Arc::new(c)))
-                        })
-                        .collect();
-                    ProjectCache {
-                        file_entries: entries,
-                        file_content,
-                        last_refresh: std::time::Instant::now(),
-                    }
-                })
+                load_project_cache(&root, &config, base, record)
             })
             .await;
 
@@ -1847,6 +2047,57 @@ impl ContextPlusServer {
             .is_some_and(|handle| handle.is_healthy())
     }
 
+    /// The parent ref's current, flat project cache, which a linked worktree's
+    /// cache layers its own changes over.
+    async fn project_cache_base(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<Arc<ProjectCache>> {
+        let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return None;
+        }
+        let cache = Box::pin(self.ensure_project_cache_for(&parent))
+            .await
+            .ok()?;
+        cache.file_content.base().is_none().then_some(cache)
+    }
+
+    /// This ref's cache when it can be served without a rebuild. A flat cache
+    /// never consults the parent. A layered one is served while the parent
+    /// still holds its base and has no pending change. No lock is nested.
+    async fn current_project_cache(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<Arc<ProjectCache>> {
+        let source_dirty = |owner: &crate::ref_index::RefIndex| {
+            owner
+                .tracker_handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|handle| handle.is_source_dirty())
+        };
+        if source_dirty(ref_index) {
+            return None;
+        }
+        let cache = ref_index.project_cache.read().await.clone()?;
+        let fresh = Self::tracker_is_running(ref_index)
+            || cache.last_refresh.elapsed().as_secs() < self.state.config.cache_ttl_secs;
+        if !fresh {
+            return None;
+        }
+        let Some(base) = cache.file_content.base() else {
+            return Some(cache);
+        };
+        let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
+        if source_dirty(&parent) {
+            return None;
+        }
+        let parent_cache = parent.project_cache.read().await.clone()?;
+        Arc::ptr_eq(base, parent_cache.file_content.own()).then_some(cache)
+    }
+
     /// Build-or-reuse the walked file cache for a **specific** ref, rather than
     /// the session's `current_ref()`. Used by tools that can be directed at an
     /// attached worktree (e.g. `get_blast_radius` with a `path` arg) so the scan
@@ -1856,6 +2107,11 @@ impl ContextPlusServer {
         &self,
         ref_index: &Arc<crate::ref_index::RefIndex>,
     ) -> Result<Arc<ProjectCache>> {
+        if let Some(cache) = self.current_project_cache(ref_index).await {
+            return Ok(cache);
+        }
+        // Only a rebuild, or a layered cache whose parent moved, needs the parent's cache.
+        let base = self.project_cache_base(ref_index).await;
         // Serialize rebuilds with invalidation so an older walk cannot overwrite it.
         let mut project_guard = ref_index.project_cache.write().await;
         let dirty = ref_index
@@ -1880,7 +2136,7 @@ impl ContextPlusServer {
         {
             if let Some(ref cache) = *project_guard {
                 let age_secs = cache.last_refresh.elapsed().as_secs();
-                if tracker_running || age_secs < ttl_secs {
+                if (tracker_running || age_secs < ttl_secs) && base_is_current(cache, &base) {
                     tracing::debug!(
                         ref_id = %ref_index.cas_ref_id_hex,
                         tracker_running,
@@ -1914,30 +2170,11 @@ impl ContextPlusServer {
         let root = ref_index.root_dir.clone();
         let config = self.state.config.clone();
 
-        let new_cache = tokio::task::spawn_blocking(move || {
-            STRUCTURAL_POOL.install(|| {
-                use rayon::prelude::*;
-
-                let entries = walk_with_config(&root, &config);
-                let file_content: HashMap<String, Arc<String>> = entries
-                    .par_iter()
-                    .filter(|entry| !entry.is_directory)
-                    .filter_map(|entry| {
-                        let full_path = root.join(&entry.relative_path);
-                        std::fs::read_to_string(&full_path)
-                            .ok()
-                            .map(|content| (entry.relative_path.clone(), Arc::new(content)))
-                    })
-                    .collect();
-                ProjectCache {
-                    file_entries: entries,
-                    file_content,
-                    last_refresh: Instant::now(),
-                }
-            })
-        })
-        .await
-        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
+        let record = ref_index.parent_ref_id.is_none();
+        let new_cache =
+            tokio::task::spawn_blocking(move || load_project_cache(&root, &config, base, record))
+                .await
+                .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
 
         let arc_cache = Arc::new(new_cache);
 
@@ -2375,12 +2612,12 @@ impl ContextPlusServer {
                 let changed = cache
                     .file_content
                     .iter()
-                    .filter(|(path, content)| source.file_content.get(*path) != Some(*content))
+                    .filter(|(path, content)| source.file_content.get(path) != Some(*content))
                     .count()
                     + source
                         .file_content
                         .keys()
-                        .filter(|path| !cache.file_content.contains_key(*path))
+                        .filter(|path| !cache.file_content.contains_key(path))
                         .count();
                 if changed as f64
                     > source.file_content.len() as f64
@@ -2450,7 +2687,7 @@ impl ContextPlusServer {
                 .file_content
                 .keys()
                 .chain(old.file_content.keys())
-                .filter(|path| cache.file_content.get(*path) != old.file_content.get(*path))
+                .filter(|path| cache.file_content.get(path) != old.file_content.get(path))
                 .cloned()
                 .collect()
         } else {
@@ -2817,11 +3054,144 @@ impl ContextPlusServer {
         &self,
         project_cache: &Arc<ProjectCache>,
     ) -> Result<Arc<CachedLexicalIndex>> {
+        let ref_index = self.current_ref().await;
+        if project_cache.file_content.base().is_some()
+            && let Some(cached) = self
+                .layered_lexical_index(&ref_index, project_cache)
+                .await?
+        {
+            return Ok(cached);
+        }
+        self.ensure_lexical_index_for(&ref_index, project_cache)
+            .await
+    }
+
+    /// Keyword index of a ref whose files layer over its parent's: the
+    /// parent's shared index with this ref's changed and removed files masked,
+    /// plus an index of only its changed and added files. `None` when the
+    /// parent's index does not match the base this ref's files layer over.
+    async fn layered_lexical_index(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        project_cache: &Arc<ProjectCache>,
+    ) -> Result<Option<Arc<CachedLexicalIndex>>> {
+        use crate::tools::lexical_search::{BaseMask, LexicalIndex};
+        use std::sync::atomic::Ordering;
+
+        let Some(parent_id) = ref_index.parent_ref_id else {
+            return Ok(None);
+        };
+        let Some(parent) = self.state.ref_index(parent_id).await else {
+            return Ok(None);
+        };
+        let Some(parent_cache) = parent.project_cache.read().await.clone() else {
+            return Ok(None);
+        };
+        if !project_cache
+            .file_content
+            .base()
+            .is_some_and(|base| Arc::ptr_eq(base, parent_cache.file_content.own()))
+        {
+            return Ok(None);
+        }
+        let base = self
+            .ensure_lexical_index_for(&parent, &parent_cache)
+            .await?;
+        let _update = ref_index.lexical_update.lock().await;
+        let generation = ref_index.cache_generation.load(Ordering::Acquire);
+        let previous = ref_index.lexical_search_cache.read().await.clone();
+        if let Some(cached) = &previous
+            && cached.generation == generation
+            && Arc::ptr_eq(&cached.project_cache, project_cache)
+            && cached
+                .base
+                .as_ref()
+                .is_some_and(|layer| Arc::ptr_eq(&layer.cached, &base))
+        {
+            return Ok(previous);
+        }
+        if base.base.is_some() || !Arc::ptr_eq(&base.project_cache, &parent_cache) {
+            // The parent is still rebuilding its index: a stale answer from this ref's
+            // last entry, even the inherited one, beats copying the parent's index.
+            return Ok(previous);
+        }
+
+        let source = Arc::clone(project_cache);
+        let parent_index = Arc::clone(&base);
+        let (index, document_paths, mask) = tokio::task::spawn_blocking(move || {
+            let files = &source.file_content;
+            let changed = |path: &str| files.shadows(path) || files.own().contains_key(path);
+            let present: std::collections::HashSet<&str> = source
+                .file_entries
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .map(|entry| entry.relative_path.as_str())
+                .collect();
+            let masked = parent_index
+                .document_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| {
+                    !path.is_empty() && (changed(path) || !present.contains(path.as_str()))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let in_base: std::collections::HashSet<&str> = parent_index
+                .document_paths
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let docs: Vec<_> = source
+                .file_entries
+                .iter()
+                .filter(|entry| {
+                    !entry.is_directory
+                        && (changed(&entry.relative_path)
+                            || !in_base.contains(entry.relative_path.as_str()))
+                })
+                .map(|entry| {
+                    lexical_document(&entry.relative_path, files.get(&entry.relative_path))
+                })
+                .collect();
+            let index = LexicalIndex::build(&docs);
+            let mask = BaseMask::new(&parent_index.index, masked);
+            (index, docs.into_iter().map(|doc| doc.path).collect(), mask)
+        })
+        .await
+        .map_err(|e| {
+            ContextPlusError::Other(format!("lexical delta spawn_blocking failed: {e}"))
+        })?;
+
+        let cached = Arc::new(CachedLexicalIndex {
+            index,
+            document_paths,
+            project_cache: Arc::clone(project_cache),
+            generation,
+            base: Some(LexicalBase { cached: base, mask }),
+        });
+        let mut guard = ref_index.lexical_search_cache.write().await;
+        if ref_index.cache_generation.load(Ordering::Acquire) == generation {
+            *guard = Some(Arc::clone(&cached));
+            ref_index.lexical_inherited.store(false, Ordering::Release);
+        }
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            generation,
+            delta_documents = cached.document_paths.len(),
+            "LexicalIndex delta replaced over the parent's index"
+        );
+        Ok(Some(cached))
+    }
+
+    async fn ensure_lexical_index_for(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        project_cache: &Arc<ProjectCache>,
+    ) -> Result<Arc<CachedLexicalIndex>> {
         use crate::tools::lexical_search::LexicalIndex;
         use crate::tools::semantic_search::SearchDocument;
         use std::sync::atomic::Ordering;
 
-        let ref_index = self.current_ref().await;
         let _update = ref_index.lexical_update.lock().await;
         let generation = ref_index.cache_generation.load(Ordering::Acquire);
 
@@ -2845,12 +3215,12 @@ impl ContextPlusServer {
             return Ok(Arc::clone(cached));
         }
 
-        if let Some(previous) = guard.as_ref() {
+        if let Some(previous) = guard.as_ref().filter(|previous| previous.base.is_none()) {
             let changed: Vec<_> = project_cache
                 .file_content
                 .iter()
                 .filter(|(path, content)| {
-                    previous.project_cache.file_content.get(*path) != Some(*content)
+                    previous.project_cache.file_content.get(path) != Some(*content)
                 })
                 .collect();
             let deleted: Vec<_> = previous
@@ -2858,7 +3228,7 @@ impl ContextPlusServer {
                 .iter()
                 .enumerate()
                 .filter(|(_, path)| {
-                    !path.is_empty() && !project_cache.file_content.contains_key(*path)
+                    !path.is_empty() && !project_cache.file_content.contains_key(path)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -2943,19 +3313,10 @@ impl ContextPlusServer {
                 .iter()
                 .filter(|e| !e.is_directory)
                 .map(|e| {
-                    let content: String = cache_for_build
-                        .file_content
-                        .get(&e.relative_path)
-                        .map(|arc| arc.as_str().to_owned())
-                        .unwrap_or_default();
-                    let ext = e.relative_path.rsplit('.').next().unwrap_or("");
-                    let symbols: Vec<String> = parse_with_tree_sitter(&content, ext)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|s| s.name)
-                        .collect();
-                    let header = crate::core::parser::extract_header(&content);
-                    SearchDocument::new(e.relative_path.clone(), header, symbols, vec![], content)
+                    lexical_document(
+                        &e.relative_path,
+                        cache_for_build.file_content.get(&e.relative_path),
+                    )
                 })
                 .collect();
             let index = LexicalIndex::build(&docs);
@@ -2982,6 +3343,7 @@ impl ContextPlusServer {
                             document_paths,
                             project_cache: source,
                             generation,
+                            base: None,
                         }));
                     }
                 }
@@ -2998,6 +3360,7 @@ impl ContextPlusServer {
             document_paths,
             project_cache: Arc::clone(project_cache),
             generation,
+            base: None,
         });
         *guard = Some(Arc::clone(&cached));
         ref_index.lexical_inherited.store(false, Ordering::Release);
@@ -4162,11 +4525,11 @@ impl ContextPlusServer {
         let cached = self.ensure_lexical_index(&cache).await?;
 
         let formatted = tokio::task::spawn_blocking(move || {
-            if cached.document_paths.is_empty() {
+            if cached.is_empty() {
                 return "No files indexed. Ensure the project cache is populated.".to_string();
             }
 
-            let hits = cached.index.search(&query, top_k);
+            let hits = cached.search(&query, top_k);
 
             if hits.is_empty() {
                 return format!("No lexical matches found for: {query}");
@@ -4177,10 +4540,8 @@ impl ContextPlusServer {
                 hits.len()
             )];
             lines.push(String::new());
-            for (rank, (doc_idx, score)) in hits.iter().enumerate() {
-                if let Some(path) = cached.document_paths.get(*doc_idx) {
-                    lines.push(format!("{}. {} (score: {:.3})", rank + 1, path, score));
-                }
+            for (rank, (path, score)) in hits.iter().enumerate() {
+                lines.push(format!("{}. {} (score: {:.3})", rank + 1, path, score));
             }
             lines.join("\n")
         })
@@ -7693,6 +8054,7 @@ mod tests {
             let expired = Arc::new(ProjectCache {
                 file_entries: current.file_entries.clone(),
                 file_content: current.file_content.clone(),
+                clean_blobs: None,
                 last_refresh: Instant::now() - std::time::Duration::from_secs(2),
             });
             *server.current_ref().await.project_cache.write().await = Some(Arc::clone(&expired));
@@ -9404,13 +9766,14 @@ mod tests {
                 depth: 0,
             })
             .collect();
-        let file_content: HashMap<String, Arc<String>> = files
+        let file_content: crate::core::walker::FileContents = files
             .into_iter()
             .map(|(path, content)| (path.to_string(), Arc::new(content.to_string())))
             .collect();
         ProjectCache {
             file_entries: entries,
             file_content,
+            clean_blobs: None,
             last_refresh: Instant::now(),
         }
     }
@@ -10690,7 +11053,8 @@ mod tests {
         }));
         *primary.identifier_source.write().await = Some(Arc::new(ProjectCache {
             file_entries: Vec::new(),
-            file_content: HashMap::new(),
+            file_content: Default::default(),
+            clean_blobs: None,
             last_refresh: Instant::now(),
         }));
 
@@ -14663,6 +15027,633 @@ mod tests {
             result.is_error != Some(true) && text_of(&result).contains("STABLE_AFTER_REMOVAL"),
             "a regular-file removal race must fall back to the full walk: {}",
             text_of(&result)
+        );
+    }
+
+    // --- linked worktrees layer their files and keyword index over the primary's ---
+
+    fn lexdelta_config() -> Config {
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        config
+    }
+
+    fn lexdelta_tag(i: usize) -> String {
+        format!(
+            "tag{}{}",
+            (b'a' + (i % 26) as u8) as char,
+            (b'a' + (i / 26) as u8) as char
+        )
+    }
+
+    fn lexdelta_corpus(root: &std::path::Path, files: usize) {
+        for i in 0..files {
+            let dir = root.join(format!("src/area_{}", i % 4));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("file_{i}.rs")),
+                format!(
+                    "pub fn shared_symbol_{i}() -> usize {{ {i} }}\n// {} {}\n",
+                    lexdelta_tag(i),
+                    "common words vary ".repeat(i % 5 + 1)
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Changes one file, adds one and deletes one.
+    fn lexdelta_edit_worktree(root: &std::path::Path) {
+        std::fs::write(
+            root.join("src/area_1/file_1.rs"),
+            "pub fn worktreechanged() -> usize { 1 }\n// common words\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/area_2/worktree_added.rs"),
+            "pub fn worktreeadded() {}\n// shared symbol vary\n",
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("src/area_3/file_3.rs")).unwrap();
+    }
+
+    async fn lexdelta_attach(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+    ) -> ContextPlusServer {
+        let canonical = root.canonicalize().unwrap();
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(args).await.unwrap();
+        server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical))
+    }
+
+    async fn lexdelta_keywords(server: &ContextPlusServer, query: &str) -> String {
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!(query));
+        args.insert("top_k".into(), json!(100));
+        text_of(&server.handle_lexical_search(args).await.unwrap())
+    }
+
+    const LEXDELTA_QUERIES: &[&str] = &[
+        "shared symbol",
+        "common words vary",
+        "usize",
+        "worktreechanged",
+        "worktreeadded",
+        "tagba",
+        "tagda",
+        "tagfa",
+        "shared_symbol_7 vary",
+    ];
+
+    async fn lexdelta_assert_matches_standalone(
+        worktree: &ContextPlusServer,
+        root: &std::path::Path,
+    ) {
+        let standalone = ContextPlusServer::new(root.to_path_buf(), lexdelta_config());
+        for query in LEXDELTA_QUERIES {
+            assert_eq!(
+                lexdelta_keywords(worktree, query).await,
+                lexdelta_keywords(&standalone, query).await,
+                "worktree keywords for {query:?} differ from a standalone index of the worktree"
+            );
+        }
+    }
+
+    fn lexdelta_git(cwd: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(status.status.success(), "git {args:?}: {status:?}");
+    }
+
+    #[tokio::test]
+    async fn lexdelta_small_delta_worktree_layers_over_the_primary_caches() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), 40);
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, worktree.path()).await;
+
+        lexdelta_assert_matches_standalone(&session, worktree.path()).await;
+        assert!(
+            lexdelta_keywords(&session, &lexdelta_tag(3))
+                .await
+                .contains("No lexical matches")
+        );
+        assert!(
+            lexdelta_keywords(&session, &lexdelta_tag(1))
+                .await
+                .contains("No lexical matches")
+        );
+        assert!(
+            lexdelta_keywords(&session, "worktreechanged")
+                .await
+                .contains("src/area_1/file_1.rs")
+        );
+        assert!(
+            lexdelta_keywords(&session, "worktreeadded")
+                .await
+                .contains("src/area_2/worktree_added.rs")
+        );
+
+        let owner = session.current_ref().await;
+        let primary_ref = server.state.default_ref().unwrap();
+        let cache = owner.project_cache.read().await.clone().unwrap();
+        let primary_cache = primary_ref.project_cache.read().await.clone().unwrap();
+        assert!(
+            cache
+                .file_content
+                .base()
+                .is_some_and(|base| Arc::ptr_eq(base, primary_cache.file_content.own())),
+            "the worktree's file contents do not layer over the primary's"
+        );
+        assert_eq!(
+            cache.file_content.own().len(),
+            2,
+            "own = the changed and added file"
+        );
+        assert_eq!(
+            cache.file_content["src/area_0/file_0.rs"].as_str(),
+            primary_cache.file_content["src/area_0/file_0.rs"].as_str()
+        );
+        assert!(!cache.file_content.contains_key("src/area_3/file_3.rs"));
+        let lexical = owner.lexical_search_cache.read().await.clone().unwrap();
+        let primary_lexical = primary_ref
+            .lexical_search_cache
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        assert!(
+            lexical
+                .base
+                .as_ref()
+                .is_some_and(|base| Arc::ptr_eq(&base.cached, &primary_lexical)),
+            "the worktree's keyword index does not layer over the primary's"
+        );
+        assert_eq!(
+            lexical.document_paths.len(),
+            2,
+            "delta = the changed and added file"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexdelta_git_linked_worktree_layers_and_matches_standalone() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_git(primary.path(), &["init", "-q", "-b", "main"]);
+        lexdelta_corpus(primary.path(), 40);
+        lexdelta_git(primary.path(), &["add", "-A"]);
+        lexdelta_git(primary.path(), &["commit", "-qm", "base"]);
+        let holder = tempfile::tempdir().unwrap();
+        let worktree = holder.path().join("feature");
+        lexdelta_git(
+            primary.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(
+            worktree.join("src/area_0/file_4.rs"),
+            "pub fn committedchange() {}\n",
+        )
+        .unwrap();
+        lexdelta_git(&worktree, &["commit", "-qam", "change"]);
+        lexdelta_edit_worktree(&worktree);
+        std::fs::write(
+            primary.path().join("src/area_1/file_5.rs"),
+            "pub fn primarydirty() {}\n",
+        )
+        .unwrap();
+
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, &worktree).await;
+
+        lexdelta_assert_matches_standalone(&session, &worktree).await;
+        for (query, expected) in [
+            ("committedchange", "src/area_0/file_4.rs"),
+            (lexdelta_tag(5).as_str(), "src/area_1/file_5.rs"),
+        ] {
+            assert!(
+                lexdelta_keywords(&session, query).await.contains(expected),
+                "{query} does not find {expected}"
+            );
+        }
+        assert!(
+            lexdelta_keywords(&session, "primarydirty")
+                .await
+                .contains("No lexical matches")
+        );
+        let cache = session
+            .current_ref()
+            .await
+            .project_cache
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        assert!(cache.file_content.base().is_some());
+        let mut own: Vec<_> = cache.file_content.own().keys().cloned().collect();
+        own.sort();
+        assert_eq!(
+            own,
+            [
+                "src/area_0/file_4.rs",
+                "src/area_1/file_1.rs",
+                "src/area_1/file_5.rs",
+                "src/area_2/worktree_added.rs"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lexdelta_worktree_over_the_change_threshold_builds_a_standalone_index() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), 40);
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(worktree.path(), 40);
+        for i in 0..12 {
+            std::fs::write(
+                worktree
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn rewritten_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, worktree.path()).await;
+
+        lexdelta_assert_matches_standalone(&session, worktree.path()).await;
+        let owner = session.current_ref().await;
+        let cache = owner.project_cache.read().await.clone().unwrap();
+        assert!(
+            cache.file_content.base().is_none(),
+            "a 30% delta must promote"
+        );
+        let lexical = owner.lexical_search_cache.read().await.clone().unwrap();
+        assert!(lexical.base.is_none());
+        assert_eq!(lexical.document_paths.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn lexdelta_primary_base_replacement_keeps_worktree_results_correct() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), 40);
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, worktree.path()).await;
+        lexdelta_assert_matches_standalone(&session, worktree.path()).await;
+        let old_base = server
+            .state
+            .default_ref()
+            .unwrap()
+            .project_cache
+            .read()
+            .await
+            .clone()
+            .unwrap();
+
+        std::fs::write(
+            primary.path().join("src/area_1/file_5.rs"),
+            "pub fn primarynew() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            primary.path().join("src/primary_added.rs"),
+            "pub fn primaryadded() {}\n",
+        )
+        .unwrap();
+        std::fs::remove_file(primary.path().join("src/area_2/file_6.rs")).unwrap();
+        server.invalidate_project_cache().await;
+        assert!(
+            lexdelta_keywords(&server, "primarynew")
+                .await
+                .contains("file_5.rs")
+        );
+
+        lexdelta_assert_matches_standalone(&session, worktree.path()).await;
+        for query in ["primarynew", "primaryadded"] {
+            assert!(
+                lexdelta_keywords(&session, query)
+                    .await
+                    .contains("No lexical matches"),
+                "the worktree answered {query} from the primary's new files"
+            );
+        }
+        assert!(
+            lexdelta_keywords(&session, &lexdelta_tag(5))
+                .await
+                .contains("src/area_1/file_5.rs")
+        );
+        assert!(
+            lexdelta_keywords(&session, &lexdelta_tag(6))
+                .await
+                .contains("src/area_2/file_6.rs")
+        );
+        let primary_cache = server
+            .state
+            .default_ref()
+            .unwrap()
+            .project_cache
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old_base, &primary_cache));
+        let cache = session
+            .current_ref()
+            .await
+            .project_cache
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        assert!(
+            cache
+                .file_content
+                .base()
+                .is_some_and(|base| Arc::ptr_eq(base, primary_cache.file_content.own())),
+            "the worktree did not rebase onto the primary's new cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexdelta_small_delta_worktree_resident_estimate_excludes_the_shared_base() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), 200);
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(worktree.path(), 200);
+        lexdelta_edit_worktree(worktree.path());
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, worktree.path()).await;
+        lexdelta_keywords(&server, "shared symbol").await;
+        lexdelta_keywords(&session, "shared symbol").await;
+
+        let primary_components = ResidentSnapshot::capture(&server.state.default_ref().unwrap())
+            .await
+            .measure();
+        let worktree_components = ResidentSnapshot::capture(&*session.current_ref().await)
+            .await
+            .measure();
+        let primary_bytes: usize = primary_components.iter().map(|(_, bytes)| bytes).sum();
+        let unique_bytes: usize = worktree_components
+            .iter()
+            .filter(|(ptr, _)| !primary_components.iter().any(|(shared, _)| shared == ptr))
+            .map(|(_, bytes)| bytes)
+            .sum();
+        assert!(primary_bytes > 0);
+        assert!(
+            unique_bytes * 20 < primary_bytes,
+            "a two-file delta holds {unique_bytes} unique bytes against a {primary_bytes}-byte base"
+        );
+    }
+
+    fn lexdelta_git_primary(files: usize) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_git(primary.path(), &["init", "-q", "-b", "main"]);
+        lexdelta_corpus(primary.path(), files);
+        lexdelta_git(primary.path(), &["add", "-A"]);
+        lexdelta_git(primary.path(), &["commit", "-qm", "base"]);
+        let holder = tempfile::tempdir().unwrap();
+        let worktree = holder.path().join("feature");
+        (primary, holder, worktree)
+    }
+
+    fn lexdelta_add_worktree(primary: &std::path::Path, worktree: &std::path::Path, start: &str) {
+        lexdelta_git(
+            primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+                start,
+            ],
+        );
+    }
+
+    #[test]
+    fn lexdelta_worktree_reads_a_same_blob_file_whose_size_differs_from_the_base() {
+        let (primary, _holder, worktree) = lexdelta_git_primary(10);
+        lexdelta_add_worktree(primary.path(), &worktree, "main");
+        let config = lexdelta_config();
+        let path = "src/area_0/file_0.rs";
+        let real = load_project_cache(primary.path(), &config, None, true);
+        assert!(
+            real.clean_blobs
+                .as_ref()
+                .is_some_and(|blobs| blobs.contains_key(path))
+        );
+        let mut smudged: crate::core::walker::ContentMap = real
+            .file_content
+            .iter()
+            .map(|(path, content)| (path.clone(), Arc::clone(content)))
+            .collect();
+        smudged.insert(path.to_string(), Arc::new("smudged\r\n".to_string()));
+        let base = Arc::new(ProjectCache {
+            file_entries: real.file_entries.clone(),
+            file_content: smudged.into(),
+            clean_blobs: real.clean_blobs.clone(),
+            last_refresh: Instant::now(),
+        });
+
+        let cache = load_project_cache(&worktree, &config, Some(base), false);
+        assert!(cache.file_content.base().is_some());
+        assert_eq!(
+            cache.file_content[path].as_str(),
+            std::fs::read_to_string(worktree.join(path)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn lexdelta_worktree_reads_a_clean_file_the_primary_walk_skipped() {
+        let (primary, _holder, worktree) = lexdelta_git_primary(40);
+        std::fs::write(primary.path().join(".ignore"), "src/area_0/file_0.rs\n").unwrap();
+        lexdelta_add_worktree(primary.path(), &worktree, "main");
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, &worktree).await;
+
+        let found = lexdelta_keywords(&session, &lexdelta_tag(0)).await;
+        assert!(
+            found.contains("src/area_0/file_0.rs"),
+            "the worktree lost a file the primary's walk skipped: {found}"
+        );
+        lexdelta_assert_matches_standalone(&session, &worktree).await;
+    }
+
+    #[tokio::test]
+    async fn lexdelta_worktree_ignores_a_primary_file_reverted_after_its_cache_was_built() {
+        let (primary, _holder, worktree) = lexdelta_git_primary(40);
+        lexdelta_add_worktree(primary.path(), &worktree, "main");
+        std::fs::write(
+            primary.path().join("src/area_1/file_5.rs"),
+            "pub fn primarydirty() {}\n",
+        )
+        .unwrap();
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        assert!(
+            lexdelta_keywords(&server, "primarydirty")
+                .await
+                .contains("file_5.rs")
+        );
+        lexdelta_git(primary.path(), &["checkout", "--", "src/area_1/file_5.rs"]);
+
+        let session = lexdelta_attach(&server, &worktree).await;
+        let stale = lexdelta_keywords(&session, "primarydirty").await;
+        assert!(
+            stale.contains("No lexical matches"),
+            "the worktree served the primary's reverted content: {stale}"
+        );
+        assert!(
+            lexdelta_keywords(&session, &lexdelta_tag(5))
+                .await
+                .contains("src/area_1/file_5.rs")
+        );
+        lexdelta_assert_matches_standalone(&session, &worktree).await;
+    }
+
+    #[tokio::test]
+    async fn lexdelta_worktree_ignores_the_primary_branch_its_cache_was_built_on() {
+        let (primary, _holder, worktree) = lexdelta_git_primary(40);
+        lexdelta_git(primary.path(), &["checkout", "-q", "-b", "other"]);
+        std::fs::write(
+            primary.path().join("src/area_3/file_7.rs"),
+            "pub fn otherbranch() {}\n",
+        )
+        .unwrap();
+        lexdelta_git(primary.path(), &["commit", "-qam", "other"]);
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        assert!(
+            lexdelta_keywords(&server, "otherbranch")
+                .await
+                .contains("file_7.rs")
+        );
+        lexdelta_add_worktree(primary.path(), &worktree, "main");
+        lexdelta_git(primary.path(), &["checkout", "-q", "main"]);
+
+        let session = lexdelta_attach(&server, &worktree).await;
+        let stale = lexdelta_keywords(&session, "otherbranch").await;
+        assert!(
+            stale.contains("No lexical matches"),
+            "the worktree served the primary's previous branch: {stale}"
+        );
+        assert!(
+            lexdelta_keywords(&session, &lexdelta_tag(7))
+                .await
+                .contains("src/area_3/file_7.rs")
+        );
+        lexdelta_assert_matches_standalone(&session, &worktree).await;
+    }
+
+    #[tokio::test]
+    async fn lexdelta_promoted_worktree_query_leaves_the_primary_cache_alone() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), 40);
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(worktree.path(), 40);
+        for i in 0..12 {
+            std::fs::write(
+                worktree
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn rewritten_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, worktree.path()).await;
+        lexdelta_keywords(&session, "shared symbol").await;
+        let owner = session.current_ref().await;
+        let cache = owner.project_cache.read().await.clone().unwrap();
+        assert!(cache.file_content.base().is_none());
+
+        let primary_ref = server.state.default_ref().unwrap();
+        let mut primary_slot = primary_ref.project_cache.write().await;
+        *primary_slot = None;
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lexdelta_keywords(&session, "rewritten_3"),
+        )
+        .await
+        .expect("a promoted worktree's query waited on the primary's cache lock");
+        assert!(answer.contains("src/area_3/file_3.rs"));
+        drop(primary_slot);
+        assert!(
+            primary_ref.project_cache.read().await.is_none(),
+            "a promoted worktree's query rebuilt the primary's cache"
+        );
+        assert!(Arc::ptr_eq(
+            &cache,
+            &owner.project_cache.read().await.clone().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn lexdelta_resident_estimate_counts_an_old_primary_cache_pinned_by_the_keyword_entry() {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), 40);
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), lexdelta_config());
+        let session = lexdelta_attach(&server, worktree.path()).await;
+        lexdelta_keywords(&session, "shared symbol").await;
+        let primary_ref = server.state.default_ref().unwrap();
+        let old_base = primary_ref.project_cache.read().await.clone().unwrap();
+
+        std::fs::write(
+            primary.path().join("src/area_1/file_5.rs"),
+            "pub fn primarynew() {}\n",
+        )
+        .unwrap();
+        server.invalidate_project_cache().await;
+        lexdelta_keywords(&server, "primarynew").await;
+        let owner = session.current_ref().await;
+        let rebased = session.ensure_project_cache_for(&owner).await.unwrap();
+        let new_base = primary_ref.project_cache.read().await.clone().unwrap();
+        assert!(!Arc::ptr_eq(&old_base, &new_base));
+        assert!(
+            rebased
+                .file_content
+                .base()
+                .is_some_and(|base| Arc::ptr_eq(base, new_base.file_content.own()))
+        );
+
+        let old_contents = Arc::as_ptr(old_base.file_content.own()) as usize;
+        drop(old_base);
+        let components = ResidentSnapshot::capture(&owner).await.measure();
+        assert!(
+            components
+                .iter()
+                .any(|(ptr, bytes)| *ptr == old_contents && *bytes > 0),
+            "the old primary content map pinned by the worktree's keyword entry is not measured"
         );
     }
 }
