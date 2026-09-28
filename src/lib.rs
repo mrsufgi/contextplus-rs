@@ -3,6 +3,8 @@ pub mod config;
 pub mod core;
 pub mod error;
 pub mod git;
+#[cfg(feature = "memory-profile")]
+pub mod memory_profile;
 pub mod ref_index;
 pub mod server;
 pub mod server_adapters;

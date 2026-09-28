@@ -105,6 +105,10 @@ indexmap = "2"
 # Content-addressed chunk store (CAS) — U6 multi-worktree CoW cache
 blake3 = "1"
 
+[features]
+# Synthetic memory profiler (`memory-profile` binary); not part of the daemon.
+memory-profile = []
+
 [dev-dependencies]
 # Mock HTTP server (for Ollama API)
 wiremock = "0.6"
@@ -186,3 +190,8 @@ path = "src/bin/warmup_labels.rs"
 [[bin]]
 name = "warmup_embeddings"
 path = "src/bin/warmup_embeddings.rs"
+
+[[bin]]
+name = "memory-profile"
+path = "src/bin/memory_profile.rs"
+required-features = ["memory-profile"]

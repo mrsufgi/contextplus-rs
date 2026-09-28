@@ -55,7 +55,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use tokio::sync::RwLock;
 
@@ -159,8 +159,16 @@ pub struct RefIndex {
     /// `Arc`-wrapped for the same backward-compat reason as `embedding_cache`.
     pub identifier_index: Arc<RwLock<Option<Arc<IdentifierIndex>>>>,
     pub(crate) identifier_source: RwLock<Option<Arc<ProjectCache>>>,
-    pub(crate) identifier_vectors: tokio::sync::OnceCell<RwLock<HashMap<String, CacheEntry>>>,
-    pub(crate) identifier_persist_generation: AtomicU64,
+    pub(crate) identifier_vectors: tokio::sync::OnceCell<Arc<RwLock<HashMap<String, CacheEntry>>>>,
+    pub(crate) identifier_vector_overlay: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    pub(crate) identifier_overlay_loaded: AtomicBool,
+    pub(crate) identifier_inherited: AtomicBool,
+    pub(crate) lexical_inherited: AtomicBool,
+    pub(crate) identifier_persist_generation: Arc<AtomicU64>,
+    pub(crate) identifier_save_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) eviction_generation: AtomicU64,
+    pub(crate) active_requests: Arc<AtomicUsize>,
+    background_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     #[cfg(test)]
     pub(crate) semantic_walks: AtomicUsize,
     #[cfg(test)]
@@ -226,7 +234,15 @@ impl RefIndex {
             identifier_index: Arc::new(RwLock::new(None)),
             identifier_source: RwLock::new(None),
             identifier_vectors: tokio::sync::OnceCell::new(),
-            identifier_persist_generation: AtomicU64::new(0),
+            identifier_vector_overlay: Arc::new(RwLock::new(HashMap::new())),
+            identifier_overlay_loaded: AtomicBool::new(false),
+            identifier_inherited: AtomicBool::new(false),
+            lexical_inherited: AtomicBool::new(false),
+            identifier_persist_generation: Arc::new(AtomicU64::new(0)),
+            identifier_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            eviction_generation: AtomicU64::new(0),
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
@@ -268,7 +284,15 @@ impl RefIndex {
             identifier_index: Arc::new(RwLock::new(None)),
             identifier_source: RwLock::new(None),
             identifier_vectors: tokio::sync::OnceCell::new(),
-            identifier_persist_generation: AtomicU64::new(0),
+            identifier_vector_overlay: Arc::new(RwLock::new(HashMap::new())),
+            identifier_overlay_loaded: AtomicBool::new(false),
+            identifier_inherited: AtomicBool::new(false),
+            lexical_inherited: AtomicBool::new(false),
+            identifier_persist_generation: Arc::new(AtomicU64::new(0)),
+            identifier_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            eviction_generation: AtomicU64::new(0),
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
@@ -312,7 +336,15 @@ impl RefIndex {
             identifier_index: Arc::new(RwLock::new(None)),
             identifier_source: RwLock::new(None),
             identifier_vectors: tokio::sync::OnceCell::new(),
-            identifier_persist_generation: AtomicU64::new(0),
+            identifier_vector_overlay: Arc::new(RwLock::new(HashMap::new())),
+            identifier_overlay_loaded: AtomicBool::new(false),
+            identifier_inherited: AtomicBool::new(false),
+            lexical_inherited: AtomicBool::new(false),
+            identifier_persist_generation: Arc::new(AtomicU64::new(0)),
+            identifier_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            eviction_generation: AtomicU64::new(0),
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
@@ -328,6 +360,18 @@ impl RefIndex {
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub(crate) fn track_background_task<T>(&self, task: &tokio::task::JoinHandle<T>) {
+        let mut tasks = self.background_tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task.abort_handle());
+    }
+
+    pub(crate) fn cancel_background_tasks(&self) {
+        for task in self.background_tasks.lock().unwrap().drain(..) {
+            task.abort();
         }
     }
 

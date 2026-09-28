@@ -1525,6 +1525,28 @@ pub(crate) mod hnsw_test_seam {
 }
 
 impl VectorStore {
+    pub(crate) fn resident_vector_bytes(&self) -> usize {
+        std::mem::size_of_val(self.vectors.as_slice())
+    }
+
+    pub(crate) fn estimated_hnsw_bytes(&self) -> usize {
+        if self.hnsw_index.get().is_some() {
+            self.count as usize * (self.dims as usize * std::mem::size_of::<f32>() + 32 * 2 * 8)
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        let strings = self
+            .keys
+            .iter()
+            .chain(&self.hashes)
+            .map(String::capacity)
+            .sum::<usize>();
+        self.resident_vector_bytes() + strings + self.estimated_hnsw_bytes()
+    }
+
     /// Build a VectorStore from parallel arrays of keys, hashes, and vectors.
     pub fn new(dims: u32, keys: Vec<String>, hashes: Vec<String>, vectors: Vec<f32>) -> Self {
         Self::new_with_tuning(dims, keys, hashes, vectors, HnswTuning::default())

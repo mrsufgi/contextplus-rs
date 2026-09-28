@@ -346,6 +346,10 @@ impl WalkAndIndexFn for RefWalkerIndexer {
     > {
         self.walker.walk_for_ref(root_dir, self.ref_index.clone())
     }
+
+    fn track_background_task(&self, task: &tokio::task::JoinHandle<()>) {
+        self.ref_index.track_background_task(task);
+    }
 }
 
 impl CachedWalkerIndexer {
@@ -642,12 +646,13 @@ impl CachedWalkerIndexer {
             drop(cache);
             if !fill.running && !fill.pending.is_empty() {
                 fill.running = true;
-                let ref_index = ref_index.clone();
+                let owner = ref_index.clone();
                 let ollama = ollama.clone();
                 let config = config.clone();
-                tokio::spawn(async move {
-                    run_fill(ref_index, ollama, config).await;
+                let task = tokio::spawn(async move {
+                    run_fill(owner, ollama, config).await;
                 });
+                ref_index.track_background_task(&task);
             }
             drop(fill);
             let deadline = tokio::time::Instant::now()

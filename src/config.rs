@@ -162,6 +162,7 @@ pub struct Config {
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
     pub cache_ttl_secs: u64,
+    pub resident_memory_budget_bytes: usize,
     pub max_embed_file_size: usize,
     pub embed_num_gpu: Option<i32>,
     pub embed_main_gpu: Option<i32>,
@@ -194,6 +195,7 @@ pub struct Config {
 
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
 const DEFAULT_OLLAMA_MAX_CONCURRENT: usize = 4;
+const DEFAULT_RESIDENT_MEMORY_BUDGET_MB: usize = 4096;
 const MIN_OLLAMA_MAX_CONCURRENT: usize = 1;
 const MAX_OLLAMA_MAX_CONCURRENT: usize = 64;
 
@@ -593,6 +595,12 @@ impl Config {
             ),
             ignore_dirs: build_ignore_dirs(env),
             cache_ttl_secs: env_parse(env, "CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            resident_memory_budget_bytes: env_parse(
+                env,
+                "CONTEXTPLUS_MEMORY_BUDGET_MB",
+                DEFAULT_RESIDENT_MEMORY_BUDGET_MB,
+            )
+            .saturating_mul(1024 * 1024),
             max_embed_file_size: env_parse(
                 env,
                 "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",

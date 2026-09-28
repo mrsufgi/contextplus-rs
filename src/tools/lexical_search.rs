@@ -217,6 +217,24 @@ fn token_counts(text: &str) -> HashMap<String, u32> {
 }
 
 impl LexicalIndex {
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        self.posting
+            .iter()
+            .map(|(term, list)| {
+                term.capacity()
+                    + list.capacity()
+                        * (std::mem::size_of::<usize>() + 4 * std::mem::size_of::<u32>())
+            })
+            .sum::<usize>()
+            + self.documents.capacity() * std::mem::size_of::<DocumentFields>()
+            + self
+                .document_terms
+                .iter()
+                .flat_map(|terms| terms.iter())
+                .map(String::capacity)
+                .sum::<usize>()
+    }
+
     /// Build an index from a slice of [`SearchDocument`]s.
     ///
     /// Records separate path, definition-name, header and body frequencies.
