@@ -13,7 +13,7 @@ use crate::core::walker::walk_with_config;
 use crate::error::Result;
 use crate::server::{SharedState, build_embedding_document, cache_name};
 use crate::tools::semantic_search::{
-    EmbedFn, SearchDocument, WalkAndIndexFn, semantic_embedding_content,
+    CachedSearchIndex, EmbedFn, SearchDocument, WalkAndIndexFn, semantic_embedding_content,
 };
 
 #[cfg(test)]
@@ -374,6 +374,28 @@ impl CachedWalkerIndexer {
                 .strip_prefix(&ref_index.canonical_root)
                 .unwrap_or(Path::new(""));
             let embedding_cache = Arc::clone(&ref_index.embedding_cache);
+            let full_walk = candidates.is_none() && prefix.as_os_str().is_empty();
+            let fork_parent = match ref_index.parent_ref_id {
+                Some(parent_id) if full_walk => self.state.ref_index(parent_id).await,
+                _ => None,
+            };
+            if let Some(parent) = &fork_parent {
+                self.build_parent_index(parent, &ref_index).await;
+            }
+            let walk_start = WalkStart {
+                generation: ref_index
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                vector_generation: ref_index
+                    .semantic_vector_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                seen: ref_index
+                    .search_index_cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(Arc::downgrade),
+            };
             #[cfg(test)]
             ref_index
                 .semantic_walks
@@ -420,7 +442,6 @@ impl CachedWalkerIndexer {
 
             // Parsing runs in parallel; a file whose content matches the
             // snapshot's document keeps that document's parsed fields.
-            let full_walk = candidates.is_none() && prefix.as_os_str().is_empty();
             let doc_shape = config.embed_doc_shape;
             let seed_config = config.clone();
             let seed_ref = Arc::clone(&ref_index);
@@ -882,9 +903,139 @@ impl CachedWalkerIndexer {
                     }
                 }
             }
-            Ok((docs, vectors))
+            match fork_parent {
+                Some(parent) => {
+                    self.seed_fork(&ref_index, &parent, canonical, docs, vectors, walk_start)
+                        .await
+                }
+                None => Ok((docs, vectors)),
+            }
         })
     }
+
+    /// Builds the parent's index of its whole root when the parent holds none,
+    /// as after a restart, and installs it so a worktree can fork it.
+    async fn build_parent_index(
+        &self,
+        parent: &Arc<crate::ref_index::RefIndex>,
+        ref_index: &crate::ref_index::RefIndex,
+    ) {
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return;
+        }
+        let seen = {
+            let current = parent.search_index_cache.read().await;
+            if current
+                .as_ref()
+                .is_some_and(|entry| entry.search_root() == parent.canonical_root)
+            {
+                return;
+            }
+            current.as_ref().map(Arc::downgrade)
+        };
+        let generation = parent
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let vector_generation = parent
+            .semantic_vector_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let started = std::time::Instant::now();
+        let metadata = self
+            .metadata_fingerprint(&parent.canonical_root)
+            .await
+            .ok()
+            .flatten();
+        let (docs, vectors) = match self
+            .walk_for_ref(&parent.canonical_root, Arc::clone(parent))
+            .await
+        {
+            Ok(walked) if !walked.0.is_empty() => walked,
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, "parent semantic index build failed");
+                return;
+            }
+        };
+        let root = parent.canonical_root.clone();
+        let Ok(entry) = tokio::task::spawn_blocking(move || {
+            CachedSearchIndex::build(
+                &root,
+                docs,
+                vectors,
+                generation,
+                vector_generation,
+                metadata,
+            )
+        })
+        .await
+        else {
+            return;
+        };
+        let installed = entry.install(&mut *parent.search_index_cache.write().await, seen.as_ref());
+        tracing::info!(
+            phase = "semantic_parent_index",
+            ref_id = %parent.cas_ref_id_hex,
+            installed,
+            elapsed_ms = started.elapsed().as_millis(),
+            "cold-start phase"
+        );
+    }
+
+    /// Installs a fork of the parent's semantic index as this worktree's,
+    /// unless the worktree's entry already shares the parent's vector store.
+    async fn seed_fork(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+        parent: &crate::ref_index::RefIndex,
+        root: std::path::PathBuf,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        start: WalkStart,
+    ) -> Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)> {
+        let base = parent.search_index_cache.read().await.clone();
+        let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
+            return Ok((docs, vectors));
+        };
+        if ref_index
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.index.shares_vector_store(&base.index))
+        {
+            return Ok((docs, vectors));
+        }
+        let started = std::time::Instant::now();
+        let (generation, vector_generation) = (start.generation, start.vector_generation);
+        let (docs, vectors, fork) = tokio::task::spawn_blocking(move || {
+            let fork = base.fork(&root, &docs, &vectors, generation, vector_generation);
+            (docs, vectors, fork)
+        })
+        .await
+        .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
+        if let Some(fork) = fork {
+            let installed = fork.install(
+                &mut *ref_index.search_index_cache.write().await,
+                start.seen.as_ref(),
+            );
+            tracing::info!(
+                phase = "semantic_fork",
+                ref_id = %ref_index.cas_ref_id_hex,
+                parent_ref_id = %parent.cas_ref_id_hex,
+                installed,
+                elapsed_ms = started.elapsed().as_millis(),
+                "cold-start phase"
+            );
+        }
+        Ok((docs, vectors))
+    }
+}
+
+/// A worktree's semantic slot and generations when its walk began.
+struct WalkStart {
+    generation: u64,
+    vector_generation: u64,
+    seen: Option<std::sync::Weak<CachedSearchIndex>>,
 }
 
 #[derive(Clone)]
