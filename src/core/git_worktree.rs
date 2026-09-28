@@ -22,7 +22,7 @@
 //! daemon places `.mcp_data/` and the unix socket next to, so every worktree
 //! of the same repo connects to one daemon.
 //!
-//! The implementation deliberately avoids invoking `git`. A subprocess call
+//! Resolution deliberately avoids invoking `git`. A subprocess call
 //! per daemon-resolve would slow startup and require git in PATH.
 
 use std::fs;
@@ -229,10 +229,158 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// Relative path to blob id of the files git shows clean in one working tree.
+pub type CleanBlobs = std::collections::HashMap<String, String>;
+
+/// The entries with the same blob in both: across two trees, the files that
+/// are byte-identical in both; across two reads of one tree, the files that
+/// stayed clean and unchanged in between.
+pub fn common_blobs(a: &CleanBlobs, b: &CleanBlobs) -> CleanBlobs {
+    a.iter()
+        .filter(|(path, blob)| b.get(*path) == Some(*blob))
+        .map(|(path, blob)| (path.clone(), blob.clone()))
+        .collect()
+}
+
+/// Regular files tracked at stage 0 whose working copy matches the index, with
+/// their blob ids. Files git is told not to check (`assume-unchanged`,
+/// `skip-worktree`) are left out. `None` when `root` is not a git working tree.
+pub fn clean_blobs(root: &Path) -> Option<CleanBlobs> {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    };
+    let (staged, modified) = std::thread::scope(|scope| {
+        let staged = scope.spawn(|| git(&["ls-files", "--stage", "-v", "-z"]));
+        let modified = git(&["diff-files", "--name-only", "--relative", "-z"]);
+        (staged.join().ok().flatten(), modified)
+    });
+    let (staged, modified) = (staged?, modified?);
+    let modified: std::collections::HashSet<&[u8]> = modified
+        .split(|&byte| byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    Some(
+        staged
+            .split(|&byte| byte == 0)
+            .filter_map(|record| {
+                let record = std::str::from_utf8(record).ok()?;
+                let (meta, path) = record.split_once('\t')?;
+                let mut fields = meta.split(' ');
+                let (tag, mode, blob, stage) = (
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?,
+                );
+                (tag == "H"
+                    && mode.starts_with("100")
+                    && stage == "0"
+                    && !modified.contains(path.as_bytes()))
+                .then(|| (path.to_string(), blob.to_string()))
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    #[test]
+    fn common_blobs_lists_only_clean_equal_blobs() {
+        let primary = TempDir::new().unwrap();
+        let root = primary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        for name in [
+            "same.rs",
+            "dirty.rs",
+            "committed.rs",
+            "primary_dirty.rs",
+            "sub/nested.rs",
+        ] {
+            fs::write(root.join(name), format!("// {name}\n")).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("committed.rs", root.join("link.rs")).unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "base"]);
+        let holder = TempDir::new().unwrap();
+        let worktree = holder.path().join("wt");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        fs::write(worktree.join("dirty.rs"), "// changed\n").unwrap();
+        fs::write(worktree.join("committed.rs"), "// committed\n").unwrap();
+        git(&worktree, &["commit", "-qam", "change"]);
+        fs::write(worktree.join("dirty.rs"), "// changed again\n").unwrap();
+        fs::write(worktree.join("untracked.rs"), "// new\n").unwrap();
+        fs::write(root.join("primary_dirty.rs"), "// edited\n").unwrap();
+
+        let same = common_blobs(
+            &clean_blobs(root).unwrap(),
+            &clean_blobs(&worktree).unwrap(),
+        );
+        let mut same: Vec<String> = same.into_keys().collect();
+        same.sort();
+        assert_eq!(same, ["same.rs", "sub/nested.rs"]);
+        assert!(clean_blobs(holder.path()).is_none());
+    }
+
+    #[test]
+    fn clean_blobs_drops_assume_unchanged_and_skip_worktree_entries() {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        for name in ["plain.rs", "assumed.rs", "skipped.rs"] {
+            fs::write(root.join(name), format!("// {name}\n")).unwrap();
+        }
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["update-index", "--assume-unchanged", "assumed.rs"]);
+        git(root, &["update-index", "--skip-worktree", "skipped.rs"]);
+        fs::write(root.join("assumed.rs"), "// edited\n").unwrap();
+        fs::remove_file(root.join("skipped.rs")).unwrap();
+
+        let mut clean: Vec<String> = clean_blobs(root).unwrap().into_keys().collect();
+        clean.sort();
+        assert_eq!(clean, ["plain.rs"]);
+    }
 
     /// Build a fake "primary repo" with a `.git/` directory and return the
     /// repo root.
