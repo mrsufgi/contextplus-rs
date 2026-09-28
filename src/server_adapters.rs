@@ -9,13 +9,11 @@ use std::sync::Arc;
 use crate::cache::rkyv_store;
 use crate::config::Config;
 use crate::core::embeddings::{CacheEntry, OllamaClient, content_hash};
-use crate::core::tree_sitter::parse_with_tree_sitter;
 use crate::core::walker::walk_with_config;
 use crate::error::Result;
 use crate::server::{SharedState, build_embedding_document, cache_name};
 use crate::tools::semantic_search::{
-    EmbedFn, SearchDocument, SymbolSearchEntry, WalkAndIndexFn, extract_plain_text_header,
-    is_text_index_candidate, semantic_embedding_content,
+    EmbedFn, SearchDocument, WalkAndIndexFn, semantic_embedding_content,
 };
 
 #[cfg(test)]
@@ -380,7 +378,9 @@ impl CachedWalkerIndexer {
             ref_index
                 .semantic_walks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let started = std::time::Instant::now();
             let entries = walk_with_config(&root, &config);
+            let walk_ms = started.elapsed().as_millis();
 
             let max_file_size = config.max_embed_file_size as u64;
             // Read all files concurrently (up to 32 at a time)
@@ -416,65 +416,72 @@ impl CachedWalkerIndexer {
                 }
             }
             file_contents.sort_unstable_by_key(|(i, _, _)| *i);
+            let read_ms = started.elapsed().as_millis() - walk_ms;
 
-            let mut docs = Vec::new();
-            let mut content_hashes = Vec::new();
-            let mut embedding_texts = Vec::new();
-
-            for (_, rel_path, maybe_content) in &file_contents {
-                let content = match maybe_content {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                if is_text_index_candidate(rel_path) {
-                    let truncated = semantic_embedding_content(rel_path, content);
-                    let header = extract_plain_text_header(&truncated);
-                    content_hashes.push((rel_path.clone(), content_hash(content)));
-                    embedding_texts.push(build_embedding_document(
-                        rel_path,
-                        content,
-                        config.embed_doc_shape,
-                    ));
-                    docs.push(SearchDocument::new(
-                        rel_path.clone(),
-                        header,
-                        vec![],
-                        vec![],
-                        truncated,
-                    ));
-                    continue;
+            // Parsing runs in parallel; a file whose content matches the
+            // snapshot's document keeps that document's parsed fields.
+            let full_walk = candidates.is_none() && prefix.as_os_str().is_empty();
+            let doc_shape = config.embed_doc_shape;
+            let seed_config = config.clone();
+            let seed_ref = Arc::clone(&ref_index);
+            let (mut docs, content_hashes, embedding_texts, reused) =
+                tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    let seeds = crate::server::snapshots::file_seed(&seed_config, &seed_ref);
+                    let built: Vec<(SearchDocument, (String, String), String, bool)> =
+                        file_contents
+                            .into_par_iter()
+                            .filter_map(|(_, rel_path, content)| {
+                                let content = content?;
+                                let hash = content_hash(&content);
+                                let embedding_text =
+                                    build_embedding_document(&rel_path, &content, doc_shape);
+                                let doc_content = semantic_embedding_content(&rel_path, &content);
+                                let seeded = match seeds.as_ref().and_then(|s| s.get(&rel_path)) {
+                                    Some(seed) => {
+                                        seed.document(rel_path.clone(), &hash, doc_content)
+                                    }
+                                    None => Err(doc_content),
+                                };
+                                let (doc, reused) = match seeded {
+                                    Ok(doc) => (doc, true),
+                                    Err(doc_content) => (
+                                        crate::tools::semantic_search::file_document(
+                                            rel_path.clone(),
+                                            &content,
+                                            doc_content,
+                                        ),
+                                        false,
+                                    ),
+                                };
+                                Some((doc, (rel_path, hash), embedding_text, reused))
+                            })
+                            .collect();
+                    let reused = built.iter().filter(|(.., reused)| *reused).count();
+                    let mut docs = Vec::with_capacity(built.len());
+                    let mut content_hashes = Vec::with_capacity(built.len());
+                    let mut embedding_texts = Vec::with_capacity(built.len());
+                    for (doc, hash, text, _) in built {
+                        docs.push(doc);
+                        content_hashes.push(hash);
+                        embedding_texts.push(text);
+                    }
+                    (docs, content_hashes, embedding_texts, reused)
+                })
+                .await
+                .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
+            if full_walk {
+                crate::server::snapshots::file_seed_used(&ref_index);
+                if reused < docs.len() {
+                    let change = match reused {
+                        0 => crate::server::snapshots::Change::Full,
+                        _ => crate::server::snapshots::Change::Files {
+                            changed: docs.len() - reused,
+                            documents: docs.len(),
+                        },
+                    };
+                    crate::server::snapshots::schedule_files(&config, &ref_index, change);
                 }
-
-                let ext = rel_path.rsplit('.').next().unwrap_or("");
-                let symbols = parse_with_tree_sitter(content, ext).unwrap_or_default();
-                let header = crate::core::parser::extract_header(content);
-
-                let symbol_names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
-                let symbol_entries: Vec<SymbolSearchEntry> = symbols
-                    .iter()
-                    .map(|s| SymbolSearchEntry {
-                        name: s.name.clone(),
-                        kind: Some(s.kind.clone()),
-                        line: s.line,
-                        end_line: Some(s.end_line),
-                        signature: s.signature.clone(),
-                    })
-                    .collect();
-
-                let doc_content = semantic_embedding_content(rel_path, content);
-                let embedding_text =
-                    build_embedding_document(rel_path, content, config.embed_doc_shape);
-                content_hashes.push((rel_path.clone(), content_hash(content)));
-                embedding_texts.push(embedding_text);
-
-                docs.push(SearchDocument::new(
-                    rel_path.clone(),
-                    header,
-                    symbol_names,
-                    symbol_entries,
-                    doc_content,
-                ));
             }
 
             for (doc, (_, hash)) in docs.iter_mut().zip(&content_hashes) {
@@ -485,6 +492,16 @@ impl CachedWalkerIndexer {
                     .to_string_lossy()
                     .into_owned();
             }
+
+            tracing::info!(
+                phase = "semantic_walk",
+                walk_ms,
+                read_ms,
+                documents_ms = started.elapsed().as_millis() - walk_ms - read_ms,
+                documents = docs.len(),
+                reused,
+                "cold-start phase"
+            );
 
             #[cfg(test)]
             test_seams::after_file_snapshot(&root, &content_hashes).await;

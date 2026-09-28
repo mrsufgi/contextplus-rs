@@ -26,6 +26,8 @@ use crate::error::{ContextPlusError, Result};
 use crate::server_adapters::{CachedWalkerIndexer, OllamaEmbedder};
 pub use crate::server_definitions::{make_tool, tool_definitions};
 
+pub(crate) mod snapshots;
+
 /// Cached project state: walked file entries and their raw file contents.
 /// Built lazily on first tool call. A running tracker invalidates it on file
 /// changes; the TTL is a fallback only when no tracker is running for the ref.
@@ -400,6 +402,14 @@ impl SharedState {
     /// default snapshot always returns `Some`.
     pub fn default_ref(&self) -> Option<Arc<crate::ref_index::RefIndex>> {
         Some(Arc::clone(&self.default_ref))
+    }
+
+    /// Writes the primary checkout's snapshots that have unwritten changes.
+    /// For a graceful shutdown.
+    pub async fn flush_snapshots(&self) {
+        let primary = Arc::clone(&self.default_ref);
+        let config = self.config.clone();
+        let _ = tokio::task::spawn_blocking(move || snapshots::flush(&config, &primary)).await;
     }
 
     /// Look up a ref by id. Reserved for U4's session-scoped dispatch.
@@ -962,22 +972,25 @@ impl ResidentSnapshot {
     }
 }
 
-/// Identifier vectors persisted under `root`, or none. The archive is moved
-/// into the map entry by entry, so loading holds one extra copy at most.
+/// Identifier vectors persisted under `root`, or none. Read in place from the
+/// mapped archive, so loading holds no copy of the file. Keys are identifier
+/// texts, not paths: the path hygiene sweep would drop any text that mentions
+/// a dotted path segment and force it to be embedded again on every start.
 fn load_identifier_vectors(root: &std::path::Path, name: &str) -> IdentifierVectors {
-    let Some(data) = rkyv_store::load_cache(root, name).ok().flatten() else {
+    let started = Instant::now();
+    let mut vectors = IdentifierVectors::new();
+    if let Err(error) = rkyv_store::visit_cache_entries(root, name, |key, vector| {
+        vectors.insert(key.to_owned(), Arc::from(vector));
+    }) {
+        tracing::warn!(%error, cache = name, "Identifier vector cache unreadable");
         return IdentifierVectors::new();
-    };
-    let dims = data.dims as usize;
-    let mut vectors = IdentifierVectors::with_capacity(data.keys.len());
-    for (i, key) in data.keys.into_iter().enumerate() {
-        if !crate::core::walker::should_keep_cache_key(&key) {
-            continue;
-        }
-        if let Some(vector) = data.vectors.get(i * dims..(i + 1) * dims) {
-            vectors.insert(key, Arc::from(vector));
-        }
     }
+    tracing::info!(
+        phase = "identifier_vectors_load",
+        elapsed_ms = started.elapsed().as_millis(),
+        vectors = vectors.len(),
+        "cold-start phase"
+    );
     vectors
 }
 
@@ -1024,32 +1037,56 @@ fn cache_entry_bytes(cache: &HashMap<String, CacheEntry>) -> usize {
     })
 }
 
+use crate::tools::lexical_search::{lexical_term_counts, lexical_updates};
+
+/// Documents parsed and tokenized together while a keyword index is built.
+const LEXICAL_BUILD_BATCH: usize = 16;
+
 /// Keyword index over `paths` of `files`, with the path of each document.
+/// Parsing and tokenizing run in parallel a batch at a time.
 fn build_lexical_index<'a>(
     paths: impl Iterator<Item = &'a str>,
     files: &crate::core::walker::FileContents,
 ) -> (crate::tools::lexical_search::LexicalIndex, Vec<String>) {
-    use crate::tools::lexical_search::{LexicalFields, LexicalIndex};
+    use rayon::prelude::*;
+    let built = build_lexical_index_batched(paths, |batch| {
+        STRUCTURAL_POOL.install(|| {
+            batch
+                .par_iter()
+                .map(|&path| lexical_term_counts(path, files))
+                .collect()
+        })
+    });
+    // Parsing on the pool threads left their allocator arenas holding the
+    // freed parse state; hand it back rather than keep it resident.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    built
+}
 
+/// Builds with `count` giving the term counts of each batch, so the counts
+/// held at once stay small next to the index being built.
+fn build_lexical_index_batched<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    count: impl Fn(&[&'a str]) -> Vec<crate::tools::lexical_search::DocumentTermCounts>,
+) -> (crate::tools::lexical_search::LexicalIndex, Vec<String>) {
+    let started = Instant::now();
     let paths: Vec<&str> = paths.collect();
-    let mut index = LexicalIndex::with_capacity(paths.len());
-    for &path in &paths {
-        let content = files.get(path).map_or("", |content| content.as_str());
-        let ext = path.rsplit('.').next().unwrap_or("");
-        let symbols: Vec<String> = parse_with_tree_sitter(content, ext)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|symbol| symbol.name)
-            .collect();
-        let header = crate::core::parser::extract_header(content);
-        index.push_document(LexicalFields {
-            path,
-            symbols: &symbols,
-            header: &header,
-            content,
-        });
+    let mut index = crate::tools::lexical_search::LexicalIndex::with_capacity(paths.len());
+    for batch in paths.chunks(LEXICAL_BUILD_BATCH) {
+        for (&path, counts) in batch.iter().zip(count(batch)) {
+            index.push_counted(path, counts);
+        }
     }
     index.finish_build();
+    tracing::info!(
+        phase = "lexical_build",
+        elapsed_ms = started.elapsed().as_millis(),
+        documents = paths.len(),
+        "cold-start phase"
+    );
     (index, paths.into_iter().map(str::to_owned).collect())
 }
 
@@ -1089,12 +1126,17 @@ fn load_project_cache(
             };
         (Arc::clone(base.file_content.own()), unchanged)
     });
+    let git_started = Instant::now();
     let clean_before = (base.is_none() && record_clean_blobs)
         .then(|| clean_blobs(root))
         .flatten();
+    let git_before_ms = git_started.elapsed().as_millis();
 
+    let started = Instant::now();
+    let mut walk_ms = 0;
     let (file_entries, file_content) = STRUCTURAL_POOL.install(|| {
         let file_entries = walk_with_config(root, config);
+        walk_ms = started.elapsed().as_millis();
         let read = |path: &String| std::fs::read_to_string(root.join(path)).ok().map(Arc::new);
         let layered = base.map(|(base, unchanged)| {
             // Same clean blob is not same bytes under a smudge filter or eol
@@ -1166,9 +1208,20 @@ fn load_project_cache(
         });
         (file_entries, file_content)
     });
+    let read_ms = started.elapsed().as_millis() - walk_ms;
+    let git_started = Instant::now();
     let clean_blobs = clean_before
         .and_then(|before| Some(common_blobs(&before, &clean_blobs(root)?)))
         .map(Arc::new);
+    tracing::info!(
+        phase = "project_cache",
+        git_before_ms,
+        walk_ms,
+        read_ms,
+        git_after_ms = git_started.elapsed().as_millis(),
+        files = file_content.len(),
+        "cold-start phase"
+    );
     ProjectCache {
         file_entries,
         file_content,
@@ -1767,11 +1820,71 @@ impl ContextPlusServer {
     ///
     /// The task is fire-and-forget: errors are logged as warnings and never
     /// propagate to the caller.  Server startup is never delayed.
-    pub fn spawn_warmup_task(&self) {
+    ///
+    /// Only a daemon, shared by every session, also preloads the keyword and
+    /// identifier indexes (`preload_snapshots`); a private server keeps to the
+    /// indexes its session asks for. Returns the preload task.
+    pub fn spawn_warmup_task(
+        &self,
+        preload_snapshots: bool,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let state = self.state.clone();
         tokio::spawn(async move {
             warmup_semantic_search_cache(&state).await;
         });
+        if let Some(primary) = self.state.default_ref()
+            && snapshots::enabled(&self.state.config, &primary)
+        {
+            tokio::task::spawn_blocking(move || {
+                crate::cache::snapshot::remove_stale_temp_files(
+                    &primary.root_dir,
+                    crate::cache::snapshot::STALE_TEMP_AGE,
+                )
+            });
+        }
+        if preload_snapshots {
+            self.spawn_snapshot_preload()
+        } else {
+            None
+        }
+    }
+
+    /// Loads the keyword and identifier indexes of the primary checkout whose
+    /// snapshots exist, alongside the semantic warmup, so the first query of
+    /// each mode finds its index ready. A query arriving first waits only on
+    /// the index it needs.
+    fn spawn_snapshot_preload(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let primary = self.state.default_ref()?;
+        if !snapshots::enabled(&self.state.config, &primary) {
+            return None;
+        }
+        let keywords =
+            crate::cache::snapshot::snapshot_path(&primary.root_dir, snapshots::KEYWORDS).exists();
+        let identifiers =
+            crate::cache::snapshot::snapshot_path(&primary.root_dir, snapshots::IDENTIFIERS)
+                .exists();
+        if !keywords && !identifiers {
+            return None;
+        }
+        let server = self.clone();
+        Some(tokio::spawn(async move {
+            let Ok(cache) = server.ensure_project_cache_for(&primary).await else {
+                return;
+            };
+            let keyword_index = async {
+                if keywords
+                    && let Err(error) = server.ensure_lexical_index_for(&primary, &cache).await
+                {
+                    tracing::warn!(%error, "keyword index preload failed");
+                }
+            };
+            let identifier_index = async {
+                if identifiers && let Err(error) = server.ensure_identifier_index(&cache).await {
+                    tracing::warn!(%error, "identifier index preload failed");
+                }
+            };
+            tokio::join!(keyword_index, identifier_index);
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -1939,47 +2052,11 @@ impl ContextPlusServer {
                         .par_iter()
                         .filter(|e| !e.is_directory)
                         .filter_map(|entry| {
-                            let content =
-                                cache_for_parse.file_content.get(&entry.relative_path)?;
-                            let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                            let (symbols, keyword_signatures) = crate::core::tree_sitter::parse_identifier_symbols(content, ext).ok()?;
-                            let header = crate::core::parser::extract_header(content);
-                            let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                                crate::core::parser::flatten_symbols(&symbols, None)
-                                    .into_iter()
-                                    .map(|sym| {
-                                        let sig = sym.signature.clone().unwrap_or_default();
-                                        let text = format!(
-                                            "{} {} {} {} {} {}",
-                                            sym.name,
-                                            sym.kind,
-                                            sig,
-                                            entry.relative_path,
-                                            header,
-                                            sym.parent_name.as_deref().unwrap_or("")
-                                        );
-                                        crate::tools::semantic_identifiers::IdentifierDoc {
-                                            id: format!(
-                                                "{}:{}:{}",
-                                                entry.relative_path, sym.name, sym.line
-                                            ),
-                                            path: entry.relative_path.clone(),
-                                            header: header.clone(),
-                                            name: sym.name.clone(),
-                                            kind_lower: sym.kind.to_lowercase(),
-                                            kind: sym.kind.clone(),
-                                            line: sym.line,
-                                            end_line: sym.end_line,
-                                            signature: sig,
-                                            parent_name: sym.parent_name.clone(),
-                                            text,
-                                            name_token_set: crate::tools::semantic_identifiers::identifier_terms(&sym.name),
-                                            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(keyword_signatures.get(&(sym.name.clone(), sym.line)).map(String::as_str).unwrap_or("")),
-                                            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(sym.parent_name.as_deref().unwrap_or("")),
-                                        }
-                                    })
-                                    .collect();
-                            Some(local)
+                            let content = cache_for_parse.file_content.get(&entry.relative_path)?;
+                            crate::tools::semantic_identifiers::identifier_docs_for_file(
+                                &entry.relative_path,
+                                content,
+                            )
                         })
                         .flatten()
                         .collect()
@@ -2159,47 +2236,11 @@ impl ContextPlusServer {
                         .par_iter()
                         .filter(|e| !e.is_directory)
                         .filter_map(|entry| {
-                            let content =
-                                cache_for_parse.file_content.get(&entry.relative_path)?;
-                            let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                            let (symbols, keyword_signatures) = crate::core::tree_sitter::parse_identifier_symbols(content, ext).ok()?;
-                            let header = crate::core::parser::extract_header(content);
-                            let local: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                                crate::core::parser::flatten_symbols(&symbols, None)
-                                    .into_iter()
-                                    .map(|sym| {
-                                        let sig = sym.signature.clone().unwrap_or_default();
-                                        let text = format!(
-                                            "{} {} {} {} {} {}",
-                                            sym.name,
-                                            sym.kind,
-                                            sig,
-                                            entry.relative_path,
-                                            header,
-                                            sym.parent_name.as_deref().unwrap_or("")
-                                        );
-                                        crate::tools::semantic_identifiers::IdentifierDoc {
-                                            id: format!(
-                                                "{}:{}:{}",
-                                                entry.relative_path, sym.name, sym.line
-                                            ),
-                                            path: entry.relative_path.clone(),
-                                            header: header.clone(),
-                                            name: sym.name.clone(),
-                                            kind_lower: sym.kind.to_lowercase(),
-                                            kind: sym.kind.clone(),
-                                            line: sym.line,
-                                            end_line: sym.end_line,
-                                            signature: sig,
-                                            parent_name: sym.parent_name.clone(),
-                                            text,
-                                            name_token_set: crate::tools::semantic_identifiers::identifier_terms(&sym.name),
-                                            signature_token_set: crate::tools::semantic_identifiers::identifier_terms(keyword_signatures.get(&(sym.name.clone(), sym.line)).map(String::as_str).unwrap_or("")),
-                                            parent_token_set: crate::tools::semantic_identifiers::identifier_terms(sym.parent_name.as_deref().unwrap_or("")),
-                                        }
-                                    })
-                                    .collect();
-                            Some(local)
+                            let content = cache_for_parse.file_content.get(&entry.relative_path)?;
+                            crate::tools::semantic_identifiers::identifier_docs_for_file(
+                                &entry.relative_path,
+                                content,
+                            )
                         })
                         .flatten()
                         .collect()
@@ -3001,112 +3042,44 @@ impl ContextPlusServer {
             cache.file_content.keys().cloned().collect()
         };
         let parse_paths = changed_paths.clone();
+        let use_snapshot = !incremental && snapshots::enabled(&self.state.config, &ref_index);
+        let snapshot_root = ref_index.root_dir.clone();
+        let snapshot_config = self.state.config.clone();
+        let started = Instant::now();
 
-        // Step 1: Parse symbols (CPU-bound)
-        let identifier_docs = tokio::task::spawn_blocking(move || {
+        // Step 1: Parse symbols (CPU-bound), while the vectors load below. A
+        // first build takes the documents of unchanged files from the snapshot.
+        let parse = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
-            cache_clone
-                .file_entries
-                .par_iter()
-                .filter(|entry| !entry.is_directory)
-                .filter_map(|entry| {
-                    let content = cache_clone.file_content.get(&entry.relative_path)?;
-                    if !parse_paths.contains(&entry.relative_path) {
-                        return None;
-                    }
-                    let content = Arc::clone(content);
-                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                    let (symbols, keyword_signatures) =
-                        crate::core::tree_sitter::parse_identifier_symbols(&content, ext).ok()?;
-                    let header = crate::core::parser::extract_header(&content);
-                    let local_docs: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                        crate::core::parser::flatten_symbols(&symbols, None)
-                            .into_iter()
-                            .map(|sym| {
-                                let sig = sym.signature.clone().unwrap_or_default();
-                                let parent = sym.parent_name.as_deref().unwrap_or("");
-                                let text = format!(
-                                    "{} {} {} {} {} {}",
-                                    sym.name, sym.kind, sig, entry.relative_path, header, parent
-                                );
-                                crate::tools::semantic_identifiers::IdentifierDoc {
-                                    id: format!(
-                                        "{}:{}:{}",
-                                        entry.relative_path, sym.name, sym.line
-                                    ),
-                                    path: entry.relative_path.clone(),
-                                    header: header.clone(),
-                                    name: sym.name.clone(),
-                                    kind_lower: sym.kind.to_lowercase(),
-                                    kind: sym.kind.clone(),
-                                    line: sym.line,
-                                    end_line: sym.end_line,
-                                    signature: sig,
-                                    parent_name: sym.parent_name.clone(),
-                                    text,
-                                    name_token_set:
-                                        crate::tools::semantic_identifiers::identifier_terms(
-                                            &sym.name,
-                                        ),
-                                    signature_token_set:
-                                        crate::tools::semantic_identifiers::identifier_terms(
-                                            keyword_signatures
-                                                .get(&(sym.name.clone(), sym.line))
-                                                .map(String::as_str)
-                                                .unwrap_or(""),
-                                        ),
-                                    parent_token_set:
-                                        crate::tools::semantic_identifiers::identifier_terms(
-                                            sym.parent_name.as_deref().unwrap_or(""),
-                                        ),
-                                }
-                            })
-                            .collect();
-                    Some(local_docs)
+            let seeded = use_snapshot
+                .then(|| {
+                    snapshots::load_identifiers(&snapshot_root, &snapshot_config, &cache_clone)
                 })
-                .flatten()
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
-
-        if identifier_docs.is_empty() && !incremental {
-            let idx = Arc::new(IdentifierIndex {
-                docs: Vec::new().into(),
-                vectors: IdentifierVectorIndex::empty(),
-                dims: 0,
-                file_count,
-                built_at: Instant::now(),
-            });
-            if !self
-                .install_identifier_index_if_current(cache, build_generation, &idx)
-                .await
-            {
-                tracing::debug!(
-                    ref_id = %ref_index.cas_ref_id_hex,
-                    build_generation,
-                    reason = "project cache or generation changed during build",
-                    "IdentifierIndex build discarded"
-                );
-                drop(update_guard);
-                let fresh_cache = self.ensure_project_cache().await?;
-                return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
-            }
-            tracing::debug!(
-                ref_id = %ref_index.cas_ref_id_hex,
-                reason = "parsed corpus contains no identifiers",
-                "IdentifierIndex replaced after rebuild"
+                .flatten();
+            let from_snapshot = seeded.is_some();
+            let (mut docs, parse_paths) = seeded.unwrap_or((Vec::new(), parse_paths));
+            let parsed_files = parse_paths.len();
+            docs.par_extend(
+                cache_clone
+                    .file_entries
+                    .par_iter()
+                    .filter(|entry| !entry.is_directory)
+                    .filter_map(|entry| {
+                        let content = cache_clone.file_content.get(&entry.relative_path)?;
+                        if !parse_paths.contains(&entry.relative_path) {
+                            return None;
+                        }
+                        crate::tools::semantic_identifiers::identifier_docs_for_file(
+                            &entry.relative_path,
+                            content,
+                        )
+                    })
+                    .flatten(),
             );
-            return Ok(idx);
-        }
+            (docs, parsed_files, from_snapshot)
+        });
 
-        // Step 2: Check identifier embedding cache on disk, embed only missing
-        let n_identifiers = identifier_docs.len();
-        tracing::info!(
-            identifiers = n_identifiers,
-            "Embedding identifiers (using disk cache for warm hits)"
-        );
-
+        let vectors_started = Instant::now();
         // Identifier texts are keyed by repo-relative path and signature, so a
         // worktree shares the primary's resident vectors and keeps only its own
         // misses in a per-ref overlay persisted under its root.
@@ -3156,6 +3129,49 @@ impl ContextPlusServer {
                 }
             }
         }
+        let vectors_ms = vectors_started.elapsed().as_millis();
+        let (identifier_docs, parsed_files, from_snapshot) = parse
+            .await
+            .map_err(|e| ContextPlusError::Other(format!("spawn_blocking failed: {e}")))?;
+        let parse_ms = started.elapsed().as_millis();
+
+        if identifier_docs.is_empty() && !incremental {
+            let idx = Arc::new(IdentifierIndex {
+                docs: Vec::new().into(),
+                vectors: IdentifierVectorIndex::empty(),
+                dims: 0,
+                file_count,
+                built_at: Instant::now(),
+            });
+            if !self
+                .install_identifier_index_if_current(cache, build_generation, &idx)
+                .await
+            {
+                tracing::debug!(
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    build_generation,
+                    reason = "project cache or generation changed during build",
+                    "IdentifierIndex build discarded"
+                );
+                drop(update_guard);
+                let fresh_cache = self.ensure_project_cache().await?;
+                return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
+            }
+            tracing::debug!(
+                ref_id = %ref_index.cas_ref_id_hex,
+                reason = "parsed corpus contains no identifiers",
+                "IdentifierIndex replaced after rebuild"
+            );
+            return Ok(idx);
+        }
+
+        // Step 2: Check identifier embedding cache on disk, embed only missing
+        let n_identifiers = identifier_docs.len();
+        tracing::info!(
+            identifiers = n_identifiers,
+            "Embedding identifiers (using disk cache for warm hits)"
+        );
+
         let overlay = ref_index.identifier_vector_overlay.read().await;
         let id_caches = resident.read().await;
 
@@ -3180,6 +3196,7 @@ impl ContextPlusServer {
             uncached = uncached_indices.len(),
             "Identifier embedding cache hit/miss"
         );
+        let lookup_done = started.elapsed().as_millis();
 
         drop(id_caches);
         drop(overlay);
@@ -3259,6 +3276,7 @@ impl ContextPlusServer {
             });
         }
 
+        let embed_ms = started.elapsed().as_millis() - lookup_done;
         let dims = result_vectors
             .first()
             .and_then(|v| v.as_ref())
@@ -3314,6 +3332,18 @@ impl ContextPlusServer {
             file_count,
             built_at: Instant::now(),
         });
+        tracing::info!(
+            phase = "identifier_build",
+            incremental,
+            from_snapshot,
+            parsed_files,
+            parse_ms,
+            vectors_ms,
+            embed_ms,
+            uncached = uncached_indices.len(),
+            assemble_ms = started.elapsed().as_millis() - lookup_done - embed_ms,
+            "cold-start phase"
+        );
 
         if !self
             .install_identifier_index_if_current(cache, build_generation, &idx)
@@ -3340,6 +3370,17 @@ impl ContextPlusServer {
             dims = idx.dims,
             "IdentifierIndex replaced after rebuild"
         );
+        let change = if incremental || from_snapshot {
+            snapshots::Change::Files {
+                changed: parsed_files,
+                documents: file_count,
+            }
+        } else {
+            snapshots::Change::Full
+        };
+        if matches!(change, snapshots::Change::Full) || parsed_files > 0 {
+            snapshots::schedule_identifiers(&self.state.config, &ref_index, change);
+        }
 
         Ok(idx)
     }
@@ -3486,7 +3527,6 @@ impl ContextPlusServer {
         ref_index: &Arc<crate::ref_index::RefIndex>,
         project_cache: &Arc<ProjectCache>,
     ) -> Result<Arc<CachedLexicalIndex>> {
-        use crate::tools::semantic_search::SearchDocument;
         use std::sync::atomic::Ordering;
 
         let _update = ref_index.lexical_update.lock().await;
@@ -3536,38 +3576,21 @@ impl ContextPlusServer {
                 let mut entry = Arc::clone(previous);
                 drop(guard);
                 let cached = Arc::make_mut(&mut entry);
-                let mut updates = Vec::new();
-                for (path, content) in changed {
-                    let i = cached
-                        .document_paths
-                        .iter()
-                        .position(|p| p == path)
-                        .unwrap_or_else(|| {
-                            cached.document_paths.push(path.clone());
-                            cached.document_paths.len() - 1
-                        });
-                    let ext = path.rsplit('.').next().unwrap_or("");
-                    let symbols = parse_with_tree_sitter(content, ext)
-                        .unwrap_or_default()
+                let updates = lexical_updates(
+                    &mut cached.document_paths,
+                    changed
                         .into_iter()
-                        .map(|s| s.name)
-                        .collect();
-                    updates.push((
-                        i,
-                        SearchDocument::new(
-                            path.clone(),
-                            crate::core::parser::extract_header(content),
-                            symbols,
-                            vec![],
-                            content.as_str().to_owned(),
-                        ),
-                    ));
-                }
+                        .map(|(path, content)| (path.as_str(), content.as_str())),
+                );
                 for &i in &deleted {
                     cached.document_paths[i].clear();
                 }
                 cached.generation = generation;
                 cached.project_cache = Arc::clone(project_cache);
+                let change = snapshots::Change::Files {
+                    changed: updates.len() + deleted.len(),
+                    documents: cached.index.document_count(),
+                };
                 let entry = tokio::task::spawn_blocking(move || {
                     Arc::make_mut(&mut entry)
                         .index
@@ -3580,8 +3603,37 @@ impl ContextPlusServer {
                 if ref_index.cache_generation.load(Ordering::Acquire) == generation {
                     *guard = Some(Arc::clone(&entry));
                     ref_index.lexical_inherited.store(false, Ordering::Release);
+                    drop(guard);
+                    snapshots::schedule_keywords(&self.state.config, ref_index, change);
                 }
                 return Ok(entry);
+            }
+        }
+
+        if guard.is_none() && snapshots::enabled(&self.state.config, ref_index) {
+            let root = ref_index.root_dir.clone();
+            let config = self.state.config.clone();
+            let source = Arc::clone(project_cache);
+            let loaded = tokio::task::spawn_blocking(move || {
+                snapshots::load_keywords(&root, &config, &source, generation)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((cached, changed)) = loaded {
+                let documents = cached.index.document_count();
+                let cached = Arc::new(cached);
+                *guard = Some(Arc::clone(&cached));
+                ref_index.lexical_inherited.store(false, Ordering::Release);
+                drop(guard);
+                if changed > 0 {
+                    snapshots::schedule_keywords(
+                        &self.state.config,
+                        ref_index,
+                        snapshots::Change::Files { changed, documents },
+                    );
+                }
+                return Ok(cached);
             }
         }
 
@@ -3620,6 +3672,8 @@ impl ContextPlusServer {
             let lock = Arc::clone(&ref_index.lexical_search_cache);
             let source = Arc::clone(project_cache);
             let stale = Arc::clone(&previous);
+            let owner = Arc::clone(ref_index);
+            let config = self.state.config.clone();
             drop(guard);
             let task = tokio::spawn(async move {
                 let _reset = RefreshGuard(flag);
@@ -3636,6 +3690,8 @@ impl ContextPlusServer {
                             generation,
                             base: None,
                         }));
+                        drop(guard);
+                        snapshots::schedule_keywords(&config, &owner, snapshots::Change::Full);
                     }
                 }
             });
@@ -3655,6 +3711,8 @@ impl ContextPlusServer {
         });
         *guard = Some(Arc::clone(&cached));
         ref_index.lexical_inherited.store(false, Ordering::Release);
+        drop(guard);
+        snapshots::schedule_keywords(&self.state.config, ref_index, snapshots::Change::Full);
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
             generation,
@@ -6446,7 +6504,7 @@ mod tests {
     }
 
     #[test]
-    fn keyword_index_build_holds_one_document_at_a_time() {
+    fn keyword_index_build_holds_one_batch_at_a_time() {
         let files: crate::core::walker::ContentMap = (0..300)
             .map(|i| {
                 let body: String = (0..800)
@@ -6459,9 +6517,15 @@ mod tests {
         let mut paths: Vec<&str> = files.keys().map(String::as_str).collect();
         paths.sort_unstable();
 
+        // Counted on this thread so the counting allocator sees every batch.
         let (((index, document_paths), retained), peak) = crate::alloc_probe::peak_bytes(|| {
             crate::alloc_probe::retained_bytes(|| {
-                build_lexical_index(paths.iter().copied(), &files)
+                build_lexical_index_batched(paths.iter().copied(), |batch| {
+                    batch
+                        .iter()
+                        .map(|path| lexical_term_counts(path, &files))
+                        .collect()
+                })
             })
         });
 
@@ -10468,7 +10532,7 @@ mod tests {
             std::env::set_var("OLLAMA_HOST", "http://127.0.0.1:1");
         }
         let server = test_server();
-        server.spawn_warmup_task();
+        server.spawn_warmup_task(false);
         // Brief yield so the spawned task has a chance to run.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         unsafe {
@@ -16235,6 +16299,507 @@ mod tests {
                 .iter()
                 .any(|(ptr, bytes, _)| *ptr == old_contents && *bytes > 0),
             "the old primary content map pinned by the worktree's keyword entry is not measured"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cold_start_tests {
+    use super::*;
+    use serde_json::json;
+
+    const KINDS: [&str; 3] = [
+        snapshots::KEYWORDS,
+        snapshots::IDENTIFIERS,
+        snapshots::FILES,
+    ];
+
+    /// A small corpus of code and docs with overlapping vocabulary.
+    fn corpus() -> Vec<(String, String)> {
+        let topics = [
+            "refund", "invoice", "payment", "ledger", "account", "session", "token", "order",
+            "shipment", "report",
+        ];
+        let mut files = Vec::new();
+        for (i, topic) in topics.iter().enumerate() {
+            let other = topics[(i + 3) % topics.len()];
+            files.push((
+                format!("src/{topic}.rs"),
+                format!(
+                    "//! Handles the {topic} lifecycle and its {other} links.\n\
+                     pub struct {Topic}Store {{ items: Vec<u32> }}\n\
+                     pub fn record_{topic}(id: u32) -> u32 {{ id + {i} }}\n\
+                     pub fn load_{other}_for_{topic}(id: u32) -> u32 {{ record_{topic}(id) }}\n\
+                     impl {Topic}Store {{\n    pub fn total_{topic}s(&self) -> usize {{ self.items.len() }}\n}}\n",
+                    Topic = topic[..1].to_uppercase() + &topic[1..],
+                ),
+            ));
+            files.push((
+                format!("web/{topic}.ts"),
+                format!(
+                    "// {topic} client for the {other} screen\n\
+                     export function fetch{Topic}(id: string): Promise<string> {{ return load{Topic}(id); }}\n\
+                     export const {topic}Limit = {i};\n\
+                     export class {Topic}View {{ render(): string {{ return '{other}'; }} }}\n",
+                    Topic = topic[..1].to_uppercase() + &topic[1..],
+                ),
+            ));
+            files.push((
+                format!("docs/{topic}.md"),
+                format!(
+                    "# {topic}\n\nHow a {topic} moves through the {other} pipeline, \
+                     including {topic} retries.\n"
+                ),
+            ));
+        }
+        files
+    }
+
+    /// An embedding service whose vector for a text is a normalized bag of
+    /// its letters, so distinct texts rank differently.
+    async fn embedder() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().cloned())
+                    .unwrap_or_default();
+                let embeddings: Vec<Vec<f32>> = inputs
+                    .iter()
+                    .map(|input| {
+                        let mut vector = [0.01_f32; 16];
+                        for byte in input.as_str().unwrap_or_default().bytes() {
+                            if byte.is_ascii_alphabetic() {
+                                vector[(byte.to_ascii_lowercase() - b'a') as usize % 16] += 1.0;
+                            }
+                        }
+                        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        vector.iter().map(|v| v / norm).collect()
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "embeddings": embeddings }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn write_files(root: &std::path::Path, files: &[(String, String)]) {
+        for (path, content) in files {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+        }
+    }
+
+    fn server(
+        root: &std::path::Path,
+        embedder: &wiremock::MockServer,
+        snapshots: bool,
+    ) -> ContextPlusServer {
+        let mut config = Config::from_env();
+        config.ollama_host = embedder.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        config.embed_budget_ms = 60_000;
+        config.snapshots = snapshots;
+        ContextPlusServer::new(root.to_path_buf(), config)
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        match &result.content[0].raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// One answer per mode.
+    async fn answers(server: &ContextPlusServer) -> Vec<String> {
+        let queries = [
+            json!({"query": "refund payment lifecycle", "top_k": 10}),
+            json!({"query": "record_refund invoice", "match": "keywords", "top_k": 10}),
+            json!({"query": "load the ledger account", "kind": "identifiers", "top_k": 10}),
+            json!({"query": "fetchOrder", "kind": "identifiers", "match": "keywords", "top_k": 10}),
+        ];
+        let mut out = Vec::new();
+        for query in queries {
+            let result = server
+                .dispatch("explore", query.as_object().unwrap().clone())
+                .await;
+            assert_eq!(result.is_error, Some(false), "{}", text(&result));
+            out.push(text(&result));
+        }
+        out
+    }
+
+    /// Writes every snapshot of `server` now, and drops its pending writes.
+    async fn flush(server: &ContextPlusServer) {
+        let primary = server.state.default_ref().unwrap();
+        for schedule in [
+            &primary.snapshots.keywords,
+            &primary.snapshots.identifiers,
+            &primary.snapshots.files,
+        ] {
+            schedule.cancel();
+        }
+        let config = server.state.config.clone();
+        let root = primary.root_dir.clone();
+        let keywords = primary.lexical_search_cache.read().await.clone().unwrap();
+        let identifiers = primary.identifier_index.read().await.clone().unwrap();
+        let source = primary.identifier_source.read().await.clone().unwrap();
+        let files = primary.search_index_cache.read().await.clone().unwrap();
+        tokio::task::spawn_blocking(move || {
+            assert!(snapshots::write_keywords(&root, &config, &keywords).unwrap());
+            assert!(snapshots::write_identifiers(&root, &config, &identifiers, &source).unwrap());
+            assert!(snapshots::write_files(&root, &config, &files).unwrap());
+        })
+        .await
+        .unwrap();
+    }
+
+    fn loads(root: &std::path::Path) -> Vec<usize> {
+        KINDS
+            .iter()
+            .map(|kind| snapshots::test_seams::load_count(root, kind))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cold_start_snapshot_round_trip_answers_like_a_fresh_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(tmp.path(), &corpus());
+        let embedder = embedder().await;
+        let first = server(tmp.path(), &embedder, true);
+        let fresh = answers(&first).await;
+        flush(&first).await;
+        drop(first);
+
+        let restarted = server(tmp.path(), &embedder, true);
+        let before = loads(tmp.path());
+        let loaded = answers(&restarted).await;
+
+        let after = loads(tmp.path());
+        for (kind, (before, after)) in KINDS.iter().zip(before.iter().zip(&after)) {
+            assert!(after > before, "the {kind} snapshot was not used");
+        }
+        for (fresh, loaded) in fresh.iter().zip(&loaded) {
+            assert_eq!(fresh, loaded);
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_start_changes_since_the_snapshot_answer_like_a_full_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = corpus();
+        write_files(tmp.path(), &files);
+        let embedder = embedder().await;
+        let first = server(tmp.path(), &embedder, true);
+        answers(&first).await;
+        flush(&first).await;
+        drop(first);
+
+        // One file changed, one added, one deleted since the snapshot.
+        files[0]
+            .1
+            .push_str("pub fn refund_reversal_window() -> u32 { 30 }\n");
+        files.push((
+            "src/chargeback.rs".into(),
+            "//! Chargeback disputes against a refund.\npub fn open_chargeback_for_refund(id: u32) -> u32 { id }\n".into(),
+        ));
+        write_files(tmp.path(), &files);
+        std::fs::remove_file(tmp.path().join("web/invoice.ts")).unwrap();
+
+        let before = loads(tmp.path());
+        let restarted = server(tmp.path(), &embedder, true);
+        let from_snapshot = answers(&restarted).await;
+        let after = loads(tmp.path());
+        drop(restarted);
+        for (kind, (before, after)) in KINDS.iter().zip(before.iter().zip(&after)) {
+            assert!(after > before, "the {kind} snapshot was not used");
+        }
+
+        let rebuilt = server(tmp.path(), &embedder, false);
+        let full = answers(&rebuilt).await;
+        for (full, from_snapshot) in full.iter().zip(&from_snapshot) {
+            assert_eq!(full, from_snapshot);
+        }
+        let joined = from_snapshot.join("\n");
+        assert!(
+            joined.contains("chargeback"),
+            "added file missing:\n{joined}"
+        );
+        assert!(
+            !joined.contains("web/invoice.ts"),
+            "deleted file served:\n{joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_corrupt_snapshots_fall_back_to_a_full_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(tmp.path(), &corpus());
+        let embedder = embedder().await;
+        let first = server(tmp.path(), &embedder, true);
+        let fresh = answers(&first).await;
+        flush(&first).await;
+        drop(first);
+        for kind in KINDS {
+            let path = crate::cache::snapshot::snapshot_path(tmp.path(), kind);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0x5a;
+            std::fs::write(&path, bytes).unwrap();
+        }
+
+        let before = loads(tmp.path());
+        let restarted = server(tmp.path(), &embedder, true);
+        let rebuilt = answers(&restarted).await;
+        assert_eq!(loads(tmp.path()), before, "a corrupt snapshot was used");
+        assert_eq!(fresh, rebuilt);
+    }
+
+    #[tokio::test]
+    async fn cold_start_snapshots_from_another_embedding_config_are_not_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(tmp.path(), &corpus());
+        let embedder = embedder().await;
+        let first = server(tmp.path(), &embedder, true);
+        answers(&first).await;
+        flush(&first).await;
+        drop(first);
+
+        let mut config = Config::from_env();
+        config.ollama_host = embedder.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        config.embed_budget_ms = 60_000;
+        config.ollama_embed_model = "another-model".into();
+        let other = ContextPlusServer::new(tmp.path().to_path_buf(), config);
+        let before = loads(tmp.path());
+        answers(&other).await;
+        let after = loads(tmp.path());
+        assert_eq!(
+            after[1], before[1],
+            "identifier documents of another model were used"
+        );
+        assert_eq!(
+            after[2], before[2],
+            "file documents of another model were used"
+        );
+        assert!(
+            after[0] > before[0],
+            "the keyword index does not depend on the model"
+        );
+    }
+
+    #[test]
+    fn cold_start_loaded_keyword_index_holds_no_more_than_a_built_one() {
+        use crate::tools::lexical_search::{LexicalFields, LexicalIndex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let files: Vec<(String, String)> = (0..40)
+            .flat_map(|round| {
+                corpus().into_iter().map(move |(path, content)| {
+                    (format!("r{round}/{path}"), content.repeat(1 + round % 3))
+                })
+            })
+            .collect();
+        write_files(tmp.path(), &files);
+        let config = Config::from_env();
+        let cache = Arc::new(load_project_cache(tmp.path(), &config, None, false));
+        let paths: Vec<&str> = cache
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+
+        // The same build as `build_lexical_index`, on this thread so that the
+        // counting allocator sees all of it.
+        let ((built, built_retained), built_peak) = crate::alloc_probe::peak_bytes(|| {
+            crate::alloc_probe::retained_bytes(|| {
+                let mut index = LexicalIndex::with_capacity(paths.len());
+                for &path in &paths {
+                    let content = cache.file_content.get(path).unwrap().as_str();
+                    let ext = path.rsplit('.').next().unwrap_or("");
+                    let symbols: Vec<String> = parse_with_tree_sitter(content, ext)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|symbol| symbol.name)
+                        .collect();
+                    let header = crate::core::parser::extract_header(content);
+                    index.push_document(LexicalFields {
+                        path,
+                        symbols: &symbols,
+                        header: &header,
+                        content,
+                    });
+                }
+                index.finish_build();
+                let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+                (index, paths)
+            })
+        });
+        let (built_index, built_paths) = built;
+        let cached = CachedLexicalIndex {
+            index: built_index,
+            document_paths: built_paths,
+            project_cache: Arc::clone(&cache),
+            generation: 0,
+            base: None,
+        };
+        assert!(snapshots::write_keywords(tmp.path(), &config, &cached).unwrap());
+
+        let ((loaded, loaded_retained), loaded_peak) = crate::alloc_probe::peak_bytes(|| {
+            crate::alloc_probe::retained_bytes(|| {
+                let (index, paths, _digests) =
+                    snapshots::read_keywords(tmp.path(), &config).unwrap();
+                (index, paths)
+            })
+        });
+        assert_eq!(loaded.0.document_count(), cached.index.document_count());
+        assert_eq!(
+            loaded.0.search("record refund invoice", 20),
+            cached.index.search("record refund invoice", 20)
+        );
+        assert!(
+            loaded_retained <= built_retained,
+            "a loaded index holds {loaded_retained} bytes, a built one {built_retained}"
+        );
+        assert!(
+            loaded_peak <= built_peak,
+            "loading peaked at {loaded_peak} bytes, building at {built_peak}"
+        );
+    }
+
+    #[test]
+    fn cold_start_loaded_identifier_documents_hold_no_more_than_parsed_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(tmp.path(), &corpus());
+        let config = Config::from_env();
+        let cache = Arc::new(load_project_cache(tmp.path(), &config, None, false));
+        let mut paths: Vec<&String> = cache.file_content.keys().collect();
+        paths.sort();
+
+        let (parsed, parsed_retained) = crate::alloc_probe::retained_bytes(|| {
+            paths
+                .iter()
+                .filter_map(|path| {
+                    crate::tools::semantic_identifiers::identifier_docs_for_file(
+                        path,
+                        cache.file_content.get(path).unwrap(),
+                    )
+                    .map(|docs| ((*path).clone(), Arc::new(docs)))
+                })
+                .collect::<BTreeMap<_, _>>()
+        });
+        let index = IdentifierIndex {
+            docs: Segmented::from_files(parsed.clone()),
+            vectors: IdentifierVectorIndex::empty(),
+            dims: 2,
+            file_count: paths.len(),
+            built_at: Instant::now(),
+        };
+        assert!(snapshots::write_identifiers(tmp.path(), &config, &index, &cache).unwrap());
+        let digests: HashMap<&str, crate::cache::snapshot::Digest> = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.as_str(),
+                    crate::cache::snapshot::digest(
+                        cache.file_content.get(path).unwrap().as_bytes(),
+                    ),
+                )
+            })
+            .collect();
+
+        let ((loaded, to_parse), loaded_retained) = crate::alloc_probe::retained_bytes(|| {
+            snapshots::read_identifiers(tmp.path(), &config, &digests).unwrap()
+        });
+        assert!(to_parse.is_empty());
+        let parsed: Vec<_> = parsed.values().flat_map(|docs| docs.iter()).collect();
+        assert_eq!(loaded.len(), parsed.len());
+        for (loaded, parsed) in loaded.iter().zip(&parsed) {
+            assert_eq!(
+                (
+                    &loaded.id,
+                    &loaded.text,
+                    &loaded.kind_lower,
+                    &loaded.signature
+                ),
+                (
+                    &parsed.id,
+                    &parsed.text,
+                    &parsed.kind_lower,
+                    &parsed.signature
+                )
+            );
+            assert_eq!(loaded.name_token_set, parsed.name_token_set);
+            assert_eq!(loaded.signature_token_set, parsed.signature_token_set);
+            assert_eq!(loaded.parent_token_set, parsed.parent_token_set);
+        }
+        assert!(
+            loaded_retained <= parsed_retained,
+            "loaded documents hold {loaded_retained} bytes, parsed ones {parsed_retained}"
+        );
+    }
+
+    #[test]
+    fn cold_start_identifier_vectors_keep_texts_that_mention_dotted_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = "identifier-embeddings-test";
+        let key = "load function () src/a.ts Reads apps/web/.storybook/main.ts ".to_string();
+        let mut vectors = IdentifierVectors::new();
+        vectors.insert(key.clone(), Arc::from(vec![0.5_f32, 0.25]));
+        rkyv_store::save_cache(tmp.path(), name, &identifier_cache_data(&vectors).unwrap())
+            .unwrap();
+
+        let loaded = load_identifier_vectors(tmp.path(), name);
+
+        assert_eq!(
+            loaded.get(&key).map(|vector| vector.to_vec()),
+            Some(vec![0.5, 0.25]),
+            "an identifier text is not a path; path hygiene must not drop it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_only_a_daemon_preloads_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(tmp.path(), &corpus());
+        let embedder = embedder().await;
+        let first = server(tmp.path(), &embedder, true);
+        answers(&first).await;
+        flush(&first).await;
+        drop(first);
+
+        let private = server(tmp.path(), &embedder, true);
+        assert!(
+            private.spawn_warmup_task(false).is_none(),
+            "a private server preloaded the keyword and identifier indexes"
+        );
+
+        let before = loads(tmp.path());
+        let daemon = server(tmp.path(), &embedder, true);
+        daemon
+            .spawn_warmup_task(true)
+            .expect("a daemon preloads the indexes whose snapshots exist")
+            .await
+            .unwrap();
+        let after = loads(tmp.path());
+        assert!(
+            after[0] > before[0],
+            "the keyword snapshot was not preloaded"
+        );
+        assert!(
+            after[1] > before[1],
+            "the identifier snapshot was not preloaded"
         );
     }
 }

@@ -129,6 +129,25 @@ impl RefId {
 /// - `project_cache` — walked file entries and raw content for this ref.
 ///
 /// Wrap in `Arc` for cheap cloning across handler dispatches.
+/// Background snapshot writes of a ref's indexes, and the file documents read
+/// from its snapshot until a full walk has used them.
+#[derive(Default)]
+pub struct SnapshotState {
+    pub(crate) keywords: Arc<crate::cache::snapshot::WriteSchedule>,
+    pub(crate) identifiers: Arc<crate::cache::snapshot::WriteSchedule>,
+    pub(crate) files: Arc<crate::cache::snapshot::WriteSchedule>,
+    pub(crate) file_seed: std::sync::Mutex<FileSeed>,
+}
+
+/// Derived fields of the documents in the files snapshot.
+#[derive(Default)]
+pub(crate) enum FileSeed {
+    #[default]
+    Unread,
+    Read(Arc<crate::tools::semantic_search::DocumentSeeds>),
+    Used,
+}
+
 pub struct RefIndex {
     /// Original `--root-dir` argument supplied by the bridge.
     pub root_dir: PathBuf,
@@ -212,6 +231,9 @@ pub struct RefIndex {
 
     /// Cached lexical index and result-formatting metadata for this ref.
     pub(crate) lexical_search_cache: Arc<RwLock<Option<Arc<CachedLexicalIndex>>>>,
+
+    /// Snapshot writes and the snapshot's file documents for this ref.
+    pub(crate) snapshots: SnapshotState,
 }
 
 impl RefIndex {
@@ -257,6 +279,7 @@ impl RefIndex {
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
+            snapshots: SnapshotState::default(),
         }
     }
 
@@ -306,6 +329,7 @@ impl RefIndex {
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
+            snapshots: SnapshotState::default(),
         }
     }
 
@@ -357,6 +381,7 @@ impl RefIndex {
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
+            snapshots: SnapshotState::default(),
         }
     }
 

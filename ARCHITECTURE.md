@@ -210,6 +210,7 @@ All runtime knobs are read from environment variables by `Config::from_env()` (`
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONTEXTPLUS_WARMUP_ON_START` | `true` | Warm `SearchIndex` cache at server startup |
+| `CONTEXTPLUS_SNAPSHOTS` | `true` | Persist the primary checkout's keyword index, identifier documents and parsed file documents under `.mcp_data/snapshots/` and load them on the next start |
 | `CONTEXTPLUS_WARMUP_CONCURRENCY` | `1` | Parallel Ollama requests during warmup binaries |
 
 ### Tracker (file-watcher)

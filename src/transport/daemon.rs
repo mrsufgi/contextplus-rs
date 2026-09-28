@@ -616,8 +616,9 @@ pub async fn run(
     }
     let _ = std::fs::remove_file(&pid_path);
 
-    // Final flush: persist query embeddings before exit.
+    // Final flush: persist query embeddings and unwritten snapshots before exit.
     server.state.ollama.flush_query_cache();
+    server.state.flush_snapshots().await;
 
     Ok(())
 }
@@ -857,7 +858,7 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
         server.ensure_tracker_started().await;
     }
     if config.warmup_on_start {
-        server.spawn_warmup_task();
+        server.spawn_warmup_task(true);
     }
 
     run(server, listener, socket_path, pid_path, idle_secs, lock).await?;

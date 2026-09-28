@@ -64,7 +64,7 @@ fn worktree_name(root_dir: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
-fn cache_dir(root_dir: &Path) -> PathBuf {
+pub(crate) fn cache_dir(root_dir: &Path) -> PathBuf {
     let base = root_dir.join(CACHE_DIR);
     match worktree_name(root_dir) {
         Some(name) => base.join(WORKTREE_SUBDIR).join(name),
@@ -850,6 +850,52 @@ pub fn load_cache_mmap(root_dir: &Path, name: &str) -> Result<Option<CacheData>>
             load_cache(root_dir, name)
         }
     }
+}
+
+/// Calls `visit` with each key and vector of a cache whose keys are not
+/// paths, reading the archive in place: no hygiene sweep, and no owned copy
+/// of the file or of its vectors. Entries whose vector is out of bounds are
+/// skipped. `Ok(false)` when there is no cache.
+pub fn visit_cache_entries(
+    root_dir: &Path,
+    name: &str,
+    mut visit: impl FnMut(&str, &[f32]),
+) -> Result<bool> {
+    #[cfg(test)]
+    test_seams::record(root_dir, name);
+    let path = cache_path(root_dir, name);
+    let Ok(file) = fs::File::open(&path) else {
+        return Ok(false);
+    };
+    if (file.metadata()?.len() as usize) < HEADER_SIZE + 1 {
+        return Ok(false);
+    }
+    // SAFETY: the map is read-only and dropped before return; writers replace
+    // the file by rename, so the mapped inode is never modified in place.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+    if mmap[0] != CACHE_VERSION {
+        return Err(ContextPlusError::Cache(format!(
+            "unsupported cache version: {} (expected {})",
+            mmap[0], CACHE_VERSION
+        )));
+    }
+    let archived = rkyv::access::<ArchivedCacheData, rkyv::rancor::Error>(&mmap[HEADER_SIZE..])
+        .map_err(|e| ContextPlusError::Cache(format!("rkyv access: {}", e)))?;
+    let dims = archived.dims.to_native() as usize;
+    let vectors = archived.vectors.as_slice();
+    if dims == 0 {
+        return Ok(true);
+    }
+    let mut vector = Vec::with_capacity(dims);
+    for (i, key) in archived.keys.iter().enumerate() {
+        let Some(values) = vectors.get(i * dims..(i + 1) * dims) else {
+            break;
+        };
+        vector.clear();
+        vector.extend(values.iter().map(|value| value.to_native()));
+        visit(key.as_str(), &vector);
+    }
+    Ok(true)
 }
 
 /// Load a VectorStore with zero-copy mmap for the vector data.

@@ -177,6 +177,9 @@ pub struct Config {
     /// Whether to warm the SearchIndex cache at server startup.
     /// Controlled by `CONTEXTPLUS_WARMUP_ON_START` (default: true).
     pub warmup_on_start: bool,
+    /// Whether the primary checkout persists its built indexes and loads them
+    /// on the next start. Controlled by `CONTEXTPLUS_SNAPSHOTS` (default: true).
+    pub snapshots: bool,
     /// HNSW `efConstruction` — quality/speed trade-off at index build time.
     /// Controlled by `CONTEXTPLUS_HNSW_EF_CONSTRUCTION` (default: 100).
     pub hnsw_ef_construction: usize,
@@ -635,6 +638,15 @@ impl Config {
             ),
             warmup_on_start: env
                 .get("CONTEXTPLUS_WARMUP_ON_START")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "false" | "0" | "no" | "off"
+                    )
+                })
+                .unwrap_or(true),
+            snapshots: env
+                .get("CONTEXTPLUS_SNAPSHOTS")
                 .map(|v| {
                     !matches!(
                         v.trim().to_lowercase().as_str(),
