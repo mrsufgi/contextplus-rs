@@ -14,4 +14,9 @@ pub mod tools;
 pub mod transport;
 
 #[cfg(test)]
+mod alloc_probe;
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc_probe::CountingAllocator = alloc_probe::CountingAllocator;
+#[cfg(test)]
 mod test_logs;

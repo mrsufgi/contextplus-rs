@@ -195,6 +195,9 @@ pub struct Config {
 
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
 const DEFAULT_OLLAMA_MAX_CONCURRENT: usize = 4;
+/// Measured process RSS above which idle worktrees are evicted. A primary of
+/// about 8.7k files and 105k identifiers holds 1.3 GiB and peaks near 2 GiB
+/// while it builds, so this leaves room for several worktrees.
 const DEFAULT_RESIDENT_MEMORY_BUDGET_MB: usize = 4096;
 const MIN_OLLAMA_MAX_CONCURRENT: usize = 1;
 const MAX_OLLAMA_MAX_CONCURRENT: usize = 64;

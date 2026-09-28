@@ -65,6 +65,17 @@ fn mib(bytes: usize) -> f64 {
 fn report_rss(step: &str) {
     let bytes = rss_bytes();
     println!("rss step={step} bytes={bytes} mib={:.1}", mib(bytes));
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let info = unsafe { libc::mallinfo2() };
+        println!(
+            "malloc step={step} in_use_mib={:.1} mmapped_mib={:.1} arena_mib={:.1} free_in_arenas_mib={:.1}",
+            mib(info.uordblks + info.hblkhd),
+            mib(info.hblkhd),
+            mib(info.arena),
+            mib(info.fordblks),
+        );
+    }
 }
 
 fn write_corpus(root: &Path, size: ProfileSize) {
@@ -198,17 +209,24 @@ async fn component_report(session: &ProfileSession) {
                 .map(|entry| entry.hash.capacity() + entry.vector.capacity() * size_of::<f32>())
                 .sum::<usize>()
         };
+    let vector_bytes = |vectors: &crate::server::IdentifierVectors| {
+        vectors
+            .values()
+            .map(|vector| size_of_val::<[f32]>(vector))
+            .sum::<usize>()
+    };
     let identifier_base = match owner.identifier_vectors.get() {
-        Some(base) => map_bytes(&*base.read().await),
+        Some(base) => vector_bytes(&*base.read().await),
         None => 0,
     };
-    let identifier_overlay = map_bytes(&*owner.identifier_vector_overlay.read().await);
+    let identifier_overlay = vector_bytes(&*owner.identifier_vector_overlay.read().await);
+    let embedding_cache = map_bytes(&*owner.embedding_cache.read().await);
     let identifier_index_vectors = owner
         .identifier_index
         .read()
         .await
         .as_ref()
-        .map_or(0, |index| index.vector_buffer.len() * size_of::<f32>());
+        .map_or(0, |index| index.vectors.len() * size_of::<f32>());
     let search = owner.search_index_cache.read().await.clone();
     let project_bytes = owner
         .project_cache
@@ -223,7 +241,7 @@ async fn component_report(session: &ProfileSession) {
         .as_ref()
         .map_or(0, |entry| entry.own_resident_bytes());
     println!(
-        "components ref={} file_vectors={} identifier_base={} identifier_overlay={} identifier_index_vectors={} hnsw={} lexical={} project={} search_documents={}",
+        "components ref={} embedding_cache={embedding_cache} file_vectors={} identifier_base={} identifier_overlay={} identifier_index_vectors={} hnsw={} lexical={} project={} search_documents={}",
         session.name,
         search
             .as_ref()
@@ -401,6 +419,103 @@ pub async fn profile(size: ProfileSize, linked_refs: usize, cycles: usize) -> Ve
     report
 }
 
+/// Cold-starts a primary on an existing checkout and runs one query per
+/// explore mode, reporting RSS, allocator and component bytes after each step.
+pub async fn profile_existing_root(root: PathBuf) -> std::io::Result<()> {
+    let root = root.canonicalize()?;
+    report_rss("start");
+    let mut config = Config::from_env();
+    config.resident_memory_budget_bytes = usize::MAX;
+    let server = ContextPlusServer::new(root, config);
+    let session = ProfileSession {
+        name: "primary".into(),
+        owner: server.state.default_ref().unwrap(),
+        server: server.clone(),
+    };
+    report_rss("server-new");
+    component_report(&session).await;
+    for (kind, matching, query) in [
+        (
+            "files",
+            "meaning",
+            "row level security policy for organizations",
+        ),
+        ("files", "keywords", "patient invoice payment"),
+        ("identifiers", "meaning", "create a stripe checkout session"),
+        ("clusters", "meaning", "payments"),
+        ("identifiers", "keywords", "handleWebhook"),
+    ] {
+        let started = std::time::Instant::now();
+        let result = explore(&session, kind, matching, query).await;
+        let step = format!("{kind}-{matching}");
+        println!(
+            "query step={step} result_len={} secs={:.1}",
+            result.len(),
+            started.elapsed().as_secs_f64()
+        );
+        report_rss(&step);
+        component_report(&session).await;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe { libc::malloc_trim(0) };
+        report_rss("after-malloc-trim");
+    }
+    teardown_report(&session).await;
+    Ok(())
+}
+
+fn in_use_bytes() -> usize {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let info = unsafe { libc::mallinfo2() };
+        info.uordblks + info.hblkhd
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    0
+}
+
+/// Drops each heavy structure in turn and reports the allocator bytes it
+/// released, which is what the structure really held.
+async fn teardown_report(session: &ProfileSession) {
+    let owner = &session.owner;
+    let mut previous = in_use_bytes();
+    let mut released = |component: &str| {
+        let now = in_use_bytes();
+        println!(
+            "teardown component={component} released_mib={:.1} in_use_mib={:.1}",
+            mib(previous.saturating_sub(now)),
+            mib(now)
+        );
+        previous = now;
+    };
+    if let Some(lexical) = owner.lexical_search_cache.read().await.as_ref() {
+        println!("lexical {}", lexical.index.profile_stats());
+    }
+    *owner.lexical_search_cache.write().await = None;
+    released("lexical_index");
+    *owner.identifier_index.write().await = None;
+    released("identifier_index");
+    *owner.identifier_source.write().await = None;
+    released("identifier_source");
+    if let Some(vectors) = owner.identifier_vectors.get() {
+        let mut vectors = vectors.write().await;
+        vectors.clear();
+        vectors.shrink_to_fit();
+    }
+    released("identifier_vectors");
+    *owner.search_index_cache.write().await = None;
+    released("search_index");
+    *owner.project_cache.write().await = None;
+    released("project_cache");
+    {
+        let mut cache = owner.embedding_cache.write().await;
+        cache.clear();
+        cache.shrink_to_fit();
+    }
+    released("embedding_cache");
+}
+
 pub async fn run_memory_profile(linked_refs: usize, cycles: usize) {
     profile(ProfileSize::BERRIES, linked_refs, cycles).await;
 }
@@ -408,6 +523,15 @@ pub async fn run_memory_profile(linked_refs: usize, cycles: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn profiling_a_root_that_does_not_exist_is_an_error() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing");
+
+        let profiled = tokio::spawn(profile_existing_root(missing)).await;
+
+        assert!(matches!(profiled, Ok(Err(_))), "{profiled:?}");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lane_m_profile_measures_worktrees_built_from_their_own_trees() {

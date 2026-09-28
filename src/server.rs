@@ -119,10 +119,78 @@ impl CachedLexicalIndex {
 /// no tracker is running for the ref.
 pub struct IdentifierIndex {
     pub docs: Segmented<crate::tools::semantic_identifiers::IdentifierDoc>,
-    pub vector_buffer: Segmented<f32>,
+    pub vectors: IdentifierVectorIndex,
     pub dims: usize,
     pub file_count: usize,
     pub built_at: Instant,
+}
+
+/// Identifier embeddings keyed by identifier text. An identifier index holds
+/// the same allocations, so a vector is resident once however many indexes use it.
+pub(crate) type IdentifierVectors = HashMap<String, Arc<[f32]>>;
+
+/// One embedding per identifier, grouped by file like the index documents and
+/// read as a flat buffer of `dims` floats per identifier.
+#[derive(Clone)]
+pub struct IdentifierVectorIndex {
+    segments: Segmented<Arc<[f32]>>,
+    dims: usize,
+}
+
+impl IdentifierVectorIndex {
+    fn new(files: std::collections::BTreeMap<String, Arc<Vec<Arc<[f32]>>>>, dims: usize) -> Self {
+        Self {
+            segments: Segmented::from_files(files),
+            dims,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(std::collections::BTreeMap::new(), 0)
+    }
+
+    /// One vector per identifier; every vector must have `dims` floats.
+    pub fn from_vectors(vectors: Vec<Vec<f32>>, dims: usize) -> Self {
+        let vectors = vectors.into_iter().map(Arc::from).collect();
+        Self::new(
+            std::collections::BTreeMap::from([(String::new(), Arc::new(vectors))]),
+            dims,
+        )
+    }
+
+    /// Floats across all identifiers.
+    pub fn len(&self) -> usize {
+        self.segments.len() * self.dims
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The vector of identifier `index`.
+    pub fn vector(&self, index: usize) -> &Arc<[f32]> {
+        crate::tools::semantic_identifiers::IndexData::get(&self.segments, index)
+    }
+
+    fn file_segments(&self) -> &std::collections::BTreeMap<String, Arc<Vec<Arc<[f32]>>>> {
+        &self.segments.files
+    }
+}
+
+impl crate::tools::semantic_identifiers::IndexData<f32> for IdentifierVectorIndex {
+    fn len(&self) -> usize {
+        IdentifierVectorIndex::len(self)
+    }
+    fn get(&self, index: usize) -> &f32 {
+        &self.vector(index / self.dims)[index % self.dims]
+    }
+    fn slice(&self, range: std::ops::Range<usize>) -> &[f32] {
+        if range.is_empty() {
+            return &[];
+        }
+        let local = range.start % self.dims;
+        &self.vector(range.start / self.dims)[local..local + range.len()]
+    }
 }
 
 #[derive(Clone)]
@@ -303,6 +371,15 @@ pub struct SharedState {
     ref_access: std::sync::Mutex<HashMap<crate::ref_index::RefId, (u64, Instant)>>,
     budget_enforcement_running: std::sync::atomic::AtomicBool,
     last_budget_enforcement: std::sync::Mutex<Option<Instant>>,
+    last_budget_trim: std::sync::Mutex<Option<Instant>>,
+    /// When the under-budget path last asked the allocator how much it holds free.
+    last_free_memory_check: std::sync::Mutex<Option<Instant>>,
+    /// Set once the over-budget warning is logged, until memory is back under budget.
+    budget_warned: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) measured_resident_override: std::sync::Mutex<Option<usize>>,
+    #[cfg(test)]
+    free_memory_checks: std::sync::atomic::AtomicUsize,
 }
 
 impl SharedState {
@@ -508,6 +585,11 @@ impl SharedState {
         });
     }
 
+    /// Keeps the process within `resident_memory_budget_bytes` of RAM. The
+    /// trigger is measured process memory; per-ref estimates only pick which
+    /// idle worktrees to evict, least recently used first, down to 80% of the
+    /// budget. The primary is never evicted: when it alone exceeds the budget
+    /// one warning names its heaviest structures.
     pub async fn enforce_memory_budget(&self) {
         let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
         let mut snapshots = Vec::with_capacity(refs.len());
@@ -526,14 +608,34 @@ impl SharedState {
         };
 
         let mut holders: HashMap<usize, (usize, usize)> = HashMap::new();
-        for &(ptr, bytes) in components.iter().flatten() {
+        for &(ptr, bytes, _) in components.iter().flatten() {
             holders.entry(ptr).or_insert((bytes, 0)).1 += 1;
         }
-        let mut resident = holders
+        let estimated = holders
             .values()
             .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
         let budget = self.config.resident_memory_budget_bytes;
-        if resident <= budget {
+        let measured = self.measured_resident_bytes(estimated);
+        if measured <= budget {
+            self.budget_warned
+                .store(false, std::sync::atomic::Ordering::Release);
+            tracing::debug!(measured, estimated, budget, "Resident memory under budget");
+            if !self.trim_due() || !interval_elapsed(&self.last_free_memory_check) {
+                return;
+            }
+            *self.last_free_memory_check.lock().unwrap() = Some(Instant::now());
+            #[cfg(test)]
+            self.free_memory_checks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Index builds leave freed memory the allocator keeps for reuse.
+            let threshold = MEMORY_RETAINED_FREE_TRIM_BYTES.max(budget / 8);
+            let trimmed =
+                tokio::task::spawn_blocking(move || trim_retained_free_memory(measured, threshold))
+                    .await
+                    .unwrap_or(false);
+            if trimmed {
+                *self.last_budget_trim.lock().unwrap() = Some(Instant::now());
+            }
             return;
         }
         let low_watermark = budget / 5 * 4;
@@ -552,13 +654,14 @@ impl SharedState {
             .collect();
         candidates.sort_unstable();
         let id_cache_name = cache_name("identifier-embeddings", &self.config);
-        let mut cleared = false;
+        let mut expected = measured;
+        let mut evicted = 0usize;
         for (_, i) in candidates {
-            if resident <= low_watermark {
+            if expected <= low_watermark {
                 break;
             }
             let owner = &refs[i];
-            let holds_unique_bytes = components[i].iter().any(|(ptr, _)| holders[ptr].1 == 1);
+            let holds_unique_bytes = components[i].iter().any(|(ptr, _, _)| holders[ptr].1 == 1);
             if !holds_unique_bytes
                 || owner
                     .active_requests
@@ -568,21 +671,80 @@ impl SharedState {
                 continue;
             }
             clear_ref_heavy_caches(owner, &id_cache_name).await;
-            cleared = true;
-            for (ptr, _) in &components[i] {
+            evicted += 1;
+            for (ptr, _, _) in &components[i] {
                 let holder = holders.get_mut(ptr).unwrap();
                 holder.1 -= 1;
                 if holder.1 == 0 {
-                    resident = resident.saturating_sub(holder.0);
+                    expected = expected.saturating_sub(holder.0);
                 }
             }
         }
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        if cleared {
-            let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+        if evicted > 0 || self.trim_due() {
+            self.trim_free_memory().await;
         }
-        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-        let _ = cleared;
+        let estimated_after = holders
+            .values()
+            .filter(|(_, count)| *count > 0)
+            .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
+        let measured_after = self.measured_resident_bytes(estimated_after);
+        if measured_after <= budget {
+            self.budget_warned
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        if self
+            .budget_warned
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mib = |bytes: usize| bytes / (1024 * 1024);
+        let primary = refs
+            .iter()
+            .position(|owner| Arc::ptr_eq(owner, &self.default_ref));
+        let mut breakdown: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for (_, bytes, name) in primary.map_or(&[][..], |i| &components[i][..]) {
+            *breakdown.entry(name).or_default() += bytes;
+        }
+        let breakdown = breakdown
+            .iter()
+            .map(|(name, bytes)| format!("{name}={}MiB", mib(*bytes)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::warn!(
+            measured_mib = mib(measured_after),
+            budget_mib = mib(budget),
+            evicted_worktrees = evicted,
+            "Resident memory is over CONTEXTPLUS_MEMORY_BUDGET_MB after evicting every idle \
+             worktree it could; the primary checkout is never evicted. Estimated primary \
+             structures: {breakdown}"
+        );
+    }
+
+    fn trim_due(&self) -> bool {
+        interval_elapsed(&self.last_budget_trim)
+    }
+
+    async fn trim_free_memory(&self) {
+        release_free_memory().await;
+        *self.last_budget_trim.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Bytes of RAM the process holds. Tests share one process, so there the
+    /// estimate stands in unless a test sets a measurement.
+    fn measured_resident_bytes(&self, estimated: usize) -> usize {
+        #[cfg(test)]
+        {
+            self.measured_resident_override
+                .lock()
+                .unwrap()
+                .unwrap_or(estimated)
+        }
+        #[cfg(not(test))]
+        {
+            process_resident_bytes().unwrap_or(estimated)
+        }
     }
 
     pub fn schedule_memory_budget_enforcement(self: &Arc<Self>) {
@@ -618,6 +780,61 @@ impl SharedState {
 }
 
 const MEMORY_BUDGET_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// While memory stays over budget with nothing left to evict, freed memory is
+/// returned to the OS at most this often.
+const MEMORY_BUDGET_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resident set size of this process, from `/proc/self/statm`.
+fn process_resident_bytes() -> Option<usize> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    Some(pages.saturating_mul(page_size))
+}
+
+/// Freed memory the allocator may keep before it is returned to the OS while
+/// the process is under budget.
+const MEMORY_RETAINED_FREE_TRIM_BYTES: usize = 256 * 1024 * 1024;
+
+/// Bytes the allocator has handed out and not had back.
+fn allocator_in_use_bytes() -> Option<usize> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let info = unsafe { libc::mallinfo2() };
+        Some(info.uordblks + info.hblkhd)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    None
+}
+
+fn interval_elapsed(last: &std::sync::Mutex<Option<Instant>>) -> bool {
+    last.lock()
+        .unwrap()
+        .is_none_or(|last| last.elapsed() >= MEMORY_BUDGET_TRIM_INTERVAL)
+}
+
+/// Returns freed memory to the OS when the allocator holds more than
+/// `threshold` of `measured` free. Walks the allocator's bins, so it runs off
+/// the async runtime.
+fn trim_retained_free_memory(measured: usize, threshold: usize) -> bool {
+    let retained_free =
+        allocator_in_use_bytes().map_or(0, |in_use| measured.saturating_sub(in_use));
+    tracing::debug!(measured, retained_free, threshold, "Allocator free memory");
+    if retained_free <= threshold {
+        return false;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    true
+}
+
+/// Returns memory the allocator holds free to the OS.
+async fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+}
 /// A worktree used more recently than this is never evicted, so concurrently
 /// active worktrees cannot evict each other into repeated cold rebuilds.
 const MEMORY_BUDGET_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -634,8 +851,12 @@ impl Drop for BudgetEnforcementGuard {
 
 /// Heavy per-ref structures captured under short read locks. Map sizes are
 /// estimated in O(1); the `Arc` snapshots are walked off the async runtime.
+/// A heavy structure: its address (shared structures count once), estimated
+/// bytes and name.
+type ResidentComponent = (usize, usize, &'static str);
+
 struct ResidentSnapshot {
-    components: Vec<(usize, usize)>,
+    components: Vec<ResidentComponent>,
     identifier_index: Option<Arc<IdentifierIndex>>,
     search_index: Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>,
     project_cache: Option<Arc<ProjectCache>>,
@@ -648,16 +869,19 @@ impl ResidentSnapshot {
         components.push((
             Arc::as_ptr(&owner.embedding_cache) as usize,
             cache_entry_bytes(&*owner.embedding_cache.read().await),
+            "file_vectors",
         ));
         if let Some(vectors) = owner.identifier_vectors.get() {
             components.push((
                 Arc::as_ptr(vectors) as usize,
-                cache_entry_bytes(&*vectors.read().await),
+                identifier_vector_bytes(&*vectors.read().await),
+                "identifier_vectors",
             ));
         }
         components.push((
             Arc::as_ptr(&owner.identifier_vector_overlay) as usize,
-            cache_entry_bytes(&*owner.identifier_vector_overlay.read().await),
+            identifier_vector_bytes(&*owner.identifier_vector_overlay.read().await),
+            "identifier_overlay",
         ));
         // One statement per lock so no guard is held while the next is awaited.
         let identifier_index = owner.identifier_index.read().await.clone();
@@ -673,18 +897,21 @@ impl ResidentSnapshot {
         }
     }
 
-    fn measure(self) -> Vec<(usize, usize)> {
+    fn measure(self) -> Vec<ResidentComponent> {
         let mut components = self.components;
         if let Some(index) = &self.identifier_index {
             components.push((
                 Arc::as_ptr(index) as usize,
-                index.vector_buffer.len() * std::mem::size_of::<f32>() + index.docs.len() * 128,
+                // The vectors themselves are charged to the maps they were looked up in.
+                index.docs.len() * (128 + std::mem::size_of::<Arc<[f32]>>()),
+                "identifier_index",
             ));
         }
         if let Some(index) = &self.search_index {
             components.push((
                 Arc::as_ptr(index) as usize,
                 index.estimated_resident_bytes(),
+                "semantic_index",
             ));
         }
         // Shared bases are keyed by the base's own pointer, so a base counts once
@@ -696,11 +923,13 @@ impl ResidentSnapshot {
             components.push((
                 Arc::as_ptr(files.own()) as usize,
                 files.own_resident_bytes(),
+                "file_contents",
             ));
             if let Some(base) = files.base() {
                 components.push((
                     Arc::as_ptr(base) as usize,
                     crate::core::walker::content_map_bytes(base),
+                    "file_contents",
                 ));
             }
         };
@@ -714,17 +943,73 @@ impl ResidentSnapshot {
             }
         }
         if let Some(cache) = &self.lexical {
-            components.push((Arc::as_ptr(cache) as usize, cache.own_resident_bytes()));
+            components.push((
+                Arc::as_ptr(cache) as usize,
+                cache.own_resident_bytes(),
+                "keyword_index",
+            ));
             if let Some(base) = &cache.base {
                 components.push((
                     Arc::as_ptr(&base.cached) as usize,
                     base.cached.own_resident_bytes(),
+                    "keyword_index",
                 ));
             }
         }
-        components.retain(|(_, bytes)| *bytes > 0);
+        components.retain(|(_, bytes, _)| *bytes > 0);
         components
     }
+}
+
+/// Identifier vectors persisted under `root`, or none. The archive is moved
+/// into the map entry by entry, so loading holds one extra copy at most.
+fn load_identifier_vectors(root: &std::path::Path, name: &str) -> IdentifierVectors {
+    let Some(data) = rkyv_store::load_cache(root, name).ok().flatten() else {
+        return IdentifierVectors::new();
+    };
+    let dims = data.dims as usize;
+    let mut vectors = IdentifierVectors::with_capacity(data.keys.len());
+    for (i, key) in data.keys.into_iter().enumerate() {
+        if !crate::core::walker::should_keep_cache_key(&key) {
+            continue;
+        }
+        if let Some(vector) = data.vectors.get(i * dims..(i + 1) * dims) {
+            vectors.insert(key, Arc::from(vector));
+        }
+    }
+    vectors
+}
+
+/// The on-disk form of identifier vectors; the hash of an identifier is the
+/// hash of its text.
+fn identifier_cache_data(vectors: &IdentifierVectors) -> Option<rkyv_store::CacheData> {
+    let dims = vectors
+        .values()
+        .map(|vector| vector.len())
+        .find(|&len| len > 0)?;
+    let mut data = rkyv_store::CacheData {
+        dims: dims as u32,
+        keys: Vec::with_capacity(vectors.len()),
+        hashes: Vec::with_capacity(vectors.len()),
+        vectors: Vec::with_capacity(vectors.len() * dims),
+    };
+    for (key, vector) in vectors.iter().filter(|(_, vector)| vector.len() == dims) {
+        data.keys.push(key.clone());
+        data.hashes.push(crate::core::parser::hash_content(key));
+        data.vectors.extend_from_slice(vector);
+    }
+    Some(data)
+}
+
+/// O(1) estimate: vectors of one map share a width.
+fn identifier_vector_bytes(vectors: &IdentifierVectors) -> usize {
+    vectors.values().next().map_or(0, |vector| {
+        vectors.len()
+            * (std::mem::size_of::<(String, Arc<[f32]>)>()
+                + 64
+                + 2 * std::mem::size_of::<usize>()
+                + std::mem::size_of_val::<[f32]>(vector))
+    })
 }
 
 /// O(1) estimate: entries of one map share a vector width.
@@ -738,27 +1023,33 @@ fn cache_entry_bytes(cache: &HashMap<String, CacheEntry>) -> usize {
     })
 }
 
-fn lexical_document(
-    path: &str,
-    content: Option<&Arc<String>>,
-) -> crate::tools::semantic_search::SearchDocument {
-    let content = content
-        .map(|content| content.as_str().to_owned())
-        .unwrap_or_default();
-    let ext = path.rsplit('.').next().unwrap_or("");
-    let symbols = parse_with_tree_sitter(&content, ext)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|symbol| symbol.name)
-        .collect();
-    let header = crate::core::parser::extract_header(&content);
-    crate::tools::semantic_search::SearchDocument::new(
-        path.to_string(),
-        header,
-        symbols,
-        vec![],
-        content,
-    )
+/// Keyword index over `paths` of `files`, with the path of each document.
+fn build_lexical_index<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    files: &crate::core::walker::FileContents,
+) -> (crate::tools::lexical_search::LexicalIndex, Vec<String>) {
+    use crate::tools::lexical_search::{LexicalFields, LexicalIndex};
+
+    let paths: Vec<&str> = paths.collect();
+    let mut index = LexicalIndex::with_capacity(paths.len());
+    for &path in &paths {
+        let content = files.get(path).map_or("", |content| content.as_str());
+        let ext = path.rsplit('.').next().unwrap_or("");
+        let symbols: Vec<String> = parse_with_tree_sitter(content, ext)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        let header = crate::core::parser::extract_header(content);
+        index.push_document(LexicalFields {
+            path,
+            symbols: &symbols,
+            header: &header,
+            content,
+        });
+    }
+    index.finish_build();
+    (index, paths.into_iter().map(str::to_owned).collect())
 }
 
 /// A cache layered over a base stays valid only while that base is still the
@@ -895,19 +1186,27 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
     owner.embedding_cache.write().await.clear();
     *owner.identifier_index.write().await = None;
     *owner.identifier_source.write().await = None;
-    if let Some(vectors) = owner.identifier_vectors.get()
-        && Arc::strong_count(vectors) == 1
-    {
-        vectors.write().await.clear();
-    }
     let save_lock = owner.identifier_save_lock.lock().await;
+    let resident = match owner.identifier_vectors.get() {
+        Some(vectors) if Arc::strong_count(vectors) == 1 => {
+            std::mem::take(&mut *vectors.write().await)
+        }
+        _ => IdentifierVectors::default(),
+    };
     let mut overlay = owner.identifier_vector_overlay.write().await;
-    let unsaved = std::mem::take(&mut *overlay);
-    if let Some(store) = crate::core::embeddings::VectorStore::from_cache(&unsaved) {
+    let mut pending = std::mem::take(&mut *overlay);
+    for (key, vector) in std::mem::take(&mut *owner.identifier_unsaved.lock().unwrap()) {
+        pending.entry(key).or_insert(vector);
+    }
+    if let Some(data) = identifier_cache_data(&pending) {
         let root = owner.root_dir.clone();
         let name = id_cache_name.to_string();
         let saved = tokio::task::spawn_blocking(move || {
-            rkyv_store::save_vector_store_merged(&root, &name, &store)
+            rkyv_store::save_cache_rebuilding(&root, &name, &data, || {
+                let mut all = resident;
+                all.extend(pending);
+                identifier_cache_data(&all)
+            })
         })
         .await;
         if let Ok(Err(error)) = saved {
@@ -1244,6 +1543,13 @@ impl ContextPlusServer {
             )])),
             budget_enforcement_running: std::sync::atomic::AtomicBool::new(false),
             last_budget_enforcement: std::sync::Mutex::new(None),
+            last_budget_trim: std::sync::Mutex::new(None),
+            last_free_memory_check: std::sync::Mutex::new(None),
+            budget_warned: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            measured_resident_override: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            free_memory_checks: std::sync::atomic::AtomicUsize::new(0),
         });
         Self {
             state,
@@ -1697,10 +2003,10 @@ impl ContextPlusServer {
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
                         docs: doc_list.into(),
-                        // vector_buffer + dims left empty — shallow mode omits
+                        // vectors + dims left empty — shallow mode omits
                         // embedding calls.  Full mode (or first real tool call)
                         // will populate these fields.
-                        vector_buffer: Vec::new().into(),
+                        vectors: IdentifierVectorIndex::empty(),
                         dims: 0,
                         file_count,
                         built_at: std::time::Instant::now(),
@@ -1917,7 +2223,7 @@ impl ContextPlusServer {
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
                         docs: doc_list.into(),
-                        vector_buffer: Vec::new().into(),
+                        vectors: IdentifierVectorIndex::empty(),
                         dims: 0,
                         file_count,
                         built_at: std::time::Instant::now(),
@@ -2766,7 +3072,7 @@ impl ContextPlusServer {
         if identifier_docs.is_empty() && !incremental {
             let idx = Arc::new(IdentifierIndex {
                 docs: Vec::new().into(),
-                vector_buffer: Vec::new().into(),
+                vectors: IdentifierVectorIndex::empty(),
                 dims: 0,
                 file_count,
                 built_at: Instant::now(),
@@ -2819,11 +3125,7 @@ impl ContextPlusServer {
                 let root = base_owner.root_dir.clone();
                 let name = id_cache_name.clone();
                 tokio::task::spawn_blocking(move || {
-                    let mut vectors = HashMap::new();
-                    if let Ok(Some(data)) = rkyv_store::load_cache(&root, &name) {
-                        vectors.extend(data.to_store().to_cache());
-                    }
-                    Arc::new(RwLock::new(vectors))
+                    Arc::new(RwLock::new(load_identifier_vectors(&root, &name)))
                 })
                 .await
                 .map_err(|error| ContextPlusError::Other(error.to_string()))
@@ -2840,15 +3142,9 @@ impl ContextPlusServer {
         {
             let root = ref_index.root_dir.clone();
             let name = id_cache_name.clone();
-            let loaded = tokio::task::spawn_blocking(move || {
-                rkyv_store::load_cache(&root, &name)
-                    .ok()
-                    .flatten()
-                    .map(|data| data.to_store().to_cache())
-                    .unwrap_or_default()
-            })
-            .await
-            .map_err(|error| ContextPlusError::Other(error.to_string()))?;
+            let loaded = tokio::task::spawn_blocking(move || load_identifier_vectors(&root, &name))
+                .await
+                .map_err(|error| ContextPlusError::Other(error.to_string()))?;
             let mut overlay = ref_index.identifier_vector_overlay.write().await;
             if !ref_index
                 .identifier_overlay_loaded
@@ -2862,22 +3158,15 @@ impl ContextPlusServer {
         let overlay = ref_index.identifier_vector_overlay.read().await;
         let id_caches = resident.read().await;
 
-        // Partition: cached vs uncached identifiers (use &str slices for cache lookup)
-        let mut result_vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_identifiers);
+        // Partition: cached vs uncached identifiers. A cached vector is shared
+        // with the map it was found in, never copied.
+        let mut result_vectors: Vec<Option<Arc<[f32]>>> = Vec::with_capacity(n_identifiers);
         let mut uncached_indices: Vec<usize> = Vec::new();
         let mut uncached_texts: Vec<String> = Vec::new();
 
         for (i, doc) in identifier_docs.iter().enumerate() {
-            if let Some(vec) = overlay
-                .get(&doc.text)
-                .or_else(|| id_caches.get(&doc.text))
-                .map(|entry| &entry.vector)
-            {
-                #[cfg(test)]
-                ref_index
-                    .identifier_resident_vector_elements_copied
-                    .fetch_add(vec.len(), std::sync::atomic::Ordering::Relaxed);
-                result_vectors.push(Some(vec.to_vec()));
+            if let Some(vector) = overlay.get(&doc.text).or_else(|| id_caches.get(&doc.text)) {
+                result_vectors.push(Some(Arc::clone(vector)));
                 continue;
             }
             result_vectors.push(None);
@@ -2901,10 +3190,11 @@ impl ContextPlusServer {
                 let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
                 let chunk_vectors = self.state.ollama.embed_documents(chunk_texts).await?;
-                for (local_j, &idx) in uncached_indices[chunk_start..chunk_end].iter().enumerate() {
-                    if local_j < chunk_vectors.len() {
-                        result_vectors[idx] = Some(chunk_vectors[local_j].clone());
-                    }
+                for (&idx, vector) in uncached_indices[chunk_start..chunk_end]
+                    .iter()
+                    .zip(chunk_vectors)
+                {
+                    result_vectors[idx] = Some(Arc::from(vector));
                 }
             }
         }
@@ -2916,18 +3206,15 @@ impl ContextPlusServer {
                 Arc::clone(resident)
             };
             let mut target_guard = target.write().await;
+            let mut unsaved = ref_index.identifier_unsaved.lock().unwrap();
             for &i in &uncached_indices {
                 if let Some(vector) = &result_vectors[i] {
                     let key = identifier_docs[i].text.clone();
-                    target_guard.insert(
-                        key.clone(),
-                        CacheEntry {
-                            hash: crate::core::parser::hash_content(&key),
-                            vector: vector.clone(),
-                        },
-                    );
+                    target_guard.insert(key.clone(), Arc::clone(vector));
+                    unsaved.insert(key, Arc::clone(vector));
                 }
             }
+            drop(unsaved);
             drop(target_guard);
             let ticket = ref_index
                 .identifier_persist_generation
@@ -2936,6 +3223,8 @@ impl ContextPlusServer {
             let persist_generation = Arc::clone(&ref_index.identifier_persist_generation);
             let persist_root = ref_index.root_dir.clone();
             let save_lock = Arc::clone(&ref_index.identifier_save_lock);
+            let unsaved = Arc::clone(&ref_index.identifier_unsaved);
+            let resident_set = Arc::downgrade(&target);
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 // Serialized with the budget flush: both merge into the same file.
@@ -2943,16 +3232,27 @@ impl ContextPlusServer {
                 if persist_generation.load(std::sync::atomic::Ordering::Acquire) != ticket {
                     return;
                 }
-                let cache = target.read().await;
-                let store = crate::core::embeddings::VectorStore::from_cache(&cache);
-                drop(cache);
-                if let Some(store) = store {
-                    let result = tokio::task::spawn_blocking(move || {
-                        rkyv_store::save_vector_store_merged(&persist_root, &id_cache_name, &store)
+                // Only the vectors embedded since the last save: the save merges
+                // them into what is already on disk, or rebuilds a missing file
+                // from the whole resident set.
+                let pending = std::mem::take(&mut *unsaved.lock().unwrap());
+                let Some(data) = identifier_cache_data(&pending) else {
+                    return;
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    rkyv_store::save_cache_rebuilding(&persist_root, &id_cache_name, &data, || {
+                        let vectors = resident_set.upgrade()?;
+                        identifier_cache_data(&vectors.blocking_read())
                     })
-                    .await;
-                    if let Ok(Err(error)) = result {
+                })
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    if let Ok(Err(error)) = &result {
                         tracing::warn!(%error, "Identifier cache persistence failed");
+                    }
+                    let mut unsaved = unsaved.lock().unwrap();
+                    for (key, vector) in pending {
+                        unsaved.entry(key).or_insert(vector);
                     }
                 }
             });
@@ -2962,20 +3262,17 @@ impl ContextPlusServer {
             .first()
             .and_then(|v| v.as_ref())
             .map_or(0, |v| v.len());
-        let flat_buffer: Vec<f32> = result_vectors
-            .into_iter()
-            .flat_map(|v| v.unwrap_or_else(|| vec![0.0; dims]))
-            .collect();
+        let zero: Arc<[f32]> = Arc::from(vec![0.0; dims]);
 
         let mut docs_by_file: std::collections::BTreeMap<String, Vec<_>> =
             std::collections::BTreeMap::new();
-        let mut vectors_by_file: std::collections::BTreeMap<String, Vec<f32>> =
+        let mut vectors_by_file: std::collections::BTreeMap<String, Vec<Arc<[f32]>>> =
             std::collections::BTreeMap::new();
-        for (i, doc) in identifier_docs.into_iter().enumerate() {
-            vectors_by_file
-                .entry(doc.path.clone())
-                .or_default()
-                .extend_from_slice(&flat_buffer[i * dims..(i + 1) * dims]);
+        for (doc, vector) in identifier_docs.into_iter().zip(result_vectors) {
+            let file_vectors = vectors_by_file.entry(doc.path.clone()).or_default();
+            if dims != 0 {
+                file_vectors.push(vector.unwrap_or_else(|| Arc::clone(&zero)));
+            }
             docs_by_file.entry(doc.path.clone()).or_default().push(doc);
         }
         let mut docs = if incremental {
@@ -2984,7 +3281,7 @@ impl ContextPlusServer {
             std::collections::BTreeMap::new()
         };
         let mut vectors = if incremental {
-            previous.as_ref().unwrap().vector_buffer.files.clone()
+            previous.as_ref().unwrap().vectors.file_segments().clone()
         } else {
             std::collections::BTreeMap::new()
         };
@@ -3008,10 +3305,11 @@ impl ContextPlusServer {
             drop(update_guard);
             return Box::pin(self.build_identifier_index(cache, background)).await;
         }
+        let dims = if incremental { previous_dims } else { dims };
         let idx = Arc::new(IdentifierIndex {
             docs: Segmented::from_files(docs),
-            vector_buffer: Segmented::from_files(vectors),
-            dims: if incremental { previous_dims } else { dims },
+            vectors: IdentifierVectorIndex::new(vectors, dims),
+            dims,
             file_count,
             built_at: Instant::now(),
         });
@@ -3075,7 +3373,7 @@ impl ContextPlusServer {
         ref_index: &Arc<crate::ref_index::RefIndex>,
         project_cache: &Arc<ProjectCache>,
     ) -> Result<Option<Arc<CachedLexicalIndex>>> {
-        use crate::tools::lexical_search::{BaseMask, LexicalIndex};
+        use crate::tools::lexical_search::BaseMask;
         use std::sync::atomic::Ordering;
 
         let Some(parent_id) = ref_index.parent_ref_id else {
@@ -3141,21 +3439,20 @@ impl ContextPlusServer {
                 .iter()
                 .map(String::as_str)
                 .collect();
-            let docs: Vec<_> = source
-                .file_entries
-                .iter()
-                .filter(|entry| {
-                    !entry.is_directory
-                        && (changed(&entry.relative_path)
-                            || !in_base.contains(entry.relative_path.as_str()))
-                })
-                .map(|entry| {
-                    lexical_document(&entry.relative_path, files.get(&entry.relative_path))
-                })
-                .collect();
-            let index = LexicalIndex::build(&docs);
+            let (index, document_paths) = build_lexical_index(
+                source
+                    .file_entries
+                    .iter()
+                    .filter(|entry| {
+                        !entry.is_directory
+                            && (changed(&entry.relative_path)
+                                || !in_base.contains(entry.relative_path.as_str()))
+                    })
+                    .map(|entry| entry.relative_path.as_str()),
+                files,
+            );
             let mask = BaseMask::new(&parent_index.index, masked);
-            (index, docs.into_iter().map(|doc| doc.path).collect(), mask)
+            (index, document_paths, mask)
         })
         .await
         .map_err(|e| {
@@ -3188,7 +3485,6 @@ impl ContextPlusServer {
         ref_index: &Arc<crate::ref_index::RefIndex>,
         project_cache: &Arc<ProjectCache>,
     ) -> Result<Arc<CachedLexicalIndex>> {
-        use crate::tools::lexical_search::LexicalIndex;
         use crate::tools::semantic_search::SearchDocument;
         use std::sync::atomic::Ordering;
 
@@ -3308,20 +3604,14 @@ impl ContextPlusServer {
             return Ok(Arc::clone(previous));
         }
         let build = tokio::task::spawn_blocking(move || {
-            let docs: Vec<SearchDocument> = cache_for_build
-                .file_entries
-                .iter()
-                .filter(|e| !e.is_directory)
-                .map(|e| {
-                    lexical_document(
-                        &e.relative_path,
-                        cache_for_build.file_content.get(&e.relative_path),
-                    )
-                })
-                .collect();
-            let index = LexicalIndex::build(&docs);
-            let document_paths = docs.into_iter().map(|doc| doc.path).collect();
-            (index, document_paths)
+            build_lexical_index(
+                cache_for_build
+                    .file_entries
+                    .iter()
+                    .filter(|e| !e.is_directory)
+                    .map(|e| e.relative_path.as_str()),
+                &cache_for_build.file_content,
+            )
         });
         if let Some(previous) = stale {
             ref_index.lexical_rebuilding.store(true, Ordering::Release);
@@ -3782,7 +4072,7 @@ impl ContextPlusServer {
             options,
             &OllamaEmbedder(self.state.ollama.clone()),
             &idx.docs,
-            &idx.vector_buffer,
+            &idx.vectors,
             idx.dims,
             &cache.file_content,
             candidates.as_deref(),
@@ -6047,10 +6337,199 @@ mod tests {
         );
     }
 
+    async fn identifier_server_with_saved_cache() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        String,
+        usize,
+    ) {
+        let files = [(
+            "src/ledger.rs",
+            "pub fn open_ledger() {}\npub fn close_ledger() {}\npub fn audit_ledger() {}\n",
+        )];
+        let (repo, ollama, server) = identifier_server(&files).await;
+        let name = cache_name("identifier-embeddings", &server.state.config);
+        explore_identifier(&server, "open_ledger", None).await;
+        let saved = wait_for_identifier_cache(repo.path(), &name, 3).await;
+        (repo, ollama, server, name, saved)
+    }
+
+    async fn wait_for_identifier_cache(
+        root: &std::path::Path,
+        name: &str,
+        at_least: usize,
+    ) -> usize {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some(data)) = rkyv_store::load_cache(root, name)
+                    && data.keys.len() >= at_least
+                {
+                    return data.keys.len();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    async fn embed_one_more_identifier(repo: &std::path::Path, server: &ContextPlusServer) {
+        std::fs::write(
+            repo.join("src/ledger.rs"),
+            "pub fn open_ledger() {}\npub fn close_ledger() {}\npub fn audit_ledger() {}\npub fn reopen_ledger() {}\n",
+        )
+        .unwrap();
+        let callback = server.build_tracker_callback().await;
+        callback(repo.to_path_buf(), vec!["src/ledger.rs".to_string()])
+            .await
+            .unwrap();
+        let output = explore_identifier(server, "reopen_ledger", None).await;
+        assert!(output.contains("reopen_ledger"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn identifier_save_rebuilds_an_unreadable_cache_file_from_memory() {
+        let (repo, _ollama, server, name, saved) = identifier_server_with_saved_cache().await;
+        assert!(saved >= 3, "the first identifier save never landed");
+        std::fs::write(
+            repo.path().join(".mcp_data").join(format!("{name}.rkyv")),
+            b"not a cache",
+        )
+        .unwrap();
+
+        embed_one_more_identifier(repo.path(), &server).await;
+
+        let rebuilt = wait_for_identifier_cache(repo.path(), &name, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rebuilt = rkyv_store::load_cache(repo.path(), &name)
+            .unwrap()
+            .map_or(rebuilt, |data| data.keys.len());
+        assert!(
+            rebuilt > saved,
+            "the save after a corrupt cache file wrote {rebuilt} entries, not the {} in memory",
+            saved + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_flush_writes_unsaved_identifiers_and_rebuilds_a_missing_cache_file() {
+        let (repo, _ollama, server, name, saved) = identifier_server_with_saved_cache().await;
+        assert!(saved >= 3, "the first identifier save never landed");
+        std::fs::remove_file(repo.path().join(".mcp_data").join(format!("{name}.rkyv"))).unwrap();
+
+        let primary = server.state.default_ref().unwrap();
+        let embedded: Arc<[f32]> = Arc::from(vec![0.0, 1.0]);
+        primary
+            .identifier_vectors
+            .get()
+            .unwrap()
+            .write()
+            .await
+            .insert("reopen_ledger".into(), Arc::clone(&embedded));
+        primary
+            .identifier_unsaved
+            .lock()
+            .unwrap()
+            .insert("reopen_ledger".into(), embedded);
+        clear_ref_heavy_caches(&primary, &name).await;
+
+        let flushed = rkyv_store::load_cache(repo.path(), &name)
+            .unwrap()
+            .map_or(0, |data| data.keys.len());
+        assert!(
+            flushed > saved,
+            "eviction left {flushed} identifier entries on disk, not the {} in memory",
+            saved + 1
+        );
+    }
+
+    #[test]
+    fn keyword_index_build_holds_one_document_at_a_time() {
+        let files: crate::core::walker::ContentMap = (0..300)
+            .map(|i| {
+                let body: String = (0..800)
+                    .map(|j| format!("word{} ", (i * 7 + j) % 900))
+                    .collect();
+                (format!("src/file_{i}.rs"), Arc::new(body))
+            })
+            .collect();
+        let files = crate::core::walker::FileContents::from(files);
+        let mut paths: Vec<&str> = files.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+
+        let (((index, document_paths), retained), peak) = crate::alloc_probe::peak_bytes(|| {
+            crate::alloc_probe::retained_bytes(|| {
+                build_lexical_index(paths.iter().copied(), &files)
+            })
+        });
+
+        assert_eq!(document_paths.len(), 300);
+        assert_eq!(index.document_count(), 300);
+        // Growing the index's own tables costs up to its size again; holding
+        // every parsed document at once cost six times the index.
+        assert!(
+            peak - retained <= retained,
+            "building held {} transient bytes over the {retained}-byte index",
+            peak - retained
+        );
+    }
+
+    #[test]
+    fn loading_identifier_vectors_holds_at_most_one_extra_copy_at_peak() {
+        let dir = tempfile::tempdir().unwrap();
+        let dims = 256;
+        let keys: Vec<String> = (0..2_000).map(|i| format!("identifier_{i}")).collect();
+        let data = rkyv_store::CacheData {
+            dims: dims as u32,
+            hashes: keys.iter().map(|key| format!("hash-{key}")).collect(),
+            vectors: vec![0.25; keys.len() * dims],
+            keys,
+        };
+        rkyv_store::save_cache(dir.path(), "identifier-embeddings", &data).unwrap();
+        drop(data);
+
+        let ((vectors, retained), peak) = crate::alloc_probe::peak_bytes(|| {
+            crate::alloc_probe::retained_bytes(|| {
+                load_identifier_vectors(dir.path(), "identifier-embeddings")
+            })
+        });
+
+        assert_eq!(vectors.len(), 2_000);
+        assert!(
+            peak <= retained * 5 / 2,
+            "loading peaked at {peak} bytes to keep {retained}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identifier_index_shares_resident_vectors_instead_of_copying_them() {
+        use crate::tools::semantic_identifiers::IndexData;
+
+        let files = [("src/a.rs", "pub fn alpha() {}\npub fn beta() {}\n")];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
+        let owner = server.current_ref().await;
+        *owner.identifier_index.write().await = None;
+        *owner.identifier_source.write().await = None;
+
+        server.ensure_identifier_index(&cache).await.unwrap();
+
+        let index = owner.identifier_index.read().await.clone().unwrap();
+        let resident = owner.identifier_vectors.get().unwrap().read().await;
+        assert_eq!(index.docs.len(), 2);
+        for i in 0..index.docs.len() {
+            assert!(
+                Arc::ptr_eq(&resident[&index.docs.get(i).text], index.vectors.vector(i)),
+                "the rebuilt index copied the resident vector of {}",
+                index.docs.get(i).name
+            );
+        }
+    }
+
     #[tokio::test]
     async fn one_file_identifier_refresh_does_not_copy_unchanged_records_or_vectors() {
-        use std::sync::atomic::Ordering;
-
         let mut stable = String::new();
         for i in 0..500 {
             stable.push_str(&format!("pub fn stable_identifier_{i}() {{}}\n"));
@@ -6071,9 +6550,6 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
-        owner
-            .identifier_resident_vector_elements_copied
-            .store(0, Ordering::Relaxed);
         std::fs::write(
             repo.path().join("src/changed.rs"),
             "pub fn changed_after() {}\n",
@@ -6124,17 +6600,10 @@ mod tests {
         );
         assert!(
             Arc::ptr_eq(
-                &segments_before.vector_buffer.files["src/stable.rs"],
-                &segments_after.vector_buffer.files["src/stable.rs"]
+                &segments_before.vectors.file_segments()["src/stable.rs"],
+                &segments_after.vectors.file_segments()["src/stable.rs"]
             ),
             "unchanged vector segment was deep-copied"
-        );
-        assert!(
-            owner
-                .identifier_resident_vector_elements_copied
-                .load(Ordering::Relaxed)
-                <= 2,
-            "one-file refresh copied the unchanged corpus vector payload"
         );
     }
 
@@ -7296,7 +7765,7 @@ mod tests {
     fn expired_empty_identifier_index(file_count: usize) -> Arc<IdentifierIndex> {
         Arc::new(IdentifierIndex {
             docs: Vec::new().into(),
-            vector_buffer: Vec::new().into(),
+            vectors: IdentifierVectorIndex::empty(),
             dims: 0,
             file_count,
             built_at: Instant::now()
@@ -10283,17 +10752,13 @@ mod tests {
 
     #[tokio::test]
     async fn lane_m_attached_worktree_shares_primary_resident_identifier_vectors() {
-        use crate::core::embeddings::CacheEntry;
         use crate::ref_index::{RefId, RefIndex};
 
         let server = test_server();
         let primary = server.state.default_ref().unwrap();
         let primary_vectors = Arc::new(RwLock::new(HashMap::from([(
             "fn shared_identifier()".to_string(),
-            CacheEntry {
-                hash: "shared-hash".to_string(),
-                vector: vec![0.25; 768],
-            },
+            Arc::from(vec![0.25_f32; 768]),
         )])));
         primary
             .identifier_vectors
@@ -10854,7 +11319,6 @@ mod tests {
 
     #[tokio::test]
     async fn lane_m_identifier_vectors_alone_are_memory_budget_evictable() {
-        use crate::core::embeddings::CacheEntry;
         use crate::ref_index::{RefId, RefIndex};
 
         let mut config = Config::from_env();
@@ -10868,10 +11332,7 @@ mod tests {
             .identifier_vectors
             .set(Arc::new(RwLock::new(HashMap::from([(
                 "worktree-only-vector".to_string(),
-                CacheEntry {
-                    hash: "hash".to_string(),
-                    vector: vec![0.5; 4096],
-                },
+                Arc::from(vec![0.5_f32; 4096]),
             )]))))
             .unwrap();
         let attached = server.state.attach_ref(ref_id, || Arc::clone(&owner)).await;
@@ -11046,7 +11507,7 @@ mod tests {
         let primary = server.state.default_ref().unwrap();
         *primary.identifier_index.write().await = Some(Arc::new(IdentifierIndex {
             docs: Vec::new().into(),
-            vector_buffer: vec![0.5_f32; 2048].into(),
+            vectors: IdentifierVectorIndex::from_vectors(vec![vec![0.5_f32; 4]; 512], 4),
             dims: 4,
             file_count: 0,
             built_at: Instant::now(),
@@ -11088,6 +11549,7 @@ mod tests {
         server.state.touch_ref(unique_id);
         mark_ref_idle(&server.state, shared_id);
         mark_ref_idle(&server.state, unique_id);
+        *server.state.measured_resident_override.lock().unwrap() = Some(20 * 1024);
 
         server.state.enforce_memory_budget().await;
 
@@ -11535,7 +11997,7 @@ mod tests {
         let primary = server.state.default_ref().unwrap();
         *primary.identifier_index.write().await = Some(Arc::new(IdentifierIndex {
             docs: Vec::new().into(),
-            vector_buffer: vec![0.5_f32; 8].into(),
+            vectors: IdentifierVectorIndex::from_vectors(vec![vec![0.5_f32; 4]; 2], 4),
             dims: 4,
             file_count: 0,
             built_at: Instant::now(),
@@ -11582,7 +12044,7 @@ mod tests {
         let owner = worktree_server.current_ref().await;
         let inherited = Arc::new(IdentifierIndex {
             docs: Vec::new().into(),
-            vector_buffer: vec![0.5_f32; 8].into(),
+            vectors: IdentifierVectorIndex::from_vectors(vec![vec![0.5_f32; 4]; 2], 4),
             dims: 4,
             file_count: 0,
             built_at: Instant::now(),
@@ -11660,6 +12122,120 @@ mod tests {
             !ref_b.embedding_cache.read().await.is_empty(),
             "the budget evicted a worktree used within the idle window"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_resident_bytes_reads_this_process() {
+        let touched = vec![1_u8; 64 * 1024 * 1024];
+        let resident = process_resident_bytes().unwrap();
+        assert!(resident >= touched.len(), "{resident}");
+    }
+
+    #[tokio::test]
+    async fn memory_budget_triggers_on_measured_memory_when_estimates_are_under_it() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (id, worktree) = attach_budget_worktree(&server, "measured-over").await;
+        mark_ref_idle(&server.state, id);
+        *server.state.measured_resident_override.lock().unwrap() = Some(2 * 1024 * 1024);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            worktree.embedding_cache.read().await.is_empty(),
+            "an idle worktree survived measured memory over the budget"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn memory_under_budget_is_returned_to_the_os_when_mostly_freed() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 256 * 1024 * 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        *server.state.measured_resident_override.lock().unwrap() = Some(128 * 1024 * 1024 * 1024);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            server.state.last_budget_trim.lock().unwrap().is_some(),
+            "memory the allocator holds free was not returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_under_budget_checks_freed_memory_at_most_once_per_trim_interval() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 256 * 1024 * 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        *server.state.measured_resident_override.lock().unwrap() = Some(128 * 1024 * 1024 * 1024);
+
+        server.state.enforce_memory_budget().await;
+        server.state.enforce_memory_budget().await;
+
+        assert_eq!(
+            server
+                .state
+                .free_memory_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the allocator was walked again within the trim interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ignores_estimates_while_measured_memory_is_under_it() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (id, worktree) = attach_budget_worktree(&server, "measured-under").await;
+        mark_ref_idle(&server.state, id);
+        *server.state.measured_resident_override.lock().unwrap() = Some(512);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            !worktree.embedding_cache.read().await.is_empty(),
+            "a worktree was evicted while measured memory was under the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_alone_over_budget_warns_once_and_keeps_its_caches() {
+        use crate::core::embeddings::CacheEntry;
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let primary = server.state.default_ref().unwrap();
+        primary.embedding_cache.write().await.insert(
+            "primary.rs".to_string(),
+            CacheEntry {
+                hash: "primary-hash".to_string(),
+                vector: vec![0.5; 4096],
+            },
+        );
+        *server.state.measured_resident_override.lock().unwrap() = Some(2 * 1024 * 1024);
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+        server.state.enforce_memory_budget().await;
+        server.state.enforce_memory_budget().await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert_eq!(
+            logs.matches("over CONTEXTPLUS_MEMORY_BUDGET_MB").count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("file_vectors="), "{logs}");
+        assert!(!primary.embedding_cache.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -12185,7 +12761,7 @@ mod tests {
             let mut guard = ref_index.identifier_index.write().await;
             *guard = Some(Arc::new(IdentifierIndex {
                 docs: vec![doc].into(),
-                vector_buffer: Vec::new().into(),
+                vectors: IdentifierVectorIndex::empty(),
                 dims: 0,
                 file_count,
                 built_at: Instant::now(),
@@ -12197,7 +12773,7 @@ mod tests {
             idx.dims, 3,
             "a vector-less index must be rebuilt with vectors"
         );
-        assert_eq!(idx.vector_buffer.len(), idx.docs.len() * idx.dims);
+        assert_eq!(idx.vectors.len(), idx.docs.len() * idx.dims);
         assert!(!idx.docs.is_empty());
         assert!(
             ollama
@@ -12363,8 +12939,8 @@ mod tests {
                 "shallow warmup must NOT populate embedding dims (no Ollama call)"
             );
             assert!(
-                idx.vector_buffer.is_empty(),
-                "shallow warmup must NOT populate vector_buffer (no Ollama call)"
+                idx.vectors.is_empty(),
+                "shallow warmup must NOT populate vectors (no Ollama call)"
             );
         }
     }
@@ -15420,11 +15996,15 @@ mod tests {
         let worktree_components = ResidentSnapshot::capture(&*session.current_ref().await)
             .await
             .measure();
-        let primary_bytes: usize = primary_components.iter().map(|(_, bytes)| bytes).sum();
+        let primary_bytes: usize = primary_components.iter().map(|(_, bytes, _)| bytes).sum();
         let unique_bytes: usize = worktree_components
             .iter()
-            .filter(|(ptr, _)| !primary_components.iter().any(|(shared, _)| shared == ptr))
-            .map(|(_, bytes)| bytes)
+            .filter(|(ptr, _, _)| {
+                !primary_components
+                    .iter()
+                    .any(|(shared, _, _)| shared == ptr)
+            })
+            .map(|(_, bytes, _)| bytes)
             .sum();
         assert!(primary_bytes > 0);
         assert!(
@@ -15652,7 +16232,7 @@ mod tests {
         assert!(
             components
                 .iter()
-                .any(|(ptr, bytes)| *ptr == old_contents && *bytes > 0),
+                .any(|(ptr, bytes, _)| *ptr == old_contents && *bytes > 0),
             "the old primary content map pinned by the worktree's keyword entry is not measured"
         );
     }

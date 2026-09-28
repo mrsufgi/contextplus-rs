@@ -61,7 +61,7 @@ use tokio::sync::RwLock;
 
 use crate::core::embedding_tracker::EmbeddingTrackerHandle;
 use crate::core::embeddings::CacheEntry;
-use crate::server::{CachedLexicalIndex, IdentifierIndex, ProjectCache};
+use crate::server::{CachedLexicalIndex, IdentifierIndex, IdentifierVectors, ProjectCache};
 use crate::tools::semantic_search::CachedSearchIndex;
 
 /// Stable identifier for a ref (worktree + HEAD).
@@ -159,8 +159,10 @@ pub struct RefIndex {
     /// `Arc`-wrapped for the same backward-compat reason as `embedding_cache`.
     pub identifier_index: Arc<RwLock<Option<Arc<IdentifierIndex>>>>,
     pub(crate) identifier_source: RwLock<Option<Arc<ProjectCache>>>,
-    pub(crate) identifier_vectors: tokio::sync::OnceCell<Arc<RwLock<HashMap<String, CacheEntry>>>>,
-    pub(crate) identifier_vector_overlay: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    pub(crate) identifier_vectors: tokio::sync::OnceCell<Arc<RwLock<IdentifierVectors>>>,
+    pub(crate) identifier_vector_overlay: Arc<RwLock<IdentifierVectors>>,
+    /// Vectors this ref embedded that are not yet persisted.
+    pub(crate) identifier_unsaved: Arc<std::sync::Mutex<IdentifierVectors>>,
     pub(crate) identifier_overlay_loaded: AtomicBool,
     pub(crate) identifier_inherited: AtomicBool,
     pub(crate) lexical_inherited: AtomicBool,
@@ -171,8 +173,6 @@ pub struct RefIndex {
     background_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     #[cfg(test)]
     pub(crate) semantic_walks: AtomicUsize,
-    #[cfg(test)]
-    pub(crate) identifier_resident_vector_elements_copied: AtomicUsize,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
     pub(crate) identifier_rebuilding: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) lexical_update: tokio::sync::Mutex<()>,
@@ -235,6 +235,7 @@ impl RefIndex {
             identifier_source: RwLock::new(None),
             identifier_vectors: tokio::sync::OnceCell::new(),
             identifier_vector_overlay: Arc::new(RwLock::new(HashMap::new())),
+            identifier_unsaved: Arc::new(std::sync::Mutex::new(HashMap::new())),
             identifier_overlay_loaded: AtomicBool::new(false),
             identifier_inherited: AtomicBool::new(false),
             lexical_inherited: AtomicBool::new(false),
@@ -245,8 +246,6 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
-            #[cfg(test)]
-            identifier_resident_vector_elements_copied: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -285,6 +284,7 @@ impl RefIndex {
             identifier_source: RwLock::new(None),
             identifier_vectors: tokio::sync::OnceCell::new(),
             identifier_vector_overlay: Arc::new(RwLock::new(HashMap::new())),
+            identifier_unsaved: Arc::new(std::sync::Mutex::new(HashMap::new())),
             identifier_overlay_loaded: AtomicBool::new(false),
             identifier_inherited: AtomicBool::new(false),
             lexical_inherited: AtomicBool::new(false),
@@ -295,8 +295,6 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
-            #[cfg(test)]
-            identifier_resident_vector_elements_copied: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -337,6 +335,7 @@ impl RefIndex {
             identifier_source: RwLock::new(None),
             identifier_vectors: tokio::sync::OnceCell::new(),
             identifier_vector_overlay: Arc::new(RwLock::new(HashMap::new())),
+            identifier_unsaved: Arc::new(std::sync::Mutex::new(HashMap::new())),
             identifier_overlay_loaded: AtomicBool::new(false),
             identifier_inherited: AtomicBool::new(false),
             lexical_inherited: AtomicBool::new(false),
@@ -347,8 +346,6 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
-            #[cfg(test)]
-            identifier_resident_vector_elements_copied: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lexical_update: tokio::sync::Mutex::new(()),
