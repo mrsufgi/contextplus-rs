@@ -54,6 +54,9 @@ Three independent cache layers minimize redundant work:
   against the cached hash. Only files with changed hashes are re-embedded.
 - **Persistence:** `rkyv` (zero-copy serialization) + `memmap2` for loading. The cache file
   contains a version header followed by rkyv-serialized `CacheData` (dims, keys, hashes, vectors).
+- **Worktrees:** a linked worktree's semantic index forks the primary's (`SearchIndex::fork`),
+  sharing its `VectorStore` and HNSW graph and overlaying only the files that differ; past a 20%
+  change, or while the primary's index is scoped, queued or rebuilding, the worktree builds its own.
 
 ### Identifier Index
 

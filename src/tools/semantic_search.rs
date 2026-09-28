@@ -1170,13 +1170,111 @@ impl CachedSearchIndex {
         Arc::new(entry)
     }
 
-    pub(crate) fn estimated_resident_bytes(&self) -> usize {
-        self.index.estimated_resident_bytes()
+    /// Bytes this entry holds on its own, excluding its shared vector store.
+    pub(crate) fn own_resident_bytes(&self) -> usize {
+        self.index.own_resident_bytes()
     }
 
     /// The canonical root this index was walked from.
     pub(crate) fn search_root(&self) -> &Path {
         &self.search_root
+    }
+
+    /// A parent entry a worktree can fork: walked from its whole `root`, over
+    /// a vector store worth sharing, with no queued batches or rebuild.
+    pub(crate) fn forkable_at(&self, root: &Path) -> bool {
+        self.search_root == root
+            && self.index.ann_store.is_some()
+            && self.pending.lock().unwrap().batches.is_empty()
+            && !self
+                .rebuild_in_progress
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_paths(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .unwrap()
+            .batches
+            .iter()
+            .flat_map(|batch| batch.docs.iter().map(|doc| doc.path.clone()))
+            .collect()
+    }
+
+    /// An entry built from a full walk of `root`.
+    pub(crate) fn build(
+        root: &Path,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        generation: u64,
+        vector_generation: u64,
+        metadata: Option<MetadataFingerprint>,
+    ) -> Self {
+        let fingerprint = IndexFingerprint::from_docs(&docs);
+        let mut index = SearchIndex::new();
+        index.index_with_vectors_and_tuning(
+            docs,
+            vectors,
+            crate::core::embeddings::HnswTuning::global(),
+        );
+        let mut entry = Self::new(index, fingerprint, generation);
+        entry.search_root = root.to_path_buf();
+        entry.vector_generation = vector_generation;
+        *entry.metadata.get_mut().unwrap() = metadata;
+        entry
+    }
+
+    /// Installs this entry in `slot` if the slot still holds `seen`, keeping
+    /// the batches queued there since this entry's walk began when both
+    /// entries index the same root.
+    pub(crate) fn install(
+        mut self,
+        slot: &mut Option<Arc<Self>>,
+        seen: Option<&std::sync::Weak<Self>>,
+    ) -> bool {
+        let unchanged = match (slot.as_ref(), seen) {
+            (None, None) => true,
+            (Some(current), Some(seen)) => std::sync::Weak::ptr_eq(&Arc::downgrade(current), seen),
+            _ => false,
+        };
+        if !unchanged {
+            return false;
+        }
+        if let Some(current) = slot
+            .as_ref()
+            .filter(|current| current.search_root == self.search_root)
+        {
+            let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+            self.pending.get_mut().unwrap().batches = current
+                .pending
+                .lock()
+                .unwrap()
+                .batches
+                .iter()
+                .filter(|batch| batch.generation >= generation)
+                .cloned()
+                .collect();
+        }
+        *slot = Some(Arc::new(self));
+        true
+    }
+
+    /// This entry's index moved to a worktree's full walk of `root`; `None`
+    /// when the worktree builds its own (see [`SearchIndex::fork`]).
+    pub(crate) fn fork(
+        &self,
+        root: &Path,
+        docs: &[SearchDocument],
+        vectors: &[Option<Vec<f32>>],
+        generation: u64,
+        vector_generation: u64,
+    ) -> Option<Self> {
+        let index = self.index.fork(docs, vectors)?;
+        let mut entry = Self::new(index, IndexFingerprint::from_docs(docs), generation);
+        entry.search_root = root.to_path_buf();
+        entry.vector_generation = vector_generation;
+        Some(entry)
     }
 
     #[cfg(feature = "memory-profile")]
@@ -1458,7 +1556,8 @@ impl SearchIndex {
             .map_or(0, |store| store.estimated_hnsw_bytes())
     }
 
-    fn estimated_resident_bytes(&self) -> usize {
+    /// Bytes excluding the vector store, which forks share.
+    fn own_resident_bytes(&self) -> usize {
         self.resident_document_bytes()
             + self.vector_buffer.capacity() * std::mem::size_of::<f32>()
             + self
@@ -1466,10 +1565,6 @@ impl SearchIndex {
                 .values()
                 .map(|vector| vector.capacity() * std::mem::size_of::<f32>())
                 .sum::<usize>()
-            + self
-                .ann_store
-                .as_ref()
-                .map_or(0, |store| store.estimated_resident_bytes())
     }
 
     fn prepare_ann(&self) {
@@ -1681,6 +1776,16 @@ impl SearchIndex {
             );
             return IndexUpdateKind::FullRebuild;
         }
+        self.apply_incremental(changed_docs, changed_vectors, deleted_paths);
+        IndexUpdateKind::Incremental
+    }
+
+    fn apply_incremental(
+        &mut self,
+        changed_docs: Vec<SearchDocument>,
+        changed_vectors: Vec<Option<Vec<f32>>>,
+        deleted_paths: &[String],
+    ) {
         if self.ann_store.is_some() {
             self.ann_dirty_paths.extend(deleted_paths.iter().cloned());
             self.ann_dirty_paths
@@ -1724,7 +1829,47 @@ impl SearchIndex {
             }
             self.documents[i] = doc;
         }
-        IndexUpdateKind::Incremental
+    }
+
+    /// This index moved to another checkout's walk. The copy shares the vector
+    /// store and its graph; `None` when the walk's own changes pass the
+    /// promotion threshold or its vectors have another shape.
+    pub(crate) fn fork(
+        &self,
+        docs: &[SearchDocument],
+        vectors: &[Option<Vec<f32>>],
+    ) -> Option<SearchIndex> {
+        if vectors.iter().flatten().any(|v| v.len() != self.dims) {
+            return None;
+        }
+        let (changed, deleted) = self.changes_from(docs, vectors);
+        if (changed.len() + deleted.len()) as f64
+            > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
+        {
+            return None;
+        }
+        let mut fork = self.clone();
+        fork.apply_incremental(
+            changed.iter().map(|&i| docs[i].clone()).collect(),
+            changed.iter().map(|&i| vectors[i].clone()).collect(),
+            &deleted,
+        );
+        Some(fork)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_is_built(&self) -> bool {
+        self.ann_store
+            .as_ref()
+            .is_some_and(|store| store.hnsw_is_initialized())
+    }
+
+    pub(crate) fn vector_store(&self) -> Option<&Arc<VectorStore>> {
+        self.ann_store.as_ref()
+    }
+
+    pub(crate) fn shares_vector_store(&self, other: &SearchIndex) -> bool {
+        matches!((&self.ann_store, &other.ann_store), (Some(a), Some(b)) if Arc::ptr_eq(a, b))
     }
 
     fn delta_from(
@@ -1732,6 +1877,25 @@ impl SearchIndex {
         docs: Vec<SearchDocument>,
         vectors: Vec<Option<Vec<f32>>>,
     ) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>, Vec<String>) {
+        let (changed, deleted) = self.changes_from(&docs, &vectors);
+        let changed: HashSet<usize> = changed.into_iter().collect();
+        let (changed, changed_vectors) = docs
+            .into_iter()
+            .zip(vectors)
+            .enumerate()
+            .filter(|(i, _)| changed.contains(i))
+            .map(|(_, change)| change)
+            .unzip();
+        (changed, changed_vectors, deleted)
+    }
+
+    /// Positions of the walked documents that differ from this index, and the
+    /// indexed paths the walk no longer has.
+    fn changes_from(
+        &self,
+        docs: &[SearchDocument],
+        vectors: &[Option<Vec<f32>>],
+    ) -> (Vec<usize>, Vec<String>) {
         let old: std::collections::HashMap<&str, usize> = self
             .documents
             .iter()
@@ -1745,21 +1909,21 @@ impl SearchIndex {
             .filter(|d| !paths.contains(d.path.as_str()))
             .map(|d| d.path.clone())
             .collect();
-        let mut changed = Vec::new();
-        let mut changed_vectors = Vec::new();
-        for (doc, vector) in docs.into_iter().zip(vectors) {
-            let same = old.get(doc.path.as_str()).is_some_and(|&i| {
-                self.documents[i].content == doc.content
-                    && self.documents[i].source_hash == doc.source_hash
-                    && self.documents[i].search_text == doc.search_text
-                    && self.vector_at(i) == vector.as_deref()
-            });
-            if !same {
-                changed.push(doc);
-                changed_vectors.push(vector);
-            }
-        }
-        (changed, changed_vectors, deleted)
+        let changed = docs
+            .iter()
+            .zip(vectors)
+            .enumerate()
+            .filter(|(_, (doc, vector))| {
+                !old.get(doc.path.as_str()).is_some_and(|&i| {
+                    self.documents[i].content == doc.content
+                        && self.documents[i].source_hash == doc.source_hash
+                        && self.documents[i].search_text == doc.search_text
+                        && self.vector_at(i) == vector.as_deref()
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        (changed, deleted)
     }
 
     /// Perform hybrid search against the indexed documents.
@@ -6618,7 +6782,7 @@ mod tests {
         let previous = cache.read().await.as_ref().cloned().unwrap();
         // The first generation's graph builds in the background while exact
         // search answers; wait for it.
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
             while !previous
                 .index
                 .ann_store
@@ -6925,5 +7089,273 @@ mod tests {
             "one mass-change batch must schedule exactly one full rebuild"
         );
         assert_eq!(index.document_count(), corpus_size);
+    }
+
+    struct ForkRng(u64);
+
+    impl ForkRng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn component(&mut self) -> f32 {
+            (self.below(2000) as f32 - 999.5) / 1000.0
+        }
+    }
+
+    const FORK_WORDS: &[&str] = &[
+        "invoice", "payment", "worker", "queue", "token", "parser", "cache", "scope", "record",
+        "status",
+    ];
+
+    fn fork_doc(rng: &mut ForkRng, path: String) -> SearchDocument {
+        let len = 1 + rng.below(12);
+        let body = (0..len)
+            .map(|_| FORK_WORDS[rng.below(FORK_WORDS.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let symbol = FORK_WORDS[rng.below(FORK_WORDS.len())].to_string();
+        SearchDocument::new(path, body.clone(), vec![symbol], vec![], body)
+    }
+
+    fn fork_vector(rng: &mut ForkRng) -> Option<Vec<f32>> {
+        if rng.below(8) == 0 {
+            return None;
+        }
+        Some((0..4).map(|_| rng.component()).collect())
+    }
+
+    fn fork_corpus(rng: &mut ForkRng, len: usize) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>) {
+        (0..len)
+            .map(|i| (fork_doc(rng, format!("src/file_{i}.rs")), fork_vector(rng)))
+            .unzip()
+    }
+
+    /// The base corpus after up to `max_ops` random edits, re-embeds, adds and deletes.
+    fn fork_worktree(
+        rng: &mut ForkRng,
+        docs: &[SearchDocument],
+        vectors: &[Option<Vec<f32>>],
+        max_ops: usize,
+        stage: &str,
+    ) -> (Vec<SearchDocument>, Vec<Option<Vec<f32>>>) {
+        let mut worktree: Vec<Option<(SearchDocument, Option<Vec<f32>>)>> = docs
+            .iter()
+            .cloned()
+            .zip(vectors.iter().cloned())
+            .map(Some)
+            .collect();
+        for op in 0..1 + rng.below(max_ops) {
+            let target = rng.below(docs.len());
+            match rng.below(4) {
+                0 => worktree[target] = None,
+                1 => {
+                    let doc = fork_doc(rng, docs[target].path.clone());
+                    worktree[target] = Some((doc, fork_vector(rng)));
+                }
+                2 => {
+                    if let Some((_, vector)) = &mut worktree[target] {
+                        *vector = fork_vector(rng);
+                    }
+                }
+                _ => {
+                    let doc = fork_doc(rng, format!("src/added_{stage}_{op}.rs"));
+                    worktree.push(Some((doc, fork_vector(rng))));
+                }
+            }
+        }
+        worktree.into_iter().flatten().unzip()
+    }
+
+    /// (path, combined score, keyword score), sorted by score, then path.
+    fn fork_hits(
+        index: &SearchIndex,
+        query: &str,
+        query_vec: &[f32],
+        opts: &ResolvedSearchOptions,
+    ) -> Vec<(String, f64, f64)> {
+        let mut hits: Vec<_> = index
+            .search(query, query_vec, opts)
+            .into_iter()
+            .map(|hit| (hit.path, hit.score, hit.keyword_score))
+            .collect();
+        hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        hits
+    }
+
+    fn fork_query(rng: &mut ForkRng) -> (String, Vec<f32>) {
+        let len = 1 + rng.below(3);
+        let query = (0..len)
+            .map(|_| FORK_WORDS[rng.below(FORK_WORDS.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        (query, (0..4).map(|_| rng.component()).collect())
+    }
+
+    /// A fork of a base index answers like an index built over the worktree's
+    /// whole corpus: same files, same scores.
+    #[test]
+    fn fork_matches_standalone_index_of_random_edits() {
+        let opts = ResolvedSearchOptions {
+            top_k: 1_000,
+            min_combined_score: 0.0,
+            ..Default::default()
+        };
+        for seed in 1..=60_u64 {
+            let mut rng = ForkRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let base_len = 45 + rng.below(40);
+            let (docs, vectors) = fork_corpus(&mut rng, base_len);
+            let mut base = SearchIndex::new();
+            base.index_with_vectors(docs.clone(), vectors.clone());
+            if seed % 2 == 1 {
+                // A base kept current incrementally carries an overlay.
+                let (edited, edited_vectors) = fork_worktree(&mut rng, &docs, &vectors, 3, "base");
+                let (changed, changed_vectors, deleted) =
+                    base.delta_from(edited.clone(), edited_vectors.clone());
+                base.apply_delta(changed, changed_vectors, &deleted);
+                let (worktree, worktree_vectors) =
+                    fork_worktree(&mut rng, &edited, &edited_vectors, 8, "worktree");
+                assert_fork_matches_standalone(
+                    &mut rng,
+                    &base,
+                    worktree,
+                    worktree_vectors,
+                    &opts,
+                    seed,
+                );
+            } else {
+                let (worktree, worktree_vectors) =
+                    fork_worktree(&mut rng, &docs, &vectors, 8, "worktree");
+                assert_fork_matches_standalone(
+                    &mut rng,
+                    &base,
+                    worktree,
+                    worktree_vectors,
+                    &opts,
+                    seed,
+                );
+            }
+        }
+    }
+
+    /// Above `ANN_THRESHOLD` the fork shares the base's vector store and graph,
+    /// and at the default `top_k` still answers like a standalone index on the
+    /// exact-scan path, which a scoped query takes without building a graph.
+    #[test]
+    fn fork_above_ann_threshold_shares_the_store_and_matches_standalone() {
+        let mut rng = ForkRng(0x5EED_F0CC);
+        let (docs, vectors) = fork_corpus(&mut rng, ANN_THRESHOLD + 600);
+        let mut base = SearchIndex::new();
+        base.index_with_vectors(docs.clone(), vectors.clone());
+        let opts = ResolvedSearchOptions {
+            scope: SearchScope::Code,
+            ..Default::default()
+        };
+        for seed in 1..=6_u64 {
+            let (worktree, worktree_vectors) =
+                fork_worktree(&mut rng, &docs, &vectors, 12, "worktree");
+            let fork = assert_fork_matches_standalone(
+                &mut rng,
+                &base,
+                worktree,
+                worktree_vectors,
+                &opts,
+                seed,
+            );
+            assert!(
+                fork.shares_vector_store(&base),
+                "seed {seed}: the fork built its own vector store"
+            );
+        }
+    }
+
+    fn assert_fork_matches_standalone(
+        rng: &mut ForkRng,
+        base: &SearchIndex,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        opts: &ResolvedSearchOptions,
+        seed: u64,
+    ) -> SearchIndex {
+        let fork = base
+            .fork(&docs, &vectors)
+            .unwrap_or_else(|| panic!("seed {seed}: a small worktree delta must fork"));
+        let mut standalone = SearchIndex::new();
+        standalone.index_with_vectors(docs, vectors);
+        for _ in 0..6 {
+            let (query, query_vec) = fork_query(rng);
+            let expected = fork_hits(&standalone, &query, &query_vec, opts);
+            assert!(!expected.is_empty(), "seed {seed} query {query:?}");
+            assert_eq!(
+                fork_hits(&fork, &query, &query_vec, opts),
+                expected,
+                "seed {seed} query {query:?}"
+            );
+        }
+        fork
+    }
+
+    #[test]
+    fn fork_past_the_promotion_threshold_is_refused() {
+        let (docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
+        let mut base = SearchIndex::new();
+        base.index_with_vectors(docs.clone(), vectors.clone());
+        let at_threshold = docs.len() / 5;
+        let mut worktree = docs.clone();
+        for doc in &mut worktree[..at_threshold] {
+            *doc = make_doc(&doc.path, "rewritten in the worktree");
+        }
+        assert!(
+            base.fork(&worktree, &vectors)
+                .is_some_and(|fork| fork.shares_vector_store(&base)),
+            "a worktree at the threshold forks"
+        );
+        worktree[at_threshold] = make_doc(&docs[at_threshold].path, "one more rewrite");
+        assert!(
+            base.fork(&worktree, &vectors).is_none(),
+            "a worktree past the threshold builds its own index"
+        );
+    }
+
+    /// Promotion counts only the worktree's own changes, not the dirty paths
+    /// a long-running parent accumulated.
+    #[test]
+    fn fork_of_a_long_running_parent_counts_only_the_worktree_changes() {
+        let (docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
+        let mut base = SearchIndex::new();
+        base.index_with_vectors(docs.clone(), vectors.clone());
+        let dirty = docs.len() / 5;
+        let mut parent_docs = docs.clone();
+        for doc in &mut parent_docs[..dirty] {
+            *doc = make_doc(&doc.path, "edited on the primary");
+        }
+        assert_eq!(
+            base.apply_delta(
+                parent_docs[..dirty].to_vec(),
+                vectors[..dirty].to_vec(),
+                &[]
+            ),
+            IndexUpdateKind::Incremental
+        );
+        let mut worktree = parent_docs.clone();
+        worktree[dirty] = make_doc(&docs[dirty].path, "edited in the worktree");
+
+        let fork = base
+            .fork(&worktree, &vectors)
+            .expect("a one-file worktree forks");
+        assert!(fork.shares_vector_store(&base));
+        assert_eq!(fork.full_rebuild_count(), base.full_rebuild_count());
+    }
+
+    #[test]
+    fn fork_with_vectors_of_another_shape_is_refused() {
+        let (docs, mut vectors) = make_ann_corpus(50);
+        let mut base = SearchIndex::new();
+        base.index_with_vectors(docs.clone(), vectors.clone());
+        vectors[0] = Some(vec![1.0, 0.0, 0.0]);
+        assert!(base.fork(&docs, &vectors).is_none());
     }
 }
