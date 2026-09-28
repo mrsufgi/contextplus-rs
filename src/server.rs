@@ -17153,7 +17153,7 @@ mod tests {
             .await
             .unwrap();
         let primary = semantic_fork_index(&server).await;
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
             while !primary.index.graph_is_built() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

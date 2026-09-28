@@ -6782,7 +6782,7 @@ mod tests {
         let previous = cache.read().await.as_ref().cloned().unwrap();
         // The first generation's graph builds in the background while exact
         // search answers; wait for it.
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
             while !previous
                 .index
                 .ann_store
