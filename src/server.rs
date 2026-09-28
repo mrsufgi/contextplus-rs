@@ -13397,19 +13397,15 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
-        // Wait for the embedding_cache to pick up the baseline hit (shared.rs).
+        // Wait for the baseline import to install the search index, which it
+        // does after caching the hit (shared.rs).
         let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            {
-                let cache = wt_ref.embedding_cache.read().await;
-                if cache.contains_key("shared.rs") {
-                    break;
-                }
+            if wt_ref.search_index_cache.read().await.is_some() {
+                break;
             }
             if std::time::Instant::now() > deadline2 {
-                panic!(
-                    "ref_warmup_full_layers_ollama_on_baseline: shared.rs never in embedding_cache"
-                );
+                panic!("ref_warmup_full_layers_ollama_on_baseline: search index never installed");
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
@@ -13674,6 +13670,234 @@ mod tests {
             matching_embed_input_count(&ollama, "src/stripe_webhook.rs").await,
             1,
             "the identical file must reuse the primary vector instead of being re-embedded"
+        );
+    }
+
+    /// A server started over a primary and a linked worktree whose changed
+    /// file has a vector persisted by an earlier daemon, and the worktree's ref.
+    async fn restarted_worktree_with_persisted_vector() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        ContextPlusServer,
+        crate::ref_index::RefId,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let vectors: Vec<Vec<f32>> = embed_request_inputs(request)
+                    .iter()
+                    .map(|input| {
+                        if input == "invoice payment status" {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        run_git(&primary, &["init", "-b", "main"]);
+        std::fs::write(primary.join("src/shared.rs"), "fn shared_helper() {}\n").unwrap();
+        std::fs::write(
+            primary.join("src/changed.rs"),
+            "fn PRIMARY_CHANGED_VERSION() {}\n",
+        )
+        .unwrap();
+        run_git(&primary, &["add", "."]);
+        run_git(&primary, &["commit", "-m", "baseline"]);
+        add_linked_worktree(&primary, &worktree);
+        let changed = "fn WORKTREE_CHANGED_VERSION() { /* invoice payment status */ }\n";
+        std::fs::write(worktree.join("src/changed.rs"), changed).unwrap();
+
+        // What an earlier daemon's background fill persisted for this worktree.
+        let config = semantic_fill_config(&ollama.uri(), 1_000, 1_000);
+        // An older binary also persisted the vector the worktree inherited.
+        let persisted = HashMap::from([
+            (
+                "src/changed.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash(changed),
+                    vector: vec![1.0, 0.0],
+                },
+            ),
+            (
+                "src/shared.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash("fn shared_helper() {}\n"),
+                    vector: vec![0.6, 0.8],
+                },
+            ),
+        ]);
+        rkyv_store::save_vector_store_merged(
+            &worktree,
+            &cache_name("embeddings", &config),
+            &crate::core::embeddings::VectorStore::from_cache(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let server = ContextPlusServer::new(primary.clone(), config);
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".into(),
+            json!(canonical_worktree.to_string_lossy().into_owned()),
+        );
+        let attached = server.handle_attach_worktree(attach_args).await.unwrap();
+        assert_eq!(attached.is_error, Some(false), "{}", text_of(&attached));
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
+        (ollama, temp, server, ref_id)
+    }
+
+    #[tokio::test]
+    async fn restarted_worktree_reuses_its_persisted_vectors_instead_of_reembedding() {
+        let (ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+
+        let result = server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_CHANGED_VERSION").await,
+            0,
+            "a restarted worktree re-embedded a file whose vector it had persisted"
+        );
+        assert!(
+            text_of(&result).contains("1. src/changed.rs"),
+            "the persisted vector must rank the file: {}",
+            text_of(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_walk_reuses_primary_documents_of_identical_files() {
+        let (_ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        let (logs, _guard) = crate::test_logs::captured_info_logs();
+        server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let walk = logs
+            .lines()
+            .find(|line| line.contains("phase=\"semantic_walk\""))
+            .unwrap_or_else(|| panic!("no semantic walk logged:\n{logs}"));
+        assert!(
+            walk.contains("documents=2 reused=1"),
+            "the worktree parsed a file the primary had already parsed: {walk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_worktree_reloads_only_vectors_its_parent_lacks() {
+        let (_ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        let worktree_ref = server.state.ref_index(ref_id).await.unwrap();
+        let cache = worktree_ref.embedding_cache.read().await;
+        assert_eq!(
+            cache.get("src/shared.rs").map(|entry| entry.vector.clone()),
+            Some(vec![0.0, 1.0]),
+            "the worktree reloaded its own copy of a vector its parent holds"
+        );
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn worktree_fill_persists_only_vectors_its_parent_lacks() {
+        let (_ollama, temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        let worktree = temp.path().join("worktree");
+        std::fs::write(worktree.join("src/fresh.rs"), "fn WORKTREE_FRESH() {}\n").unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+
+        let name = cache_name("embeddings", &server.state.config);
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let persisted = rkyv_store::mmap_vector_store(&worktree, &name)
+                    .unwrap()
+                    .map(|store| store.to_cache())
+                    .unwrap_or_default();
+                if persisted.contains_key("src/fresh.rs") {
+                    return persisted;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worktree fill never persisted its new vector");
+        let mut keys: Vec<_> = persisted.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["src/changed.rs", "src/fresh.rs"],
+            "the worktree persisted vectors its parent holds"
+        );
+    }
+
+    #[tokio::test]
+    async fn evicted_worktree_reuses_its_persisted_vectors_instead_of_reembedding() {
+        let (ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        let worktree_server = server.with_session(ref_id);
+        worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        let worktree_ref = server.state.ref_index(ref_id).await.unwrap();
+        clear_ref_heavy_caches(
+            &worktree_ref,
+            &cache_name("identifier-embeddings", &server.state.config),
+        )
+        .await;
+
+        let result = worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_CHANGED_VERSION").await,
+            0,
+            "an evicted worktree re-embedded a file whose vector it had persisted"
+        );
+        assert!(
+            text_of(&result).contains("1. src/changed.rs"),
+            "the persisted vector must rank the file: {}",
+            text_of(&result)
         );
     }
 
