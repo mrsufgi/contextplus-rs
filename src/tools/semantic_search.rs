@@ -1170,8 +1170,9 @@ impl CachedSearchIndex {
         Arc::new(entry)
     }
 
-    pub(crate) fn estimated_resident_bytes(&self) -> usize {
-        self.index.estimated_resident_bytes()
+    /// Bytes this entry holds on its own, excluding its shared vector store.
+    pub(crate) fn own_resident_bytes(&self) -> usize {
+        self.index.own_resident_bytes()
     }
 
     /// The canonical root this index was walked from.
@@ -1540,7 +1541,8 @@ impl SearchIndex {
             .map_or(0, |store| store.estimated_hnsw_bytes())
     }
 
-    fn estimated_resident_bytes(&self) -> usize {
+    /// Bytes excluding the vector store, which forks share.
+    fn own_resident_bytes(&self) -> usize {
         self.resident_document_bytes()
             + self.vector_buffer.capacity() * std::mem::size_of::<f32>()
             + self
@@ -1548,10 +1550,6 @@ impl SearchIndex {
                 .values()
                 .map(|vector| vector.capacity() * std::mem::size_of::<f32>())
                 .sum::<usize>()
-            + self
-                .ann_store
-                .as_ref()
-                .map_or(0, |store| store.estimated_resident_bytes())
     }
 
     fn prepare_ann(&self) {
@@ -1849,6 +1847,10 @@ impl SearchIndex {
         self.ann_store
             .as_ref()
             .is_some_and(|store| store.hnsw_is_initialized())
+    }
+
+    pub(crate) fn vector_store(&self) -> Option<&Arc<VectorStore>> {
+        self.ann_store.as_ref()
     }
 
     pub(crate) fn shares_vector_store(&self, other: &SearchIndex) -> bool {

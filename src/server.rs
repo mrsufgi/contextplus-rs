@@ -921,9 +921,17 @@ impl ResidentSnapshot {
         if let Some(index) = &self.search_index {
             components.push((
                 Arc::as_ptr(index) as usize,
-                index.estimated_resident_bytes(),
+                index.own_resident_bytes(),
                 "semantic_index",
             ));
+            // Forks share the store, and keep an old one alive after the primary replaces it.
+            if let Some(store) = index.index.vector_store() {
+                components.push((
+                    Arc::as_ptr(store) as usize,
+                    store.estimated_resident_bytes(),
+                    "vector_store",
+                ));
+            }
         }
         // Shared bases are keyed by the base's own pointer, so a base counts once
         // however many refs layer over it.
@@ -4118,6 +4126,7 @@ impl ContextPlusServer {
         // `semantic_code_search` can skip the walk on a generation hit.
         // When the tracker is Off the counter stays at 0 and the
         // fingerprint-based fallback is used instead.
+        walker.expire_stale_fork(&root).await;
         let ref_index = self.current_ref().await;
         let cache_gen = if self.state.config.embed_tracker_mode != crate::config::TrackerMode::Off {
             Some(&ref_index.cache_generation)
@@ -17151,6 +17160,330 @@ mod tests {
             result,
             semantic_fork_standalone(&server, worktree.path()).await
         );
+    }
+
+    /// Replaces the primary's vector store with a fresh build, as after an eviction.
+    async fn semantic_fork_rebuild_primary(
+        server: &ContextPlusServer,
+    ) -> Arc<crate::tools::semantic_search::CachedSearchIndex> {
+        let old = semantic_fork_index(server).await;
+        *server.current_ref().await.search_index_cache.write().await = None;
+        semantic_fork_query(server).await;
+        let rebuilt = semantic_fork_index(server).await;
+        assert!(!rebuilt.index.shares_vector_store(&old.index));
+        rebuilt
+    }
+
+    /// Queries the primary until a background rebuild replaces the store of `old`.
+    async fn semantic_fork_await_primary_rebuild(
+        server: &ContextPlusServer,
+        old: &crate::tools::semantic_search::CachedSearchIndex,
+    ) -> Arc<crate::tools::semantic_search::CachedSearchIndex> {
+        semantic_fork_query(server).await;
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let current = semantic_fork_index(server).await;
+                if current.index.vector_store().is_some()
+                    && !current.index.shares_vector_store(&old.index)
+                    && !current
+                        .rebuild_in_progress
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return current;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the primary rebuilds its store")
+    }
+
+    /// (path, score) of every code hit, sorted by score, then path.
+    fn semantic_fork_hits(
+        entry: &crate::tools::semantic_search::CachedSearchIndex,
+    ) -> Vec<(String, f64)> {
+        let opts = crate::tools::semantic_search::ResolvedSearchOptions {
+            scope: crate::tools::semantic_search::SearchScope::Code,
+            top_k: 10_000,
+            min_combined_score: 0.0,
+            ..Default::default()
+        };
+        let mut hits: Vec<_> = entry
+            .index
+            .search("shared symbol", &[13.0, 1.0, 0.0], &opts)
+            .into_iter()
+            .map(|hit| (hit.path, hit.score))
+            .collect();
+        hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        hits
+    }
+
+    /// [`semantic_fork_hits`] of a server over `root` alone.
+    async fn semantic_fork_standalone_hits(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+    ) -> Vec<(String, f64)> {
+        let standalone = ContextPlusServer::new(root.to_path_buf(), server.state.config.clone());
+        semantic_fork_query(&standalone).await;
+        let entry = semantic_fork_index(&standalone).await;
+        semantic_fork_hits(&entry)
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_primary_incremental_edits_leave_the_fork_in_place() {
+        let (_ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        let fork = semantic_fork_index(&session).await;
+        std::fs::write(
+            primary_root.path().join("src/area_1/file_5.rs"),
+            "pub fn primaryedited() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            primary_root.path().join("src/area_2/primary_added.rs"),
+            "pub fn primaryadded() {}\n",
+        )
+        .unwrap();
+        std::fs::remove_file(primary_root.path().join("src/area_3/file_7.rs")).unwrap();
+
+        semantic_fork_query(&server).await;
+        let primary = semantic_fork_index(&server).await;
+        assert!(primary.index.document_count() > 0);
+        assert!(
+            primary.index.shares_vector_store(&fork.index),
+            "the primary's incremental edits replaced its store"
+        );
+        semantic_fork_query(&session).await;
+        assert!(
+            Arc::ptr_eq(&fork, &semantic_fork_index(&session).await),
+            "the primary's incremental edits re-forked the worktree"
+        );
+        assert_eq!(
+            semantic_fork_hits(&fork),
+            semantic_fork_standalone_hits(&server, worktree.path()).await
+        );
+    }
+
+    /// An idle worktree moves onto the primary's new store at its first query
+    /// after the primary replaces it, and walks no more after that.
+    #[tokio::test]
+    async fn semantic_fork_idle_worktree_reforks_onto_a_replaced_primary_store() {
+        let (_ollama, _primary, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_query(&session).await;
+        let primary = semantic_fork_rebuild_primary(&server).await;
+
+        semantic_fork_query(&session).await;
+        let fork = semantic_fork_index(&session).await;
+        assert!(
+            fork.index.shares_vector_store(&primary.index),
+            "the idle worktree still searches the primary's old store"
+        );
+        assert_eq!(
+            semantic_fork_hits(&fork),
+            semantic_fork_standalone_hits(&server, worktree.path()).await
+        );
+        let owner = session.current_ref().await;
+        let walks = owner
+            .semantic_walks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        semantic_fork_query(&session).await;
+        assert_eq!(
+            owner
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            walks,
+            "the re-forked worktree walked again"
+        );
+    }
+
+    /// The budget's pointer-keyed components of the refs behind `servers`.
+    async fn semantic_fork_resident(servers: &[&ContextPlusServer]) -> HashMap<usize, usize> {
+        let mut holders = HashMap::new();
+        for server in servers {
+            let owner = server.current_ref().await;
+            for (ptr, bytes, _) in ResidentSnapshot::capture(&owner).await.measure() {
+                holders.insert(ptr, bytes);
+            }
+        }
+        holders
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_resident_estimate_counts_a_store_shared_by_two_forks_once() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let second = tempfile::tempdir().unwrap();
+        lexdelta_corpus(second.path(), SEMANTIC_FORK_FILES);
+        lexdelta_edit_worktree(second.path());
+        let sibling = attached_worktree(&server, second.path()).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_query(&sibling).await;
+        let entries = [
+            semantic_fork_index(&server).await,
+            semantic_fork_index(&session).await,
+            semantic_fork_index(&sibling).await,
+        ];
+        let store = Arc::clone(entries[0].index.vector_store().unwrap());
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.index.shares_vector_store(&entries[0].index))
+        );
+
+        let holders = semantic_fork_resident(&[&server, &session, &sibling]).await;
+        let charged: usize = entries
+            .iter()
+            .map(|entry| Arc::as_ptr(entry) as usize)
+            .chain([Arc::as_ptr(&store) as usize])
+            .filter_map(|ptr| holders.get(&ptr))
+            .sum();
+        let store_bytes = store.estimated_resident_bytes();
+        assert!(store_bytes > 0);
+        let own: usize = entries.iter().map(|entry| entry.own_resident_bytes()).sum();
+        assert_eq!(
+            charged,
+            own + store_bytes,
+            "the store shared by the primary and two forks is not charged once"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_resident_estimate_counts_an_old_store_pinned_by_a_fork() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        let (old_store, old_bytes) = {
+            let store = Arc::clone(
+                semantic_fork_index(&server)
+                    .await
+                    .index
+                    .vector_store()
+                    .unwrap(),
+            );
+            (
+                Arc::as_ptr(&store) as usize,
+                store.estimated_resident_bytes(),
+            )
+        };
+        semantic_fork_rebuild_primary(&server).await;
+
+        assert!(
+            !semantic_fork_resident(&[&server])
+                .await
+                .contains_key(&old_store)
+        );
+        assert_eq!(
+            semantic_fork_resident(&[&session]).await.get(&old_store),
+            Some(&old_bytes),
+            "the old primary store pinned by the worktree's fork is not charged to it"
+        );
+    }
+
+    /// With the tracker on, the worktree's first query after the primary
+    /// replaces its store answers from the old fork while a background refresh
+    /// re-forks onto the new one.
+    #[tokio::test]
+    async fn semantic_fork_tracked_worktree_reforks_in_the_background() {
+        let (_ollama, primary_root, worktree, untracked, _) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let mut config = untracked.state.config.clone();
+        config.embed_tracker_mode = crate::config::TrackerMode::Lazy;
+        let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
+        let session = attached_worktree(&server, worktree.path()).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_query(&session).await;
+        let primary = semantic_fork_rebuild_primary(&server).await;
+
+        semantic_fork_query(&session).await;
+        let fork = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let fork = semantic_fork_index(&session).await;
+                if fork.index.shares_vector_store(&primary.index) {
+                    return fork;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worktree re-forks onto the primary's new store");
+        assert_eq!(
+            semantic_fork_hits(&fork),
+            semantic_fork_standalone_hits(&server, worktree.path()).await
+        );
+    }
+
+    /// A worktree past the change threshold re-checks the fork once per new
+    /// primary store, not on every query.
+    #[tokio::test]
+    async fn semantic_fork_promoted_worktree_walks_once_per_primary_store() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(semantic_fork_rewrite_a_third).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_query(&session).await;
+        let owner = session.current_ref().await;
+        let walks = || {
+            owner
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = walks();
+        semantic_fork_query(&session).await;
+        assert_eq!(walks(), before, "an idle standalone worktree walked");
+
+        let primary = semantic_fork_rebuild_primary(&server).await;
+        for _ in 0..3 {
+            semantic_fork_query(&session).await;
+        }
+        assert_eq!(
+            walks(),
+            before + 1,
+            "the worktree did not re-check the new store exactly once"
+        );
+        assert!(
+            !semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&primary.index)
+        );
+    }
+
+    /// A primary full rebuild leaves the worktree's old fork answering like the
+    /// re-fork its next query makes over the new store.
+    #[tokio::test]
+    async fn semantic_fork_worktree_stays_correct_across_a_primary_full_rebuild() {
+        let (_ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_query(&session).await;
+        let old_fork = semantic_fork_index(&session).await;
+        // Past the change threshold and back: two full rebuilds.
+        semantic_fork_rewrite_a_third(primary_root.path());
+        let original = semantic_fork_index(&server).await;
+        let rewritten = semantic_fork_await_primary_rebuild(&server, &original).await;
+        lexdelta_corpus(primary_root.path(), SEMANTIC_FORK_FILES);
+        let rebuilt = semantic_fork_await_primary_rebuild(&server, &rewritten).await;
+        assert!(!rebuilt.index.shares_vector_store(&old_fork.index));
+
+        let expected = semantic_fork_standalone_hits(&server, worktree.path()).await;
+        assert_eq!(semantic_fork_hits(&old_fork), expected);
+
+        semantic_fork_query(&session).await;
+        let fork = semantic_fork_index(&session).await;
+        assert!(
+            fork.index.shares_vector_store(&rebuilt.index),
+            "the worktree did not re-fork onto the rebuilt store"
+        );
+        assert_eq!(semantic_fork_hits(&fork), expected);
     }
 }
 

@@ -201,6 +201,8 @@ pub struct RefIndex {
     /// Already `Arc<RwLock<…>>` so background rebuild tasks can hold a clone.
     pub(crate) semantic_vector_generation: AtomicU64,
     pub(crate) semantic_fill: tokio::sync::Mutex<crate::server_adapters::SemanticFill>,
+    /// The parent's vector store this worktree last forked, or was refused a fork of.
+    pub(crate) fork_base: std::sync::Mutex<std::sync::Weak<crate::core::embeddings::VectorStore>>,
     pub search_index_cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
 
     /// Monotonic counter incremented by the embedding tracker on each file-change
@@ -274,6 +276,7 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
@@ -324,6 +327,7 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
@@ -376,6 +380,7 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),

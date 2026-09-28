@@ -311,6 +311,40 @@ impl RefWalkerIndexer {
         self.walker
             .walk_for_ref_candidates(root, self.ref_index.clone(), Some(candidates))
     }
+
+    /// Expires a worktree's semantic entry when its parent holds a forkable
+    /// vector store the worktree has not forked or been refused, so a query of
+    /// its whole `root` walks and re-forks.
+    pub(crate) async fn expire_stale_fork(&self, root: &Path) {
+        let ref_index = &self.ref_index;
+        let Some(parent_id) = ref_index.parent_ref_id else {
+            return;
+        };
+        if tokio::fs::canonicalize(root).await.ok().as_deref() != Some(&ref_index.canonical_root) {
+            return;
+        }
+        let Some(parent) = self.walker.state.ref_index(parent_id).await else {
+            return;
+        };
+        let base = parent.search_index_cache.read().await.clone();
+        let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
+            return;
+        };
+        if base.index.vector_store().is_some_and(|store| {
+            std::sync::Weak::ptr_eq(&ref_index.fork_base.lock().unwrap(), &Arc::downgrade(store))
+        }) {
+            return;
+        }
+        let entry = ref_index.search_index_cache.read().await.clone();
+        let Some(entry) = entry.filter(|entry| !entry.index.shares_vector_store(&base.index))
+        else {
+            return;
+        };
+        ref_index
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *entry.metadata.write().unwrap() = None;
+    }
 }
 
 impl WalkAndIndexFn for RefWalkerIndexer {
@@ -996,6 +1030,9 @@ impl CachedWalkerIndexer {
         let Some(base) = base.filter(|base| base.forkable_at(&parent.canonical_root)) else {
             return Ok((docs, vectors));
         };
+        if let Some(store) = base.index.vector_store() {
+            *ref_index.fork_base.lock().unwrap() = Arc::downgrade(store);
+        }
         if ref_index
             .search_index_cache
             .read()
