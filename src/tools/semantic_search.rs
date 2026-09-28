@@ -1011,6 +1011,54 @@ impl CachedSearchIndex {
         }
     }
 
+    fn delta_generation(
+        current: Arc<CachedSearchIndex>,
+        changed: Vec<SearchDocument>,
+        changed_vectors: Vec<Option<Vec<f32>>>,
+        deleted: Vec<String>,
+        generation: u64,
+    ) -> Arc<CachedSearchIndex> {
+        let mut entry = match Arc::try_unwrap(current) {
+            Ok(entry) => entry,
+            Err(current) => {
+                let mut entry = Self::new(
+                    current.index.clone(),
+                    current.fingerprint.clone(),
+                    generation,
+                );
+                entry.search_root = current.search_root.clone();
+                entry.vector_generation = current.vector_generation;
+                entry
+            }
+        };
+        entry.index.apply_delta(changed, changed_vectors, &deleted);
+        entry.fingerprint = IndexFingerprint::from_docs(&entry.index.documents);
+        entry
+            .generation
+            .store(generation, std::sync::atomic::Ordering::Release);
+        *entry.metadata.write().unwrap() = None;
+        Arc::new(entry)
+    }
+
+    pub(crate) fn estimated_resident_bytes(&self) -> usize {
+        self.index.estimated_resident_bytes()
+    }
+
+    #[cfg(feature = "memory-profile")]
+    pub(crate) fn resident_file_vector_bytes(&self) -> usize {
+        self.index.resident_file_vector_bytes()
+    }
+
+    #[cfg(feature = "memory-profile")]
+    pub(crate) fn estimated_hnsw_bytes(&self) -> usize {
+        self.index.estimated_hnsw_bytes()
+    }
+
+    #[cfg(feature = "memory-profile")]
+    pub(crate) fn resident_document_bytes(&self) -> usize {
+        self.index.resident_document_bytes()
+    }
+
     pub(crate) fn refresh_paths(
         entry: &mut Arc<Self>,
         root: &Path,
@@ -1122,10 +1170,9 @@ impl CachedSearchIndex {
         let mut docs = Vec::new();
         let mut vectors = Vec::new();
         let mut represented = true;
-        let prefix = entry
-            .search_root
-            .strip_prefix(root)
-            .unwrap_or(Path::new(""));
+        let Ok(prefix) = entry.search_root.strip_prefix(root) else {
+            return;
+        };
         for (path, hash, vector) in updates {
             let Ok(path) = Path::new(&path).strip_prefix(prefix) else {
                 continue;
@@ -1242,6 +1289,54 @@ impl Default for SearchIndex {
 }
 
 impl SearchIndex {
+    fn resident_document_bytes(&self) -> usize {
+        self.documents
+            .iter()
+            .map(|doc| {
+                doc.path.capacity()
+                    + doc.content.capacity()
+                    + doc.header.capacity()
+                    + doc.source_hash.capacity()
+                    + doc.symbols.iter().map(String::capacity).sum::<usize>()
+            })
+            .sum()
+    }
+
+    #[cfg(feature = "memory-profile")]
+    fn resident_file_vector_bytes(&self) -> usize {
+        self.vector_buffer.capacity() * std::mem::size_of::<f32>()
+            + self
+                .vector_updates
+                .values()
+                .map(|vector| vector.capacity() * std::mem::size_of::<f32>())
+                .sum::<usize>()
+            + self
+                .ann_store
+                .as_ref()
+                .map_or(0, |store| store.resident_vector_bytes())
+    }
+
+    #[cfg(feature = "memory-profile")]
+    fn estimated_hnsw_bytes(&self) -> usize {
+        self.ann_store
+            .as_ref()
+            .map_or(0, |store| store.estimated_hnsw_bytes())
+    }
+
+    fn estimated_resident_bytes(&self) -> usize {
+        self.resident_document_bytes()
+            + self.vector_buffer.capacity() * std::mem::size_of::<f32>()
+            + self
+                .vector_updates
+                .values()
+                .map(|vector| vector.capacity() * std::mem::size_of::<f32>())
+                .sum::<usize>()
+            + self
+                .ann_store
+                .as_ref()
+                .map_or(0, |store| store.estimated_resident_bytes())
+    }
+
     fn prepare_ann(&self) {
         if let Some(store) = &self.ann_store {
             store.find_nearest_hnsw(&vec![0.0; self.dims], 1);
@@ -1984,7 +2079,7 @@ pub(crate) async fn semantic_code_search_owned(
                 let walker = Arc::clone(&walk_and_index_fn);
                 let root = options.root_dir.clone();
                 let build_generation = generation.load(Ordering::Acquire);
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let _reset = RebuildGuard(Arc::clone(&previous));
                     let vector_generation = walker.vector_generation(&root).await;
                     match walker.walk_and_index(&root).await {
@@ -2064,6 +2159,7 @@ pub(crate) async fn semantic_code_search_owned(
                         Err(error) => tracing::warn!(%error, "Background index refresh failed"),
                     }
                 });
+                walk_and_index_fn.track_background_task(&task);
             }
             let query = sanitize_query(&options.query);
             let vectors = embed_fn.embed(&[query.to_string()]).await?;
@@ -2288,7 +2384,7 @@ pub async fn semantic_code_search(
                     {
                         let previous = Arc::clone(&stale);
                         let lock = Arc::clone(&lock);
-                        tokio::spawn(async move {
+                        let task = tokio::spawn(async move {
                             let _reset = RebuildGuard(Arc::clone(&previous));
                             let base = Arc::clone(&previous);
                             let built = tokio::task::spawn_blocking(move || {
@@ -2368,21 +2464,17 @@ pub async fn semantic_code_search(
                                 }
                             }
                         });
+                        walk_and_index_fn.track_background_task(&task);
                     }
                     break 'cache stale;
                 }
-                let mut entry = guard.take().unwrap();
-                let index = if let Some(entry) = Arc::get_mut(&mut entry) {
-                    entry.index.apply_delta(changed, changed_vectors, &deleted);
-                    None
-                } else {
-                    let mut index = entry.index.clone();
-                    index.apply_delta(changed, changed_vectors, &deleted);
-                    Some(index)
-                };
-                if let Some(index) = index {
-                    entry = Arc::new(CachedSearchIndex::new(index, fp.clone(), current_gen));
-                }
+                let mut entry = CachedSearchIndex::delta_generation(
+                    guard.take().unwrap(),
+                    changed,
+                    changed_vectors,
+                    deleted,
+                    current_gen,
+                );
                 let fresh = Arc::get_mut(&mut entry).unwrap();
                 fresh.fingerprint = fp;
                 fresh
@@ -2445,6 +2537,7 @@ pub trait WalkAndIndexFn: Send + Sync {
         Box::pin(async { Ok(None) })
     }
     fn walk_and_index(&self, root_dir: &Path) -> WalkAndIndexFuture<'_>;
+    fn track_background_task(&self, _task: &tokio::task::JoinHandle<()>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -5883,6 +5976,167 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             "RebuildGuard must reset flag on drop"
         );
+    }
+
+    #[test]
+    fn lane_m_worktree_fill_cannot_push_into_or_clone_primary_semantic_index() {
+        let mut doc = SearchDocument::new(
+            "src/shared.rs".to_string(),
+            String::new(),
+            vec![],
+            vec![],
+            "fn shared() {}".to_string(),
+        );
+        doc.source_hash = "shared-hash".to_string();
+        let fingerprint = IndexFingerprint::from_docs(std::slice::from_ref(&doc));
+        let mut index = SearchIndex::new();
+        index.index_with_vectors(vec![doc], vec![Some(vec![1.0, 0.0])]);
+        let mut cache = CachedSearchIndex::new(index, fingerprint, 0);
+        cache.search_root = PathBuf::from("/lane-m/primary");
+        let primary = Arc::new(cache);
+        let mut worktree_slot = Arc::clone(&primary);
+
+        CachedSearchIndex::refresh_vectors(
+            &mut worktree_slot,
+            Path::new("/lane-m/worktree"),
+            vec![(
+                "src/shared.rs".to_string(),
+                "shared-hash".to_string(),
+                vec![0.0, 1.0],
+            )],
+            1,
+        );
+
+        assert!(
+            primary.pending.lock().unwrap().batches.is_empty(),
+            "a worktree fill pushed a refresh batch into the primary's index"
+        );
+        assert!(
+            Arc::ptr_eq(&worktree_slot, &primary),
+            "a worktree fill deep-cloned the primary's index into its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_background_rebuild_releases_snapshot_and_stale_generation_after_readers() {
+        struct SnapshotWalker {
+            docs: Vec<SearchDocument>,
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        impl WalkAndIndexFn for SnapshotWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    Ok((
+                        self.docs.clone(),
+                        vec![Some(vec![1.0, 0.0]); self.docs.len()],
+                    ))
+                })
+            }
+        }
+
+        struct InitialWalker(Vec<SearchDocument>);
+        impl WalkAndIndexFn for InitialWalker {
+            fn walk_and_index(
+                &self,
+                _root: &Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(
+                    async move { Ok((self.0.clone(), vec![Some(vec![1.0, 0.0]); self.0.len()])) },
+                )
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let mut options = gen_test_opts();
+        options.root_dir = root.path().to_path_buf();
+        let initial_docs = (0..100)
+            .map(|i| make_doc(&format!("src/initial_{i}.rs"), "initial generation"))
+            .collect();
+        semantic_code_search_owned(
+            options.clone(),
+            &FixedEmbedder2,
+            Arc::new(InitialWalker(initial_docs)),
+            Some(Arc::clone(&cache)),
+            Some(Arc::clone(&generation)),
+        )
+        .await
+        .unwrap();
+
+        for cycle in 1..=3_u64 {
+            let reader = cache.read().await.as_ref().unwrap().clone();
+            let stale = Arc::downgrade(&reader);
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let docs = (0..100 + cycle as usize)
+                .map(|i| make_doc(&format!("src/cycle_{cycle}_{i}.rs"), "rebuilt generation"))
+                .collect();
+            let snapshot = Arc::new(SnapshotWalker {
+                docs,
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            });
+            let snapshot_weak = Arc::downgrade(&snapshot);
+            generation.store(cycle, std::sync::atomic::Ordering::Release);
+            semantic_code_search_owned(
+                options.clone(),
+                &FixedEmbedder2,
+                snapshot.clone(),
+                Some(Arc::clone(&cache)),
+                Some(Arc::clone(&generation)),
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+                .await
+                .expect("production background rebuild did not start");
+            release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let installed = cache.read().await.as_ref().is_some_and(|entry| {
+                        entry.generation.load(std::sync::atomic::Ordering::Acquire) == cycle
+                    });
+                    if installed && snapshot_weak.upgrade().is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background rebuild retained its build snapshot after completion");
+            assert!(
+                stale.upgrade().is_some(),
+                "the stale generation died while a reader still retained it"
+            );
+            drop(reader);
+            assert!(
+                stale.upgrade().is_none(),
+                "the completed rebuild retained its stale generation after readers released it"
+            );
+        }
     }
 
     /// Stale-write guard: if a fresher index is installed before the background

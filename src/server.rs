@@ -235,6 +235,10 @@ pub struct SharedState {
     /// no-op.
     pub warmup_in_flight:
         Arc<tokio::sync::Mutex<std::collections::HashSet<crate::ref_index::RefId>>>,
+    access_clock: std::sync::atomic::AtomicU64,
+    ref_access: std::sync::Mutex<HashMap<crate::ref_index::RefId, (u64, Instant)>>,
+    budget_enforcement_running: std::sync::atomic::AtomicBool,
+    last_budget_enforcement: std::sync::Mutex<Option<Instant>>,
 }
 
 impl SharedState {
@@ -278,12 +282,80 @@ impl SharedState {
         ref_id: crate::ref_index::RefId,
         make_ref: impl FnOnce() -> Arc<crate::ref_index::RefIndex>,
     ) -> Arc<crate::ref_index::RefIndex> {
+        let existing = {
+            let guard = self.refs.read().await;
+            guard.get(&ref_id).cloned().inspect(|existing| {
+                existing
+                    .eviction_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                existing
+                    .session_count
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            })
+        };
+        if let Some(existing) = existing {
+            self.touch_ref(ref_id);
+            return existing;
+        }
+
+        let created = make_ref();
+        if let Some(parent_id) = created.parent_ref_id {
+            let parent = self.refs.read().await.get(&parent_id).cloned();
+            if let Some(parent) = parent {
+                if let Some(parent_vectors) = parent.identifier_vectors.get() {
+                    let _ = created.identifier_vectors.set(Arc::clone(parent_vectors));
+                }
+                // Installs write the index and its source under the index write
+                // lock, so reading both under one read guard cannot tear.
+                let (identifier_index, identifier_source) = {
+                    let index = parent.identifier_index.read().await;
+                    let source = parent.identifier_source.read().await;
+                    match (index.as_ref(), source.as_ref()) {
+                        (Some(index), Some(source)) => {
+                            (Some(Arc::clone(index)), Some(Arc::clone(source)))
+                        }
+                        _ => (None, None),
+                    }
+                };
+                created.identifier_inherited.store(
+                    identifier_index.is_some(),
+                    std::sync::atomic::Ordering::Release,
+                );
+                *created.identifier_index.write().await = identifier_index;
+                *created.identifier_source.write().await = identifier_source;
+                let lexical = parent.lexical_search_cache.read().await.as_ref().cloned();
+                created
+                    .lexical_inherited
+                    .store(lexical.is_some(), std::sync::atomic::Ordering::Release);
+                *created.lexical_search_cache.write().await = lexical;
+            }
+        }
+
         let mut guard = self.refs.write().await;
-        let entry = guard.entry(ref_id).or_insert_with(make_ref);
+        let entry = guard
+            .entry(ref_id)
+            .or_insert_with(|| Arc::clone(&created))
+            .clone();
+        entry
+            .eviction_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         entry
             .session_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Arc::clone(entry)
+        drop(guard);
+        self.touch_ref(ref_id);
+        entry
+    }
+
+    pub fn touch_ref(&self, ref_id: crate::ref_index::RefId) {
+        let tick = self
+            .access_clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        self.ref_access
+            .lock()
+            .unwrap()
+            .insert(ref_id, (tick, Instant::now()));
     }
 
     /// Detach a session from a ref. Decrements the session refcount. When the
@@ -291,10 +363,14 @@ impl SharedState {
     /// background task). The primary ref (matching `default_ref_id`) is never
     /// evicted from the registry regardless of refcount.
     ///
-    /// `ttl_secs` — how long after last-session-disconnect before the in-memory
+    /// `ttl` — how long after last-session-disconnect before the in-memory
     /// `RefIndex` is removed. `0` means immediate removal. The on-disk overlay
     /// (U6) is not touched here; only the in-memory registry entry is dropped.
-    pub async fn detach_ref(self: &Arc<Self>, ref_id: crate::ref_index::RefId, ttl_secs: u64) {
+    pub async fn detach_ref(
+        self: &Arc<Self>,
+        ref_id: crate::ref_index::RefId,
+        ttl: std::time::Duration,
+    ) {
         let count = {
             let guard = self.refs.read().await;
             guard
@@ -314,16 +390,30 @@ impl SharedState {
         if ref_id == self.default_ref_id {
             return;
         }
+        let epoch = {
+            let guard = self.refs.read().await;
+            let Some(owner) = guard.get(&ref_id) else {
+                return;
+            };
+            owner
+                .eviction_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1
+        };
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            if ttl_secs > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(ttl_secs)).await;
+            if !ttl.is_zero() {
+                tokio::time::sleep(ttl).await;
             }
             // Re-check the refcount after the TTL — a new session may have
             // re-attached in the interim.
             let guard = state.refs.read().await;
             if let Some(r) = guard.get(&ref_id) {
-                if r.session_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                if r.session_count.load(std::sync::atomic::Ordering::Acquire) > 0
+                    || r.eviction_generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != epoch
+                {
                     tracing::debug!(
                         ref_id = ref_id.0,
                         "TTL eviction cancelled — new session attached"
@@ -338,12 +428,270 @@ impl SharedState {
             // Double-check under write lock.
             if let Some(r) = guard.get(&ref_id)
                 && r.session_count.load(std::sync::atomic::Ordering::Acquire) == 0
+                && r.eviction_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == epoch
             {
+                r.cancel_background_tasks();
+                r.tracker_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
                 guard.remove(&ref_id);
+                state.ref_access.lock().unwrap().remove(&ref_id);
                 tracing::info!(ref_id = ref_id.0, "ref evicted after TTL expiry");
             }
         });
     }
+
+    pub async fn enforce_memory_budget(&self) {
+        let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
+        let mut snapshots = Vec::with_capacity(refs.len());
+        for owner in &refs {
+            snapshots.push(ResidentSnapshot::capture(owner).await);
+        }
+        let Ok(components) = tokio::task::spawn_blocking(move || {
+            snapshots
+                .into_iter()
+                .map(ResidentSnapshot::measure)
+                .collect::<Vec<_>>()
+        })
+        .await
+        else {
+            return;
+        };
+
+        let mut holders: HashMap<usize, (usize, usize)> = HashMap::new();
+        for &(ptr, bytes) in components.iter().flatten() {
+            holders.entry(ptr).or_insert((bytes, 0)).1 += 1;
+        }
+        let mut resident = holders
+            .values()
+            .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
+        let budget = self.config.resident_memory_budget_bytes;
+        if resident <= budget {
+            return;
+        }
+        let low_watermark = budget / 5 * 4;
+        let access = self.ref_access.lock().unwrap().clone();
+        let mut candidates: Vec<_> = (0..refs.len())
+            .filter_map(|i| {
+                if Arc::ptr_eq(&refs[i], &self.default_ref) {
+                    return None;
+                }
+                let id = crate::ref_index::RefId::for_canonical_path(&refs[i].canonical_root);
+                let Some(&(tick, last_used)) = access.get(&id) else {
+                    return Some((0, i));
+                };
+                (last_used.elapsed() >= MEMORY_BUDGET_MIN_IDLE).then_some((tick, i))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let id_cache_name = cache_name("identifier-embeddings", &self.config);
+        let mut cleared = false;
+        for (_, i) in candidates {
+            if resident <= low_watermark {
+                break;
+            }
+            let owner = &refs[i];
+            let holds_unique_bytes = components[i].iter().any(|(ptr, _)| holders[ptr].1 == 1);
+            if !holds_unique_bytes
+                || owner
+                    .active_requests
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    > 0
+            {
+                continue;
+            }
+            clear_ref_heavy_caches(owner, &id_cache_name).await;
+            cleared = true;
+            for (ptr, _) in &components[i] {
+                let holder = holders.get_mut(ptr).unwrap();
+                holder.1 -= 1;
+                if holder.1 == 0 {
+                    resident = resident.saturating_sub(holder.0);
+                }
+            }
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        if cleared {
+            let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let _ = cleared;
+    }
+
+    pub fn schedule_memory_budget_enforcement(self: &Arc<Self>) {
+        if self
+            .budget_enforcement_running
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let guard = BudgetEnforcementGuard(Arc::clone(self));
+        tokio::spawn(async move {
+            let state = &guard.0;
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if state.inflight.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            let last = *state.last_budget_enforcement.lock().unwrap();
+            if let Some(last) = last {
+                tokio::time::sleep(MEMORY_BUDGET_MIN_INTERVAL.saturating_sub(last.elapsed())).await;
+            }
+            state.enforce_memory_budget().await;
+            *state.last_budget_enforcement.lock().unwrap() = Some(Instant::now());
+        });
+    }
+}
+
+const MEMORY_BUDGET_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// A worktree used more recently than this is never evicted, so concurrently
+/// active worktrees cannot evict each other into repeated cold rebuilds.
+const MEMORY_BUDGET_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct BudgetEnforcementGuard(Arc<SharedState>);
+
+impl Drop for BudgetEnforcementGuard {
+    fn drop(&mut self) {
+        self.0
+            .budget_enforcement_running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Heavy per-ref structures captured under short read locks. Map sizes are
+/// estimated in O(1); the `Arc` snapshots are walked off the async runtime.
+struct ResidentSnapshot {
+    components: Vec<(usize, usize)>,
+    identifier_index: Option<Arc<IdentifierIndex>>,
+    search_index: Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>,
+    project_cache: Option<Arc<ProjectCache>>,
+    lexical: Option<Arc<CachedLexicalIndex>>,
+}
+
+impl ResidentSnapshot {
+    async fn capture(owner: &crate::ref_index::RefIndex) -> Self {
+        let mut components = Vec::new();
+        components.push((
+            Arc::as_ptr(&owner.embedding_cache) as usize,
+            cache_entry_bytes(&*owner.embedding_cache.read().await),
+        ));
+        if let Some(vectors) = owner.identifier_vectors.get() {
+            components.push((
+                Arc::as_ptr(vectors) as usize,
+                cache_entry_bytes(&*vectors.read().await),
+            ));
+        }
+        components.push((
+            Arc::as_ptr(&owner.identifier_vector_overlay) as usize,
+            cache_entry_bytes(&*owner.identifier_vector_overlay.read().await),
+        ));
+        // One statement per lock so no guard is held while the next is awaited.
+        let identifier_index = owner.identifier_index.read().await.clone();
+        let search_index = owner.search_index_cache.read().await.clone();
+        let project_cache = owner.project_cache.read().await.clone();
+        let lexical = owner.lexical_search_cache.read().await.clone();
+        Self {
+            components,
+            identifier_index,
+            search_index,
+            project_cache,
+            lexical,
+        }
+    }
+
+    fn measure(self) -> Vec<(usize, usize)> {
+        let mut components = self.components;
+        if let Some(index) = &self.identifier_index {
+            components.push((
+                Arc::as_ptr(index) as usize,
+                index.vector_buffer.len() * std::mem::size_of::<f32>() + index.docs.len() * 128,
+            ));
+        }
+        if let Some(index) = &self.search_index {
+            components.push((
+                Arc::as_ptr(index) as usize,
+                index.estimated_resident_bytes(),
+            ));
+        }
+        if let Some(cache) = &self.project_cache {
+            components.push((
+                Arc::as_ptr(cache) as usize,
+                cache
+                    .file_content
+                    .iter()
+                    .map(|(path, content)| path.capacity() + content.capacity())
+                    .sum(),
+            ));
+        }
+        if let Some(cache) = &self.lexical {
+            components.push((
+                Arc::as_ptr(cache) as usize,
+                cache.index.estimated_resident_bytes(),
+            ));
+        }
+        components.retain(|(_, bytes)| *bytes > 0);
+        components
+    }
+}
+
+/// O(1) estimate: entries of one map share a vector width.
+fn cache_entry_bytes(cache: &HashMap<String, CacheEntry>) -> usize {
+    cache.values().next().map_or(0, |entry| {
+        cache.len()
+            * (std::mem::size_of::<(String, CacheEntry)>()
+                + 64
+                + entry.hash.capacity()
+                + entry.vector.capacity() * std::mem::size_of::<f32>())
+    })
+}
+
+async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_name: &str) {
+    // Background rebuilds and fills would refill what is cleared here.
+    owner.cancel_background_tasks();
+    owner
+        .cache_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    *owner.semantic_fill.lock().await = Default::default();
+    owner.embedding_cache.write().await.clear();
+    *owner.identifier_index.write().await = None;
+    *owner.identifier_source.write().await = None;
+    if let Some(vectors) = owner.identifier_vectors.get()
+        && Arc::strong_count(vectors) == 1
+    {
+        vectors.write().await.clear();
+    }
+    let save_lock = owner.identifier_save_lock.lock().await;
+    let mut overlay = owner.identifier_vector_overlay.write().await;
+    let unsaved = std::mem::take(&mut *overlay);
+    if let Some(store) = crate::core::embeddings::VectorStore::from_cache(&unsaved) {
+        let root = owner.root_dir.clone();
+        let name = id_cache_name.to_string();
+        let saved = tokio::task::spawn_blocking(move || {
+            rkyv_store::save_vector_store_merged(&root, &name, &store)
+        })
+        .await;
+        if let Ok(Err(error)) = saved {
+            tracing::warn!(%error, "Identifier overlay flush failed");
+        }
+    }
+    owner
+        .identifier_overlay_loaded
+        .store(false, std::sync::atomic::Ordering::Release);
+    drop(overlay);
+    drop(save_lock);
+    *owner.search_index_cache.write().await = None;
+    *owner.lexical_search_cache.write().await = None;
+    *owner.project_cache.write().await = None;
 }
 
 /// The MCP server exposing context+ tools.
@@ -659,6 +1007,13 @@ impl ContextPlusServer {
             default_ref_id,
             ollama_semaphore,
             warmup_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            access_clock: std::sync::atomic::AtomicU64::new(0),
+            ref_access: std::sync::Mutex::new(HashMap::from([(
+                default_ref_id,
+                (0, Instant::now()),
+            )])),
+            budget_enforcement_running: std::sync::atomic::AtomicBool::new(false),
+            last_budget_enforcement: std::sync::Mutex::new(None),
         });
         Self {
             state,
@@ -1937,6 +2292,9 @@ impl ContextPlusServer {
 
         *ref_index.identifier_source.write().await = Some(Arc::clone(source_cache));
         *identifier_guard = Some(Arc::clone(index));
+        ref_index
+            .identifier_inherited
+            .store(false, Ordering::Release);
         true
     }
 
@@ -1967,6 +2325,9 @@ impl ContextPlusServer {
                 if let Some(ref idx) = *guard
                     && idx.file_count == file_count
                     && source_matches
+                    && !ref_index
+                        .identifier_inherited
+                        .load(std::sync::atomic::Ordering::Acquire)
                     && (tracker_running
                         || idx.built_at.elapsed().as_secs() < IDENTIFIER_INDEX_TTL_SECS)
                     && (idx.dims > 0 || idx.docs.is_empty())
@@ -1997,7 +2358,19 @@ impl ContextPlusServer {
                 );
             }
 
-            let previous = ref_index.identifier_index.read().await.as_ref().cloned();
+            // An index inherited from the parent ref answers for another tree,
+            // so it is never served while this ref rebuilds.
+            let previous = ref_index
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .cloned()
+                .filter(|_| {
+                    !ref_index
+                        .identifier_inherited
+                        .load(std::sync::atomic::Ordering::Acquire)
+                });
             if let (Some(source), Some(previous)) = (&source, previous) {
                 let changed = cache
                     .file_content
@@ -2026,23 +2399,25 @@ impl ContextPlusServer {
                         let server = self.clone();
                         let cache = Arc::clone(cache);
                         let flag = Arc::clone(&ref_index.identifier_rebuilding);
-                        tokio::spawn(async move {
+                        let task = tokio::spawn(async move {
                             let _reset = RefreshGuard(flag);
-                            if let Err(error) = server.build_identifier_index(&cache).await {
+                            if let Err(error) = server.build_identifier_index(&cache, true).await {
                                 tracing::warn!(%error, "Background identifier rebuild failed");
                             }
                         });
+                        ref_index.track_background_task(&task);
                     }
                     return Ok(previous);
                 }
             }
-            self.build_identifier_index(cache).await
+            self.build_identifier_index(cache, false).await
         })
     }
 
     async fn build_identifier_index(
         &self,
         cache: &Arc<ProjectCache>,
+        background: bool,
     ) -> Result<Arc<IdentifierIndex>> {
         let ref_index = self.current_ref().await;
         let update_guard = ref_index.identifier_update.lock().await;
@@ -2188,51 +2563,66 @@ impl ContextPlusServer {
             "Embedding identifiers (using disk cache for warm hits)"
         );
 
-        // Load identifier-specific embedding cache. Identifier texts are keyed
-        // by repo-relative path and signature, so a worktree shares them with
-        // the primary: its own cache is consulted first, then the primary's,
-        // and new vectors are merged into the primary's so every worktree of
-        // the repo benefits. Without the fallback a worktree's first search
-        // re-embedded the whole repo.
+        // Identifier texts are keyed by repo-relative path and signature, so a
+        // worktree shares the primary's resident vectors and keeps only its own
+        // misses in a per-ref overlay persisted under its root.
         let id_cache_name = cache_name("identifier-embeddings", &self.state.config);
-        let primary_root = self.state.root_dir.clone();
-        let resident = ref_index
+        let is_worktree = ref_index.parent_ref_id.is_some();
+        let base_owner = match ref_index.parent_ref_id {
+            Some(parent_id) => self
+                .state
+                .ref_index(parent_id)
+                .await
+                .unwrap_or_else(|| Arc::clone(&ref_index)),
+            None => Arc::clone(&ref_index),
+        };
+        let resident = base_owner
             .identifier_vectors
             .get_or_try_init(|| async {
-                let root = ref_index.root_dir.clone();
-                let primary = primary_root.clone();
+                let root = base_owner.root_dir.clone();
                 let name = id_cache_name.clone();
-                let primary_ref = self.state.default_ref();
-                let inherited = if root != primary {
-                    if let Some(resident) = primary_ref
-                        .as_ref()
-                        .and_then(|owner| owner.identifier_vectors.get())
-                    {
-                        Some(resident.read().await.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
                 tokio::task::spawn_blocking(move || {
-                    let resident_primary = inherited.is_some();
-                    let mut vectors = inherited.unwrap_or_default();
-                    if root != primary
-                        && !resident_primary
-                        && let Ok(Some(data)) = rkyv_store::load_cache(&primary, &name)
-                    {
-                        vectors.extend(data.to_store().to_cache());
-                    }
+                    let mut vectors = HashMap::new();
                     if let Ok(Some(data)) = rkyv_store::load_cache(&root, &name) {
                         vectors.extend(data.to_store().to_cache());
                     }
-                    RwLock::new(vectors)
+                    Arc::new(RwLock::new(vectors))
                 })
                 .await
                 .map_err(|error| ContextPlusError::Other(error.to_string()))
             })
             .await?;
+        let resident = ref_index
+            .identifier_vectors
+            .get_or_init(|| async { Arc::clone(resident) })
+            .await;
+        if is_worktree
+            && !ref_index
+                .identifier_overlay_loaded
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let root = ref_index.root_dir.clone();
+            let name = id_cache_name.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                rkyv_store::load_cache(&root, &name)
+                    .ok()
+                    .flatten()
+                    .map(|data| data.to_store().to_cache())
+                    .unwrap_or_default()
+            })
+            .await
+            .map_err(|error| ContextPlusError::Other(error.to_string()))?;
+            let mut overlay = ref_index.identifier_vector_overlay.write().await;
+            if !ref_index
+                .identifier_overlay_loaded
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                for (key, entry) in loaded {
+                    overlay.entry(key).or_insert(entry);
+                }
+            }
+        }
+        let overlay = ref_index.identifier_vector_overlay.read().await;
         let id_caches = resident.read().await;
 
         // Partition: cached vs uncached identifiers (use &str slices for cache lookup)
@@ -2241,7 +2631,11 @@ impl ContextPlusServer {
         let mut uncached_texts: Vec<String> = Vec::new();
 
         for (i, doc) in identifier_docs.iter().enumerate() {
-            if let Some(vec) = id_caches.get(&doc.text).map(|entry| &entry.vector) {
+            if let Some(vec) = overlay
+                .get(&doc.text)
+                .or_else(|| id_caches.get(&doc.text))
+                .map(|entry| &entry.vector)
+            {
                 #[cfg(test)]
                 ref_index
                     .identifier_resident_vector_elements_copied
@@ -2261,6 +2655,7 @@ impl ContextPlusServer {
         );
 
         drop(id_caches);
+        drop(overlay);
         // Embed only uncached identifiers, in chunks to survive MCP connection timeouts.
         if !uncached_texts.is_empty() {
             let chunk_size = self.state.ollama.batch_size();
@@ -2278,11 +2673,16 @@ impl ContextPlusServer {
         }
 
         if !uncached_indices.is_empty() {
-            let mut resident = resident.write().await;
+            let target = if is_worktree {
+                Arc::clone(&ref_index.identifier_vector_overlay)
+            } else {
+                Arc::clone(resident)
+            };
+            let mut target_guard = target.write().await;
             for &i in &uncached_indices {
                 if let Some(vector) = &result_vectors[i] {
                     let key = identifier_docs[i].text.clone();
-                    resident.insert(
+                    target_guard.insert(
                         key.clone(),
                         CacheEntry {
                             hash: crate::core::parser::hash_content(&key),
@@ -2291,27 +2691,27 @@ impl ContextPlusServer {
                     );
                 }
             }
-            drop(resident);
+            drop(target_guard);
             let ticket = ref_index
                 .identifier_persist_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 + 1;
-            let owner = Arc::clone(&ref_index);
+            let persist_generation = Arc::clone(&ref_index.identifier_persist_generation);
+            let persist_root = ref_index.root_dir.clone();
+            let save_lock = Arc::clone(&ref_index.identifier_save_lock);
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                if owner
-                    .identifier_persist_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != ticket
-                {
+                // Serialized with the budget flush: both merge into the same file.
+                let _save = save_lock.lock().await;
+                if persist_generation.load(std::sync::atomic::Ordering::Acquire) != ticket {
                     return;
                 }
-                let cache = owner.identifier_vectors.get().unwrap().read().await;
+                let cache = target.read().await;
                 let store = crate::core::embeddings::VectorStore::from_cache(&cache);
                 drop(cache);
                 if let Some(store) = store {
                     let result = tokio::task::spawn_blocking(move || {
-                        rkyv_store::save_vector_store_merged(&primary_root, &id_cache_name, &store)
+                        rkyv_store::save_vector_store_merged(&persist_root, &id_cache_name, &store)
                     })
                     .await;
                     if let Ok(Err(error)) = result {
@@ -2369,7 +2769,7 @@ impl ContextPlusServer {
         if incremental && dims != 0 && dims != previous_dims {
             *ref_index.identifier_source.write().await = None;
             drop(update_guard);
-            return Box::pin(self.build_identifier_index(cache)).await;
+            return Box::pin(self.build_identifier_index(cache, background)).await;
         }
         let idx = Arc::new(IdentifierIndex {
             docs: Segmented::from_files(docs),
@@ -2390,6 +2790,11 @@ impl ContextPlusServer {
                 "IdentifierIndex build discarded"
             );
             drop(update_guard);
+            // A background rebuild must not re-walk a ref whose caches were
+            // evicted or replaced; the next request rebuilds on demand.
+            if background {
+                return Ok(idx);
+            }
             let fresh_cache = self.ensure_project_cache().await?;
             return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
         }
@@ -2507,6 +2912,7 @@ impl ContextPlusServer {
                 let mut guard = ref_index.lexical_search_cache.write().await;
                 if ref_index.cache_generation.load(Ordering::Acquire) == generation {
                     *guard = Some(Arc::clone(&entry));
+                    ref_index.lexical_inherited.store(false, Ordering::Release);
                 }
                 return Ok(entry);
             }
@@ -2520,7 +2926,13 @@ impl ContextPlusServer {
         tracing::debug!(generation, reason, "Rebuilding LexicalIndex");
 
         let cache_for_build = Arc::clone(project_cache);
-        if let Some(previous) = guard.as_ref()
+        // An index inherited from the parent ref answers for another tree,
+        // so it is never served while this ref rebuilds.
+        let stale = guard
+            .as_ref()
+            .filter(|_| !ref_index.lexical_inherited.load(Ordering::Acquire))
+            .cloned();
+        if let Some(previous) = &stale
             && ref_index.lexical_rebuilding.load(Ordering::Acquire)
         {
             return Ok(Arc::clone(previous));
@@ -2550,14 +2962,14 @@ impl ContextPlusServer {
             let document_paths = docs.into_iter().map(|doc| doc.path).collect();
             (index, document_paths)
         });
-        if let Some(previous) = guard.as_ref().cloned() {
+        if let Some(previous) = stale {
             ref_index.lexical_rebuilding.store(true, Ordering::Release);
             let flag = Arc::clone(&ref_index.lexical_rebuilding);
             let lock = Arc::clone(&ref_index.lexical_search_cache);
             let source = Arc::clone(project_cache);
             let stale = Arc::clone(&previous);
             drop(guard);
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _reset = RefreshGuard(flag);
                 if let Ok((index, document_paths)) = build.await {
                     let mut guard = lock.write().await;
@@ -2574,6 +2986,7 @@ impl ContextPlusServer {
                     }
                 }
             });
+            ref_index.track_background_task(&task);
             return Ok(previous);
         }
         let (index, document_paths) = build.await.map_err(|e| {
@@ -2587,6 +3000,7 @@ impl ContextPlusServer {
             generation,
         });
         *guard = Some(Arc::clone(&cached));
+        ref_index.lexical_inherited.store(false, Ordering::Release);
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
             generation,
@@ -2603,10 +3017,18 @@ impl ContextPlusServer {
         name: &str,
         args: serde_json::Map<String, Value>,
     ) -> CallToolResult {
-        match self.dispatch_inner(name, args).await {
+        let ref_id = self.session_ref_id.unwrap_or(self.state.default_ref_id);
+        self.state.touch_ref(ref_id);
+        let serving = crate::core::process_lifecycle::InflightGuard::new(Arc::clone(
+            &self.current_ref().await.active_requests,
+        ));
+        let result = match self.dispatch_inner(name, args).await {
             Ok(result) => result,
             Err(e) => Self::err_text(format!("Error: {}", e)),
-        }
+        };
+        drop(serving);
+        self.state.schedule_memory_budget_enforcement();
+        result
     }
 
     async fn dispatch_inner(
@@ -3131,8 +3553,8 @@ impl ContextPlusServer {
         let head_sha = crate::core::head_watcher::resolve_head_sha(&canonical);
 
         // Build the ref.
-        // `attach_ref` is idempotent under concurrent calls — the closure runs
-        // only on first insert, so duplicate construction is impossible.
+        // `attach_ref` is idempotent under concurrent calls: racing first
+        // attaches may each build a candidate, but only one is inserted.
         let raw_for_closure = raw.clone();
         let canonical_for_closure = canonical.clone();
         let head_sha_for_closure = head_sha.clone();
@@ -3239,7 +3661,9 @@ impl ContextPlusServer {
         }
 
         let ttl = self.state.config.cache_ttl_secs;
-        self.state.detach_ref(ref_id, ttl).await;
+        self.state
+            .detach_ref(ref_id, std::time::Duration::from_secs(ttl))
+            .await;
 
         Ok(Self::ok_text(format!(
             "Worktree detach scheduled: {} (ref_id={}, ttl={}s)",
@@ -9492,6 +9916,1410 @@ mod tests {
                 .contains_key("worktree_only.rs"),
             "default ref cache must not contain worktree-only keys"
         );
+    }
+
+    #[tokio::test]
+    async fn lane_m_attached_worktree_shares_primary_resident_identifier_vectors() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+        let primary = server.state.default_ref().unwrap();
+        let primary_vectors = Arc::new(RwLock::new(HashMap::from([(
+            "fn shared_identifier()".to_string(),
+            CacheEntry {
+                hash: "shared-hash".to_string(),
+                vector: vec![0.25; 768],
+            },
+        )])));
+        primary
+            .identifier_vectors
+            .set(Arc::clone(&primary_vectors))
+            .unwrap();
+
+        let worktree_path = PathBuf::from("/tmp/lane-m-shared-identifier-vectors");
+        let worktree_id = RefId::for_canonical_path(&worktree_path);
+        let worktree = server
+            .state
+            .attach_ref(worktree_id, || {
+                Arc::new(RefIndex::new(
+                    worktree_path.clone(),
+                    worktree_path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let inherited = worktree
+            .identifier_vectors
+            .get()
+            .expect("attach must install the primary's resident identifier vector base");
+
+        assert!(
+            Arc::ptr_eq(inherited, &primary_vectors),
+            "an unchanged worktree must share, not clone, primary identifier vectors"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lane_m_attach_does_not_hold_registry_write_lock_while_inheriting_caches() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+        let primary = server.state.default_ref().unwrap();
+        let parent_cache = primary.identifier_index.write().await;
+        let worktree_path = PathBuf::from("/tmp/lane-m-attach-lock-scope");
+        let worktree_id = RefId::for_canonical_path(&worktree_path);
+        let attaching = {
+            let state = Arc::clone(&server.state);
+            tokio::spawn(async move {
+                state
+                    .attach_ref(worktree_id, || {
+                        Arc::new(RefIndex::new(
+                            worktree_path.clone(),
+                            worktree_path,
+                            Some(state.default_ref_id),
+                        ))
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let registry_remained_readable = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.state.refs.read(),
+        )
+        .await
+        .is_ok();
+        drop(parent_cache);
+        attaching.await.unwrap();
+
+        assert!(
+            registry_remained_readable,
+            "attach held the registry write lock while awaiting a parent cache lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_worktree_identifier_misses_do_not_mutate_primary_resident_base() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        std::fs::write(primary.path().join("shared.rs"), "fn shared_symbol() {}\n").unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let primary_cache = server.ensure_project_cache().await.unwrap();
+        server
+            .ensure_identifier_index(&primary_cache)
+            .await
+            .unwrap();
+        let primary_ref = server.state.default_ref().unwrap();
+        let base = primary_ref.identifier_vectors.get().unwrap().clone();
+        let keys_before = base
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("shared.rs"),
+            "fn shared_symbol() {}\nfn worktree_only_symbol() {}\n",
+        )
+        .unwrap();
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        let worktree_server = server.with_session(worktree_id);
+        let worktree_ref = worktree_server.current_ref().await;
+        *worktree_ref.identifier_index.write().await = None;
+        *worktree_ref.identifier_source.write().await = None;
+        let worktree_cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&worktree_cache)
+            .await
+            .unwrap();
+
+        let keys_after = base
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            keys_after, keys_before,
+            "a worktree identifier miss was inserted into the primary's immutable base"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_worktree_first_identifier_load_is_shared_with_primary() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("only.rs"), "fn worktree_first() {}\n").unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_server =
+            server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        let worktree_base = worktree_server
+            .current_ref()
+            .await
+            .identifier_vectors
+            .get()
+            .cloned()
+            .unwrap();
+        let primary_base = server
+            .state
+            .default_ref()
+            .unwrap()
+            .identifier_vectors
+            .get()
+            .cloned()
+            .expect("a worktree-first load must populate the primary's shared base");
+        assert!(
+            Arc::ptr_eq(&worktree_base, &primary_base),
+            "a worktree-first identifier load built a private copy of the primary base"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lane_m_evicted_worktree_overlay_reloads_from_disk_without_reembedding() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        std::fs::write(primary.path().join("shared.rs"), "fn shared_symbol() {}\n").unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("shared.rs"),
+            "fn shared_symbol() {}\nfn worktree_only_symbol() {}\n",
+        )
+        .unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let id_cache_name = cache_name("identifier-embeddings", &config);
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_server =
+            server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let owner = worktree_server.current_ref().await;
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+        assert!(
+            !owner.identifier_vector_overlay.read().await.is_empty(),
+            "the worktree miss must land in its overlay"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !matches!(
+                rkyv_store::load_cache(&canonical, &id_cache_name),
+                Ok(Some(_))
+            ) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worktree overlay was not persisted");
+        let embeds_before = ollama.received_requests().await.unwrap().len();
+
+        clear_ref_heavy_caches(&owner, &id_cache_name).await;
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        assert!(
+            !owner.identifier_vector_overlay.read().await.is_empty(),
+            "the evicted overlay was not reloaded"
+        );
+        assert_eq!(
+            ollama.received_requests().await.unwrap().len(),
+            embeds_before,
+            "an evicted worktree re-embedded identifiers its persisted overlay already held"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_last_detach_cancels_identifier_persistence_and_drops_heavy_state() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("persist.rs"),
+            "fn persistence_keeps_owner_alive() {}\n",
+        )
+        .unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        let worktree_server = server.with_session(worktree_id);
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+        let owner = worktree_server.current_ref().await;
+        let heavy_cache = Arc::downgrade(&owner.search_index_cache);
+        drop(owner);
+        drop(cache);
+
+        server
+            .state
+            .detach_ref(worktree_id, std::time::Duration::ZERO)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !server.state.refs.read().await.contains_key(&worktree_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worktree ref was not evicted after its TTL");
+
+        assert!(
+            heavy_cache.upgrade().is_none(),
+            "identifier persistence retained the evicted ref's heavy caches"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lane_m_last_detach_aborts_paused_semantic_rebuild_and_drops_heavy_state() {
+        use crate::ref_index::{RefId, RefIndex};
+        use crate::tools::semantic_search::{
+            EmbedFn, SearchDocument, SemanticSearchOptions, semantic_code_search_owned,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct PausedRefWalker {
+            ref_index: Arc<RefIndex>,
+            calls: AtomicU32,
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        impl WalkAndIndexFn for PausedRefWalker {
+            fn walk_and_index(
+                &self,
+                _root: &std::path::Path,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>)>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    if call > 0 {
+                        self.started.notify_one();
+                        self.release.notified().await;
+                    }
+                    let docs = (0..25)
+                        .map(|i| {
+                            SearchDocument::new(
+                                format!("src/file_{i}.rs"),
+                                String::new(),
+                                vec![],
+                                vec![],
+                                format!("paused rebuild content {call}"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let vectors = vec![Some(vec![1.0, 0.0]); docs.len()];
+                    Ok((docs, vectors))
+                })
+            }
+
+            fn track_background_task(&self, task: &tokio::task::JoinHandle<()>) {
+                self.ref_index.track_background_task(task);
+            }
+        }
+        struct FixedEmbedder;
+        impl EmbedFn for FixedEmbedder {
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(vec![vec![1.0, 0.0]]) })
+            }
+        }
+
+        let server = test_server();
+        let worktree = tempfile::tempdir().unwrap();
+        let root = worktree.path().canonicalize().unwrap();
+        let worktree_id = RefId::for_canonical_path(&root);
+        let owner = server
+            .state
+            .attach_ref(worktree_id, || {
+                Arc::new(RefIndex::new(
+                    root.clone(),
+                    root.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let walker: Arc<dyn WalkAndIndexFn> = Arc::new(PausedRefWalker {
+            ref_index: Arc::clone(&owner),
+            calls: AtomicU32::new(0),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let options = SemanticSearchOptions {
+            root_dir: root.clone(),
+            query: "paused rebuild content".to_string(),
+            top_k: Some(5),
+            semantic_weight: Some(0.0),
+            keyword_weight: Some(1.0),
+            min_semantic_score: None,
+            min_keyword_score: Some(0.01),
+            min_combined_score: None,
+            require_keyword_match: Some(true),
+            require_semantic_match: Some(false),
+            include_globs: None,
+            exclude_globs: None,
+            recency_window_days: None,
+            scope: None,
+        };
+        for generation in 0..2 {
+            owner.cache_generation.store(generation, Ordering::Release);
+            semantic_code_search_owned(
+                options.clone(),
+                &FixedEmbedder,
+                Arc::clone(&walker),
+                Some(Arc::clone(&owner.search_index_cache)),
+                Some(Arc::clone(&owner.cache_generation)),
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("the background semantic rebuild did not start");
+        let stale_generation =
+            Arc::downgrade(owner.search_index_cache.read().await.as_ref().unwrap());
+        let heavy_cache = Arc::downgrade(&owner.search_index_cache);
+        let evicted = Arc::downgrade(&owner);
+        drop(walker);
+        drop(owner);
+
+        server
+            .state
+            .detach_ref(worktree_id, std::time::Duration::ZERO)
+            .await;
+        let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while evicted.upgrade().is_some()
+                || heavy_cache.upgrade().is_some()
+                || stale_generation.upgrade().is_some()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        drop(release);
+
+        assert!(
+            released.is_ok(),
+            "a paused semantic rebuild kept the evicted ref's heavy state alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_detach_ttl_is_scoped_to_latest_zero_session_epoch() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+        let path = PathBuf::from("/tmp/lane-m-detach-epoch");
+        let ref_id = RefId::for_canonical_path(&path);
+        server
+            .state
+            .attach_ref(ref_id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path.clone(),
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let ttl = std::time::Duration::from_millis(120);
+        server.state.detach_ref(ref_id, ttl).await;
+        tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+        server
+            .state
+            .attach_ref(ref_id, || unreachable!("ref is still registered"))
+            .await;
+        server.state.detach_ref(ref_id, ttl).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            server.state.refs.read().await.contains_key(&ref_id),
+            "the first detach timer evicted the ref during the later detach epoch"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while server.state.refs.read().await.contains_key(&ref_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the latest detach epoch did not evict after its full TTL");
+    }
+
+    #[tokio::test]
+    async fn lane_m_identifier_vectors_alone_are_memory_budget_evictable() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let path = PathBuf::from("/tmp/lane-m-identifier-only-budget");
+        let ref_id = RefId::for_canonical_path(&path);
+        let owner = Arc::new(RefIndex::new(path.clone(), path, None));
+        owner
+            .identifier_vectors
+            .set(Arc::new(RwLock::new(HashMap::from([(
+                "worktree-only-vector".to_string(),
+                CacheEntry {
+                    hash: "hash".to_string(),
+                    vector: vec![0.5; 4096],
+                },
+            )]))))
+            .unwrap();
+        let attached = server.state.attach_ref(ref_id, || Arc::clone(&owner)).await;
+        mark_ref_idle(&server.state, ref_id);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            attached
+                .identifier_vectors
+                .get()
+                .unwrap()
+                .read()
+                .await
+                .is_empty(),
+            "identifier-vector-only pressure was not reclaimed from the non-primary ref"
+        );
+        assert!(server.state.refs.read().await.contains_key(&ref_id));
+    }
+
+    #[tokio::test]
+    async fn lane_m_dispatch_does_not_wait_for_synchronous_heap_scan() {
+        let server = test_server();
+        let primary = server.state.default_ref().unwrap();
+        let cache_guard = primary.embedding_cache.write().await;
+        let mut dispatch = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .dispatch("nonexistent_tool", serde_json::Map::new())
+                    .await
+            }
+        });
+
+        let returned_without_cache_lock =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut dispatch)
+                .await
+                .is_ok();
+        drop(cache_guard);
+        if !dispatch.is_finished() {
+            dispatch.await.unwrap();
+        }
+
+        assert!(
+            returned_without_cache_lock,
+            "tool response waited for memory accounting to acquire a heavy-cache lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_memory_budget_evicts_lru_non_primary_caches_only() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 11 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let primary = server.state.default_ref().unwrap();
+
+        let path_a = PathBuf::from("/tmp/lane-m-budget-a");
+        let path_b = PathBuf::from("/tmp/lane-m-budget-b");
+        let id_a = RefId::for_canonical_path(&path_a);
+        let id_b = RefId::for_canonical_path(&path_b);
+        let ref_a = server
+            .state
+            .attach_ref(id_a, || {
+                Arc::new(RefIndex::new(
+                    path_a.clone(),
+                    path_a,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        let ref_b = server
+            .state
+            .attach_ref(id_b, || {
+                Arc::new(RefIndex::new(
+                    path_b.clone(),
+                    path_b,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        for (owner, name) in [(&primary, "primary"), (&ref_a, "a"), (&ref_b, "b")] {
+            owner.embedding_cache.write().await.insert(
+                format!("{name}.rs"),
+                CacheEntry {
+                    hash: format!("{name}-hash"),
+                    vector: vec![0.5; 1024],
+                },
+            );
+        }
+        server.state.touch_ref(id_a);
+        server.state.touch_ref(id_b);
+        mark_ref_idle(&server.state, id_a);
+        mark_ref_idle(&server.state, id_b);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            !primary.embedding_cache.read().await.is_empty(),
+            "the primary ref's heavy caches must never be evicted"
+        );
+        assert!(
+            ref_a.embedding_cache.read().await.is_empty(),
+            "the least recently used non-primary ref must be evicted first"
+        );
+        assert!(
+            !ref_b.embedding_cache.read().await.is_empty(),
+            "the most recently used worktree must remain when one eviction is sufficient"
+        );
+        assert!(server.state.ref_index(id_a).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn lane_m_memory_budget_never_evicts_a_ref_serving_a_request() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let path = PathBuf::from("/tmp/lane-m-budget-serving");
+        let ref_id = RefId::for_canonical_path(&path);
+        let owner = server
+            .state
+            .attach_ref(ref_id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        owner.embedding_cache.write().await.insert(
+            "serving.rs".to_string(),
+            CacheEntry {
+                hash: "serving-hash".to_string(),
+                vector: vec![0.5; 4096],
+            },
+        );
+
+        mark_ref_idle(&server.state, ref_id);
+        let serving =
+            crate::core::process_lifecycle::InflightGuard::new(Arc::clone(&owner.active_requests));
+        server.state.enforce_memory_budget().await;
+        assert!(
+            !owner.embedding_cache.read().await.is_empty(),
+            "the budget evicted the caches of a ref that was serving a request"
+        );
+
+        drop(serving);
+        server.state.enforce_memory_budget().await;
+        assert!(
+            owner.embedding_cache.read().await.is_empty(),
+            "an idle over-budget ref must still be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_memory_budget_skips_worktrees_holding_only_shared_caches() {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 10 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let primary = server.state.default_ref().unwrap();
+        *primary.identifier_index.write().await = Some(Arc::new(IdentifierIndex {
+            docs: Vec::new().into(),
+            vector_buffer: vec![0.5_f32; 2048].into(),
+            dims: 4,
+            file_count: 0,
+            built_at: Instant::now(),
+        }));
+        *primary.identifier_source.write().await = Some(Arc::new(ProjectCache {
+            file_entries: Vec::new(),
+            file_content: HashMap::new(),
+            last_refresh: Instant::now(),
+        }));
+
+        let attach = |name: &str| {
+            let path = PathBuf::from(format!("/tmp/lane-m-budget-shared-{name}"));
+            let id = RefId::for_canonical_path(&path);
+            let state = Arc::clone(&server.state);
+            async move {
+                let owner = state
+                    .attach_ref(id, || {
+                        Arc::new(RefIndex::new(
+                            path.clone(),
+                            path,
+                            Some(state.default_ref_id),
+                        ))
+                    })
+                    .await;
+                (id, owner)
+            }
+        };
+        let (shared_id, shared_only) = attach("only").await;
+        let (unique_id, unique) = attach("unique").await;
+        unique.embedding_cache.write().await.insert(
+            "unique.rs".to_string(),
+            CacheEntry {
+                hash: "unique-hash".to_string(),
+                vector: vec![0.5; 1024],
+            },
+        );
+        server.state.touch_ref(shared_id);
+        server.state.touch_ref(unique_id);
+        mark_ref_idle(&server.state, shared_id);
+        mark_ref_idle(&server.state, unique_id);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            shared_only.identifier_index.read().await.is_some(),
+            "a worktree holding only the primary's shared caches was evicted"
+        );
+        assert!(
+            unique.embedding_cache.read().await.is_empty(),
+            "the worktree with unique resident bytes must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_attached_worktree_does_not_inherit_primary_semantic_index() {
+        use crate::ref_index::{RefId, RefIndex};
+        use crate::tools::semantic_search::{CachedSearchIndex, IndexFingerprint, SearchIndex};
+
+        let server = test_server();
+        let primary = server.state.default_ref().unwrap();
+        *primary.search_index_cache.write().await = Some(Arc::new(CachedSearchIndex::new(
+            SearchIndex::new(),
+            IndexFingerprint::from_docs(&[]),
+            0,
+        )));
+        let path = PathBuf::from("/tmp/lane-m-no-semantic-inheritance");
+        let id = RefId::for_canonical_path(&path);
+        let worktree = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        assert!(
+            worktree.search_index_cache.read().await.is_none(),
+            "a worktree inherited the primary's semantic index, which its fill could mutate"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_divergent_worktree_first_keywords_does_not_serve_primary_lexical_index() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+
+        let primary = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(
+                primary.path().join(format!("primary_only_{i}.rs")),
+                format!("fn primary_only_symbol_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut config = Config::from_env();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let primary_cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_lexical_index(&primary_cache).await.unwrap();
+
+        let worktree = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(
+                worktree.path().join(format!("worktree_only_{i}.rs")),
+                format!("fn worktree_only_symbol_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_server =
+            server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let lexical = worktree_server.ensure_lexical_index(&cache).await.unwrap();
+
+        let paths = lexical.document_paths.to_vec();
+        assert!(
+            !paths.iter().any(|path| path.starts_with("primary_only_")),
+            "worktree's first keywords index is the primary's: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| path.starts_with("worktree_only_")),
+            "worktree's first keywords index misses its own files: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_divergent_worktree_first_identifiers_do_not_serve_primary_index() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = embed_request_inputs(request).len().max(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(
+                primary.path().join(format!("primary_only_{i}.rs")),
+                format!("fn primary_only_symbol_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let primary_cache = server.ensure_project_cache().await.unwrap();
+        server
+            .ensure_identifier_index(&primary_cache)
+            .await
+            .unwrap();
+
+        let worktree = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(
+                worktree.path().join(format!("worktree_only_{i}.rs")),
+                format!("fn worktree_only_symbol_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_server =
+            server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let index = worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        let paths: std::collections::BTreeSet<_> =
+            index.docs.iter().map(|doc| doc.path.clone()).collect();
+        assert!(
+            !paths.iter().any(|path| path.starts_with("primary_only_")),
+            "worktree's first identifiers index is the primary's: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| path.starts_with("worktree_only_")),
+            "worktree's first identifiers index misses its own files: {paths:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lane_m_last_detach_aborts_pending_fill_and_drops_evicted_ref() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len().max(1)]
+                }));
+                if inputs
+                    .iter()
+                    .any(|input| input.contains("PENDING_FILL_MARKER"))
+                {
+                    response.set_delay(std::time::Duration::from_secs(30))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("fill.rs"),
+            "fn PENDING_FILL_MARKER() {}\n",
+        )
+        .unwrap();
+        let server = ContextPlusServer::new(
+            primary.path().to_path_buf(),
+            semantic_fill_config(&ollama.uri(), 20, 60_000),
+        );
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        let worktree_server = server.with_session(worktree_id);
+        worktree_server
+            .handle_semantic_code_search(semantic_args("pending fill"))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while matching_embed_request_batches(&ollama, "PENDING_FILL_MARKER")
+                .await
+                .len()
+                < 2
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the background fill never sent its embed request");
+        let evicted = Arc::downgrade(&worktree_server.current_ref().await);
+        drop(worktree_server);
+
+        server
+            .state
+            .detach_ref(worktree_id, std::time::Duration::ZERO)
+            .await;
+        let released = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while evicted.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            released.is_ok(),
+            "a pending semantic fill kept the evicted ref alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_m_last_detach_keeps_pending_identifier_overlay_save() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let count = embed_request_inputs(request).len().max(1);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; count]
+                }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("overlay.rs"),
+            "fn detached_overlay_symbol() {}\n",
+        )
+        .unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let id_cache_name = cache_name("identifier-embeddings", &config);
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        let worktree_server = server.with_session(worktree_id);
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+        drop(worktree_server);
+
+        server
+            .state
+            .detach_ref(worktree_id, std::time::Duration::ZERO)
+            .await;
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !matches!(
+                rkyv_store::load_cache(&canonical, &id_cache_name),
+                Ok(Some(_))
+            ) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            saved.is_ok(),
+            "evicting the worktree dropped its pending identifier overlay save"
+        );
+    }
+
+    fn mark_ref_idle(state: &SharedState, ref_id: crate::ref_index::RefId) {
+        let idle_since = Instant::now()
+            .checked_sub(MEMORY_BUDGET_MIN_IDLE * 2)
+            .unwrap();
+        if let Some(access) = state.ref_access.lock().unwrap().get_mut(&ref_id) {
+            access.1 = idle_since;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_r3_budget_snapshot_does_not_deadlock_with_identifier_install() {
+        let server = test_server();
+        let owner = server.state.default_ref().unwrap();
+        let project_read = owner.project_cache.read().await;
+        let writer_owner = Arc::clone(&owner);
+        let _writer = tokio::spawn(async move {
+            *writer_owner.project_cache.write().await = None;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let snapshot_owner = Arc::clone(&owner);
+        let _snapshot = tokio::spawn(async move {
+            let _ = ResidentSnapshot::capture(&snapshot_owner).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let acquired = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            owner.identifier_index.write(),
+        )
+        .await;
+        assert!(
+            acquired.is_ok(),
+            "deadlock: the budget snapshot holds identifier_index.read while queued on project_cache.read"
+        );
+        drop(acquired);
+        drop(project_read);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_r3_budget_eviction_stops_background_identifier_rebuild() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "embeddings": vec![vec![1.0, 0.0]; inputs.len().max(1)]
+                }));
+                if inputs.iter().any(|input| input.contains("rebuild_marker")) {
+                    response.set_delay(std::time::Duration::from_secs(1))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                worktree.path().join(format!("base_{i}.rs")),
+                format!("fn base_symbol_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        config.resident_memory_budget_bytes = 1;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_id = crate::ref_index::RefId::for_canonical_path(&canonical);
+        let worktree_server = server.with_session(worktree_id);
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                worktree.path().join(format!("rebuild_marker_{i}.rs")),
+                format!("fn rebuild_marker_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let owner = worktree_server.current_ref().await;
+        *owner.project_cache.write().await = None;
+        let fresh = worktree_server.ensure_project_cache().await.unwrap();
+        worktree_server
+            .ensure_identifier_index(&fresh)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while matching_embed_request_batches(&ollama, "rebuild_marker")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the background identifier rebuild never sent its embed request");
+
+        mark_ref_idle(&server.state, worktree_id);
+        server.state.enforce_memory_budget().await;
+        assert!(owner.project_cache.read().await.is_none());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        assert!(
+            owner.project_cache.read().await.is_none()
+                && owner.identifier_index.read().await.is_none(),
+            "budget eviction was undone by the ref's background identifier rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_r3_attach_does_not_inherit_identifier_index_without_its_source() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let server = test_server();
+        let primary = server.state.default_ref().unwrap();
+        *primary.identifier_index.write().await = Some(Arc::new(IdentifierIndex {
+            docs: Vec::new().into(),
+            vector_buffer: vec![0.5_f32; 8].into(),
+            dims: 4,
+            file_count: 0,
+            built_at: Instant::now(),
+        }));
+        *primary.identifier_source.write().await = None;
+        let path = PathBuf::from("/tmp/review-r3-sourceless-identifier-inheritance");
+        let worktree = server
+            .state
+            .attach_ref(RefId::for_canonical_path(&path), || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+
+        assert!(
+            worktree.identifier_index.read().await.is_none(),
+            "a worktree inherited an identifier index without the source it was built from"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_r3_inherited_identifier_index_without_source_is_not_served() {
+        use crate::config::{RefWarmupMode, TrackerMode};
+
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert(
+            "path".into(),
+            json!(canonical.to_string_lossy().to_string()),
+        );
+        server.handle_attach_worktree(attach).await.unwrap();
+        let worktree_server =
+            server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let owner = worktree_server.current_ref().await;
+        let inherited = Arc::new(IdentifierIndex {
+            docs: Vec::new().into(),
+            vector_buffer: vec![0.5_f32; 8].into(),
+            dims: 4,
+            file_count: 0,
+            built_at: Instant::now(),
+        });
+        *owner.identifier_index.write().await = Some(Arc::clone(&inherited));
+        *owner.identifier_source.write().await = None;
+        owner
+            .identifier_inherited
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let index = worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&index, &inherited),
+            "the fast path served an inherited identifier index"
+        );
+    }
+
+    async fn attach_budget_worktree(
+        server: &ContextPlusServer,
+        name: &str,
+    ) -> (crate::ref_index::RefId, Arc<crate::ref_index::RefIndex>) {
+        use crate::core::embeddings::CacheEntry;
+        use crate::ref_index::{RefId, RefIndex};
+
+        let path = PathBuf::from(format!("/tmp/review-r3-budget-{name}"));
+        let id = RefId::for_canonical_path(&path);
+        let owner = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        owner.embedding_cache.write().await.insert(
+            format!("{name}.rs"),
+            CacheEntry {
+                hash: format!("{name}-hash"),
+                vector: vec![0.5; 4096],
+            },
+        );
+        (id, owner)
+    }
+
+    #[tokio::test]
+    async fn review_r3_memory_budget_evicts_only_idle_worktrees() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (id_a, ref_a) = attach_budget_worktree(&server, "a").await;
+        let (_, ref_b) = attach_budget_worktree(&server, "b").await;
+
+        server.state.enforce_memory_budget().await;
+        assert!(
+            !ref_a.embedding_cache.read().await.is_empty()
+                && !ref_b.embedding_cache.read().await.is_empty(),
+            "the budget evicted a worktree used within the idle window"
+        );
+
+        mark_ref_idle(&server.state, id_a);
+        server.state.enforce_memory_budget().await;
+        assert!(
+            ref_a.embedding_cache.read().await.is_empty(),
+            "an idle over-budget worktree must be evicted"
+        );
+        assert!(
+            !ref_b.embedding_cache.read().await.is_empty(),
+            "the budget evicted a worktree used within the idle window"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_r3_memory_budget_evicts_down_to_low_watermark() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 40_000;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let mut refs = Vec::new();
+        for name in ["a", "b", "c"] {
+            refs.push(attach_budget_worktree(&server, name).await);
+        }
+        for (id, _) in &refs {
+            mark_ref_idle(&server.state, *id);
+        }
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            refs[0].1.embedding_cache.read().await.is_empty()
+                && refs[1].1.embedding_cache.read().await.is_empty(),
+            "the budget stopped just under the limit instead of the low watermark"
+        );
+        assert!(!refs[2].1.embedding_cache.read().await.is_empty());
     }
 
     // ── U11: current_ref() routing ───────────────────────────────────────────

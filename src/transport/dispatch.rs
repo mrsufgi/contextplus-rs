@@ -1649,7 +1649,10 @@ mod tests {
         );
 
         // Clean up: detach to avoid Arc leaks in short-lived tests.
-        server.state.detach_ref(wt_ref_id, 0).await;
+        server
+            .state
+            .detach_ref(wt_ref_id, std::time::Duration::ZERO)
+            .await;
     }
 
     // ── foreign_roots_for_session ─────────────────────────────────────────────

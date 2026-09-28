@@ -745,7 +745,10 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     };
     if let Err(e) = write_frame(&mut stream, &reply).await {
         tracing::warn!("session_ready write failed: {e}");
-        server.state.detach_ref(ref_id, 0).await;
+        server
+            .state
+            .detach_ref(ref_id, std::time::Duration::ZERO)
+            .await;
         return;
     }
 
@@ -771,7 +774,9 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     }
 
     // ── Step 5: detach ref (decrement refcount, schedule eviction if 0) ─────
-    state.detach_ref(ref_id, ttl_secs).await;
+    state
+        .detach_ref(ref_id, std::time::Duration::from_secs(ttl_secs))
+        .await;
     tracing::debug!(ref_id = ref_id.0, "ref detached");
 }
 
