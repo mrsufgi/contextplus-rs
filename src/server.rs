@@ -13677,6 +13677,135 @@ mod tests {
         );
     }
 
+    /// A server started over a primary and a linked worktree whose changed
+    /// file has a vector persisted by an earlier daemon, and the worktree's ref.
+    async fn restarted_worktree_with_persisted_vector() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        ContextPlusServer,
+        crate::ref_index::RefId,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let vectors: Vec<Vec<f32>> = embed_request_inputs(request)
+                    .iter()
+                    .map(|input| {
+                        if input == "invoice payment status" {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        }
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "embeddings": vectors }))
+            })
+            .mount(&ollama)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        run_git(&primary, &["init", "-b", "main"]);
+        std::fs::write(primary.join("src/shared.rs"), "fn shared_helper() {}\n").unwrap();
+        std::fs::write(
+            primary.join("src/changed.rs"),
+            "fn PRIMARY_CHANGED_VERSION() {}\n",
+        )
+        .unwrap();
+        run_git(&primary, &["add", "."]);
+        run_git(&primary, &["commit", "-m", "baseline"]);
+        add_linked_worktree(&primary, &worktree);
+        let changed = "fn WORKTREE_CHANGED_VERSION() { /* invoice payment status */ }\n";
+        std::fs::write(worktree.join("src/changed.rs"), changed).unwrap();
+
+        // What an earlier daemon's background fill persisted for this worktree.
+        let config = semantic_fill_config(&ollama.uri(), 1_000, 1_000);
+        let persisted = HashMap::from([(
+            "src/changed.rs".to_string(),
+            CacheEntry {
+                hash: crate::core::embeddings::content_hash(changed),
+                vector: vec![1.0, 0.0],
+            },
+        )]);
+        rkyv_store::save_vector_store_merged(
+            &worktree,
+            &cache_name("embeddings", &config),
+            &crate::core::embeddings::VectorStore::from_cache(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let server = ContextPlusServer::new(primary.clone(), config);
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        let mut attach_args = serde_json::Map::new();
+        attach_args.insert(
+            "path".into(),
+            json!(canonical_worktree.to_string_lossy().into_owned()),
+        );
+        let attached = server.handle_attach_worktree(attach_args).await.unwrap();
+        assert_eq!(attached.is_error, Some(false), "{}", text_of(&attached));
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&canonical_worktree);
+        (ollama, temp, server, ref_id)
+    }
+
+    #[tokio::test]
+    async fn restarted_worktree_reuses_its_persisted_vectors_instead_of_reembedding() {
+        let (ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+
+        let result = server
+            .with_session(ref_id)
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_CHANGED_VERSION").await,
+            0,
+            "a restarted worktree re-embedded a file whose vector it had persisted"
+        );
+        assert!(
+            text_of(&result).contains("1. src/changed.rs"),
+            "the persisted vector must rank the file: {}",
+            text_of(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn evicted_worktree_reuses_its_persisted_vectors_instead_of_reembedding() {
+        let (ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        let worktree_server = server.with_session(ref_id);
+        worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        let worktree_ref = server.state.ref_index(ref_id).await.unwrap();
+        clear_ref_heavy_caches(
+            &worktree_ref,
+            &cache_name("identifier-embeddings", &server.state.config),
+        )
+        .await;
+
+        let result = worktree_server
+            .handle_semantic_code_search(semantic_args("invoice payment status"))
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_CHANGED_VERSION").await,
+            0,
+            "an evicted worktree re-embedded a file whose vector it had persisted"
+        );
+        assert!(
+            text_of(&result).contains("1. src/changed.rs"),
+            "the persisted vector must rank the file: {}",
+            text_of(&result)
+        );
+    }
+
     #[tokio::test]
     async fn attached_worktree_filler_completes_missing_vectors_for_the_next_query() {
         use wiremock::matchers::{method, path};

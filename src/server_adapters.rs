@@ -510,6 +510,22 @@ impl CachedWalkerIndexer {
                 return Ok((docs, Vec::new()));
             }
 
+            // A worktree starts, and restarts after an eviction, from the
+            // vectors it persisted.
+            if ref_index.parent_ref_id.is_some() && embedding_cache.read().await.is_empty() {
+                let root = ref_index.root_dir.clone();
+                let name = cache_name("embeddings", &config);
+                if let Ok(Ok(Some(store))) =
+                    tokio::task::spawn_blocking(move || rkyv_store::mmap_vector_store(&root, &name))
+                        .await
+                {
+                    let mut cache = embedding_cache.write().await;
+                    if cache.is_empty() {
+                        *cache = store.to_cache();
+                    }
+                }
+            }
+
             let fill_snapshot = ref_index.semantic_fill.lock().await;
             let cache_read = embedding_cache.read().await;
             let observed: Vec<_> = content_hashes
