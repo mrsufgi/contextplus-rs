@@ -13397,19 +13397,15 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
-        // Wait for the embedding_cache to pick up the baseline hit (shared.rs).
+        // Wait for the baseline import to install the search index, which it
+        // does after caching the hit (shared.rs).
         let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            {
-                let cache = wt_ref.embedding_cache.read().await;
-                if cache.contains_key("shared.rs") {
-                    break;
-                }
+            if wt_ref.search_index_cache.read().await.is_some() {
+                break;
             }
             if std::time::Instant::now() > deadline2 {
-                panic!(
-                    "ref_warmup_full_layers_ollama_on_baseline: shared.rs never in embedding_cache"
-                );
+                panic!("ref_warmup_full_layers_ollama_on_baseline: search index never installed");
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
