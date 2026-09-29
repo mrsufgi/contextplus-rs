@@ -1053,7 +1053,8 @@ pub fn sanitize_query(query: &str) -> Cow<'_, str> {
 pub struct IndexFingerprint {
     /// Number of documents returned by the walker.
     pub n_docs: usize,
-    /// SipHash over `(path, content)` for each document, order-dependent.
+    /// SipHash over `(path, content, source_hash)` for each document,
+    /// order-dependent: `content` keeps only a code file's head.
     pub content_hash: u64,
 }
 
@@ -1072,6 +1073,7 @@ impl IndexFingerprint {
         for d in docs {
             d.path.hash(&mut hasher);
             d.content.hash(&mut hasher);
+            d.source_hash.hash(&mut hasher);
         }
         Self {
             n_docs,
