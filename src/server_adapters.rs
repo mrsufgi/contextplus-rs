@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::server::{SharedState, build_embedding_document, cache_name};
 use crate::tools::semantic_search::{
     CachedSearchIndex, EmbedFn, IndexFingerprint, SearchDocument, SearchIndex, WalkAndIndexFn,
-    semantic_embedding_content,
+    WalkOutcome, semantic_embedding_content,
 };
 
 #[cfg(test)]
@@ -465,6 +465,14 @@ impl WalkAndIndexFn for RefWalkerIndexer {
         self.walker.walk_for_ref(root_dir, self.ref_index.clone())
     }
 
+    fn walk_or_install(
+        &self,
+        root_dir: &Path,
+    ) -> crate::tools::semantic_search::WalkOrInstallFuture<'_> {
+        self.walker
+            .walk_ref(root_dir, self.ref_index.clone(), None, false)
+    }
+
     fn track_background_task(&self, task: &tokio::task::JoinHandle<()>) {
         self.ref_index.track_background_task(task);
     }
@@ -485,15 +493,31 @@ impl CachedWalkerIndexer {
         ref_index: Arc<crate::ref_index::RefIndex>,
         candidates: Option<std::collections::HashSet<String>>,
     ) -> crate::tools::semantic_search::WalkAndIndexFuture<'_> {
+        let walk = self.walk_ref(root_dir, ref_index, candidates, true);
+        Box::pin(async move {
+            match walk.await? {
+                WalkOutcome::Documents(docs, vectors) => Ok((docs, vectors)),
+                WalkOutcome::Installed(_) => unreachable!("a walk for documents returns them"),
+            }
+        })
+    }
+
+    /// Walks `root_dir` of `ref_index`, or its `candidates`, into documents and
+    /// vectors. A full walk of a worktree forks its parent's index when it
+    /// can, and returns the fork it installed when no `documents` are wanted.
+    fn walk_ref(
+        &self,
+        root_dir: &Path,
+        ref_index: Arc<crate::ref_index::RefIndex>,
+        candidates: Option<std::collections::HashSet<String>>,
+        documents: bool,
+    ) -> crate::tools::semantic_search::WalkOrInstallFuture<'_> {
         let root = root_dir.to_path_buf();
-        let config = self.config.clone();
-        let ollama = self.ollama.clone();
         Box::pin(async move {
             let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
             let prefix = canonical
                 .strip_prefix(&ref_index.canonical_root)
                 .unwrap_or(Path::new(""));
-            let embedding_cache = Arc::clone(&ref_index.embedding_cache);
             let full_walk = candidates.is_none() && prefix.as_os_str().is_empty();
             let fork_parent = match ref_index.parent_ref_id {
                 Some(parent_id) if full_walk => self.state.ref_index(parent_id).await,
@@ -520,162 +544,341 @@ impl CachedWalkerIndexer {
                 .and_then(|entry| entry.pending_vector_dimensions());
             let base =
                 base.filter(|base| replacement_dims.is_none_or(|dims| dims == base.index.dims()));
-            let forked = match (&fork_parent, &base) {
-                (Some(parent), Some(base)) => self.fork_documents(&root, parent, base).await,
-                _ => None,
-            };
-            let (docs, content_hashes, embedding_texts, shared) = match forked {
-                Some((docs, content_hashes, embedding_texts, shared)) => {
-                    (docs, content_hashes, embedding_texts, Some(shared))
-                }
-                None => {
-                    let (docs, content_hashes, embedding_texts) = self
-                        .read_documents(
-                            &root,
-                            prefix,
-                            &ref_index,
-                            candidates.as_ref(),
-                            full_walk,
-                            base.clone(),
-                        )
-                        .await?;
-                    let shared = base
-                        .as_ref()
-                        .and_then(|base| Shared::of(&base.index, &docs));
-                    (docs, content_hashes, embedding_texts, shared)
-                }
-            };
+            if let (Some(parent), Some(base)) = (&fork_parent, &base)
+                && let Some(forked) = self.fork_documents(&root, parent, base).await
+            {
+                return self
+                    .fork_walk(
+                        &root, &ref_index, parent, base, forked, walk_start, documents,
+                    )
+                    .await;
+            }
 
+            let (docs, content_hashes, embedding_texts) = self
+                .read_documents(
+                    &root,
+                    prefix,
+                    &ref_index,
+                    candidates.as_ref(),
+                    full_walk,
+                    base.clone(),
+                )
+                .await?;
             #[cfg(test)]
             test_seams::after_file_snapshot(&root, &content_hashes).await;
-
             if docs.is_empty() {
-                return Ok((docs, Vec::new()));
+                return Ok(WalkOutcome::Documents(docs, Vec::new()));
             }
-            // Documents identical to the forked parent's keep its vectors, which
-            // live in its shared store; only the worktree's changes need theirs.
-            let mut borrowed = vec![false; docs.len()];
-
-            let parent_vectors = match ref_index.parent_ref_id {
-                Some(parent_id) => self
-                    .state
-                    .ref_index(parent_id)
-                    .await
-                    .map(|parent| Arc::clone(&parent.embedding_cache)),
-                None => None,
-            };
-            // A worktree starts, and restarts after an eviction, from the
-            // vectors it persisted that its parent lacks.
-            if let Some(parent_vectors) = &parent_vectors
-                && embedding_cache.read().await.is_empty()
+            if let (Some(parent), Some(base)) = (&fork_parent, &base)
+                && let Some(shared) = Shared::of(&base.index, &docs)
             {
-                let started = std::time::Instant::now();
-                let root = ref_index.root_dir.clone();
-                let name = cache_name("embeddings", &config);
-                if let Ok(Ok(Some(store))) =
-                    tokio::task::spawn_blocking(move || rkyv_store::mmap_vector_store(&root, &name))
-                        .await
-                {
-                    let own: HashMap<String, CacheEntry> = {
-                        let parent = parent_vectors.read().await;
-                        store
-                            .to_cache()
-                            .into_iter()
-                            .filter(|(path, entry)| !inherits(&parent, path, entry))
-                            .collect()
-                    };
-                    let mut cache = embedding_cache.write().await;
-                    if cache.is_empty() {
-                        *cache = own;
-                    }
-                }
-                let entries = embedding_cache.read().await.len();
-                tracing::info!(
-                    phase = "semantic_vector_reload",
-                    ref_id = %ref_index.cas_ref_id_hex,
-                    entries,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "cold-start phase"
-                );
-            }
-
-            let fill_snapshot = ref_index.semantic_fill.lock().await;
-            let cache_read = embedding_cache.read().await;
-            let observed: Vec<_> = content_hashes
-                .iter()
-                .map(|(path, _)| {
-                    (
-                        cache_read.get(path).map(|entry| entry.hash.clone()),
-                        fill_snapshot.pending.get(path).map(|doc| doc.hash.clone()),
+                let forked = shared.forked(docs, content_hashes, embedding_texts);
+                return self
+                    .fork_walk(
+                        &root, &ref_index, parent, base, forked, walk_start, documents,
                     )
-                })
-                .collect();
-            let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
-            let mut uncached_indices: Vec<usize> = Vec::new();
-            let mut uncached_texts: Vec<String> = Vec::new();
-
-            for (i, (rel_path, hash)) in content_hashes.iter().enumerate() {
-                if let (Some(shared), Some(base)) = (&shared, &base)
-                    && let Some(vector) =
-                        shared.positions[i].and_then(|at| base.index.vector_at(at))
-                {
-                    vectors.push(Some(vector.to_vec()));
-                    borrowed[i] = true;
-                    continue;
-                }
-                if let Some(entry) = cache_read.get(rel_path)
-                    && entry.hash == *hash
-                {
-                    vectors.push(Some(entry.vector.clone()));
-                    continue;
-                }
-                vectors.push(None);
-                uncached_indices.push(i);
-                uncached_texts.push(embedding_texts[i].clone());
+                    .await;
             }
-            drop(cache_read);
-            drop(fill_snapshot);
+            let vectors = self
+                .walk_vectors(&root, &ref_index, &content_hashes, &embedding_texts, true)
+                .await?;
+            match fork_parent {
+                Some(parent) => self
+                    .seed_fork(&ref_index, &parent, canonical, docs, vectors, walk_start)
+                    .await
+                    .map(|(docs, vectors, _)| WalkOutcome::Documents(docs, vectors)),
+                None => Ok(WalkOutcome::Documents(docs, vectors)),
+            }
+        })
+    }
 
-            // Query and filler vectors live in memory even when no CAS manifest exists.
-            let mut ancestor_id = ref_index.parent_ref_id;
-            let mut visited = std::collections::HashSet::new();
-            let mut inherited = Vec::new();
-            while let Some(id) = ancestor_id {
-                if !visited.insert(id) {
-                    break;
+    /// Forks `base` over a worktree walk's `forked` documents: vectors for the
+    /// worktree's own documents alone, then the fork installed unless the
+    /// worktree's entry already shares `base`'s store. The fork it installed
+    /// when no `documents` are wanted, else the walk's documents and vectors.
+    #[allow(clippy::too_many_arguments)]
+    async fn fork_walk(
+        &self,
+        root: &Path,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        parent: &crate::ref_index::RefIndex,
+        base: &Arc<CachedSearchIndex>,
+        forked: Forked,
+        start: WalkStart,
+        documents: bool,
+    ) -> Result<WalkOutcome> {
+        let Forked {
+            documents: walked,
+            deleted,
+        } = forked;
+        let mut order = Vec::with_capacity(walked.len());
+        let mut built = Vec::new();
+        let mut content_hashes = Vec::new();
+        let mut embedding_texts = Vec::new();
+        for document in walked {
+            order.push(match document {
+                ForkDocument::Shared(at) => Ok(at),
+                ForkDocument::Own(own) => {
+                    let (doc, hash, text) = *own;
+                    content_hashes.push((doc.path.clone(), hash));
+                    embedding_texts.push(text);
+                    built.push(doc);
+                    Err(built.len() - 1)
                 }
-                let ancestor = self.state.refs.read().await.get(&id).cloned();
-                let Some(ancestor) = ancestor else {
-                    break;
+            });
+        }
+        let vectors = self
+            .walk_vectors(root, ref_index, &content_hashes, &embedding_texts, false)
+            .await?;
+        let fingerprint = {
+            let (base, order, built) = (Arc::clone(base), order.clone(), built.clone());
+            tokio::task::spawn_blocking(move || {
+                IndexFingerprint::of(order.iter().map(|at| match at {
+                    Ok(at) => &base.index.documents()[*at],
+                    Err(i) => &built[*i],
+                }))
+            })
+            .await
+            .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?
+        };
+        let installed = self
+            .install_fork(
+                ref_index,
+                parent,
+                Arc::clone(base),
+                built.clone(),
+                vectors.clone(),
+                deleted,
+                fingerprint,
+                start,
+            )
+            .await;
+        if let Some(installed) = installed.filter(|_| !documents) {
+            return Ok(WalkOutcome::Installed(installed));
+        }
+        let base = Arc::clone(base);
+        let walked = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            order
+                .into_par_iter()
+                .map(|at| match at {
+                    Ok(at) => (
+                        base.index.documents()[at].clone(),
+                        base.index.vector_at(at).map(<[f32]>::to_vec),
+                    ),
+                    Err(i) => (built[i].clone(), vectors[i].clone()),
+                })
+                .unzip()
+        })
+        .await
+        .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
+        let (docs, vectors) = walked;
+        Ok(WalkOutcome::Documents(docs, vectors))
+    }
+
+    /// The vectors of a walk's documents, by path and content hash: this ref's
+    /// cached ones, its ancestors', its attached worktrees', and embeddings
+    /// within the budget, the rest queued for the background fill. With
+    /// `inherit`, ancestors' vectors are copied into this ref's cache once
+    /// their files are rechecked; a fork uses them without a copy.
+    async fn walk_vectors(
+        &self,
+        #[cfg_attr(not(test), allow(unused_variables))] root: &Path,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        content_hashes: &[(String, String)],
+        embedding_texts: &[String],
+        inherit: bool,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let config = &self.config;
+        let ollama = &self.ollama;
+        let embedding_cache = Arc::clone(&ref_index.embedding_cache);
+        let mut borrowed = vec![false; content_hashes.len()];
+        let parent_vectors = match ref_index.parent_ref_id {
+            Some(parent_id) => self
+                .state
+                .ref_index(parent_id)
+                .await
+                .map(|parent| Arc::clone(&parent.embedding_cache)),
+            None => None,
+        };
+        // A worktree starts, and restarts after an eviction, from the
+        // vectors it persisted that its parent lacks.
+        if let Some(parent_vectors) = &parent_vectors
+            && embedding_cache.read().await.is_empty()
+        {
+            let started = std::time::Instant::now();
+            let root = ref_index.root_dir.clone();
+            let name = cache_name("embeddings", config);
+            if let Ok(Ok(Some(store))) =
+                tokio::task::spawn_blocking(move || rkyv_store::mmap_vector_store(&root, &name))
+                    .await
+            {
+                let own: HashMap<String, CacheEntry> = {
+                    let parent = parent_vectors.read().await;
+                    store
+                        .to_cache()
+                        .into_iter()
+                        .filter(|(path, entry)| !inherits(&parent, path, entry))
+                        .collect()
                 };
-                let cache = ancestor.embedding_cache.read().await;
-                for &idx in &uncached_indices {
-                    let (path, hash) = &content_hashes[idx];
-                    if vectors[idx].is_none()
-                        && let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash)
-                    {
-                        vectors[idx] = Some(entry.vector.clone());
-                        // A fork keeps only its own vectors in its cache.
-                        if shared.is_some() {
-                            borrowed[idx] = true;
-                        } else {
-                            inherited.push((idx, entry.clone()));
-                        }
+                let mut cache = embedding_cache.write().await;
+                if cache.is_empty() {
+                    *cache = own;
+                }
+            }
+            let entries = embedding_cache.read().await.len();
+            tracing::info!(
+                phase = "semantic_vector_reload",
+                ref_id = %ref_index.cas_ref_id_hex,
+                entries,
+                elapsed_ms = started.elapsed().as_millis(),
+                "cold-start phase"
+            );
+        }
+
+        let fill_snapshot = ref_index.semantic_fill.lock().await;
+        let cache_read = embedding_cache.read().await;
+        let observed: Vec<_> = content_hashes
+            .iter()
+            .map(|(path, _)| {
+                (
+                    cache_read.get(path).map(|entry| entry.hash.clone()),
+                    fill_snapshot.pending.get(path).map(|doc| doc.hash.clone()),
+                )
+            })
+            .collect();
+        let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(content_hashes.len());
+        let mut uncached_indices: Vec<usize> = Vec::new();
+        let mut uncached_texts: Vec<String> = Vec::new();
+
+        for (i, (rel_path, hash)) in content_hashes.iter().enumerate() {
+            if let Some(entry) = cache_read.get(rel_path)
+                && entry.hash == *hash
+            {
+                vectors.push(Some(entry.vector.clone()));
+                continue;
+            }
+            vectors.push(None);
+            uncached_indices.push(i);
+            uncached_texts.push(embedding_texts[i].clone());
+        }
+        drop(cache_read);
+        drop(fill_snapshot);
+
+        // Query and filler vectors live in memory even when no CAS manifest exists.
+        let mut ancestor_id = ref_index.parent_ref_id;
+        let mut visited = std::collections::HashSet::new();
+        let mut inherited = Vec::new();
+        while let Some(id) = ancestor_id {
+            if !visited.insert(id) {
+                break;
+            }
+            let ancestor = self.state.refs.read().await.get(&id).cloned();
+            let Some(ancestor) = ancestor else {
+                break;
+            };
+            let cache = ancestor.embedding_cache.read().await;
+            for &idx in &uncached_indices {
+                let (path, hash) = &content_hashes[idx];
+                if vectors[idx].is_none()
+                    && let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash)
+                {
+                    vectors[idx] = Some(entry.vector.clone());
+                    // A fork keeps only its own vectors in its cache.
+                    if inherit {
+                        inherited.push((idx, entry.clone()));
+                    } else {
+                        borrowed[idx] = true;
                     }
                 }
-                tracing::info!(
-                    ref_id = %ref_index.cas_ref_id_hex,
-                    ancestor_ref_id = %ancestor.cas_ref_id_hex,
-                    ancestor_entries = cache.len(),
-                    inherited = inherited.len(),
-                    "semantic ancestor cache lookup"
-                );
-                ancestor_id = ancestor.parent_ref_id;
             }
-            let mut current = vec![true; content_hashes.len()];
-            let started = std::time::Instant::now();
-            for &(idx, _) in &inherited {
+            tracing::info!(
+                ref_id = %ref_index.cas_ref_id_hex,
+                ancestor_ref_id = %ancestor.cas_ref_id_hex,
+                ancestor_entries = cache.len(),
+                inherited = inherited.len(),
+                "semantic ancestor cache lookup"
+            );
+            ancestor_id = ancestor.parent_ref_id;
+        }
+        let mut current = vec![true; content_hashes.len()];
+        let started = std::time::Instant::now();
+        for &(idx, _) in &inherited {
+            let (path, hash) = &content_hashes[idx];
+            current[idx] = FillDocument {
+                path: path.clone(),
+                hash: hash.clone(),
+                text: String::new(),
+                owner: None,
+            }
+            .is_current(&ref_index.canonical_root, config.max_embed_file_size)
+            .await;
+        }
+        if !inherited.is_empty() {
+            let validate_ms = started.elapsed().as_millis();
+            let fill = ref_index.semantic_fill.lock().await;
+            let mut cache = embedding_cache.write().await;
+            let lock_ms = started.elapsed().as_millis() - validate_ms;
+            tracing::info!(
+                phase = "semantic_inherit",
+                ref_id = %ref_index.cas_ref_id_hex,
+                inherited = inherited.len(),
+                validate_ms,
+                lock_ms,
+                "cold-start phase"
+            );
+            for (idx, entry) in inherited {
+                let (path, _) = &content_hashes[idx];
+                // File validation runs without locks; reject intervening cache/fill changes.
+                if current[idx]
+                    && cache.get(path).map(|entry| &entry.hash) == observed[idx].0.as_ref()
+                    && fill.pending.get(path).map(|doc| &doc.hash) == observed[idx].1.as_ref()
+                {
+                    cache.insert(path.clone(), entry);
+                } else {
+                    current[idx] = false;
+                    vectors[idx] = None;
+                }
+            }
+        }
+        let (miss_indices, misses): (Vec<usize>, Vec<VectorMiss>) = uncached_indices
+            .iter()
+            .filter(|&&idx| current[idx] && vectors[idx].is_none())
+            .map(|&idx| {
                 let (path, hash) = &content_hashes[idx];
+                let miss = VectorMiss {
+                    path: path.clone(),
+                    hash: hash.clone(),
+                    cached_hash: observed[idx].0.clone(),
+                    pending_hash: observed[idx].1.clone(),
+                };
+                (idx, miss)
+            })
+            .unzip();
+        let adopted =
+            adopt_worktree_vectors(&self.state, ref_index, &misses, config.max_embed_file_size)
+                .await;
+        for (idx, vector) in miss_indices.into_iter().zip(adopted) {
+            if vector.is_some() {
+                vectors[idx] = vector;
+            }
+        }
+        uncached_indices.retain(|&idx| vectors[idx].is_none());
+
+        #[cfg(test)]
+        test_seams::after_cache_snapshot(root).await;
+
+        let cache_entries = embedding_cache.read().await.len();
+        tracing::info!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            cache_entries,
+            cached = content_hashes.len() - uncached_indices.len(),
+            uncached = uncached_indices.len(),
+            "semantic_code_search embedding cache hit/miss"
+        );
+
+        for (idx, (path, hash)) in content_hashes.iter().enumerate() {
+            if current[idx] && vectors[idx].is_none() {
                 current[idx] = FillDocument {
                     path: path.clone(),
                     hash: hash.clone(),
@@ -685,182 +888,75 @@ impl CachedWalkerIndexer {
                 .is_current(&ref_index.canonical_root, config.max_embed_file_size)
                 .await;
             }
-            if !inherited.is_empty() {
-                let validate_ms = started.elapsed().as_millis();
-                let fill = ref_index.semantic_fill.lock().await;
-                let mut cache = embedding_cache.write().await;
-                let lock_ms = started.elapsed().as_millis() - validate_ms;
-                tracing::info!(
-                    phase = "semantic_inherit",
-                    ref_id = %ref_index.cas_ref_id_hex,
-                    inherited = inherited.len(),
-                    validate_ms,
-                    lock_ms,
-                    "cold-start phase"
-                );
-                for (idx, entry) in inherited {
-                    let (path, _) = &content_hashes[idx];
-                    // File validation runs without locks; reject intervening cache/fill changes.
-                    if current[idx]
-                        && cache.get(path).map(|entry| &entry.hash) == observed[idx].0.as_ref()
-                        && fill.pending.get(path).map(|doc| &doc.hash) == observed[idx].1.as_ref()
-                    {
-                        cache.insert(path.clone(), entry);
-                    } else {
-                        current[idx] = false;
-                        vectors[idx] = None;
-                    }
-                }
+        }
+        let owner = Arc::new(());
+        let mut fill = ref_index.semantic_fill.lock().await;
+        let cache = embedding_cache.read().await;
+        let mut pending = Vec::new();
+        for (idx, (path, hash)) in content_hashes.iter().enumerate() {
+            if !current[idx] || borrowed[idx] {
+                continue;
             }
-            let (miss_indices, misses): (Vec<usize>, Vec<VectorMiss>) = uncached_indices
-                .iter()
-                .filter(|&&idx| current[idx] && vectors[idx].is_none())
-                .map(|&idx| {
-                    let (path, hash) = &content_hashes[idx];
-                    let miss = VectorMiss {
-                        path: path.clone(),
-                        hash: hash.clone(),
-                        cached_hash: observed[idx].0.clone(),
-                        pending_hash: observed[idx].1.clone(),
-                    };
-                    (idx, miss)
-                })
-                .unzip();
-            let adopted = adopt_worktree_vectors(
-                &self.state,
-                &ref_index,
-                &misses,
-                config.max_embed_file_size,
-            )
-            .await;
-            for (idx, vector) in miss_indices.into_iter().zip(adopted) {
-                if vector.is_some() {
-                    vectors[idx] = vector;
-                }
-            }
-            uncached_indices.retain(|&idx| vectors[idx].is_none());
-
-            #[cfg(test)]
-            test_seams::after_cache_snapshot(&root).await;
-
-            let cache_entries = embedding_cache.read().await.len();
-            tracing::info!(
-                ref_id = %ref_index.cas_ref_id_hex,
-                cache_entries,
-                cached = docs.len() - uncached_indices.len(),
-                uncached = uncached_indices.len(),
-                "semantic_code_search embedding cache hit/miss"
-            );
-
-            for (idx, (path, hash)) in content_hashes.iter().enumerate() {
-                if current[idx] && vectors[idx].is_none() {
-                    current[idx] = FillDocument {
-                        path: path.clone(),
-                        hash: hash.clone(),
-                        text: String::new(),
-                        owner: None,
-                    }
-                    .is_current(&ref_index.canonical_root, config.max_embed_file_size)
-                    .await;
-                }
-            }
-            let owner = Arc::new(());
-            let mut fill = ref_index.semantic_fill.lock().await;
-            let cache = embedding_cache.read().await;
-            let mut pending = Vec::new();
-            for (idx, (path, hash)) in content_hashes.iter().enumerate() {
-                if !current[idx] || borrowed[idx] {
-                    continue;
-                }
-                if let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash) {
-                    vectors[idx] = Some(entry.vector.clone());
-                    if fill.pending.get(path).is_some_and(|doc| doc.hash == *hash) {
-                        fill.pending.remove(path);
-                    }
-                    continue;
-                }
-                let mut doc = FillDocument {
-                    path: path.clone(),
-                    hash: hash.clone(),
-                    text: embedding_texts[idx].clone(),
-                    owner: Some(Arc::downgrade(&owner)),
-                };
-                if fill.failed(&doc) {
+            if let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash) {
+                vectors[idx] = Some(entry.vector.clone());
+                if fill.pending.get(path).is_some_and(|doc| doc.hash == *hash) {
                     fill.pending.remove(path);
+                }
+                continue;
+            }
+            let mut doc = FillDocument {
+                path: path.clone(),
+                hash: hash.clone(),
+                text: embedding_texts[idx].clone(),
+                owner: Some(Arc::downgrade(&owner)),
+            };
+            if fill.failed(&doc) {
+                fill.pending.remove(path);
+                continue;
+            }
+            if let Some(current) = fill.pending.get(path) {
+                if current.hash == *hash {
                     continue;
                 }
-                if let Some(current) = fill.pending.get(path) {
-                    if current.hash == *hash {
-                        continue;
-                    }
-                    doc.owner = None;
-                } else {
-                    pending.push((idx, doc.clone()));
-                }
-                fill.pending.insert(path.clone(), doc);
+                doc.owner = None;
+            } else {
+                pending.push((idx, doc.clone()));
             }
-            drop(cache);
-            if !fill.running && !fill.pending.is_empty() {
-                fill.running = true;
-                let owner = ref_index.clone();
-                let ollama = ollama.clone();
-                let config = config.clone();
-                let parent_vectors = parent_vectors.clone();
-                let task = tokio::spawn(async move {
-                    run_fill(owner, ollama, config, parent_vectors).await;
-                });
-                ref_index.track_background_task(&task);
+            fill.pending.insert(path.clone(), doc);
+        }
+        drop(cache);
+        if !fill.running && !fill.pending.is_empty() {
+            fill.running = true;
+            let owner = Arc::clone(ref_index);
+            let ollama = ollama.clone();
+            let config = config.clone();
+            let parent_vectors = parent_vectors.clone();
+            let task = tokio::spawn(async move {
+                run_fill(owner, ollama, config, parent_vectors).await;
+            });
+            ref_index.track_background_task(&task);
+        }
+        drop(fill);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(config.embed_budget_ms);
+        for chunk in pending.chunks(config.embed_batch_size.max(1)) {
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
-            drop(fill);
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_millis(config.embed_budget_ms);
-            for chunk in pending.chunks(config.embed_batch_size.max(1)) {
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                let texts: Vec<_> = chunk.iter().map(|(_, d)| d.text.clone()).collect();
-                match tokio::time::timeout_at(deadline, ollama.embed_documents(&texts)).await {
-                    Ok(Ok(result)) if result.len() == chunk.len() => {
-                        let mut current = Vec::with_capacity(chunk.len());
-                        for (_, doc) in chunk {
-                            current.push(
-                                doc.is_current(
-                                    &ref_index.canonical_root,
-                                    config.max_embed_file_size,
-                                )
+            let texts: Vec<_> = chunk.iter().map(|(_, d)| d.text.clone()).collect();
+            match tokio::time::timeout_at(deadline, ollama.embed_documents(&texts)).await {
+                Ok(Ok(result)) if result.len() == chunk.len() => {
+                    let mut current = Vec::with_capacity(chunk.len());
+                    for (_, doc) in chunk {
+                        current.push(
+                            doc.is_current(&ref_index.canonical_root, config.max_embed_file_size)
                                 .await,
-                            );
-                        }
-                        let mut fill = ref_index.semantic_fill.lock().await;
-                        let mut cache = embedding_cache.write().await;
-                        for (((idx, doc), vector), current) in chunk.iter().zip(result).zip(current)
-                        {
-                            if !current {
-                                if fill
-                                    .pending
-                                    .get(&doc.path)
-                                    .is_some_and(|cur| cur.hash == doc.hash)
-                                {
-                                    fill.pending.remove(&doc.path);
-                                }
-                                continue;
-                            }
-                            if vector.is_empty()
-                                || !fill
-                                    .pending
-                                    .get(&doc.path)
-                                    .is_some_and(|cur| cur.hash == doc.hash)
-                            {
-                                continue;
-                            }
-                            cache.insert(
-                                doc.path.clone(),
-                                CacheEntry {
-                                    hash: doc.hash.clone(),
-                                    vector: vector.clone(),
-                                },
-                            );
-                            vectors[*idx] = Some(vector);
+                        );
+                    }
+                    let mut fill = ref_index.semantic_fill.lock().await;
+                    let mut cache = embedding_cache.write().await;
+                    for (((idx, doc), vector), current) in chunk.iter().zip(result).zip(current) {
+                        if !current {
                             if fill
                                 .pending
                                 .get(&doc.path)
@@ -868,124 +964,117 @@ impl CachedWalkerIndexer {
                             {
                                 fill.pending.remove(&doc.path);
                             }
+                            continue;
                         }
-                    }
-                    Ok(Err(_)) => {
-                        let mut fill = ref_index.semantic_fill.lock().await;
-                        for (_, doc) in chunk {
-                            if fill
+                        if vector.is_empty()
+                            || !fill
                                 .pending
                                 .get(&doc.path)
                                 .is_some_and(|cur| cur.hash == doc.hash)
-                            {
-                                fill.record_error(doc);
-                            }
+                        {
+                            continue;
+                        }
+                        cache.insert(
+                            doc.path.clone(),
+                            CacheEntry {
+                                hash: doc.hash.clone(),
+                                vector: vector.clone(),
+                            },
+                        );
+                        vectors[*idx] = Some(vector);
+                        if fill
+                            .pending
+                            .get(&doc.path)
+                            .is_some_and(|cur| cur.hash == doc.hash)
+                        {
+                            fill.pending.remove(&doc.path);
                         }
                     }
-                    _ => {}
                 }
-            }
-            let mut fill = ref_index.semantic_fill.lock().await;
-            for (_, doc) in &pending {
-                if fill.failed(doc)
-                    && fill
-                        .pending
-                        .get(&doc.path)
-                        .is_some_and(|cur| cur.hash == doc.hash)
-                {
-                    fill.pending.remove(&doc.path);
+                Ok(Err(_)) => {
+                    let mut fill = ref_index.semantic_fill.lock().await;
+                    for (_, doc) in chunk {
+                        if fill
+                            .pending
+                            .get(&doc.path)
+                            .is_some_and(|cur| cur.hash == doc.hash)
+                        {
+                            fill.record_error(doc);
+                        }
+                    }
                 }
+                _ => {}
             }
-            let queued = pending
-                .iter()
-                .filter(|(idx, _)| vectors[*idx].is_none())
-                .count();
-            drop(owner);
-            drop(fill);
-            if queued > 0 {
-                tracing::warn!(
-                    queued,
-                    "semantic_code_search returning partial results; leftovers queued for background fill"
-                );
+        }
+        let mut fill = ref_index.semantic_fill.lock().await;
+        for (_, doc) in &pending {
+            if fill.failed(doc)
+                && fill
+                    .pending
+                    .get(&doc.path)
+                    .is_some_and(|cur| cur.hash == doc.hash)
+            {
+                fill.pending.remove(&doc.path);
             }
+        }
+        let queued = pending
+            .iter()
+            .filter(|(idx, _)| vectors[*idx].is_none())
+            .count();
+        drop(owner);
+        drop(fill);
+        if queued > 0 {
+            tracing::warn!(
+                queued,
+                "semantic_code_search returning partial results; leftovers queued for background fill"
+            );
+        }
 
-            let replacement_dims = ref_index
-                .search_index_cache
-                .read()
-                .await
-                .as_ref()
-                .and_then(|entry| entry.pending_vector_dimensions());
-            if let Some(dims) = replacement_dims {
-                let missing: Vec<_> = vectors
+        let replacement_dims = ref_index
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .and_then(|entry| entry.pending_vector_dimensions());
+        if let Some(dims) = replacement_dims {
+            let missing: Vec<_> = vectors
+                .iter()
+                .enumerate()
+                .filter(|(i, vector)| {
+                    !borrowed[*i] && vector.as_ref().is_none_or(|v| v.len() != dims)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if !missing.is_empty() {
+                let texts: Vec<_> = missing
                     .iter()
-                    .enumerate()
-                    .filter(|(i, vector)| {
-                        !borrowed[*i] && vector.as_ref().is_none_or(|v| v.len() != dims)
-                    })
-                    .map(|(i, _)| i)
+                    .map(|&i| embedding_texts[i].clone())
                     .collect();
-                if !missing.is_empty() {
-                    let texts: Vec<_> = missing
-                        .iter()
-                        .map(|&i| embedding_texts[i].clone())
-                        .collect();
-                    let replacements = ollama.embed_documents(&texts).await?;
-                    if replacements.len() != missing.len()
-                        || replacements.iter().any(|v| v.len() != dims)
-                    {
-                        return Err(crate::error::ContextPlusError::Other(
-                            "incompatible replacement embedding shape".into(),
-                        ));
+                let replacements = ollama.embed_documents(&texts).await?;
+                if replacements.len() != missing.len()
+                    || replacements.iter().any(|v| v.len() != dims)
+                {
+                    return Err(crate::error::ContextPlusError::Other(
+                        "incompatible replacement embedding shape".into(),
+                    ));
+                }
+                let mut cache = embedding_cache.write().await;
+                for (i, vector) in missing.into_iter().zip(replacements) {
+                    let (path, hash) = &content_hashes[i];
+                    if cache.get(path).is_none_or(|entry| entry.hash == *hash) {
+                        cache.insert(
+                            path.clone(),
+                            CacheEntry {
+                                hash: hash.clone(),
+                                vector: vector.clone(),
+                            },
+                        );
                     }
-                    let mut cache = embedding_cache.write().await;
-                    for (i, vector) in missing.into_iter().zip(replacements) {
-                        let (path, hash) = &content_hashes[i];
-                        if cache.get(path).is_none_or(|entry| entry.hash == *hash) {
-                            cache.insert(
-                                path.clone(),
-                                CacheEntry {
-                                    hash: hash.clone(),
-                                    vector: vector.clone(),
-                                },
-                            );
-                        }
-                        vectors[i] = Some(vector);
-                    }
+                    vectors[i] = Some(vector);
                 }
             }
-            match (fork_parent, base.zip(shared)) {
-                (Some(parent), Some((base, Shared { positions, deleted }))) => {
-                    let (docs, vectors, (changed, changed_vectors), fingerprint) =
-                        tokio::task::spawn_blocking(move || {
-                            let changed = (0..docs.len())
-                                .filter(|&i| positions[i].is_none())
-                                .map(|i| (docs[i].clone(), vectors[i].clone()))
-                                .unzip();
-                            let fingerprint = IndexFingerprint::from_docs(&docs);
-                            (docs, vectors, changed, fingerprint)
-                        })
-                        .await
-                        .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
-                    self.install_fork(
-                        &ref_index,
-                        &parent,
-                        base,
-                        changed,
-                        changed_vectors,
-                        deleted,
-                        fingerprint,
-                        walk_start,
-                    )
-                    .await;
-                    Ok((docs, vectors))
-                }
-                (Some(parent), None) => self
-                    .seed_fork(&ref_index, &parent, canonical, docs, vectors, walk_start)
-                    .await
-                    .map(|(docs, vectors, _)| (docs, vectors)),
-                (None, _) => Ok((docs, vectors)),
-            }
-        })
+        }
+        Ok(vectors)
     }
 
     /// Walks `root` and reads its files, or the `candidates` among them, into
@@ -1131,22 +1220,17 @@ impl CachedWalkerIndexer {
     }
 
     /// The documents of a full walk of the worktree at `root` whose parent
-    /// holds the forkable `base`, and which of them are `base`'s. A file the
-    /// parent's cached contents show unchanged takes `base`'s document unread
-    /// when `base` indexed those contents with a vector; the other files are
-    /// read. `None` when those contents are unavailable or the worktree's
-    /// changes pass the promotion threshold.
+    /// holds the forkable `base`. A file the parent's cached contents show
+    /// unchanged keeps `base`'s document unread when `base` indexed those
+    /// contents with a vector; the other files are read. `None` when those
+    /// contents are unavailable or the worktree's changes pass the promotion
+    /// threshold.
     async fn fork_documents(
         &self,
         root: &Path,
         parent: &Arc<crate::ref_index::RefIndex>,
         base: &Arc<CachedSearchIndex>,
-    ) -> Option<(
-        Vec<SearchDocument>,
-        Vec<(String, String)>,
-        Vec<String>,
-        Shared,
-    )> {
+    ) -> Option<Forked> {
         let files = crate::server::worktree_file_base(&self.state, parent).await?;
         let started = std::time::Instant::now();
         let config = self.config.clone();
@@ -1199,57 +1283,32 @@ impl CachedWalkerIndexer {
 
         let doc_shape = self.config.embed_doc_shape;
         let base = Arc::clone(base);
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            let Forked { documents, deleted } = Forked::of(walked, &base.index, doc_shape)?;
-            let documents: Vec<_> = documents
-                .into_par_iter()
-                .map(|document| match document {
-                    Ok(at) => {
-                        let doc = base.index.documents()[at].clone();
-                        let hash = doc.source_hash.clone();
-                        (Some(at), doc, hash, String::new())
-                    }
-                    Err((doc, hash, text)) => (None, doc, hash, text),
-                })
-                .collect();
-            let mut positions = Vec::with_capacity(documents.len());
-            let mut docs = Vec::with_capacity(documents.len());
-            let mut content_hashes = Vec::with_capacity(documents.len());
-            let mut embedding_texts = Vec::with_capacity(documents.len());
-            for (at, doc, hash, text) in documents {
-                positions.push(at);
-                content_hashes.push((doc.path.clone(), hash));
-                docs.push(doc);
-                embedding_texts.push(text);
-            }
-            tracing::info!(
-                phase = "semantic_walk",
-                walk_ms,
-                read_ms,
-                documents_ms = started.elapsed().as_millis() - walk_ms - read_ms,
-                documents = docs.len(),
-                reused = positions.iter().flatten().count(),
-                changed,
-                read,
-                "cold-start phase"
-            );
-            Some((
-                docs,
-                content_hashes,
-                embedding_texts,
-                Shared { positions, deleted },
-            ))
-        })
-        .await
-        .ok()
-        .flatten()
+        let forked =
+            tokio::task::spawn_blocking(move || Forked::of(walked, &base.index, doc_shape))
+                .await
+                .ok()??;
+        tracing::info!(
+            phase = "semantic_walk",
+            walk_ms,
+            read_ms,
+            documents_ms = started.elapsed().as_millis() - walk_ms - read_ms,
+            documents = forked.documents.len(),
+            reused = forked
+                .documents
+                .iter()
+                .filter(|doc| matches!(doc, ForkDocument::Shared(_)))
+                .count(),
+            changed,
+            read,
+            "cold-start phase"
+        );
+        Some(forked)
     }
 
     /// Installs `base` forked with a worktree's `changed` documents, their
     /// `vectors` and its `deleted` paths as the worktree's index, unless the
     /// worktree's entry already shares `base`'s store. `fingerprint` is that
-    /// of all the worktree's documents. Whether the fork was installed.
+    /// of all the worktree's documents. The fork, when installed.
     #[allow(clippy::too_many_arguments)]
     async fn install_fork(
         &self,
@@ -1261,7 +1320,7 @@ impl CachedWalkerIndexer {
         deleted: Vec<String>,
         fingerprint: IndexFingerprint,
         start: WalkStart,
-    ) -> bool {
+    ) -> Option<Arc<CachedSearchIndex>> {
         // Recorded once forked or refused, so a fork dropped by a changed slot is retried.
         let store = base.index.vector_store().map(Arc::downgrade);
         let record = || {
@@ -1277,7 +1336,7 @@ impl CachedWalkerIndexer {
             .is_some_and(|current| current.index.shares_vector_store(&base.index))
         {
             record();
-            return false;
+            return None;
         }
         let started = std::time::Instant::now();
         let root = ref_index.canonical_root.clone();
@@ -1299,20 +1358,22 @@ impl CachedWalkerIndexer {
         .flatten();
         let Some(fork) = fork else {
             record();
-            return false;
+            return None;
         };
-        let installed = fork.install(
-            &mut *ref_index.search_index_cache.write().await,
-            start.seen.as_ref(),
-        );
-        if installed {
+        let installed = {
+            let mut slot = ref_index.search_index_cache.write().await;
+            fork.install(&mut slot, start.seen.as_ref())
+                .then(|| slot.clone())
+                .flatten()
+        };
+        if installed.is_some() {
             record();
         }
         tracing::info!(
             phase = "semantic_fork",
             ref_id = %ref_index.cas_ref_id_hex,
             parent_ref_id = %parent.cas_ref_id_hex,
-            installed,
+            installed = installed.is_some(),
             changed = changed_count,
             deleted = deleted_count,
             elapsed_ms = started.elapsed().as_millis(),
@@ -1469,8 +1530,8 @@ impl CachedWalkerIndexer {
                 forked = self.warmup_delta(ref_index, files, &base).await;
             }
             match forked {
-                Some((changed, vectors, deleted, fingerprint)) => {
-                    self.install_fork(
+                Some((changed, vectors, deleted, fingerprint)) => self
+                    .install_fork(
                         ref_index,
                         &parent,
                         Arc::clone(&base),
@@ -1481,7 +1542,7 @@ impl CachedWalkerIndexer {
                         start,
                     )
                     .await
-                }
+                    .is_some(),
                 None => {
                     if let Some(store) = base.index.vector_store() {
                         *ref_index.fork_base.lock().unwrap() = Arc::downgrade(store);
@@ -1602,12 +1663,15 @@ impl CachedWalkerIndexer {
                 Forked::of(walked, &classify_base.index, doc_shape)?;
             let fingerprint =
                 IndexFingerprint::of(documents.iter().map(|document| match document {
-                    Ok(at) => &classify_base.index.documents()[*at],
-                    Err((doc, ..)) => doc,
+                    ForkDocument::Shared(at) => &classify_base.index.documents()[*at],
+                    ForkDocument::Own(own) => &own.0,
                 }));
             let changed: Vec<SearchDocument> = documents
                 .into_iter()
-                .filter_map(|document| document.err().map(|(doc, ..)| doc))
+                .filter_map(|document| match document {
+                    ForkDocument::Own(own) => Some(own.0),
+                    ForkDocument::Shared(_) => None,
+                })
                 .collect();
             Some((changed, deleted, fingerprint))
         })
@@ -1988,12 +2052,19 @@ fn classify(
         .collect()
 }
 
+/// A document of a worktree's walk over its parent's forkable index.
+enum ForkDocument {
+    /// The parent's document at this position.
+    Shared(usize),
+    /// A document of the worktree's own content, with its content hash and
+    /// embedding text.
+    Own(Box<(SearchDocument, String, String)>),
+}
+
 /// A worktree's documents over its parent's forkable index.
 struct Forked {
-    /// In walk order: the position of a document the parent's index shares,
-    /// or a document of the worktree's own content with its content hash and
-    /// embedding text.
-    documents: Vec<std::result::Result<usize, (SearchDocument, String, String)>>,
+    /// In walk order.
+    documents: Vec<ForkDocument>,
     /// The parent's documents the worktree does not have.
     deleted: Vec<String>,
 }
@@ -2016,20 +2087,20 @@ impl Forked {
         let documents: Vec<_> = walked
             .into_par_iter()
             .filter_map(|(path, walked)| match walked {
-                Walked::Shared(at) => Some(Ok(at)),
+                Walked::Shared(at) => Some(ForkDocument::Shared(at)),
                 Walked::Read(Some(content)) => {
                     let hash = content_hash(&content);
                     if let Some(&at) = held
                         .get(path.as_str())
                         .filter(|&&at| holds(base, at, &path, &content, &hash))
                     {
-                        return Some(Ok(at));
+                        return Some(ForkDocument::Shared(at));
                     }
                     let text = build_embedding_document(&path, &content, doc_shape);
                     let (mut doc, _) =
                         walk_document(&path, &content, &hash, None, &parent_documents);
                     doc.source_hash = hash.clone();
-                    Some(Err((doc, hash, text)))
+                    Some(ForkDocument::Own(Box::new((doc, hash, text))))
                 }
                 Walked::Read(None) | Walked::Skipped => None,
             })
@@ -2037,8 +2108,8 @@ impl Forked {
         let walked: std::collections::HashSet<&str> = documents
             .iter()
             .map(|document| match document {
-                Ok(at) => base.documents()[*at].path.as_str(),
-                Err((doc, ..)) => doc.path.as_str(),
+                ForkDocument::Shared(at) => base.documents()[*at].path.as_str(),
+                ForkDocument::Own(own) => own.0.path.as_str(),
             })
             .collect();
         let deleted: Vec<String> = base
@@ -2049,7 +2120,7 @@ impl Forked {
             .collect();
         let changed = documents
             .iter()
-            .filter(|document| document.is_err())
+            .filter(|document| matches!(document, ForkDocument::Own(_)))
             .count();
         ((changed + deleted.len()) as f64
             <= base.documents().len() as f64
@@ -2101,6 +2172,30 @@ impl Shared {
             <= base.documents().len() as f64
                 * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION)
             .then_some(Self { positions, deleted })
+    }
+
+    /// The walked `docs`, with their content hashes and embedding texts, over
+    /// the parent's index.
+    fn forked(
+        self,
+        docs: Vec<SearchDocument>,
+        content_hashes: Vec<(String, String)>,
+        embedding_texts: Vec<String>,
+    ) -> Forked {
+        let documents = docs
+            .into_iter()
+            .zip(content_hashes)
+            .zip(embedding_texts)
+            .zip(self.positions)
+            .map(|(((doc, (_, hash)), text), at)| match at {
+                Some(at) => ForkDocument::Shared(at),
+                None => ForkDocument::Own(Box::new((doc, hash, text))),
+            })
+            .collect();
+        Forked {
+            documents,
+            deleted: self.deleted,
+        }
     }
 }
 

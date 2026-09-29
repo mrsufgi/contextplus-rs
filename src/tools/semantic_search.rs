@@ -60,6 +60,16 @@ pub(crate) type WalkAndIndexFuture<'a> = std::pin::Pin<
     >,
 >;
 
+/// What a walk produced: its documents and vectors, or the index of its root
+/// it installed in the slot itself.
+pub enum WalkOutcome {
+    Documents(Vec<SearchDocument>, Vec<Option<Vec<f32>>>),
+    Installed(Arc<CachedSearchIndex>),
+}
+
+pub(crate) type WalkOrInstallFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<WalkOutcome>> + Send + 'a>>;
+
 pub(crate) type VectorGenerationFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + 'a>>;
 
@@ -2450,8 +2460,10 @@ pub(crate) async fn semantic_code_search_owned(
                 let task = tokio::spawn(async move {
                     let _reset = RebuildGuard(Arc::clone(&previous));
                     let vector_generation = walker.vector_generation(&root).await;
-                    match walker.walk_and_index(&root).await {
-                        Ok((docs, vectors)) => {
+                    match walker.walk_or_install(&root).await {
+                        // The walk replaced `previous` with an index of its own.
+                        Ok(WalkOutcome::Installed(_)) => {}
+                        Ok(WalkOutcome::Documents(docs, vectors)) => {
                             let base = Arc::clone(&previous);
                             let built = tokio::task::spawn_blocking(move || {
                                 let pending = base.pending.lock().unwrap();
@@ -2678,7 +2690,30 @@ pub async fn semantic_code_search(
 
             // Walk the filesystem and compute fingerprint (tracker-off fallback or
             // generation mismatch meaning the tracker saw a change).
-            let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
+            let (docs, vectors) = match walk_and_index_fn.walk_or_install(&options.root_dir).await?
+            {
+                WalkOutcome::Documents(docs, vectors) => (docs, vectors),
+                WalkOutcome::Installed(installed) => {
+                    // Built from this walk, it answers; while it is current it
+                    // also takes the walk's metadata and generation.
+                    let current = lock
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|cached| Arc::ptr_eq(cached, &installed));
+                    if current
+                        && installed.vector_generation == vector_generation
+                        && installed.pending.lock().unwrap().batches.is_empty()
+                    {
+                        *installed.metadata.write().unwrap() = metadata.clone();
+                        installed
+                            .generation
+                            .store(current_gen, std::sync::atomic::Ordering::Release);
+                    }
+                    installed.record_reuse();
+                    break 'cache installed;
+                }
+            };
             let fp = IndexFingerprint::from_docs(&docs);
 
             {
@@ -2924,6 +2959,15 @@ pub trait WalkAndIndexFn: Send + Sync {
         Box::pin(async { Ok(None) })
     }
     fn walk_and_index(&self, root_dir: &Path) -> WalkAndIndexFuture<'_>;
+    /// [`Self::walk_and_index`], unless the walk installs the index of
+    /// `root_dir` in the slot itself.
+    fn walk_or_install(&self, root_dir: &Path) -> WalkOrInstallFuture<'_> {
+        let walk = self.walk_and_index(root_dir);
+        Box::pin(async move {
+            walk.await
+                .map(|(docs, vectors)| WalkOutcome::Documents(docs, vectors))
+        })
+    }
     fn track_background_task(&self, _task: &tokio::task::JoinHandle<()>) {}
 }
 
@@ -5855,6 +5899,65 @@ mod tests {
                 Ok((docs, vecs))
             })
         }
+    }
+
+    /// A walker that installs the index of its root in `slot` itself and
+    /// counts the walks asked for documents.
+    struct InstallingWalker {
+        slot: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
+        document_walks: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl WalkAndIndexFn for InstallingWalker {
+        fn walk_and_index(&self, _root: &Path) -> WalkAndIndexFuture<'_> {
+            self.document_walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok((vec![make_doc("a.rs", "walked")], vec![Some(vec![1.0, 0.0])])) })
+        }
+
+        fn walk_or_install(&self, root: &Path) -> WalkOrInstallFuture<'_> {
+            let root = root.canonicalize().unwrap();
+            Box::pin(async move {
+                let entry = Arc::new(CachedSearchIndex::build(
+                    &root,
+                    vec![make_doc("installed.rs", "installed by the walk")],
+                    vec![Some(vec![1.0, 0.0])],
+                    0,
+                    0,
+                    None,
+                ));
+                *self.slot.write().await = Some(Arc::clone(&entry));
+                Ok(WalkOutcome::Installed(entry))
+            })
+        }
+    }
+
+    /// A walk that installs the index of its root is not asked for documents:
+    /// the search answers from what it installed.
+    #[tokio::test]
+    async fn search_answers_from_the_index_its_walk_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let slot: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let walker = InstallingWalker {
+            slot: Arc::clone(&slot),
+            document_walks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        let opts = SemanticSearchOptions {
+            root_dir: root.path().to_path_buf(),
+            ..gen_test_opts()
+        };
+
+        let answer = semantic_code_search(opts, &FixedEmbedder2, &walker, Some(slot), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            walker
+                .document_walks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the search asked for the documents of a walk that installed its index"
+        );
+        assert!(answer.contains("installed.rs"), "{answer}");
     }
 
     /// Cache hit without a file change: when the generation matches, the walk

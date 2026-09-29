@@ -18325,6 +18325,33 @@ mod tests {
         );
     }
 
+    /// A walk that installs the worktree's fork hands no documents back: the
+    /// search answers from the fork, so the primary's documents are not copied
+    /// out of it.
+    #[tokio::test]
+    async fn semantic_fork_walk_that_installs_the_fork_returns_no_documents() {
+        let (_ollama, _primary, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+
+        let walked = semantic_fork_walker(&session, session.current_ref().await)
+            .walk_or_install(worktree.path())
+            .await
+            .unwrap();
+        let fork = match walked {
+            crate::tools::semantic_search::WalkOutcome::Installed(fork) => fork,
+            crate::tools::semantic_search::WalkOutcome::Documents(docs, _) => panic!(
+                "the walk that installed the fork returned {} documents",
+                docs.len()
+            ),
+        };
+        assert!(Arc::ptr_eq(&fork, &semantic_fork_index(&session).await));
+        assert!(
+            fork.index
+                .shares_vector_store(&semantic_fork_index(&server).await.index)
+        );
+    }
+
     /// A primary of [`SEMANTIC_FORK_FILES`] files in git, its file cache built
     /// as the daemon's preload builds it, and a linked worktree edited by `edit`.
     async fn semantic_fork_git_servers(
