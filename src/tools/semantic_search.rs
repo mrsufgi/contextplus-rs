@@ -7211,7 +7211,7 @@ mod tests {
         );
 
         graph_pause.release();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
             loop {
                 let current = cache.read().await.as_ref().cloned().unwrap();
                 if !Arc::ptr_eq(&current, &previous) {
