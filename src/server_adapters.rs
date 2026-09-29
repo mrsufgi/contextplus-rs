@@ -127,6 +127,33 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn store_read_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Counts the persisted-store reads of the worktree at `root` from now on.
+    pub(crate) fn record_store_reads(root: &Path) {
+        store_read_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), 0);
+    }
+
+    pub(crate) fn store_read(root: &Path) {
+        if let Some(reads) = store_read_slots().lock().unwrap().get_mut(root) {
+            *reads += 1;
+        }
+    }
+
+    pub(crate) fn store_reads(root: &Path) -> usize {
+        store_read_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     fn read_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<String>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1949,68 +1976,53 @@ enum Held {
     Persisted,
 }
 
-/// A primary's linked git worktree roots, as git's `worktrees` directory
-/// listed them at its modification time.
-#[derive(Clone)]
-pub(crate) struct LinkedWorktrees {
-    listing: std::path::PathBuf,
-    modified: std::time::SystemTime,
-    roots: Vec<std::path::PathBuf>,
-}
-
-/// The linked git worktrees of the checkout at `root`, from the `gitdir`
-/// record git keeps for each; `known` unless that list changed since.
-fn list_linked_worktrees(root: &Path, known: Option<LinkedWorktrees>) -> Option<LinkedWorktrees> {
-    let listing = crate::core::git_worktree::git_dirs(root)?
-        .common_dir
-        .join("worktrees");
-    let modified = std::fs::metadata(&listing)
-        .and_then(|meta| meta.modified())
-        .ok()?;
-    if let Some(known) =
-        known.filter(|known| known.listing == listing && known.modified == modified)
-    {
-        return Some(known);
-    }
-    let roots = std::fs::read_dir(&listing)
+/// The linked git worktrees of the checkout at `root`, read on each call
+/// from the `gitdir` record git keeps for each, which `git worktree move`
+/// rewrites in place and which may hold a path relative to its own directory.
+fn linked_worktree_roots(root: &Path) -> Vec<std::path::PathBuf> {
+    let Some(dirs) = crate::core::git_worktree::git_dirs(root) else {
+        return Vec::new();
+    };
+    std::fs::read_dir(dirs.common_dir.join("worktrees"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|entry| std::fs::read_to_string(entry.path().join("gitdir")).ok())
-        .filter_map(|gitdir| Path::new(gitdir.trim()).parent().map(Path::to_path_buf))
-        .collect();
-    Some(LinkedWorktrees {
-        listing,
-        modified,
-        roots,
-    })
+        .filter_map(|entry| {
+            let gitdir = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            entry
+                .path()
+                .join(gitdir.trim())
+                .parent()?
+                .canonicalize()
+                .ok()
+        })
+        .collect()
 }
 
 /// Vectors the persisted stores of the primary `ref_index`'s linked git
 /// worktrees hold at each `(path, hash)` of `wanted`, read only from stores
-/// of its embedding config and dimensions.
+/// of its embedding config and of the dimensions of its cache, or else of
+/// the first such store.
 async fn persisted_worktree_vectors(
     state: &SharedState,
     ref_index: &crate::ref_index::RefIndex,
     wanted: Vec<(String, String)>,
 ) -> Vec<Option<Vec<f32>>> {
     let mut vectors = vec![None; wanted.len()];
-    if ref_index.parent_ref_id.is_some() {
+    if ref_index.parent_ref_id.is_some() || wanted.is_empty() {
         return vectors;
     }
-    let dims = {
+    let mut dims = {
         let cache = ref_index.embedding_cache.read().await;
-        cache.values().next().map(|entry| entry.vector.len())
+        cache
+            .values()
+            .map(|entry| entry.vector.len())
+            .find(|&len| len > 0)
     };
-    let Some(dims) = dims else {
-        return vectors;
-    };
-    let known = state.linked_worktrees.lock().unwrap().clone();
     let root = ref_index.canonical_root.clone();
     let name = cache_name("embeddings", &state.config);
     let read = tokio::task::spawn_blocking(move || {
-        let listed = list_linked_worktrees(&root, known);
-        for root in listed.iter().flat_map(|listed| &listed.roots) {
+        for root in linked_worktree_roots(&root) {
             if vectors.iter().all(Option::is_some) {
                 break;
             }
@@ -2018,10 +2030,12 @@ async fn persisted_worktree_vectors(
             if !root.join(".git").is_file() {
                 continue;
             }
-            let Ok(Some(store)) = rkyv_store::mmap_vector_store(root, &name) else {
+            #[cfg(test)]
+            test_seams::store_read(&root);
+            let Ok(Some(store)) = rkyv_store::mmap_vector_store(&root, &name) else {
                 continue;
             };
-            if store.dims() != dims {
+            if store.dims() == 0 || *dims.get_or_insert(store.dims()) != store.dims() {
                 continue;
             }
             for (vector, (path, hash)) in vectors.iter_mut().zip(&wanted) {
@@ -2030,14 +2044,10 @@ async fn persisted_worktree_vectors(
                 }
             }
         }
-        (listed, vectors)
+        vectors
     })
     .await;
-    let Ok((listed, vectors)) = read else {
-        return Vec::new();
-    };
-    *state.linked_worktrees.lock().unwrap() = listed;
-    vectors
+    read.unwrap_or_default()
 }
 
 /// The vector `ref_index` holds of each `(path, hash)`: its cached one, else
