@@ -1962,7 +1962,9 @@ impl ContextPlusServer {
     /// Shallow warmup (U20 contract):
     /// 1. Walks the ref's `root_dir` via `walk_with_config`.
     /// 2. Reads all non-directory files into `ref.project_cache`.
-    /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`.
+    /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`; a
+    ///    worktree parses only the files that differ from an embedded
+    ///    primary identifier index.
     /// 4. Calls `import_baseline_for_ref` — for every chunk a fork of the
     ///    parent's index does not share, looks up the BLAKE3 hash in the CAS
     ///    parent chain.  Hits are loaded into `embedding_cache` and used to
@@ -2082,26 +2084,7 @@ impl ContextPlusServer {
             // We run the full parse pipeline (flatten_symbols + token_set) but
             // skip the embedding step.  The identifier search handler will rebuild
             // with embeddings on the first real tool call.
-            let cache_for_parse = Arc::clone(&new_cache);
-            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    cache_for_parse
-                        .file_entries
-                        .par_iter()
-                        .filter(|e| !e.is_directory)
-                        .filter_map(|entry| {
-                            let content = cache_for_parse.file_content.get(&entry.relative_path)?;
-                            crate::tools::semantic_identifiers::identifier_docs_for_file(
-                                &entry.relative_path,
-                                content,
-                            )
-                        })
-                        .flatten()
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+            let docs = server.warmup_identifier_docs(&ref_index, &new_cache).await;
             let file_count = new_cache
                 .file_entries
                 .iter()
@@ -2119,7 +2102,7 @@ impl ContextPlusServer {
                     };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
-                        docs: doc_list.into(),
+                        docs,
                         // vectors + dims left empty — shallow mode omits
                         // embedding calls.  Full mode (or first real tool call)
                         // will populate these fields.
@@ -2268,26 +2251,7 @@ impl ContextPlusServer {
             }
 
             // --- Phase 2: tree-sitter parse ---
-            let cache_for_parse = Arc::clone(&new_cache);
-            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    cache_for_parse
-                        .file_entries
-                        .par_iter()
-                        .filter(|e| !e.is_directory)
-                        .filter_map(|entry| {
-                            let content = cache_for_parse.file_content.get(&entry.relative_path)?;
-                            crate::tools::semantic_identifiers::identifier_docs_for_file(
-                                &entry.relative_path,
-                                content,
-                            )
-                        })
-                        .flatten()
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+            let docs = server.warmup_identifier_docs(&ref_index, &new_cache).await;
             let file_count = new_cache
                 .file_entries
                 .iter()
@@ -2305,7 +2269,7 @@ impl ContextPlusServer {
                     };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
-                        docs: doc_list.into(),
+                        docs,
                         vectors: IdentifierVectorIndex::empty(),
                         dims: 0,
                         file_count,
@@ -3067,25 +3031,82 @@ impl ContextPlusServer {
         &self,
         ref_index: &crate::ref_index::RefIndex,
     ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
-        let parent_id = ref_index.parent_ref_id?;
-        let parent = self.state.ref_index(parent_id).await?;
-        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
-            return None;
-        }
-        let parent_server = self.with_session(parent_id);
+        let parent = self.identifier_parent(ref_index).await?;
+        let parent_server = self.with_session(ref_index.parent_ref_id?);
         let parent_cache = parent_server.ensure_project_cache().await.ok()?;
         parent_server
             .ensure_identifier_index(&parent_cache)
             .await
             .ok()?;
-        let index = parent.identifier_index.read().await;
-        let source = parent.identifier_source.read().await;
+        Self::built_identifier_index(&parent).await
+    }
+
+    /// The primary checkout a linked worktree's identifier index seeds from.
+    async fn identifier_parent(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<Arc<crate::ref_index::RefIndex>> {
+        let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return None;
+        }
+        Some(parent)
+    }
+
+    /// A ref's embedded identifier index, paired with the project cache it
+    /// was built from, without building either.
+    async fn built_identifier_index(
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
+        let index = ref_index.identifier_index.read().await;
+        let source = ref_index.identifier_source.read().await;
         match (index.as_ref(), source.as_ref()) {
             (Some(index), Some(source)) if index.dims > 0 => {
                 Some((Arc::clone(index), Arc::clone(source)))
             }
             _ => None,
         }
+    }
+
+    /// The identifier documents of a warmup's project cache. A linked
+    /// worktree whose primary has an embedded identifier index takes the
+    /// primary's documents of every identical file and parses only the files
+    /// that differ; a missing primary index is never built here.
+    async fn warmup_identifier_docs(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+        cache: &Arc<ProjectCache>,
+    ) -> Segmented<crate::tools::semantic_identifiers::IdentifierDoc> {
+        let seed = match self.identifier_parent(ref_index).await {
+            Some(parent) => Self::built_identifier_index(&parent).await,
+            None => None,
+        };
+        let cache = Arc::clone(cache);
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let files: std::collections::BTreeMap<_, _> = cache
+                .file_entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory)
+                .filter_map(|entry| {
+                    let path = &entry.relative_path;
+                    let content = cache.file_content.get(path)?;
+                    if let Some((index, source)) = &seed
+                        && source.file_content.get(path) == Some(content)
+                    {
+                        let docs = index.docs.files.get(path)?;
+                        return Some((path.clone(), Arc::clone(docs)));
+                    }
+                    let docs = crate::tools::semantic_identifiers::identifier_docs_for_file(
+                        path, content,
+                    )?;
+                    Some((path.clone(), Arc::new(docs)))
+                })
+                .collect();
+            Segmented::from_files(files)
+        })
+        .await
+        .unwrap_or_else(|_| Vec::new().into())
     }
 
     async fn build_identifier_index(
@@ -12059,40 +12080,42 @@ mod tests {
         assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
     }
 
+    /// Every field of an identifier index's documents, in index order.
+    fn identifier_documents(index: &IdentifierIndex) -> Vec<String> {
+        let sorted = |tokens: &std::collections::HashSet<String>| {
+            let mut tokens: Vec<_> = tokens.iter().cloned().collect();
+            tokens.sort();
+            tokens
+        };
+        index
+            .docs
+            .iter()
+            .map(|doc| {
+                format!(
+                    "{} {} {} {} {} {} {} {} {:?} {} {:?} {:?} {:?}",
+                    doc.id,
+                    doc.path,
+                    doc.header,
+                    doc.name,
+                    doc.kind,
+                    doc.line,
+                    doc.end_line,
+                    doc.signature,
+                    doc.parent_name,
+                    doc.text,
+                    sorted(&doc.name_token_set),
+                    sorted(&doc.signature_token_set),
+                    sorted(&doc.parent_token_set),
+                )
+            })
+            .collect()
+    }
+
     /// A worktree build seeded from the primary's identifier index answers
     /// exactly as a full parse of the worktree does, whether its files are
     /// identical, changed, added or deleted.
     #[tokio::test]
     async fn worktree_identifier_build_from_primary_equals_full_parse() {
-        fn documents(index: &IdentifierIndex) -> Vec<String> {
-            let sorted = |tokens: &std::collections::HashSet<String>| {
-                let mut tokens: Vec<_> = tokens.iter().cloned().collect();
-                tokens.sort();
-                tokens
-            };
-            index
-                .docs
-                .iter()
-                .map(|doc| {
-                    format!(
-                        "{} {} {} {} {} {} {} {} {:?} {} {:?} {:?} {:?}",
-                        doc.id,
-                        doc.path,
-                        doc.header,
-                        doc.name,
-                        doc.kind,
-                        doc.line,
-                        doc.end_line,
-                        doc.signature,
-                        doc.parent_name,
-                        doc.text,
-                        sorted(&doc.name_token_set),
-                        sorted(&doc.signature_token_set),
-                        sorted(&doc.parent_token_set),
-                    )
-                })
-                .collect()
-        }
         fn vectors(index: &IdentifierIndex) -> Vec<(String, Vec<Vec<f32>>)> {
             index
                 .vectors
@@ -12143,10 +12166,115 @@ mod tests {
             .unwrap();
 
         assert!(!seeded.docs.files.contains_key("deleted.rs"));
-        assert_eq!(documents(&seeded), documents(&full));
+        assert_eq!(identifier_documents(&seeded), identifier_documents(&full));
         assert_eq!(vectors(&seeded), vectors(&full));
         assert_eq!(seeded.dims, full.dims);
         assert_eq!(seeded.file_count, full.file_count);
+    }
+
+    /// Writes the primary, worktree and reference trees of the shallow warmup
+    /// tests: the worktree and the reference keep one primary file, change
+    /// one, delete one and add one.
+    fn identifier_warmup_trees(
+        primary: &std::path::Path,
+        worktree: &std::path::Path,
+        reference: &std::path::Path,
+    ) {
+        std::fs::write(
+            primary.join("same.rs"),
+            "struct Kept;\nimpl Kept {\n    fn kept(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(primary.join("changed.rs"), "fn before() {}\n").unwrap();
+        std::fs::write(primary.join("deleted.rs"), "fn deleted() {}\n").unwrap();
+        for dir in [worktree, reference] {
+            std::fs::copy(primary.join("same.rs"), dir.join("same.rs")).unwrap();
+            std::fs::write(
+                dir.join("changed.rs"),
+                "fn after() {}\nfn after_too(x: u8) {}\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("added.rs"), "fn added() {}\n").unwrap();
+        }
+    }
+
+    /// Runs the shallow warmup of `server`'s ref and returns the identifier
+    /// index it installs.
+    async fn identifier_shallow_warmup(server: &ContextPlusServer) -> Arc<IdentifierIndex> {
+        let owner = server.current_ref().await;
+        server.spawn_shallow_warmup_task(crate::ref_index::RefId::for_canonical_path(
+            &owner.canonical_root,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(index) = owner.identifier_index.read().await.as_ref() {
+                    return Arc::clone(index);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the shallow warmup installed no identifier index")
+    }
+
+    /// A worktree's shallow warmup over a primary with an identifier index
+    /// takes the primary's documents of every identical file, parses only the
+    /// files that differ, calls no Ollama, and matches a standalone warmup.
+    #[tokio::test]
+    async fn worktree_shallow_warmup_seeds_identifiers_from_the_primary() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        identifier_warmup_trees(primary.path(), worktree.path(), reference.path());
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        // Attached first, as after a restart, so it inherits no index.
+        let session = attached_worktree(&server, worktree.path()).await;
+        let primary_cache = server.ensure_project_cache().await.unwrap();
+        let primary_index = server
+            .ensure_identifier_index(&primary_cache)
+            .await
+            .unwrap();
+        let embedded = ollama.received_requests().await.unwrap().len();
+
+        let seeded = identifier_shallow_warmup(&session).await;
+        assert!(
+            seeded
+                .docs
+                .files
+                .get("same.rs")
+                .is_some_and(|docs| Arc::ptr_eq(docs, &primary_index.docs.files["same.rs"])),
+            "the warmup parsed same.rs instead of taking the primary's documents"
+        );
+        assert!(!seeded.docs.files.contains_key("deleted.rs"));
+        assert_eq!(ollama.received_requests().await.unwrap().len(), embedded);
+
+        let standalone = identifier_test_server(&ollama, reference.path()).await;
+        let full = identifier_shallow_warmup(&standalone).await;
+        assert_eq!(identifier_documents(&seeded), identifier_documents(&full));
+        assert_eq!(seeded.file_count, full.file_count);
+    }
+
+    /// A worktree's shallow warmup over a primary with no identifier index
+    /// parses the whole worktree and builds nothing of the primary's.
+    #[tokio::test]
+    async fn worktree_shallow_warmup_over_a_primary_without_identifiers_parses_it_all() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        identifier_warmup_trees(primary.path(), worktree.path(), reference.path());
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+
+        let index = identifier_shallow_warmup(&session).await;
+        let primary_ref = server.state.default_ref().unwrap();
+        assert!(primary_ref.identifier_index.read().await.is_none());
+        assert_eq!(ollama.received_requests().await.unwrap().len(), 0);
+
+        let standalone = identifier_test_server(&ollama, reference.path()).await;
+        let full = identifier_shallow_warmup(&standalone).await;
+        assert_eq!(identifier_documents(&index), identifier_documents(&full));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
