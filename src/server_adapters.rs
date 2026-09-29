@@ -591,6 +591,7 @@ impl CachedWalkerIndexer {
             if let Some(parent_vectors) = &parent_vectors
                 && embedding_cache.read().await.is_empty()
             {
+                let started = std::time::Instant::now();
                 let root = ref_index.root_dir.clone();
                 let name = cache_name("embeddings", &config);
                 if let Ok(Ok(Some(store))) =
@@ -610,6 +611,14 @@ impl CachedWalkerIndexer {
                         *cache = own;
                     }
                 }
+                let entries = embedding_cache.read().await.len();
+                tracing::info!(
+                    phase = "semantic_vector_reload",
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    entries,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "cold-start phase"
+                );
             }
 
             let fill_snapshot = ref_index.semantic_fill.lock().await;
@@ -673,6 +682,7 @@ impl CachedWalkerIndexer {
                 ancestor_id = ancestor.parent_ref_id;
             }
             let mut current = vec![true; content_hashes.len()];
+            let started = std::time::Instant::now();
             for &(idx, _) in &inherited {
                 let (path, hash) = &content_hashes[idx];
                 current[idx] = FillDocument {
@@ -685,8 +695,18 @@ impl CachedWalkerIndexer {
                 .await;
             }
             if !inherited.is_empty() {
+                let validate_ms = started.elapsed().as_millis();
                 let fill = ref_index.semantic_fill.lock().await;
                 let mut cache = embedding_cache.write().await;
+                let lock_ms = started.elapsed().as_millis() - validate_ms;
+                tracing::info!(
+                    phase = "semantic_inherit",
+                    ref_id = %ref_index.cas_ref_id_hex,
+                    inherited = inherited.len(),
+                    validate_ms,
+                    lock_ms,
+                    "cold-start phase"
+                );
                 for (idx, entry) in inherited {
                     let (path, _) = &content_hashes[idx];
                     // File validation runs without locks; reject intervening cache/fill changes.
