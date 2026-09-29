@@ -94,6 +94,8 @@ pub struct SearchConfig {
     pub warmup_on_start: bool,
     pub hnsw_ef_construction: usize,
     pub hnsw_ef_search: usize,
+    #[serde(default)]
+    pub hnsw_min_vectors: usize,
     pub ref_warmup_mode: String,
 }
 
@@ -127,6 +129,7 @@ impl From<&crate::config::Config> for SearchConfig {
             warmup_on_start: config.warmup_on_start,
             hnsw_ef_construction: config.hnsw_ef_construction,
             hnsw_ef_search: config.hnsw_ef_search,
+            hnsw_min_vectors: config.hnsw_min_vectors,
             ref_warmup_mode: config.ref_warmup_mode.to_string(),
         }
     }
@@ -197,6 +200,10 @@ impl SearchConfig {
             (
                 "CONTEXTPLUS_HNSW_EF_SEARCH",
                 self.hnsw_ef_search.to_string(),
+            ),
+            (
+                "CONTEXTPLUS_HNSW_MIN_VECTORS",
+                self.hnsw_min_vectors.to_string(),
             ),
             ("CONTEXTPLUS_REF_WARMUP_MODE", self.ref_warmup_mode.clone()),
         ]
