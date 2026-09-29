@@ -18319,7 +18319,9 @@ mod tests {
             &owner.canonical_root,
             docs,
             vectors,
-            current.generation.load(std::sync::atomic::Ordering::Acquire),
+            current
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire),
             owner
                 .semantic_vector_generation
                 .load(std::sync::atomic::Ordering::Acquire),

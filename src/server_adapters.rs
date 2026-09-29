@@ -2072,7 +2072,10 @@ pub(crate) async fn adopt_worktree_vectors(
             .zip(misses)
             .enumerate()
             .filter(|(i, (slot, _))| {
-                current[*i] && slot.as_ref().is_some_and(|(held_by, ..)| *held_by == child_idx)
+                current[*i]
+                    && slot
+                        .as_ref()
+                        .is_some_and(|(held_by, ..)| *held_by == child_idx)
             })
             .map(|(i, (_, miss))| (i, (miss.path.as_str(), miss.hash.as_str())))
             .unzip();
@@ -2268,8 +2271,7 @@ impl Forked {
                         return Some(ForkDocument::Shared(at));
                     }
                     let text = build_embedding_document(path, content, doc_shape);
-                    let (mut doc, _) =
-                        walk_document(path, content, &hash, None, &parent_documents);
+                    let (mut doc, _) = walk_document(path, content, &hash, None, &parent_documents);
                     doc.source_hash = hash.clone();
                     Some(ForkDocument::Own(Box::new((doc, hash, text))))
                 }
