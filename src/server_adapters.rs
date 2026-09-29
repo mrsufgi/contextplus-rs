@@ -668,7 +668,7 @@ impl CachedWalkerIndexer {
                 .into_par_iter()
                 .map(|at| match at {
                     Ok(at) => (
-                        base.index.documents()[at].clone(),
+                        SearchDocument::clone(&base.index.documents()[at]),
                         base.index.vector_at(at).map(<[f32]>::to_vec),
                     ),
                     Err(i) => (built[i].clone(), vectors[i].clone()),
@@ -1904,7 +1904,7 @@ fn documents_by_path(index: Option<&CachedSearchIndex>) -> HashMap<&str, &Search
                 .index
                 .documents()
                 .iter()
-                .map(|doc| (doc.path.as_str(), doc))
+                .map(|doc| (doc.path.as_str(), &**doc))
                 .collect()
         })
         .unwrap_or_default()
@@ -2256,7 +2256,7 @@ impl Forked {
         let parent_documents: HashMap<&str, &SearchDocument> = base
             .documents()
             .iter()
-            .map(|doc| (doc.path.as_str(), doc))
+            .map(|doc| (doc.path.as_str(), &**doc))
             .collect();
         let documents: Vec<_> = walked
             .par_iter()

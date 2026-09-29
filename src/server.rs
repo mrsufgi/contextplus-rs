@@ -944,6 +944,12 @@ impl ResidentSnapshot {
                 index.own_resident_bytes(),
                 "semantic_index",
             ));
+            components.extend(
+                index
+                    .index
+                    .shared_documents()
+                    .map(|(ptr, bytes)| (ptr, bytes, "semantic_documents")),
+            );
             // Forks share the store, and keep an old one alive after the primary replaces it.
             if let Some(store) = index.index.vector_store() {
                 components.push((
@@ -17247,6 +17253,49 @@ mod tests {
         assert!(result.contains("1. src/"), "{result}");
     }
 
+    /// A fork's unchanged documents are the primary's, measured once.
+    #[tokio::test]
+    async fn semantic_fork_resident_estimate_excludes_the_primary_documents() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&semantic_fork_index(&server).await.index)
+        );
+
+        let semantic = |components: Vec<ResidentComponent>| {
+            components
+                .into_iter()
+                .filter(|(_, _, name)| name.starts_with("semantic"))
+                .collect::<Vec<_>>()
+        };
+        let primary = semantic(
+            ResidentSnapshot::capture(&server.state.default_ref().unwrap())
+                .await
+                .measure(),
+        );
+        let worktree = semantic(
+            ResidentSnapshot::capture(&*session.current_ref().await)
+                .await
+                .measure(),
+        );
+        let primary_bytes: usize = primary.iter().map(|(_, bytes, _)| bytes).sum();
+        let unique_bytes: usize = worktree
+            .iter()
+            .filter(|(ptr, _, _)| !primary.iter().any(|(shared, _, _)| shared == ptr))
+            .map(|(_, bytes, _)| bytes)
+            .sum();
+        assert!(primary_bytes > 0);
+        assert!(
+            unique_bytes * 20 < primary_bytes,
+            "a small fork holds {unique_bytes} unique bytes against a {primary_bytes}-byte primary"
+        );
+    }
+
     fn semantic_fork_walker(
         server: &ContextPlusServer,
         ref_index: Arc<crate::ref_index::RefIndex>,
@@ -18303,7 +18352,12 @@ mod tests {
         // while its first fill runs, so the worktree's changes pass the threshold.
         let owner = server.current_ref().await;
         let current = semantic_fork_index(&server).await;
-        let docs = current.index.documents().to_vec();
+        let docs: Vec<_> = current
+            .index
+            .documents()
+            .iter()
+            .map(|doc| (**doc).clone())
+            .collect();
         let vectors = docs
             .iter()
             .enumerate()

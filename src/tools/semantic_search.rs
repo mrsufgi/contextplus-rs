@@ -224,6 +224,14 @@ pub struct SearchDocument {
 }
 
 impl SearchDocument {
+    fn resident_bytes(&self) -> usize {
+        self.path.capacity()
+            + self.content.capacity()
+            + self.header.capacity()
+            + self.source_hash.capacity()
+            + self.symbols.iter().map(String::capacity).sum::<usize>()
+    }
+
     /// Create a SearchDocument with pre-computed search fields.
     pub fn new(
         path: String,
@@ -335,7 +343,7 @@ pub(crate) fn file_document(path: String, source: &str, content: String) -> Sear
 /// Writes the parsed fields of `docs`, read back by [`read_document_seeds`].
 pub(crate) fn write_document_seeds(
     out: &mut crate::cache::snapshot::SnapshotWriter,
-    docs: &[SearchDocument],
+    docs: &[Arc<SearchDocument>],
 ) -> io::Result<()> {
     out.usize(docs.len())?;
     for doc in docs {
@@ -1186,7 +1194,7 @@ impl CachedSearchIndex {
             }
         };
         entry.index.apply_delta(changed, changed_vectors, &deleted);
-        entry.fingerprint = IndexFingerprint::from_docs(&entry.index.documents);
+        entry.fingerprint = entry.index.fingerprint();
         entry
             .generation
             .store(generation, std::sync::atomic::Ordering::Release);
@@ -1377,7 +1385,7 @@ impl CachedSearchIndex {
         }
         let fresh = Arc::get_mut(entry).unwrap();
         fresh.index.apply_delta(docs, vectors, deleted);
-        fresh.fingerprint = IndexFingerprint::from_docs(&fresh.index.documents);
+        fresh.fingerprint = fresh.index.fingerprint();
         fresh
             .generation
             .store(generation, std::sync::atomic::Ordering::Release);
@@ -1460,7 +1468,7 @@ impl CachedSearchIndex {
                 .iter()
                 .rev()
                 .flat_map(|batch| &batch.docs)
-                .chain(&entry.index.documents)
+                .chain(entry.index.documents.iter().map(|doc| &**doc))
                 .find(|doc| Path::new(&doc.path) == path && doc.source_hash == hash);
             if let Some(doc) = doc {
                 docs.push(doc.clone());
@@ -1544,7 +1552,8 @@ pub struct SearchIndex {
     full_rebuilds: u64,
     ann_dirty_paths: HashSet<String>,
     vector_updates: std::collections::HashMap<String, Vec<f32>>,
-    documents: Vec<SearchDocument>,
+    /// Shared with forks; a changed document is replaced, never edited in place.
+    documents: Vec<Arc<SearchDocument>>,
     /// Flat buffer: `vector_buffer[i * dims .. (i+1) * dims]` is the vector for doc `i`.
     /// Docs without vectors have `has_vector[i] == false` and zeros in the buffer.
     /// **Dropped (capacity 0) when `ann_store.is_some()`** — vectors live in the
@@ -1569,17 +1578,18 @@ impl Default for SearchIndex {
 }
 
 impl SearchIndex {
+    #[cfg(feature = "memory-profile")]
     fn resident_document_bytes(&self) -> usize {
+        self.documents.iter().map(|doc| doc.resident_bytes()).sum()
+    }
+
+    /// Documents another index also holds, by address and bytes; each counts
+    /// once however many indexes share it.
+    pub(crate) fn shared_documents(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.documents
             .iter()
-            .map(|doc| {
-                doc.path.capacity()
-                    + doc.content.capacity()
-                    + doc.header.capacity()
-                    + doc.source_hash.capacity()
-                    + doc.symbols.iter().map(String::capacity).sum::<usize>()
-            })
-            .sum()
+            .filter(|doc| Arc::strong_count(doc) > 1)
+            .map(|doc| (Arc::as_ptr(doc) as usize, doc.resident_bytes()))
     }
 
     #[cfg(feature = "memory-profile")]
@@ -1603,9 +1613,13 @@ impl SearchIndex {
             .map_or(0, |store| store.estimated_hnsw_bytes())
     }
 
-    /// Bytes excluding the vector store, which forks share.
+    /// Bytes excluding the vector store and [`Self::shared_documents`].
     fn own_resident_bytes(&self) -> usize {
-        self.resident_document_bytes()
+        self.documents
+            .iter()
+            .filter(|doc| Arc::strong_count(doc) == 1)
+            .map(|doc| doc.resident_bytes())
+            .sum::<usize>()
             + self.vector_buffer.capacity() * std::mem::size_of::<f32>()
             + self
                 .vector_updates
@@ -1663,6 +1677,19 @@ impl SearchIndex {
     pub fn index_with_vectors_and_tuning(
         &mut self,
         docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        hnsw_tuning: crate::core::embeddings::HnswTuning,
+    ) {
+        self.index_shared(
+            docs.into_iter().map(Arc::new).collect(),
+            vectors,
+            hnsw_tuning,
+        );
+    }
+
+    fn index_shared(
+        &mut self,
+        docs: Vec<Arc<SearchDocument>>,
         vectors: Vec<Option<Vec<f32>>>,
         hnsw_tuning: crate::core::embeddings::HnswTuning,
     ) {
@@ -1736,8 +1763,12 @@ impl SearchIndex {
         self.hnsw_min_vectors = hnsw_tuning.min_vectors;
     }
 
-    pub(crate) fn documents(&self) -> &[SearchDocument] {
+    pub(crate) fn documents(&self) -> &[Arc<SearchDocument>] {
         &self.documents
+    }
+
+    pub(crate) fn fingerprint(&self) -> IndexFingerprint {
+        IndexFingerprint::of(self.documents.iter().map(|doc| &**doc))
     }
 
     pub(crate) fn dims(&self) -> usize {
@@ -1816,7 +1847,7 @@ impl SearchIndex {
             let mut vectors = Vec::new();
             for (i, doc) in self.documents.iter().enumerate() {
                 if !affected.contains(doc.path.as_str()) {
-                    docs.push(doc.clone());
+                    docs.push(Arc::clone(doc));
                     vectors.push(
                         self.vector_at(i)
                             .filter(|v| v.len() == replacement_dims)
@@ -1824,13 +1855,13 @@ impl SearchIndex {
                     );
                 }
             }
-            docs.extend(changed_docs);
+            docs.extend(changed_docs.into_iter().map(Arc::new));
             vectors.extend(
                 changed_vectors
                     .into_iter()
                     .map(|v| v.filter(|v| v.len() == replacement_dims)),
             );
-            self.index_with_vectors_and_tuning(
+            self.index_shared(
                 docs,
                 vectors,
                 crate::core::embeddings::HnswTuning {
@@ -1874,8 +1905,9 @@ impl SearchIndex {
                 .iter()
                 .position(|d| d.path == doc.path)
                 .unwrap_or(self.documents.len());
+            let doc = Arc::new(doc);
             if i == self.documents.len() {
-                self.documents.push(doc.clone());
+                self.documents.push(Arc::clone(&doc));
                 self.has_vector.push(false);
                 if self.ann_store.is_none() {
                     self.vector_buffer.resize((i + 1) * self.dims, 0.0);
@@ -2526,7 +2558,7 @@ pub(crate) async fn semantic_code_search_owned(
                                 }
                                 let mut guard = lock.write().await;
                                 if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
-                                    let fp = IndexFingerprint::from_docs(&index.documents);
+                                    let fp = index.fingerprint();
                                     let mut entry =
                                         CachedSearchIndex::new(index, fp, ready_generation);
                                     entry.pending.get_mut().unwrap().batches =
@@ -2862,7 +2894,7 @@ pub async fn semantic_code_search(
                                 }
                                 let mut guard = lock.write().await;
                                 if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
-                                    let fp = IndexFingerprint::from_docs(&index.documents);
+                                    let fp = index.fingerprint();
                                     let mut entry =
                                         CachedSearchIndex::new(index, fp, ready_generation);
                                     entry.pending.get_mut().unwrap().batches =
@@ -7735,6 +7767,48 @@ mod tests {
             .expect("a one-file worktree forks");
         assert!(fork.shares_vector_store(&base));
         assert_eq!(fork.full_rebuild_count(), base.full_rebuild_count());
+    }
+
+    /// A fork holds the base's unchanged documents themselves, not copies.
+    #[test]
+    fn fork_shares_unchanged_documents_with_the_base() {
+        let (docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
+        let mut base = SearchIndex::new();
+        base.index_with_vectors(docs.clone(), vectors.clone());
+        let mut worktree = docs.clone();
+        worktree[0] = make_doc(&docs[0].path, "edited in the worktree");
+        worktree.swap_remove(1);
+        let mut worktree_vectors = vectors.clone();
+        worktree_vectors.swap_remove(1);
+
+        let fork = base
+            .fork(&worktree, &worktree_vectors)
+            .expect("a two-file worktree forks");
+        let at = |index: &SearchIndex, path: &str| -> *const SearchDocument {
+            let doc: &SearchDocument = index
+                .documents()
+                .iter()
+                .find(|doc| doc.path == path)
+                .unwrap();
+            doc
+        };
+        for doc in &docs[2..] {
+            assert!(
+                std::ptr::eq(at(&fork, &doc.path), at(&base, &doc.path)),
+                "{} was copied into the fork",
+                doc.path
+            );
+        }
+        assert!(!std::ptr::eq(
+            at(&fork, &docs[0].path),
+            at(&base, &docs[0].path)
+        ));
+        assert!(
+            fork.documents()
+                .iter()
+                .any(|doc| doc.content == "edited in the worktree")
+        );
+        assert_eq!(fork.document_count(), docs.len() - 1);
     }
 
     #[test]
