@@ -1944,6 +1944,100 @@ impl VectorMiss {
 enum Held {
     Cached,
     Indexed,
+    /// In a worktree's persisted store, which saves replace by rename, so a
+    /// mapped vector never changes after it is read.
+    Persisted,
+}
+
+/// A primary's linked git worktree roots, as git's `worktrees` directory
+/// listed them at its modification time.
+#[derive(Clone)]
+pub(crate) struct LinkedWorktrees {
+    listing: std::path::PathBuf,
+    modified: std::time::SystemTime,
+    roots: Vec<std::path::PathBuf>,
+}
+
+/// The linked git worktrees of the checkout at `root`, from the `gitdir`
+/// record git keeps for each; `known` unless that list changed since.
+fn list_linked_worktrees(root: &Path, known: Option<LinkedWorktrees>) -> Option<LinkedWorktrees> {
+    let listing = crate::core::git_worktree::git_dirs(root)?
+        .common_dir
+        .join("worktrees");
+    let modified = std::fs::metadata(&listing)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    if let Some(known) =
+        known.filter(|known| known.listing == listing && known.modified == modified)
+    {
+        return Some(known);
+    }
+    let roots = std::fs::read_dir(&listing)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("gitdir")).ok())
+        .filter_map(|gitdir| Path::new(gitdir.trim()).parent().map(Path::to_path_buf))
+        .collect();
+    Some(LinkedWorktrees {
+        listing,
+        modified,
+        roots,
+    })
+}
+
+/// Vectors the persisted stores of the primary `ref_index`'s linked git
+/// worktrees hold at each `(path, hash)` of `wanted`, read only from stores
+/// of its embedding config and dimensions.
+async fn persisted_worktree_vectors(
+    state: &SharedState,
+    ref_index: &crate::ref_index::RefIndex,
+    wanted: Vec<(String, String)>,
+) -> Vec<Option<Vec<f32>>> {
+    let mut vectors = vec![None; wanted.len()];
+    if ref_index.parent_ref_id.is_some() {
+        return vectors;
+    }
+    let dims = {
+        let cache = ref_index.embedding_cache.read().await;
+        cache.values().next().map(|entry| entry.vector.len())
+    };
+    let Some(dims) = dims else {
+        return vectors;
+    };
+    let known = state.linked_worktrees.lock().unwrap().clone();
+    let root = ref_index.canonical_root.clone();
+    let name = cache_name("embeddings", &state.config);
+    let read = tokio::task::spawn_blocking(move || {
+        let listed = list_linked_worktrees(&root, known);
+        for root in listed.iter().flat_map(|listed| &listed.roots) {
+            if vectors.iter().all(Option::is_some) {
+                break;
+            }
+            // A removed worktree, or a directory no longer one, has no store of its own.
+            if !root.join(".git").is_file() {
+                continue;
+            }
+            let Ok(Some(store)) = rkyv_store::mmap_vector_store(root, &name) else {
+                continue;
+            };
+            if store.dims() != dims {
+                continue;
+            }
+            for (vector, (path, hash)) in vectors.iter_mut().zip(&wanted) {
+                if vector.is_none() && store.get_hash(path) == Some(hash.as_str()) {
+                    *vector = store.get_vector(path).map(<[f32]>::to_vec);
+                }
+            }
+        }
+        (listed, vectors)
+    })
+    .await;
+    let Ok((listed, vectors)) = read else {
+        return Vec::new();
+    };
+    *state.linked_worktrees.lock().unwrap() = listed;
+    vectors
 }
 
 /// The vector `ref_index` holds of each `(path, hash)`: its cached one, else
@@ -2001,7 +2095,8 @@ pub(crate) async fn adopt_worktree_vectors(
         return vectors;
     }
     let children = state.attached_children(ref_index).await;
-    let mut found: Vec<Option<(usize, Held, CacheEntry)>> = vec![None; misses.len()];
+    // The attached worktree it was found in; `None` for a persisted store.
+    let mut found: Vec<Option<(Option<usize>, Held, CacheEntry)>> = vec![None; misses.len()];
     for (child_idx, child) in children.iter().enumerate() {
         let (unfound, wanted): (Vec<usize>, Vec<(&str, &str)>) = found
             .iter()
@@ -2016,7 +2111,23 @@ pub(crate) async fn adopt_worktree_vectors(
         for (i, vector) in unfound.into_iter().zip(held_vectors(child, &wanted).await) {
             found[i] = vector.map(|(held, vector)| {
                 let hash = misses[i].hash.clone();
-                (child_idx, held, CacheEntry { hash, vector })
+                (Some(child_idx), held, CacheEntry { hash, vector })
+            });
+        }
+    }
+    if found.iter().any(Option::is_none) {
+        let (unfound, wanted): (Vec<usize>, Vec<(String, String)>) = found
+            .iter()
+            .zip(misses)
+            .enumerate()
+            .filter(|(_, (slot, _))| slot.is_none())
+            .map(|(i, (_, miss))| (i, (miss.path.clone(), miss.hash.clone())))
+            .unzip();
+        let persisted = persisted_worktree_vectors(state, ref_index, wanted).await;
+        for (i, vector) in unfound.into_iter().zip(persisted) {
+            found[i] = vector.map(|vector| {
+                let hash = misses[i].hash.clone();
+                (None, Held::Persisted, CacheEntry { hash, vector })
             });
         }
     }
@@ -2045,7 +2156,7 @@ pub(crate) async fn adopt_worktree_vectors(
                 current[*i]
                     && slot
                         .as_ref()
-                        .is_some_and(|(held_by, ..)| *held_by == child_idx)
+                        .is_some_and(|(held_by, ..)| *held_by == Some(child_idx))
             })
             .map(|(i, (_, miss))| (i, (miss.path.as_str(), miss.hash.as_str())))
             .unzip();
