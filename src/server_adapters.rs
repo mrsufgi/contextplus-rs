@@ -127,6 +127,33 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn store_read_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Counts the persisted-store reads of the worktree at `root` from now on.
+    pub(crate) fn record_store_reads(root: &Path) {
+        store_read_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), 0);
+    }
+
+    pub(crate) fn store_read(root: &Path) {
+        if let Some(reads) = store_read_slots().lock().unwrap().get_mut(root) {
+            *reads += 1;
+        }
+    }
+
+    pub(crate) fn store_reads(root: &Path) -> usize {
+        store_read_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     fn read_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<String>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1944,6 +1971,83 @@ impl VectorMiss {
 enum Held {
     Cached,
     Indexed,
+    /// In a worktree's persisted store, which saves replace by rename, so a
+    /// mapped vector never changes after it is read.
+    Persisted,
+}
+
+/// The linked git worktrees of the checkout at `root`, read on each call
+/// from the `gitdir` record git keeps for each, which `git worktree move`
+/// rewrites in place and which may hold a path relative to its own directory.
+fn linked_worktree_roots(root: &Path) -> Vec<std::path::PathBuf> {
+    let Some(dirs) = crate::core::git_worktree::git_dirs(root) else {
+        return Vec::new();
+    };
+    std::fs::read_dir(dirs.common_dir.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let gitdir = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            entry
+                .path()
+                .join(gitdir.trim())
+                .parent()?
+                .canonicalize()
+                .ok()
+        })
+        .collect()
+}
+
+/// Vectors the persisted stores of the primary `ref_index`'s linked git
+/// worktrees hold at each `(path, hash)` of `wanted`, read only from stores
+/// of its embedding config and of the dimensions of its cache, or else of
+/// the first such store.
+async fn persisted_worktree_vectors(
+    state: &SharedState,
+    ref_index: &crate::ref_index::RefIndex,
+    wanted: Vec<(String, String)>,
+) -> Vec<Option<Vec<f32>>> {
+    let mut vectors = vec![None; wanted.len()];
+    if ref_index.parent_ref_id.is_some() || wanted.is_empty() {
+        return vectors;
+    }
+    let mut dims = {
+        let cache = ref_index.embedding_cache.read().await;
+        cache
+            .values()
+            .map(|entry| entry.vector.len())
+            .find(|&len| len > 0)
+    };
+    let root = ref_index.canonical_root.clone();
+    let name = cache_name("embeddings", &state.config);
+    let read = tokio::task::spawn_blocking(move || {
+        for root in linked_worktree_roots(&root) {
+            if vectors.iter().all(Option::is_some) {
+                break;
+            }
+            // A removed worktree, or a directory no longer one, has no store of its own.
+            if !root.join(".git").is_file() {
+                continue;
+            }
+            #[cfg(test)]
+            test_seams::store_read(&root);
+            let Ok(Some(store)) = rkyv_store::mmap_vector_store(&root, &name) else {
+                continue;
+            };
+            if store.dims() == 0 || *dims.get_or_insert(store.dims()) != store.dims() {
+                continue;
+            }
+            for (vector, (path, hash)) in vectors.iter_mut().zip(&wanted) {
+                if vector.is_none() && store.get_hash(path) == Some(hash.as_str()) {
+                    *vector = store.get_vector(path).map(<[f32]>::to_vec);
+                }
+            }
+        }
+        vectors
+    })
+    .await;
+    read.unwrap_or_default()
 }
 
 /// The vector `ref_index` holds of each `(path, hash)`: its cached one, else
@@ -2001,7 +2105,8 @@ pub(crate) async fn adopt_worktree_vectors(
         return vectors;
     }
     let children = state.attached_children(ref_index).await;
-    let mut found: Vec<Option<(usize, Held, CacheEntry)>> = vec![None; misses.len()];
+    // The attached worktree it was found in; `None` for a persisted store.
+    let mut found: Vec<Option<(Option<usize>, Held, CacheEntry)>> = vec![None; misses.len()];
     for (child_idx, child) in children.iter().enumerate() {
         let (unfound, wanted): (Vec<usize>, Vec<(&str, &str)>) = found
             .iter()
@@ -2016,7 +2121,23 @@ pub(crate) async fn adopt_worktree_vectors(
         for (i, vector) in unfound.into_iter().zip(held_vectors(child, &wanted).await) {
             found[i] = vector.map(|(held, vector)| {
                 let hash = misses[i].hash.clone();
-                (child_idx, held, CacheEntry { hash, vector })
+                (Some(child_idx), held, CacheEntry { hash, vector })
+            });
+        }
+    }
+    if found.iter().any(Option::is_none) {
+        let (unfound, wanted): (Vec<usize>, Vec<(String, String)>) = found
+            .iter()
+            .zip(misses)
+            .enumerate()
+            .filter(|(_, (slot, _))| slot.is_none())
+            .map(|(i, (_, miss))| (i, (miss.path.clone(), miss.hash.clone())))
+            .unzip();
+        let persisted = persisted_worktree_vectors(state, ref_index, wanted).await;
+        for (i, vector) in unfound.into_iter().zip(persisted) {
+            found[i] = vector.map(|vector| {
+                let hash = misses[i].hash.clone();
+                (None, Held::Persisted, CacheEntry { hash, vector })
             });
         }
     }
@@ -2045,7 +2166,7 @@ pub(crate) async fn adopt_worktree_vectors(
                 current[*i]
                     && slot
                         .as_ref()
-                        .is_some_and(|(held_by, ..)| *held_by == child_idx)
+                        .is_some_and(|(held_by, ..)| *held_by == Some(child_idx))
             })
             .map(|(i, (_, miss))| (i, (miss.path.as_str(), miss.hash.as_str())))
             .unzip();

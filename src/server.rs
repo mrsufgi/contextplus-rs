@@ -2616,6 +2616,8 @@ impl ContextPlusServer {
         // Must be plumbed through to `save_vector_store_merged_with_deletions` —
         // a plain merged save would re-populate them from disk on the next save.
         let mut deletions: Vec<String> = Vec::new();
+        let mut misses: Vec<crate::server_adapters::VectorMiss> = Vec::new();
+        let mut miss_contents: Vec<String> = Vec::new();
 
         for file_path in files {
             let rel_path = match file_path.strip_prefix(&ref_index.root_dir) {
@@ -2671,24 +2673,31 @@ impl ContextPlusServer {
                 continue;
             }
 
-            let miss = crate::server_adapters::VectorMiss::observe(
-                &ref_index,
-                rel_path.clone(),
-                hash.clone(),
-            )
-            .await;
-            if let [Some(_)] = crate::server_adapters::adopt_worktree_vectors(
-                &self.state,
-                &ref_index,
-                &[miss],
-                self.state.config.max_embed_file_size,
-            )
-            .await[..]
-            {
+            misses.push(
+                crate::server_adapters::VectorMiss::observe(&ref_index, rel_path, hash).await,
+            );
+            miss_contents.push(content);
+        }
+
+        // One lookup per batch, so each worktree store is read once.
+        let held = crate::server_adapters::adopt_worktree_vectors(
+            &self.state,
+            &ref_index,
+            &misses,
+            self.state.config.max_embed_file_size,
+        )
+        .await;
+        for (i, (miss, content)) in misses.into_iter().zip(miss_contents).enumerate() {
+            if held.get(i).is_some_and(Option::is_some) {
                 adopted += 1;
                 updated += 1;
                 continue;
             }
+            let crate::server_adapters::VectorMiss {
+                path: rel_path,
+                hash,
+                ..
+            } = miss;
 
             let text =
                 build_embedding_document(&rel_path, &content, self.state.config.embed_doc_shape);
@@ -14308,11 +14317,19 @@ mod tests {
 
     #[tokio::test]
     async fn restarted_worktree_reloads_only_vectors_its_parent_lacks() {
-        let (_ollama, _temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        let (_ollama, temp, server, ref_id) = restarted_worktree_with_persisted_vector().await;
+        // The primary embeds its own vector rather than adopting the worktree's.
+        let store = rkyv_store::cache_dir(&temp.path().join("worktree")).join(format!(
+            "{}.rkyv",
+            cache_name("embeddings", &server.state.config)
+        ));
+        let hidden = store.with_extension("hidden");
+        std::fs::rename(&store, &hidden).unwrap();
         server
             .handle_semantic_code_search(semantic_args("invoice payment status"))
             .await
             .unwrap();
+        std::fs::rename(&hidden, &store).unwrap();
 
         server
             .with_session(ref_id)
@@ -14775,6 +14792,361 @@ mod tests {
             matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
             2,
             "the primary embeds instead"
+        );
+    }
+
+    /// A git primary holding `merged.rs` at [`MERGED_PRIMARY`], and a linked
+    /// worktree that embedded `worktree_path` at `worktree_content`, persisted
+    /// it with its vector marked [`WORKTREE_VECTOR`], and left the registry.
+    async fn primary_with_departed_worktree(
+        ollama: &wiremock::MockServer,
+        worktree_path: &str,
+        worktree_content: &str,
+    ) -> (tempfile::TempDir, ContextPlusServer) {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        run_git(&primary, &["init", "-b", "main"]);
+        std::fs::write(primary.join("merged.rs"), MERGED_PRIMARY).unwrap();
+        run_git(&primary, &["add", "."]);
+        run_git(&primary, &["commit", "-m", "baseline"]);
+        add_linked_worktree(&primary, &worktree);
+        std::fs::write(worktree.join(worktree_path), worktree_content).unwrap();
+        let server = identifier_test_server(ollama, &primary).await;
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+        cached_vector(&server.current_ref().await, "merged.rs", MERGED_PRIMARY).await;
+
+        let worktree_server = attached_worktree(&server, &worktree).await;
+        worktree_server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+        semantic_fork_await_persisted(&server, &worktree, worktree_path, worktree_content).await;
+        let worktree_id =
+            crate::ref_index::RefId::for_canonical_path(&worktree.canonicalize().unwrap());
+        server
+            .state
+            .detach_ref(worktree_id, std::time::Duration::ZERO)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.state.ref_index(worktree_id).await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached worktree leaves the registry");
+        persist_worktree_vector(
+            &server.state.config,
+            &worktree,
+            worktree_path,
+            worktree_content,
+            &WORKTREE_VECTOR,
+        );
+        (temp, server)
+    }
+
+    /// Replaces the worktree's persisted vectors with `vector` of `path` at `content`.
+    fn persist_worktree_vector(
+        config: &Config,
+        worktree: &std::path::Path,
+        path: &str,
+        content: &str,
+        vector: &[f32],
+    ) {
+        let name = cache_name("embeddings", config);
+        let store = crate::cache::rkyv_store::cache_dir(worktree).join(format!("{name}.rkyv"));
+        std::fs::remove_file(store).unwrap();
+        let persisted = HashMap::from([(
+            path.to_string(),
+            CacheEntry {
+                hash: crate::core::embeddings::content_hash(content),
+                vector: vector.to_vec(),
+            },
+        )]);
+        rkyv_store::save_vector_store_merged(
+            worktree,
+            &name,
+            &crate::core::embeddings::VectorStore::from_cache(&persisted).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A primary file changed to content a worktree that left the registry
+    /// persisted at the same path takes its vector on the next query walk.
+    #[tokio::test]
+    async fn primary_walk_reuses_a_departed_worktree_persisted_vector() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1
+        );
+
+        std::fs::write(temp.path().join("primary/merged.rs"), MERGED_WORKTREE).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            vector, WORKTREE_VECTOR,
+            "the primary takes the persisted worktree vector"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1,
+            "the primary must not re-embed content the departed worktree embedded"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_tracker_reuses_a_departed_worktree_persisted_vector() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+
+        let merged = temp.path().join("primary/merged.rs");
+        std::fs::write(&merged, MERGED_WORKTREE).unwrap();
+        let (updated, _) = server.incremental_reembed(&[merged]).await;
+
+        assert_eq!(updated, 1);
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            vector, WORKTREE_VECTOR,
+            "the primary takes the persisted worktree vector"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1,
+            "the tracker must not re-embed content the departed worktree embedded"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_walk_embeds_departed_worktree_content_held_at_another_path() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "moved.rs", MERGED_WORKTREE).await;
+
+        std::fs::write(temp.path().join("primary/merged.rs"), MERGED_WORKTREE).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            2,
+            "the primary embeds the content the worktree persisted at another path"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_tracker_embeds_content_a_departed_worktree_holds_at_another_hash() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+
+        let primary_content = "fn merged() {}\n// PRIMARY_MERGED_BODY\n";
+        let merged = temp.path().join("primary/merged.rs");
+        std::fs::write(&merged, primary_content).unwrap();
+        server.incremental_reembed(&[merged]).await;
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", primary_content).await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(
+            matching_embed_input_count(&ollama, "PRIMARY_MERGED_BODY").await,
+            1
+        );
+    }
+
+    /// The primary's walk of `merged.rs` changed to [`MERGED_WORKTREE`] after
+    /// `change` alters the departed worktree's store: the vector it caches and
+    /// the embeds of that content so far.
+    async fn primary_walk_after_departed_store_change(
+        change: impl FnOnce(&Config, &std::path::Path),
+    ) -> (Vec<f32>, usize) {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        change(&server.state.config, &temp.path().join("worktree"));
+
+        std::fs::write(temp.path().join("primary/merged.rs"), MERGED_WORKTREE).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        (
+            vector,
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+        )
+    }
+
+    #[tokio::test]
+    async fn primary_walk_ignores_a_departed_worktree_store_of_other_dimensions() {
+        let (vector, embeds) = primary_walk_after_departed_store_change(|config, worktree| {
+            persist_worktree_vector(config, worktree, "merged.rs", MERGED_WORKTREE, &[7.0, 7.0]);
+        })
+        .await;
+        assert_eq!(vector.len(), 3);
+        assert_eq!(embeds, 2, "the primary embeds instead");
+    }
+
+    #[tokio::test]
+    async fn primary_walk_ignores_a_departed_worktree_store_of_another_model() {
+        let (vector, embeds) = primary_walk_after_departed_store_change(|config, worktree| {
+            let mut other = config.clone();
+            other.ollama_embed_model = "another-embed-model".to_string();
+            let dir = crate::cache::rkyv_store::cache_dir(worktree);
+            let store =
+                |config: &Config| dir.join(format!("{}.rkyv", cache_name("embeddings", config)));
+            std::fs::rename(store(config), store(&other)).unwrap();
+        })
+        .await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(embeds, 2, "the primary embeds instead");
+    }
+
+    /// A directory git still records as a worktree but that is no longer one
+    /// keeps a store at its own checkout's cache path, which is not consulted.
+    #[tokio::test]
+    async fn primary_walk_skips_a_directory_no_longer_a_worktree() {
+        let (vector, embeds) = primary_walk_after_departed_store_change(|config, worktree| {
+            std::fs::remove_file(worktree.join(".git")).unwrap();
+            std::fs::create_dir(worktree.join(".git")).unwrap();
+            let persisted = HashMap::from([(
+                "merged.rs".to_string(),
+                CacheEntry {
+                    hash: crate::core::embeddings::content_hash(MERGED_WORKTREE),
+                    vector: WORKTREE_VECTOR.to_vec(),
+                },
+            )]);
+            rkyv_store::save_vector_store_merged(
+                worktree,
+                &cache_name("embeddings", config),
+                &crate::core::embeddings::VectorStore::from_cache(&persisted).unwrap(),
+            )
+            .unwrap();
+        })
+        .await;
+        assert_ne!(vector, WORKTREE_VECTOR);
+        assert_eq!(embeds, 2, "the primary embeds instead");
+    }
+
+    #[tokio::test]
+    async fn primary_walk_reuses_a_worktree_recorded_at_a_relative_gitdir() {
+        let (vector, embeds) = primary_walk_after_departed_store_change(|_, worktree| {
+            let name = worktree.file_name().unwrap();
+            let record = worktree
+                .parent()
+                .unwrap()
+                .join("primary/.git/worktrees")
+                .join(name)
+                .join("gitdir");
+            let relative = std::path::Path::new("../../../..").join(name).join(".git");
+            std::fs::write(record, format!("{}\n", relative.display())).unwrap();
+        })
+        .await;
+        assert_eq!(vector, WORKTREE_VECTOR);
+        assert_eq!(embeds, 1, "the primary must not re-embed");
+    }
+
+    #[tokio::test]
+    async fn primary_walk_reuses_a_worktree_moved_after_a_lookup() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        let primary = temp.path().join("primary");
+        std::fs::write(primary.join("other.rs"), "fn other() {}\n").unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+        cached_vector(&server.current_ref().await, "other.rs", "fn other() {}\n").await;
+        let moved = temp.path().join("moved");
+        run_git(
+            &primary,
+            &[
+                "worktree",
+                "move",
+                temp.path().join("worktree").to_str().unwrap(),
+                moved.to_str().unwrap(),
+            ],
+        );
+
+        std::fs::write(primary.join("merged.rs"), MERGED_WORKTREE).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+
+        let vector = cached_vector(&server.current_ref().await, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            vector, WORKTREE_VECTOR,
+            "the moved worktree's store is read"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_walk_reuses_a_departed_worktree_vector_after_its_cache_is_cleared() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        let primary_ref = server.current_ref().await;
+        primary_ref.embedding_cache.write().await.clear();
+        std::fs::write(temp.path().join("primary/merged.rs"), MERGED_WORKTREE).unwrap();
+        server
+            .handle_semantic_code_search(semantic_args("merged"))
+            .await
+            .unwrap();
+
+        let vector = cached_vector(&primary_ref, "merged.rs", MERGED_WORKTREE).await;
+        assert_eq!(
+            vector, WORKTREE_VECTOR,
+            "an empty primary cache still takes the persisted vector"
+        );
+        assert_eq!(
+            matching_embed_input_count(&ollama, "WORKTREE_MERGED_BODY").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_tracker_reads_each_worktree_store_once_per_batch() {
+        let ollama = wiremock::MockServer::start().await;
+        let (temp, server) =
+            primary_with_departed_worktree(&ollama, "merged.rs", MERGED_WORKTREE).await;
+        let files: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|name| {
+                let file = temp.path().join("primary").join(format!("{name}.rs"));
+                std::fs::write(&file, format!("fn {name}() {{}}\n")).unwrap();
+                file
+            })
+            .collect();
+        let worktree = temp.path().join("worktree").canonicalize().unwrap();
+        crate::server_adapters::test_seams::record_store_reads(&worktree);
+
+        let (updated, _) = server.incremental_reembed(&files).await;
+
+        assert_eq!(updated, 3);
+        assert_eq!(
+            crate::server_adapters::test_seams::store_reads(&worktree),
+            1,
+            "one tracker batch reads a worktree's store once"
         );
     }
 
@@ -18191,6 +18563,158 @@ mod tests {
             0,
             "the restarted worktree re-embedded a file whose copied vector the primary moved off"
         );
+    }
+
+    /// A primary and a worktree below `ANN_THRESHOLD`, both queried, the
+    /// worktree holding the primary's vector of `src/area_1/file_5.rs`.
+    async fn small_worktree_servers() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+        ContextPlusServer,
+    ) {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), 40);
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = identifier_test_server(&ollama, primary_root.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(primary_root.path().join(file)).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, &original).await;
+        semantic_fork_query(&session).await;
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .vector_store()
+                .is_none(),
+            "the small worktree holds a vector store"
+        );
+        assert_eq!(
+            session.current_ref().await.embedding_cache.read().await[file].hash,
+            crate::core::embeddings::content_hash(&original),
+            "the worktree did not copy the primary's vector"
+        );
+        (ollama, primary_root, worktree, server, session)
+    }
+
+    /// Asserts the worktree persisted its copy of `src/area_1/file_5.rs`.
+    async fn small_worktree_assert_kept(server: &ContextPlusServer, worktree: &tempfile::TempDir) {
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(worktree.path().join(file)).unwrap();
+        assert_eq!(
+            semantic_fork_persisted(server, worktree.path())
+                .get(file)
+                .map(|entry| entry.hash.clone()),
+            Some(crate::core::embeddings::content_hash(&original)),
+            "the worktree did not persist a copied vector the primary moved off"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_a_tracked_primary_edit_moved_off() {
+        let (ollama, primary_root, worktree, server, _session) = small_worktree_servers().await;
+        let file = primary_root.path().join("src/area_1/file_5.rs");
+        std::fs::write(&file, "pub fn primaryedited() {}\n").unwrap();
+        server.incremental_reembed(&[file]).await;
+        small_worktree_assert_kept(&server, &worktree).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file whose copied vector the primary moved off"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_of_a_file_the_primary_deleted() {
+        let (ollama, primary_root, worktree, server, _session) = small_worktree_servers().await;
+        let file = primary_root.path().join("src/area_1/file_5.rs");
+        std::fs::remove_file(&file).unwrap();
+        server.incremental_reembed(&[file]).await;
+        small_worktree_assert_kept(&server, &worktree).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file the primary deleted"
+        );
+    }
+
+    /// A primary walk keeps the vector of a file it no longer sees, so the
+    /// restarted worktree still inherits it.
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_of_a_file_a_primary_walk_deleted() {
+        let (ollama, primary_root, worktree, server, _session) = small_worktree_servers().await;
+        std::fs::remove_file(primary_root.path().join("src/area_1/file_5.rs")).unwrap();
+        let added = "pub fn primaryadded() {}\n";
+        std::fs::write(
+            primary_root.path().join("src/area_2/primary_added.rs"),
+            added,
+        )
+        .unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(
+            &server,
+            primary_root.path(),
+            "src/area_2/primary_added.rs",
+            added,
+        )
+        .await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file the primary deleted"
+        );
+    }
+
+    /// A small worktree persists only its own vectors while the primary still
+    /// holds the ones it copied.
+    #[tokio::test]
+    async fn small_worktree_persists_no_copied_vector_the_primary_still_holds() {
+        let (_ollama, primary_root, worktree, server, session) = small_worktree_servers().await;
+        let added = "pub fn primaryadded() {}\n";
+        std::fs::write(
+            primary_root.path().join("src/area_2/primary_added.rs"),
+            added,
+        )
+        .unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(
+            &server,
+            primary_root.path(),
+            "src/area_2/primary_added.rs",
+            added,
+        )
+        .await;
+        let tracked = primary_root.path().join("src/area_1/file_9.rs");
+        std::fs::write(&tracked, "pub fn primarytracked() {}\n").unwrap();
+        server.incremental_reembed(&[tracked]).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_await_persisted(
+            &server,
+            worktree.path(),
+            "src/area_2/worktree_added.rs",
+            "pub fn worktreeadded() {}\n// shared symbol vary\n",
+        )
+        .await;
+        let own = [
+            "src/area_1/file_1.rs",
+            "src/area_2/worktree_added.rs",
+            "src/area_1/file_9.rs",
+        ];
+        for path in semantic_fork_persisted(&server, worktree.path()).into_keys() {
+            assert!(
+                own.contains(&path.as_str()),
+                "the worktree persisted {path}, a vector the primary still holds"
+            );
+        }
     }
 
     /// A worktree that edits a file and then restores the primary's content
