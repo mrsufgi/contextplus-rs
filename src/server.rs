@@ -18427,6 +18427,158 @@ mod tests {
         );
     }
 
+    /// A primary and a worktree below `ANN_THRESHOLD`, both queried, the
+    /// worktree holding the primary's vector of `src/area_1/file_5.rs`.
+    async fn small_worktree_servers() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+        ContextPlusServer,
+    ) {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), 40);
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = identifier_test_server(&ollama, primary_root.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(primary_root.path().join(file)).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, &original).await;
+        semantic_fork_query(&session).await;
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .vector_store()
+                .is_none(),
+            "the small worktree holds a vector store"
+        );
+        assert_eq!(
+            session.current_ref().await.embedding_cache.read().await[file].hash,
+            crate::core::embeddings::content_hash(&original),
+            "the worktree did not copy the primary's vector"
+        );
+        (ollama, primary_root, worktree, server, session)
+    }
+
+    /// Asserts the worktree persisted its copy of `src/area_1/file_5.rs`.
+    async fn small_worktree_assert_kept(server: &ContextPlusServer, worktree: &tempfile::TempDir) {
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(worktree.path().join(file)).unwrap();
+        assert_eq!(
+            semantic_fork_persisted(server, worktree.path())
+                .get(file)
+                .map(|entry| entry.hash.clone()),
+            Some(crate::core::embeddings::content_hash(&original)),
+            "the worktree did not persist a copied vector the primary moved off"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_a_tracked_primary_edit_moved_off() {
+        let (ollama, primary_root, worktree, server, _session) = small_worktree_servers().await;
+        let file = primary_root.path().join("src/area_1/file_5.rs");
+        std::fs::write(&file, "pub fn primaryedited() {}\n").unwrap();
+        server.incremental_reembed(&[file]).await;
+        small_worktree_assert_kept(&server, &worktree).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file whose copied vector the primary moved off"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_of_a_file_the_primary_deleted() {
+        let (ollama, primary_root, worktree, server, _session) = small_worktree_servers().await;
+        let file = primary_root.path().join("src/area_1/file_5.rs");
+        std::fs::remove_file(&file).unwrap();
+        server.incremental_reembed(&[file]).await;
+        small_worktree_assert_kept(&server, &worktree).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file the primary deleted"
+        );
+    }
+
+    /// A primary walk keeps the vector of a file it no longer sees, so the
+    /// restarted worktree still inherits it.
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_of_a_file_a_primary_walk_deleted() {
+        let (ollama, primary_root, worktree, server, _session) = small_worktree_servers().await;
+        std::fs::remove_file(primary_root.path().join("src/area_1/file_5.rs")).unwrap();
+        let added = "pub fn primaryadded() {}\n";
+        std::fs::write(
+            primary_root.path().join("src/area_2/primary_added.rs"),
+            added,
+        )
+        .unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(
+            &server,
+            primary_root.path(),
+            "src/area_2/primary_added.rs",
+            added,
+        )
+        .await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file the primary deleted"
+        );
+    }
+
+    /// A small worktree persists only its own vectors while the primary still
+    /// holds the ones it copied.
+    #[tokio::test]
+    async fn small_worktree_persists_no_copied_vector_the_primary_still_holds() {
+        let (_ollama, primary_root, worktree, server, session) = small_worktree_servers().await;
+        let added = "pub fn primaryadded() {}\n";
+        std::fs::write(
+            primary_root.path().join("src/area_2/primary_added.rs"),
+            added,
+        )
+        .unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(
+            &server,
+            primary_root.path(),
+            "src/area_2/primary_added.rs",
+            added,
+        )
+        .await;
+        let tracked = primary_root.path().join("src/area_1/file_9.rs");
+        std::fs::write(&tracked, "pub fn primarytracked() {}\n").unwrap();
+        server.incremental_reembed(&[tracked]).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_await_persisted(
+            &server,
+            worktree.path(),
+            "src/area_2/worktree_added.rs",
+            "pub fn worktreeadded() {}\n// shared symbol vary\n",
+        )
+        .await;
+        let own = [
+            "src/area_1/file_1.rs",
+            "src/area_2/worktree_added.rs",
+            "src/area_1/file_9.rs",
+        ];
+        for path in semantic_fork_persisted(&server, worktree.path()).into_keys() {
+            assert!(
+                own.contains(&path.as_str()),
+                "the worktree persisted {path}, a vector the primary still holds"
+            );
+        }
+    }
+
     /// A worktree that edits a file and then restores the primary's content
     /// keeps the shared vector, not its stale own one.
     #[tokio::test]
