@@ -707,7 +707,7 @@ impl CachedWalkerIndexer {
             None => None,
         };
         if let Some(parent_vectors) = &parent_vectors {
-            reload_own_vectors(ref_index, parent_vectors, config).await;
+            reload_own_vectors(ref_index, parent_vectors, config, false).await;
         }
 
         let fill_snapshot = ref_index.semantic_fill.lock().await;
@@ -2442,6 +2442,7 @@ async fn reload_own_vectors(
     ref_index: &crate::ref_index::RefIndex,
     parent_vectors: &FileVectors,
     config: &Config,
+    indexed_only: bool,
 ) {
     let embedding_cache = &ref_index.embedding_cache;
     if !embedding_cache.read().await.is_empty() {
@@ -2462,7 +2463,7 @@ async fn reload_own_vectors(
                 .collect()
         };
         let mut cache = embedding_cache.write().await;
-        if cache.is_empty() {
+        if cache.is_empty() && !(indexed_only && evicted(ref_index)) {
             *cache = own;
         }
     }
@@ -2476,9 +2477,20 @@ async fn reload_own_vectors(
     );
 }
 
+/// Whether an eviction dropped `ref_index`'s semantic entry. It does so
+/// before clearing the vectors, so a caller holding the vector lock that sees
+/// the entry, or its eviction mid-write, is cleared after.
+fn evicted(ref_index: &crate::ref_index::RefIndex) -> bool {
+    ref_index
+        .search_index_cache
+        .try_read()
+        .is_ok_and(|entry| entry.is_none())
+}
+
 /// Copies into each worktree attached to `ref_index` the vectors its semantic
-/// entry shares at content `ref_index` has since replaced or `deleted`, and
-/// persists them, so a restart keeps them. Vectors `ref_index` still holds
+/// entry holds at content `ref_index` has since replaced or `deleted`, and
+/// persists them and any vector it copied from `ref_index` that `ref_index`
+/// no longer holds, so a restart keeps them. Vectors `ref_index` still holds
 /// stay shared.
 pub(crate) async fn keep_moved_off_vectors(
     state: &SharedState,
@@ -2492,17 +2504,18 @@ pub(crate) async fn keep_moved_off_vectors(
         let Some(entry) = entry.filter(|entry| entry.search_root() == child.canonical_root) else {
             continue;
         };
-        reload_own_vectors(&child, &ref_index.embedding_cache, config).await;
-        let moved: Vec<(String, CacheEntry)> = {
+        reload_own_vectors(&child, &ref_index.embedding_cache, config, true).await;
+        let (moved, own) = {
             let own = child.embedding_cache.read().await;
             let parent = ref_index.embedding_cache.read().await;
-            entry
+            let moved: Vec<(String, Option<String>, CacheEntry)> = entry
                 .index
                 .documents()
                 .iter()
                 .enumerate()
                 .filter(|(_, doc)| {
-                    !own.contains_key(&doc.path)
+                    own.get(&doc.path)
+                        .is_none_or(|held| held.hash != doc.source_hash)
                         && match parent.get(&doc.path) {
                             Some(held) => held.hash != doc.source_hash,
                             None => deleted.contains(doc.path.as_str()),
@@ -2511,20 +2524,48 @@ pub(crate) async fn keep_moved_off_vectors(
                 .filter_map(|(at, doc)| {
                     let vector = entry.index.vector_at(at)?.to_vec();
                     let hash = doc.source_hash.clone();
-                    Some((doc.path.clone(), CacheEntry { hash, vector }))
+                    let seen = own.get(&doc.path).map(|held| held.hash.clone());
+                    Some((doc.path.clone(), seen, CacheEntry { hash, vector }))
                 })
-                .collect()
+                .collect();
+            let own: Vec<(String, String)> = own
+                .iter()
+                .filter(|(path, held)| !inherits(&parent, path, held))
+                .map(|(path, held)| (path.clone(), held.hash.clone()))
+                .collect();
+            (moved, own)
         };
-        if moved.is_empty() {
-            continue;
-        }
-        {
-            let mut own = child.embedding_cache.write().await;
-            for (path, entry) in moved {
-                own.entry(path).or_insert(entry);
+        let mut dirty = false;
+        if !moved.is_empty() {
+            let mut cache = child.embedding_cache.write().await;
+            if evicted(&child) {
+                continue;
+            }
+            for (path, seen, entry) in moved {
+                // A stale own vector gives way; a newer one the fill wrote since stays.
+                if cache.get(&path).map(|held| &held.hash) == seen.as_ref() {
+                    cache.insert(path, entry);
+                    dirty = true;
+                }
             }
         }
-        save_vectors(&child, config, Some(&ref_index.embedding_cache)).await;
+        // Vectors the parent held at the worktree's last save are not on its disk.
+        if !dirty && !own.is_empty() {
+            let root = child.root_dir.clone();
+            let name = cache_name("embeddings", config);
+            let saved =
+                tokio::task::spawn_blocking(move || rkyv_store::mmap_vector_store(&root, &name))
+                    .await;
+            dirty = match saved {
+                Ok(Ok(Some(store))) => own
+                    .iter()
+                    .any(|(path, hash)| store.get_hash(path) != Some(hash.as_str())),
+                _ => true,
+            };
+        }
+        if dirty {
+            save_vectors(&child, config, Some(&ref_index.embedding_cache)).await;
+        }
     }
 }
 

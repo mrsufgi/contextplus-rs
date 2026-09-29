@@ -939,15 +939,11 @@ impl ResidentSnapshot {
             ));
         }
         if let Some(index) = &self.search_index {
-            components.push((
-                Arc::as_ptr(index) as usize,
-                index.own_resident_bytes(),
-                "semantic_index",
-            ));
+            let (own, shared) = index.resident_split();
+            components.push((Arc::as_ptr(index) as usize, own, "semantic_index"));
             components.extend(
-                index
-                    .index
-                    .shared_documents()
+                shared
+                    .into_iter()
                     .map(|(ptr, bytes)| (ptr, bytes, "semantic_documents")),
             );
             // Forks share the store, and keep an old one alive after the primary replaces it.
@@ -1275,6 +1271,8 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
         .cache_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     *owner.semantic_fill.lock().await = Default::default();
+    // Before the vectors: a parent's persist that still sees the entry is cleared after.
+    *owner.search_index_cache.write().await = None;
     owner.embedding_cache.write().await.clear();
     *owner.identifier_index.write().await = None;
     *owner.identifier_source.write().await = None;
@@ -1310,7 +1308,6 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
         .store(false, std::sync::atomic::Ordering::Release);
     drop(overlay);
     drop(save_lock);
-    *owner.search_index_cache.write().await = None;
     *owner.lexical_search_cache.write().await = None;
     *owner.project_cache.write().await = None;
 }
@@ -18154,6 +18151,120 @@ mod tests {
         }
     }
 
+    /// Below `ANN_THRESHOLD` a worktree builds its own index over vectors it
+    /// copied from the primary, which it persists only once the primary moves
+    /// off them.
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_the_primary_moved_off() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), 40);
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = identifier_test_server(&ollama, primary_root.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(primary_root.path().join(file)).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, &original).await;
+        semantic_fork_query(&session).await;
+        assert_eq!(
+            session.current_ref().await.embedding_cache.read().await[file].hash,
+            crate::core::embeddings::content_hash(&original),
+            "the worktree did not copy the primary's vector"
+        );
+        let edited = "pub fn primaryedited() {}\n";
+        std::fs::write(primary_root.path().join(file), edited).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, edited).await;
+        assert_eq!(
+            semantic_fork_persisted(&server, worktree.path())
+                .get(file)
+                .map(|entry| entry.hash.clone()),
+            Some(crate::core::embeddings::content_hash(&original)),
+            "the worktree did not persist a copied vector the primary moved off"
+        );
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file whose copied vector the primary moved off"
+        );
+    }
+
+    /// A worktree that edits a file and then restores the primary's content
+    /// keeps the shared vector, not its stale own one.
+    #[tokio::test]
+    async fn semantic_fork_restarted_worktree_keeps_a_vector_it_reverted_to() {
+        let (ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(primary_root.path().join(file)).unwrap();
+        let own = "pub fn worktreeedited() {}\n";
+        std::fs::write(worktree.path().join(file), own).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_await_persisted(&server, worktree.path(), file, own).await;
+        std::fs::write(worktree.path().join(file), &original).unwrap();
+        semantic_fork_query(&session).await;
+        let edited = "pub fn primaryedited() {}\n";
+        std::fs::write(primary_root.path().join(file), edited).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, edited).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file it reverted to the primary's content"
+        );
+    }
+
+    /// The primary persisting while a worktree is evicted does not reload the
+    /// worktree's vectors into memory.
+    #[tokio::test]
+    async fn semantic_fork_primary_persist_leaves_an_evicting_worktree_cache_empty() {
+        let (_ollama, _primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_await_persisted(
+            &server,
+            worktree.path(),
+            "src/area_2/worktree_added.rs",
+            "pub fn worktreeadded() {}\n// shared symbol vary\n",
+        )
+        .await;
+        let primary = server.current_ref().await;
+        let child = session.current_ref().await;
+        let flush = Arc::clone(&child.identifier_save_lock).lock_owned().await;
+        let evicting = {
+            let child = Arc::clone(&child);
+            let name = cache_name("identifier-embeddings", &server.state.config);
+            tokio::spawn(async move { clear_ref_heavy_caches(&child, &name).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !child.embedding_cache.read().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the eviction never cleared the worktree's vectors");
+        crate::server_adapters::keep_moved_off_vectors(
+            &server.state,
+            &primary,
+            &server.state.config,
+            &[],
+        )
+        .await;
+        drop(flush);
+        evicting.await.unwrap();
+        assert!(
+            child.embedding_cache.read().await.is_empty(),
+            "the primary's persist reloaded the evicted worktree's vectors"
+        );
+    }
+
     /// The budget's pointer-keyed components of the refs behind `servers`.
     async fn semantic_fork_resident(servers: &[&ContextPlusServer]) -> HashMap<usize, usize> {
         let mut holders = HashMap::new();
@@ -18198,7 +18309,7 @@ mod tests {
             .sum();
         let store_bytes = store.estimated_resident_bytes();
         assert!(store_bytes > 0);
-        let own: usize = entries.iter().map(|entry| entry.own_resident_bytes()).sum();
+        let own: usize = entries.iter().map(|entry| entry.resident_split().0).sum();
         assert_eq!(
             charged,
             own + store_bytes,

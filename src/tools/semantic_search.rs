@@ -1202,9 +1202,10 @@ impl CachedSearchIndex {
         Arc::new(entry)
     }
 
-    /// Bytes this entry holds on its own, excluding its shared vector store.
-    pub(crate) fn own_resident_bytes(&self) -> usize {
-        self.index.own_resident_bytes()
+    /// Bytes this entry holds on its own, excluding its shared vector store,
+    /// and the documents another index also holds, by address and bytes.
+    pub(crate) fn resident_split(&self) -> (usize, Vec<(usize, usize)>) {
+        self.index.resident_split()
     }
 
     /// The canonical root this index was walked from.
@@ -1583,15 +1584,6 @@ impl SearchIndex {
         self.documents.iter().map(|doc| doc.resident_bytes()).sum()
     }
 
-    /// Documents another index also holds, by address and bytes; each counts
-    /// once however many indexes share it.
-    pub(crate) fn shared_documents(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        self.documents
-            .iter()
-            .filter(|doc| Arc::strong_count(doc) > 1)
-            .map(|doc| (Arc::as_ptr(doc) as usize, doc.resident_bytes()))
-    }
-
     #[cfg(feature = "memory-profile")]
     fn resident_file_vector_bytes(&self) -> usize {
         self.vector_buffer.capacity() * std::mem::size_of::<f32>()
@@ -1613,19 +1605,26 @@ impl SearchIndex {
             .map_or(0, |store| store.estimated_hnsw_bytes())
     }
 
-    /// Bytes excluding the vector store and [`Self::shared_documents`].
-    fn own_resident_bytes(&self) -> usize {
-        self.documents
-            .iter()
-            .filter(|doc| Arc::strong_count(doc) == 1)
-            .map(|doc| doc.resident_bytes())
-            .sum::<usize>()
-            + self.vector_buffer.capacity() * std::mem::size_of::<f32>()
+    /// Bytes excluding the vector store and the documents another index also
+    /// holds, which follow by address and bytes; each counts once however many
+    /// indexes share it. One read of each count, so a clone racing the
+    /// measure cannot charge a document twice or not at all.
+    fn resident_split(&self) -> (usize, Vec<(usize, usize)>) {
+        let mut own = self.vector_buffer.capacity() * std::mem::size_of::<f32>()
             + self
                 .vector_updates
                 .values()
                 .map(|vector| vector.capacity() * std::mem::size_of::<f32>())
-                .sum::<usize>()
+                .sum::<usize>();
+        let mut shared = Vec::new();
+        for doc in &self.documents {
+            if Arc::strong_count(doc) == 1 {
+                own += doc.resident_bytes();
+            } else {
+                shared.push((Arc::as_ptr(doc) as usize, doc.resident_bytes()));
+            }
+        }
+        (own, shared)
     }
 
     /// The store whose graph `search()` prunes with; `None` below
@@ -7818,5 +7817,33 @@ mod tests {
         base.index_with_vectors(docs.clone(), vectors.clone());
         vectors[0] = Some(vec![1.0, 0.0, 0.0]);
         assert!(base.fork(&docs, &vectors).is_none());
+    }
+
+    /// A fork's resident split charges every document once, to the fork or
+    /// as shared.
+    #[test]
+    fn fork_resident_split_charges_each_document_once() {
+        let (docs, vectors) = make_ann_corpus(ANN_THRESHOLD + 50);
+        let mut base = SearchIndex::new();
+        base.index_with_vectors(docs.clone(), vectors.clone());
+        let mut worktree = docs.clone();
+        worktree[0] = make_doc(&docs[0].path, "edited in the worktree");
+        let fork = base
+            .fork(&worktree, &vectors)
+            .expect("a one-file worktree forks");
+
+        let (own, shared) = fork.resident_split();
+        let documents: usize = fork.documents.iter().map(|doc| doc.resident_bytes()).sum();
+        let buffers = fork.vector_buffer.capacity() * std::mem::size_of::<f32>()
+            + fork
+                .vector_updates
+                .values()
+                .map(|vector| vector.capacity() * std::mem::size_of::<f32>())
+                .sum::<usize>();
+        assert_eq!(
+            own + shared.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+            documents + buffers
+        );
+        assert_eq!(shared.len(), docs.len() - 1);
     }
 }
