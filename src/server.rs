@@ -1957,9 +1957,10 @@ impl ContextPlusServer {
     /// 1. Walks the ref's `root_dir` via `walk_with_config`.
     /// 2. Reads all non-directory files into `ref.project_cache`.
     /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`.
-    /// 4. Calls `import_baseline_for_ref` — for every chunk, looks up the
-    ///    BLAKE3 hash in the CAS parent chain.  Hits are loaded into
-    ///    `embedding_cache` and used to build `search_index_cache` (HNSW).
+    /// 4. Calls `import_baseline_for_ref` — for every chunk a fork of the
+    ///    parent's index does not share, looks up the BLAKE3 hash in the CAS
+    ///    parent chain.  Hits are loaded into `embedding_cache` and used to
+    ///    build `search_index_cache`.
     /// 5. Does NOT call `OllamaClient::embed*`.  Zero outbound Ollama calls.
     ///    Diff chunks (misses in step 4) remain unembedded; they fill lazily
     ///    on the first real tool call.
@@ -2130,10 +2131,12 @@ impl ContextPlusServer {
             }
 
             // --- U20: CAS baseline import — zero Ollama calls ---
-            // Walk the CAS parent chain for every chunk in the corpus.  Hits are
-            // loaded into `embedding_cache` and used to build `search_index_cache`.
+            // Walk the CAS parent chain for every chunk a fork of the parent's
+            // index does not share.  Hits are loaded into `embedding_cache` and
+            // used to build `search_index_cache`.
             // Misses are left for lazy fill on first tool call (Shallow mode).
-            let report = import_baseline_for_ref(&state, ref_id, Arc::clone(&new_cache)).await;
+            let report =
+                import_baseline_for_ref(&state, ref_id, Arc::clone(&new_cache), false).await;
             tracing::info!(
                 ref_id = ref_id.0,
                 hits = report.hits,
@@ -2311,7 +2314,8 @@ impl ContextPlusServer {
             }
 
             // --- Phase 3: CAS baseline import (same as Shallow, zero Ollama) ---
-            let report = import_baseline_for_ref(&state, ref_id, Arc::clone(&new_cache)).await;
+            let report =
+                import_baseline_for_ref(&state, ref_id, Arc::clone(&new_cache), true).await;
             tracing::info!(
                 ref_id = ref_id.0,
                 hits = report.hits,
@@ -5326,8 +5330,10 @@ pub struct BaselineImportReport {
 /// when it can, and otherwise indexes its hits.
 ///
 /// Called by **both** Shallow and Full warmup so neither duplicates logic:
-/// - Shallow invokes this and discards the misses.
-/// - Full invokes this then calls [`embed_diff_chunks`] on the misses.
+/// - Shallow invokes this and discards the misses. A worktree whose parent's
+///   index it forks looks up only its files that fork does not share.
+/// - Full invokes this with `embeds_misses` then calls [`embed_diff_chunks`]
+///   on the misses.
 ///
 /// The CAS is rooted at `state.root_dir/.mcp_data` (the primary worktree's
 /// data directory) regardless of which ref is being warmed, matching the
@@ -5336,6 +5342,7 @@ async fn import_baseline_for_ref(
     state: &Arc<SharedState>,
     ref_id: crate::ref_index::RefId,
     project_cache: Arc<ProjectCache>,
+    embeds_misses: bool,
 ) -> BaselineImportReport {
     use crate::cache::cas::{CasStore, ChunkHash, ChunkKey};
     use crate::tools::semantic_search::{CachedSearchIndex, IndexFingerprint, SearchDocument};
@@ -5357,6 +5364,15 @@ async fn import_baseline_for_ref(
     let ref_id_hex = ref_index.cas_ref_id_hex.clone();
     let max_file_size = state.config.max_embed_file_size;
     let embed_doc_shape = state.config.embed_doc_shape;
+    let walker = CachedWalkerIndexer {
+        config: state.config.clone(),
+        ollama: state.ollama.clone(),
+        state: Arc::clone(state),
+    };
+    let shared = match ref_index.parent_ref_id {
+        Some(_) if !embeds_misses => walker.fork_shared_paths(&ref_index, &project_cache).await,
+        _ => Default::default(),
+    };
 
     // Collect per-file results on a blocking thread to avoid holding async locks
     // during synchronous I/O.
@@ -5369,8 +5385,8 @@ async fn import_baseline_for_ref(
             let mut misses: Vec<MissedChunk> = Vec::new();
 
             for (rel_path, content) in &project_cache.file_content {
-                // Skip files that exceed the max embed size.
-                if content.len() > max_file_size {
+                // Skip files that exceed the max embed size, and those the fork shares.
+                if content.len() > max_file_size || shared.contains(rel_path) {
                     continue;
                 }
                 let content_hash = crate::core::parser::hash_content(content);
@@ -5434,18 +5450,14 @@ async fn import_baseline_for_ref(
         }
     }
 
-    let walker = CachedWalkerIndexer {
-        config: state.config.clone(),
-        ollama: state.ollama.clone(),
-        state: Arc::clone(state),
-    };
-    let files = &*project_cache_for_idx;
     let indexed = match ref_index.parent_ref_id {
         None => {
-            walker.primary_warmup(&ref_index, files).await;
+            walker
+                .primary_warmup(&ref_index, &project_cache_for_idx)
+                .await;
             true
         }
-        Some(_) => walker.fork_warmup(&ref_index, files).await,
+        Some(_) => walker.fork_warmup(&ref_index, &project_cache_for_idx).await,
     };
 
     // Build search_index_cache from the inherited blobs.
@@ -17993,11 +18005,33 @@ mod tests {
     }
 
     /// Runs the shallow warmup's baseline import for `server`'s ref.
-    async fn semantic_fork_warmup(server: &ContextPlusServer) {
+    async fn semantic_fork_warmup(server: &ContextPlusServer) -> BaselineImportReport {
         let owner = server.current_ref().await;
         let cache = server.ensure_project_cache().await.unwrap();
         let id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
-        import_baseline_for_ref(&server.state, id, cache).await;
+        import_baseline_for_ref(&server.state, id, cache, false).await
+    }
+
+    /// A worktree's warmup looks up in the CAS only the vectors of the files
+    /// that differ from the primary's; its fork shares the others'.
+    #[tokio::test]
+    async fn semantic_fork_warmup_looks_up_only_the_worktree_changes() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+
+        let report = semantic_fork_warmup(&session).await;
+        let lookups = report.hits + report.misses.len();
+        assert_eq!(
+            lookups, 2,
+            "the warmup looked up {lookups} files in the CAS, not only the worktree's 2 changes"
+        );
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&semantic_fork_index(&server).await.index)
+        );
     }
 
     #[tokio::test]

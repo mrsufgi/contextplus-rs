@@ -1050,15 +1050,21 @@ pub struct IndexFingerprint {
 impl IndexFingerprint {
     /// Compute a fingerprint from a slice of `SearchDocument`s.
     pub fn from_docs(docs: &[SearchDocument]) -> Self {
+        Self::of(docs.iter())
+    }
+
+    /// [`Self::from_docs`] of documents held in several places.
+    pub(crate) fn of<'a>(docs: impl ExactSizeIterator<Item = &'a SearchDocument>) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        docs.len().hash(&mut hasher);
+        let n_docs = docs.len();
+        n_docs.hash(&mut hasher);
         for d in docs {
             d.path.hash(&mut hasher);
             d.content.hash(&mut hasher);
         }
         Self {
-            n_docs: docs.len(),
+            n_docs,
             content_hash: hasher.finish(),
         }
     }
