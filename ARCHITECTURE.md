@@ -57,6 +57,9 @@ Three independent cache layers minimize redundant work:
 - **Worktrees:** a linked worktree's semantic index forks the primary's (`SearchIndex::fork`),
   sharing its `VectorStore` and HNSW graph and overlaying only the files that differ; past a 20%
   change, or while the primary's index is scoped, queued or rebuilding, the worktree builds its own.
+  Its walk layers the worktree's files over the primary's cached contents and reads only the files
+  git shows differ; the others keep the primary's documents and vectors unread, so the worktree's
+  vector cache holds only its own changes.
 - **Exact scoring:** below `CONTEXTPLUS_HNSW_MIN_VECTORS` (50,000) embedded files, every query
   scores every document on the blended score (cosine, keywords, recency, path prior) and no HNSW
   graph is built. From that size, the graph's cosine shortlist of `top_k ×

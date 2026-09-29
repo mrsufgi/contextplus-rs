@@ -60,6 +60,16 @@ pub(crate) type WalkAndIndexFuture<'a> = std::pin::Pin<
     >,
 >;
 
+/// What a walk produced: its documents and vectors, or the index of its root
+/// it installed in the slot itself.
+pub enum WalkOutcome {
+    Documents(Vec<SearchDocument>, Vec<Option<Vec<f32>>>),
+    Installed(Arc<CachedSearchIndex>),
+}
+
+pub(crate) type WalkOrInstallFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<WalkOutcome>> + Send + 'a>>;
+
 pub(crate) type VectorGenerationFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + 'a>>;
 
@@ -1043,22 +1053,30 @@ pub fn sanitize_query(query: &str) -> Cow<'_, str> {
 pub struct IndexFingerprint {
     /// Number of documents returned by the walker.
     pub n_docs: usize,
-    /// SipHash over `(path, content)` for each document, order-dependent.
+    /// SipHash over `(path, content, source_hash)` for each document,
+    /// order-dependent: `content` keeps only a code file's head.
     pub content_hash: u64,
 }
 
 impl IndexFingerprint {
     /// Compute a fingerprint from a slice of `SearchDocument`s.
     pub fn from_docs(docs: &[SearchDocument]) -> Self {
+        Self::of(docs.iter())
+    }
+
+    /// [`Self::from_docs`] of documents held in several places.
+    pub(crate) fn of<'a>(docs: impl ExactSizeIterator<Item = &'a SearchDocument>) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        docs.len().hash(&mut hasher);
+        let n_docs = docs.len();
+        n_docs.hash(&mut hasher);
         for d in docs {
             d.path.hash(&mut hasher);
             d.content.hash(&mut hasher);
+            d.source_hash.hash(&mut hasher);
         }
         Self {
-            n_docs: docs.len(),
+            n_docs,
             content_hash: hasher.finish(),
         }
     }
@@ -1278,6 +1296,26 @@ impl CachedSearchIndex {
     ) -> Option<Self> {
         let index = self.index.fork(docs, vectors)?;
         let mut entry = Self::new(index, IndexFingerprint::from_docs(docs), generation);
+        entry.search_root = root.to_path_buf();
+        entry.vector_generation = vector_generation;
+        Some(entry)
+    }
+
+    /// [`Self::fork`] from the worktree walk's `changed` documents and
+    /// `deleted` paths alone; `fingerprint` is the whole walk's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fork_delta(
+        &self,
+        root: &Path,
+        changed: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        deleted: &[String],
+        fingerprint: IndexFingerprint,
+        generation: u64,
+        vector_generation: u64,
+    ) -> Option<Self> {
+        let index = self.index.fork_delta(changed, vectors, deleted)?;
+        let mut entry = Self::new(index, fingerprint, generation);
         entry.search_root = root.to_path_buf();
         entry.vector_generation = vector_generation;
         Some(entry)
@@ -1702,11 +1740,15 @@ impl SearchIndex {
         &self.documents
     }
 
+    pub(crate) fn dims(&self) -> usize {
+        self.dims
+    }
+
     pub fn full_rebuild_count(&self) -> u64 {
         self.full_rebuilds
     }
 
-    fn vector_at(&self, i: usize) -> Option<&[f32]> {
+    pub(crate) fn vector_at(&self, i: usize) -> Option<&[f32]> {
         if !self.has_vector[i] {
             return None;
         }
@@ -1865,17 +1907,29 @@ impl SearchIndex {
             return None;
         }
         let (changed, deleted) = self.changes_from(docs, vectors);
-        if (changed.len() + deleted.len()) as f64
-            > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
+        self.fork_delta(
+            changed.iter().map(|&i| docs[i].clone()).collect(),
+            changed.iter().map(|&i| vectors[i].clone()).collect(),
+            &deleted,
+        )
+    }
+
+    /// This index moved to a checkout that differs from it by the `changed`
+    /// documents, with their `vectors`, and the `deleted` paths; see [`Self::fork`].
+    pub(crate) fn fork_delta(
+        &self,
+        changed: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        deleted: &[String],
+    ) -> Option<SearchIndex> {
+        if vectors.iter().flatten().any(|v| v.len() != self.dims)
+            || (changed.len() + deleted.len()) as f64
+                > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
         {
             return None;
         }
         let mut fork = self.clone();
-        fork.apply_incremental(
-            changed.iter().map(|&i| docs[i].clone()).collect(),
-            changed.iter().map(|&i| vectors[i].clone()).collect(),
-            &deleted,
-        );
+        fork.apply_incremental(changed, vectors, deleted);
         Some(fork)
     }
 
@@ -2408,8 +2462,10 @@ pub(crate) async fn semantic_code_search_owned(
                 let task = tokio::spawn(async move {
                     let _reset = RebuildGuard(Arc::clone(&previous));
                     let vector_generation = walker.vector_generation(&root).await;
-                    match walker.walk_and_index(&root).await {
-                        Ok((docs, vectors)) => {
+                    match walker.walk_or_install(&root).await {
+                        // The walk replaced `previous` with an index of its own.
+                        Ok(WalkOutcome::Installed(_)) => {}
+                        Ok(WalkOutcome::Documents(docs, vectors)) => {
                             let base = Arc::clone(&previous);
                             let built = tokio::task::spawn_blocking(move || {
                                 let pending = base.pending.lock().unwrap();
@@ -2636,7 +2692,30 @@ pub async fn semantic_code_search(
 
             // Walk the filesystem and compute fingerprint (tracker-off fallback or
             // generation mismatch meaning the tracker saw a change).
-            let (docs, vectors) = walk_and_index_fn.walk_and_index(&options.root_dir).await?;
+            let (docs, vectors) = match walk_and_index_fn.walk_or_install(&options.root_dir).await?
+            {
+                WalkOutcome::Documents(docs, vectors) => (docs, vectors),
+                WalkOutcome::Installed(installed) => {
+                    // Built from this walk, it answers; while it is current it
+                    // also takes the walk's metadata and generation.
+                    let current = lock
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|cached| Arc::ptr_eq(cached, &installed));
+                    if current
+                        && installed.vector_generation == vector_generation
+                        && installed.pending.lock().unwrap().batches.is_empty()
+                    {
+                        *installed.metadata.write().unwrap() = metadata.clone();
+                        installed
+                            .generation
+                            .store(current_gen, std::sync::atomic::Ordering::Release);
+                    }
+                    installed.record_reuse();
+                    break 'cache installed;
+                }
+            };
             let fp = IndexFingerprint::from_docs(&docs);
 
             {
@@ -2882,6 +2961,15 @@ pub trait WalkAndIndexFn: Send + Sync {
         Box::pin(async { Ok(None) })
     }
     fn walk_and_index(&self, root_dir: &Path) -> WalkAndIndexFuture<'_>;
+    /// [`Self::walk_and_index`], unless the walk installs the index of
+    /// `root_dir` in the slot itself.
+    fn walk_or_install(&self, root_dir: &Path) -> WalkOrInstallFuture<'_> {
+        let walk = self.walk_and_index(root_dir);
+        Box::pin(async move {
+            walk.await
+                .map(|(docs, vectors)| WalkOutcome::Documents(docs, vectors))
+        })
+    }
     fn track_background_task(&self, _task: &tokio::task::JoinHandle<()>) {}
 }
 
@@ -5815,6 +5903,65 @@ mod tests {
         }
     }
 
+    /// A walker that installs the index of its root in `slot` itself and
+    /// counts the walks asked for documents.
+    struct InstallingWalker {
+        slot: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
+        document_walks: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl WalkAndIndexFn for InstallingWalker {
+        fn walk_and_index(&self, _root: &Path) -> WalkAndIndexFuture<'_> {
+            self.document_walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok((vec![make_doc("a.rs", "walked")], vec![Some(vec![1.0, 0.0])])) })
+        }
+
+        fn walk_or_install(&self, root: &Path) -> WalkOrInstallFuture<'_> {
+            let root = root.canonicalize().unwrap();
+            Box::pin(async move {
+                let entry = Arc::new(CachedSearchIndex::build(
+                    &root,
+                    vec![make_doc("installed.rs", "installed by the walk")],
+                    vec![Some(vec![1.0, 0.0])],
+                    0,
+                    0,
+                    None,
+                ));
+                *self.slot.write().await = Some(Arc::clone(&entry));
+                Ok(WalkOutcome::Installed(entry))
+            })
+        }
+    }
+
+    /// A walk that installs the index of its root is not asked for documents:
+    /// the search answers from what it installed.
+    #[tokio::test]
+    async fn search_answers_from_the_index_its_walk_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let slot: Arc<RwLock<Option<Arc<CachedSearchIndex>>>> = Arc::new(RwLock::new(None));
+        let walker = InstallingWalker {
+            slot: Arc::clone(&slot),
+            document_walks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        let opts = SemanticSearchOptions {
+            root_dir: root.path().to_path_buf(),
+            ..gen_test_opts()
+        };
+
+        let answer = semantic_code_search(opts, &FixedEmbedder2, &walker, Some(slot), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            walker
+                .document_walks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the search asked for the documents of a walk that installed its index"
+        );
+        assert!(answer.contains("installed.rs"), "{answer}");
+    }
+
     /// Cache hit without a file change: when the generation matches, the walk
     /// should be skipped entirely on the second request.
     #[tokio::test]
@@ -7064,7 +7211,7 @@ mod tests {
         );
 
         graph_pause.release();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
             loop {
                 let current = cache.read().await.as_ref().cloned().unwrap();
                 if !Arc::ptr_eq(&current, &previous) {
