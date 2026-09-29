@@ -127,6 +127,41 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn read_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<String>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Records the source files read under `root` from now on.
+    pub(crate) fn record_reads(root: &Path) {
+        read_slots()
+            .lock()
+            .unwrap()
+            .insert(root.canonicalize().unwrap(), Vec::new());
+    }
+
+    pub(crate) fn file_read(root: &Path, path: &str) {
+        let mut slots = read_slots().lock().unwrap();
+        if slots.is_empty() {
+            return;
+        }
+        if let Some(paths) = root
+            .canonicalize()
+            .ok()
+            .and_then(|root| slots.get_mut(&root))
+        {
+            paths.push(path.to_string());
+        }
+    }
+
+    pub(crate) fn reads(root: &Path) -> Vec<String> {
+        read_slots()
+            .lock()
+            .unwrap()
+            .remove(&root.canonicalize().unwrap())
+            .unwrap_or_default()
+    }
+
     fn revalidation_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<String>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -472,138 +507,44 @@ impl CachedWalkerIndexer {
             ref_index
                 .semantic_walks
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let started = std::time::Instant::now();
-            let entries = walk_with_config(&root, &config);
-            let walk_ms = started.elapsed().as_millis();
-
-            let max_file_size = config.max_embed_file_size as u64;
-            // Read all files concurrently (up to 32 at a time)
-            let mut join_set = tokio::task::JoinSet::new();
-            for (i, entry) in entries.iter().enumerate() {
-                if candidates
-                    .as_ref()
-                    .is_some_and(|paths| !paths.contains(&entry.relative_path))
-                {
-                    continue;
-                }
-                let full_path = root.join(&entry.relative_path);
-                let rel_path = prefix
-                    .join(&entry.relative_path)
-                    .to_string_lossy()
-                    .into_owned();
-                join_set.spawn(async move {
-                    if let Ok(meta) = tokio::fs::metadata(&full_path).await
-                        && meta.len() > max_file_size
-                    {
-                        return (i, rel_path, None);
-                    }
-                    let content = tokio::fs::read_to_string(&full_path).await.ok();
-                    (i, rel_path, content)
-                });
-            }
-
-            let mut file_contents: Vec<(usize, String, Option<String>)> =
-                Vec::with_capacity(entries.len());
-            while let Some(result) = join_set.join_next().await {
-                if let Ok(item) = result {
-                    file_contents.push(item);
-                }
-            }
-            file_contents.sort_unstable_by_key(|(i, _, _)| *i);
-            let read_ms = started.elapsed().as_millis() - walk_ms;
-
-            // Parsing runs in parallel; a file whose content matches the
-            // snapshot's document keeps that document's parsed fields.
-            let doc_shape = config.embed_doc_shape;
-            let seed_config = config.clone();
-            let seed_ref = Arc::clone(&ref_index);
-            // A worktree takes the documents of files identical to its parent's,
-            // and forks the parent's index when it can.
+            // A worktree forks its parent's index when it can.
             let base = match &fork_parent {
                 Some(parent) => forkable_base(parent).await,
                 None => None,
             };
-            let parent_index = match (&base, ref_index.parent_ref_id) {
-                (Some(base), _) => Some(Arc::clone(base)),
-                (None, Some(parent_id)) => match self.state.ref_index(parent_id).await {
-                    Some(parent) => parent
-                        .search_index_cache
-                        .read()
-                        .await
-                        .clone()
-                        .filter(|cached| cached.search_root() == parent.canonical_root),
-                    None => None,
-                },
-                (None, None) => None,
-            };
-            let (mut docs, content_hashes, embedding_texts, reused) =
-                tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    let seeds = crate::server::snapshots::file_seed(&seed_config, &seed_ref);
-                    let parent_documents = documents_by_path(parent_index.as_deref());
-                    let built: Vec<(SearchDocument, (String, String), String, bool)> =
-                        file_contents
-                            .into_par_iter()
-                            .filter_map(|(_, rel_path, content)| {
-                                let content = content?;
-                                let hash = content_hash(&content);
-                                let embedding_text =
-                                    build_embedding_document(&rel_path, &content, doc_shape);
-                                let (doc, reused) = walk_document(
-                                    &rel_path,
-                                    &content,
-                                    &hash,
-                                    seeds.as_deref(),
-                                    &parent_documents,
-                                );
-                                Some((doc, (rel_path, hash), embedding_text, reused))
-                            })
-                            .collect();
-                    let reused = built.iter().filter(|(.., reused)| *reused).count();
-                    let mut docs = Vec::with_capacity(built.len());
-                    let mut content_hashes = Vec::with_capacity(built.len());
-                    let mut embedding_texts = Vec::with_capacity(built.len());
-                    for (doc, hash, text, _) in built {
-                        docs.push(doc);
-                        content_hashes.push(hash);
-                        embedding_texts.push(text);
-                    }
-                    (docs, content_hashes, embedding_texts, reused)
-                })
+            let replacement_dims = ref_index
+                .search_index_cache
+                .read()
                 .await
-                .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
-            if full_walk {
-                crate::server::snapshots::file_seed_used(&ref_index);
-                if reused < docs.len() {
-                    let change = match reused {
-                        0 => crate::server::snapshots::Change::Full,
-                        _ => crate::server::snapshots::Change::Files {
-                            changed: docs.len() - reused,
-                            documents: docs.len(),
-                        },
-                    };
-                    crate::server::snapshots::schedule_files(&config, &ref_index, change);
+                .as_ref()
+                .and_then(|entry| entry.pending_vector_dimensions());
+            let base =
+                base.filter(|base| replacement_dims.is_none_or(|dims| dims == base.index.dims()));
+            let forked = match (&fork_parent, &base) {
+                (Some(parent), Some(base)) => self.fork_documents(&root, parent, base).await,
+                _ => None,
+            };
+            let (docs, content_hashes, embedding_texts, shared) = match forked {
+                Some((docs, content_hashes, embedding_texts, shared)) => {
+                    (docs, content_hashes, embedding_texts, Some(shared))
                 }
-            }
-
-            for (doc, (_, hash)) in docs.iter_mut().zip(&content_hashes) {
-                doc.source_hash = hash.clone();
-                doc.path = Path::new(&doc.path)
-                    .strip_prefix(prefix)
-                    .unwrap_or(Path::new(&doc.path))
-                    .to_string_lossy()
-                    .into_owned();
-            }
-
-            tracing::info!(
-                phase = "semantic_walk",
-                walk_ms,
-                read_ms,
-                documents_ms = started.elapsed().as_millis() - walk_ms - read_ms,
-                documents = docs.len(),
-                reused,
-                "cold-start phase"
-            );
+                None => {
+                    let (docs, content_hashes, embedding_texts) = self
+                        .read_documents(
+                            &root,
+                            prefix,
+                            &ref_index,
+                            candidates.as_ref(),
+                            full_walk,
+                            base.clone(),
+                        )
+                        .await?;
+                    let shared = base
+                        .as_ref()
+                        .and_then(|base| Shared::of(&base.index, &docs));
+                    (docs, content_hashes, embedding_texts, shared)
+                }
+            };
 
             #[cfg(test)]
             test_seams::after_file_snapshot(&root, &content_hashes).await;
@@ -611,18 +552,8 @@ impl CachedWalkerIndexer {
             if docs.is_empty() {
                 return Ok((docs, Vec::new()));
             }
-            let replacement_dims = ref_index
-                .search_index_cache
-                .read()
-                .await
-                .as_ref()
-                .and_then(|entry| entry.pending_vector_dimensions());
             // Documents identical to the forked parent's keep its vectors, which
             // live in its shared store; only the worktree's changes need theirs.
-            let shared = base
-                .as_ref()
-                .filter(|base| replacement_dims.is_none_or(|dims| dims == base.index.dims()))
-                .and_then(|base| Shared::of(&base.index, &docs));
             let mut borrowed = vec![false; docs.len()];
 
             let parent_vectors = match ref_index.parent_ref_id {
@@ -1036,6 +967,333 @@ impl CachedWalkerIndexer {
                 (None, _) => Ok((docs, vectors)),
             }
         })
+    }
+
+    /// Walks `root` and reads its files, or the `candidates` among them, into
+    /// documents with their content hashes and embedding texts. A file whose
+    /// content matches the snapshot's document, or its parent's (`base` when
+    /// forkable), keeps that document's parsed fields.
+    async fn read_documents(
+        &self,
+        root: &Path,
+        prefix: &Path,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        candidates: Option<&std::collections::HashSet<String>>,
+        full_walk: bool,
+        base: Option<Arc<CachedSearchIndex>>,
+    ) -> Result<(Vec<SearchDocument>, Vec<(String, String)>, Vec<String>)> {
+        let config = &self.config;
+        let started = std::time::Instant::now();
+        let entries = walk_with_config(root, config);
+        let walk_ms = started.elapsed().as_millis();
+
+        let max_file_size = config.max_embed_file_size as u64;
+        // Read all files concurrently (up to 32 at a time)
+        let mut join_set = tokio::task::JoinSet::new();
+        for (i, entry) in entries.iter().enumerate() {
+            if candidates.is_some_and(|paths| !paths.contains(&entry.relative_path)) {
+                continue;
+            }
+            let full_path = root.join(&entry.relative_path);
+            let rel_path = prefix
+                .join(&entry.relative_path)
+                .to_string_lossy()
+                .into_owned();
+            #[cfg(test)]
+            test_seams::file_read(root, &entry.relative_path);
+            join_set.spawn(async move {
+                if let Ok(meta) = tokio::fs::metadata(&full_path).await
+                    && meta.len() > max_file_size
+                {
+                    return (i, rel_path, None);
+                }
+                let content = tokio::fs::read_to_string(&full_path).await.ok();
+                (i, rel_path, content)
+            });
+        }
+
+        let mut file_contents: Vec<(usize, String, Option<String>)> =
+            Vec::with_capacity(entries.len());
+        while let Some(result) = join_set.join_next().await {
+            if let Ok(item) = result {
+                file_contents.push(item);
+            }
+        }
+        file_contents.sort_unstable_by_key(|(i, _, _)| *i);
+        let read_ms = started.elapsed().as_millis() - walk_ms;
+
+        // Parsing runs in parallel; a file whose content matches the
+        // snapshot's document keeps that document's parsed fields.
+        let doc_shape = config.embed_doc_shape;
+        let seed_config = config.clone();
+        let seed_ref = Arc::clone(ref_index);
+        // A worktree takes the documents of files identical to its parent's.
+        let parent_index = match (base, ref_index.parent_ref_id) {
+            (Some(base), _) => Some(base),
+            (None, Some(parent_id)) => match self.state.ref_index(parent_id).await {
+                Some(parent) => parent
+                    .search_index_cache
+                    .read()
+                    .await
+                    .clone()
+                    .filter(|cached| cached.search_root() == parent.canonical_root),
+                None => None,
+            },
+            (None, None) => None,
+        };
+        let (mut docs, content_hashes, embedding_texts, reused) =
+            tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                let seeds = crate::server::snapshots::file_seed(&seed_config, &seed_ref);
+                let parent_documents = documents_by_path(parent_index.as_deref());
+                let built: Vec<(SearchDocument, (String, String), String, bool)> = file_contents
+                    .into_par_iter()
+                    .filter_map(|(_, rel_path, content)| {
+                        let content = content?;
+                        let hash = content_hash(&content);
+                        let embedding_text =
+                            build_embedding_document(&rel_path, &content, doc_shape);
+                        let (doc, reused) = walk_document(
+                            &rel_path,
+                            &content,
+                            &hash,
+                            seeds.as_deref(),
+                            &parent_documents,
+                        );
+                        Some((doc, (rel_path, hash), embedding_text, reused))
+                    })
+                    .collect();
+                let reused = built.iter().filter(|(.., reused)| *reused).count();
+                let mut docs = Vec::with_capacity(built.len());
+                let mut content_hashes = Vec::with_capacity(built.len());
+                let mut embedding_texts = Vec::with_capacity(built.len());
+                for (doc, hash, text, _) in built {
+                    docs.push(doc);
+                    content_hashes.push(hash);
+                    embedding_texts.push(text);
+                }
+                (docs, content_hashes, embedding_texts, reused)
+            })
+            .await
+            .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
+        if full_walk {
+            crate::server::snapshots::file_seed_used(ref_index);
+            if reused < docs.len() {
+                let change = match reused {
+                    0 => crate::server::snapshots::Change::Full,
+                    _ => crate::server::snapshots::Change::Files {
+                        changed: docs.len() - reused,
+                        documents: docs.len(),
+                    },
+                };
+                crate::server::snapshots::schedule_files(config, ref_index, change);
+            }
+        }
+
+        for (doc, (_, hash)) in docs.iter_mut().zip(&content_hashes) {
+            doc.source_hash = hash.clone();
+            doc.path = Path::new(&doc.path)
+                .strip_prefix(prefix)
+                .unwrap_or(Path::new(&doc.path))
+                .to_string_lossy()
+                .into_owned();
+        }
+
+        tracing::info!(
+            phase = "semantic_walk",
+            walk_ms,
+            read_ms,
+            documents_ms = started.elapsed().as_millis() - walk_ms - read_ms,
+            documents = docs.len(),
+            reused,
+            "cold-start phase"
+        );
+        Ok((docs, content_hashes, embedding_texts))
+    }
+
+    /// The documents of a full walk of the worktree at `root` whose parent
+    /// holds the forkable `base`, and which of them are `base`'s. A file the
+    /// parent's cached contents show unchanged takes `base`'s document unread
+    /// when `base` indexed those contents with a vector; the other files are
+    /// read. `None` when those contents are unavailable or the worktree's
+    /// changes pass the promotion threshold.
+    async fn fork_documents(
+        &self,
+        root: &Path,
+        parent: &Arc<crate::ref_index::RefIndex>,
+        base: &Arc<CachedSearchIndex>,
+    ) -> Option<(
+        Vec<SearchDocument>,
+        Vec<(String, String)>,
+        Vec<String>,
+        Shared,
+    )> {
+        let files = crate::server::worktree_file_base(&self.state, parent).await?;
+        let started = std::time::Instant::now();
+        let config = self.config.clone();
+        let walk_root = root.to_path_buf();
+        let files = tokio::task::spawn_blocking(move || {
+            crate::server::load_project_cache(&walk_root, &config, Some(files), false)
+        })
+        .await
+        .ok()?;
+        files.file_content.base()?;
+        let walk_ms = started.elapsed().as_millis();
+
+        let max_size = self.config.max_embed_file_size;
+        let files = Arc::new(files);
+        let (classify_files, classify_base) = (Arc::clone(&files), Arc::clone(base));
+        let walked: Vec<(String, Walked)> = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let held = positions_by_path(&classify_base.index);
+            let contents = &classify_files.file_content;
+            classify_files
+                .file_entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory)
+                .map(|entry| {
+                    let path = &entry.relative_path;
+                    let walked = match contents.own().get(path) {
+                        Some(content) if content.len() > max_size => Walked::Skipped,
+                        Some(content) => Walked::Read(Some(Arc::clone(content))),
+                        None if contents.shadows(path) => Walked::Read(None),
+                        None => match contents.get(path) {
+                            Some(content) if content.len() > max_size => Walked::Skipped,
+                            Some(content) => {
+                                let hash = content_hash(content);
+                                held.get(path.as_str())
+                                    .copied()
+                                    .filter(|&at| {
+                                        holds(&classify_base.index, at, path, content, &hash)
+                                    })
+                                    .map_or(Walked::Read(None), Walked::Shared)
+                            }
+                            None => Walked::Read(None),
+                        },
+                    };
+                    (path.clone(), walked)
+                })
+                .collect()
+        })
+        .await
+        .ok()?;
+
+        // Files the parent's contents do not vouch for are read as a walk reads them.
+        let read_started = std::time::Instant::now();
+        let mut join_set = tokio::task::JoinSet::new();
+        for (i, (path, walked)) in walked.iter().enumerate() {
+            if !matches!(walked, Walked::Read(None)) {
+                continue;
+            }
+            let full_path = root.join(path);
+            #[cfg(test)]
+            test_seams::file_read(root, path);
+            join_set.spawn(async move {
+                if let Ok(meta) = tokio::fs::metadata(&full_path).await
+                    && meta.len() > max_size as u64
+                {
+                    return (i, None);
+                }
+                (
+                    i,
+                    tokio::fs::read_to_string(&full_path)
+                        .await
+                        .ok()
+                        .map(Arc::new),
+                )
+            });
+        }
+        let mut walked = walked;
+        let mut read = 0usize;
+        while let Some(result) = join_set.join_next().await {
+            if let Ok((i, content)) = result {
+                read += 1;
+                walked[i].1 =
+                    content.map_or(Walked::Skipped, |content| Walked::Read(Some(content)));
+            }
+        }
+        let read_ms = read_started.elapsed().as_millis();
+
+        let doc_shape = self.config.embed_doc_shape;
+        let base = Arc::clone(base);
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let held = positions_by_path(&base.index);
+            let parent_documents = documents_by_path(Some(&*base));
+            let built: Vec<_> = walked
+                .into_par_iter()
+                .filter_map(|(path, walked)| match walked {
+                    Walked::Shared(at) => {
+                        let doc = base.index.documents()[at].clone();
+                        let hash = doc.source_hash.clone();
+                        Some((Some(at), doc, (path, hash), String::new()))
+                    }
+                    Walked::Read(Some(content)) => {
+                        let hash = content_hash(&content);
+                        let shared = held
+                            .get(path.as_str())
+                            .copied()
+                            .filter(|&at| holds(&base.index, at, &path, &content, &hash));
+                        if let Some(at) = shared {
+                            let doc = base.index.documents()[at].clone();
+                            return Some((Some(at), doc, (path, hash), String::new()));
+                        }
+                        let text = build_embedding_document(&path, &content, doc_shape);
+                        let (mut doc, _) =
+                            walk_document(&path, &content, &hash, None, &parent_documents);
+                        doc.source_hash = hash.clone();
+                        Some((None, doc, (path, hash), text))
+                    }
+                    Walked::Read(None) | Walked::Skipped => None,
+                })
+                .collect();
+            let walked_paths: std::collections::HashSet<&str> =
+                built.iter().map(|(_, doc, ..)| doc.path.as_str()).collect();
+            let deleted: Vec<String> = base
+                .index
+                .documents()
+                .iter()
+                .filter(|doc| !walked_paths.contains(doc.path.as_str()))
+                .map(|doc| doc.path.clone())
+                .collect();
+            let reused = built.iter().filter(|(at, ..)| at.is_some()).count();
+            if ((built.len() - reused) + deleted.len()) as f64
+                > base.index.documents().len() as f64
+                    * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
+            {
+                return None;
+            }
+            let mut positions = Vec::with_capacity(built.len());
+            let mut docs = Vec::with_capacity(built.len());
+            let mut content_hashes = Vec::with_capacity(built.len());
+            let mut embedding_texts = Vec::with_capacity(built.len());
+            for (at, doc, hash, text) in built {
+                positions.push(at);
+                docs.push(doc);
+                content_hashes.push(hash);
+                embedding_texts.push(text);
+            }
+            tracing::info!(
+                phase = "semantic_walk",
+                walk_ms,
+                read_ms,
+                documents_ms = started.elapsed().as_millis() - walk_ms - read_ms,
+                documents = docs.len(),
+                reused,
+                changed = files.file_content.own().len(),
+                read,
+                "cold-start phase"
+            );
+            Some((
+                docs,
+                content_hashes,
+                embedding_texts,
+                Shared { positions, deleted },
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Installs `base` forked over a worktree walk's changes as the worktree's
@@ -1572,6 +1830,35 @@ impl WalkStart {
                 .map(Arc::downgrade),
         }
     }
+}
+
+/// A file of a worktree's walk over its parent's forkable index.
+enum Walked {
+    /// Its content is the one the parent's index holds at this position.
+    Shared(usize),
+    /// Its content, or `None` until it is read.
+    Read(Option<Arc<String>>),
+    /// Not indexed: past the size limit or unreadable.
+    Skipped,
+}
+
+/// Positions of `index`'s documents by path.
+fn positions_by_path(index: &SearchIndex) -> HashMap<&str, usize> {
+    index
+        .documents()
+        .iter()
+        .enumerate()
+        .map(|(at, doc)| (doc.path.as_str(), at))
+        .collect()
+}
+
+/// Whether `index`'s document at `at` holds `content`, hashed `hash`, of the
+/// file at `path`, with a vector.
+fn holds(index: &SearchIndex, at: usize, path: &str, content: &str, hash: &str) -> bool {
+    let doc = &index.documents()[at];
+    doc.source_hash == hash
+        && index.vector_at(at).is_some()
+        && doc.content == semantic_embedding_content(path, content)
 }
 
 /// A worktree walk's documents identical to its parent's, which a fork of the

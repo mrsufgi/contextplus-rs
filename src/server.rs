@@ -1133,7 +1133,7 @@ fn base_is_current(cache: &ProjectCache, base: &Option<Arc<ProjectCache>>) -> bo
 /// blob the base recorded in `clean_blobs`, and of the same size, is not read.
 /// Past `FULL_REBUILD_CHANGE_FRACTION` of the base, builds flat. With
 /// `record_clean_blobs` and no base, records `clean_blobs` for worktrees.
-fn load_project_cache(
+pub(crate) fn load_project_cache(
     root: &std::path::Path,
     config: &Config,
     base: Option<Arc<ProjectCache>>,
@@ -1165,7 +1165,11 @@ fn load_project_cache(
     let (file_entries, file_content) = STRUCTURAL_POOL.install(|| {
         let file_entries = walk_with_config(root, config);
         walk_ms = started.elapsed().as_millis();
-        let read = |path: &String| std::fs::read_to_string(root.join(path)).ok().map(Arc::new);
+        let read = |path: &String| {
+            #[cfg(test)]
+            crate::server_adapters::test_seams::file_read(root, path);
+            std::fs::read_to_string(root.join(path)).ok().map(Arc::new)
+        };
         let layered = base.map(|(base, unchanged)| {
             // Same clean blob is not same bytes under a smudge filter or eol
             // conversion that differs between the trees; a size check catches most.
@@ -5510,6 +5514,29 @@ async fn import_baseline_for_ref(
         hits: hit_count,
         misses,
     }
+}
+
+/// The flat file cache of the primary `parent` that a linked worktree's files
+/// layer over: the one it holds, however old, else a fresh one. Its clean
+/// blobs and contents were recorded together, so any age will do.
+pub(crate) async fn worktree_file_base(
+    state: &Arc<SharedState>,
+    parent: &Arc<crate::ref_index::RefIndex>,
+) -> Option<Arc<ProjectCache>> {
+    let flat = |cache: &Arc<ProjectCache>| cache.file_content.base().is_none();
+    if let Some(cache) = parent.project_cache.read().await.clone().filter(flat) {
+        return Some(cache);
+    }
+    let server = ContextPlusServer {
+        state: Arc::clone(state),
+        session_ref_id: None,
+        session_config_warning: None,
+    };
+    server
+        .ensure_project_cache_for(parent)
+        .await
+        .ok()
+        .filter(flat)
 }
 
 /// Embed the diff chunks (CAS misses from [`import_baseline_for_ref`]) via
@@ -18261,6 +18288,86 @@ mod tests {
         assert_eq!(
             shared, 0,
             "the first query re-read {shared} files it shares with the primary"
+        );
+    }
+
+    /// A primary of [`SEMANTIC_FORK_FILES`] files in git, its file cache built
+    /// as the daemon's preload builds it, and a linked worktree edited by `edit`.
+    async fn semantic_fork_git_servers(
+        edit: fn(&std::path::Path),
+    ) -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        ContextPlusServer,
+    ) {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, holder, worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        lexdelta_add_worktree(primary.path(), &worktree, "main");
+        edit(&worktree);
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        server.ensure_project_cache().await.unwrap();
+        (ollama, primary, holder, worktree, server)
+    }
+
+    /// A worktree's first query reads from disk only the files that differ
+    /// from the primary's; the others keep the primary's documents unread.
+    #[tokio::test]
+    async fn semantic_fork_first_query_reads_only_the_worktree_changes() {
+        let (_ollama, _primary, _holder, worktree, server) =
+            semantic_fork_git_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        let session = attached_worktree(&server, &worktree).await;
+        crate::server_adapters::test_seams::record_reads(&worktree);
+
+        semantic_fork_query(&session).await;
+        let mut read = crate::server_adapters::test_seams::reads(&worktree);
+        read.sort_unstable();
+        read.dedup();
+        assert!(
+            read == ["src/area_1/file_1.rs", "src/area_2/worktree_added.rs"],
+            "the first query read {} files, not only the 2 the worktree changed",
+            read.len()
+        );
+        let fork = semantic_fork_index(&session).await;
+        assert!(
+            fork.index
+                .shares_vector_store(&semantic_fork_index(&server).await.index)
+        );
+        assert_eq!(
+            semantic_fork_hits(&fork),
+            semantic_fork_standalone_hits(&server, &worktree).await
+        );
+    }
+
+    /// A primary file edited after the primary's file cache was built: that
+    /// cache still shows the worktree's copy unchanged, but the primary's
+    /// document no longer holds its content, so the worktree reads the file.
+    #[tokio::test]
+    async fn semantic_fork_reads_a_file_the_primary_edited_after_its_file_cache() {
+        let (_ollama, primary, _holder, worktree, server) =
+            semantic_fork_git_servers(lexdelta_edit_worktree).await;
+        let edited = "src/area_1/file_5.rs";
+        std::fs::write(
+            primary.path().join(edited),
+            "pub fn primaryedited() -> usize { 5 }\n// shared symbol primary edit\n",
+        )
+        .unwrap();
+        semantic_fork_query(&server).await;
+        let session = attached_worktree(&server, &worktree).await;
+        crate::server_adapters::test_seams::record_reads(&worktree);
+
+        semantic_fork_query(&session).await;
+        let read = crate::server_adapters::test_seams::reads(&worktree);
+        assert!(
+            read.iter().any(|path| path == edited),
+            "the worktree took the primary's document of a file the primary edited"
+        );
+        let fork = semantic_fork_index(&session).await;
+        assert_eq!(
+            semantic_fork_hits(&fork),
+            semantic_fork_standalone_hits(&server, &worktree).await
         );
     }
 
