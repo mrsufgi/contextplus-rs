@@ -18213,6 +18213,57 @@ mod tests {
         );
     }
 
+    /// A forked worktree's file-vector cache holds only the vectors of its own
+    /// changes; the vectors of files identical to the primary's stay in the
+    /// shared store.
+    #[tokio::test]
+    async fn semantic_fork_worktree_caches_only_its_own_vectors() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&semantic_fork_index(&server).await.index)
+        );
+
+        let owner = session.current_ref().await;
+        let cache = owner.embedding_cache.read().await;
+        let mut cached: Vec<&str> = cache.keys().map(String::as_str).collect();
+        cached.sort_unstable();
+        assert!(
+            cached == ["src/area_1/file_1.rs", "src/area_2/worktree_added.rs"],
+            "the forked worktree caches {} vectors, not only its own 2",
+            cached.len()
+        );
+    }
+
+    /// A worktree's first query re-reads none of the files it shares with the
+    /// primary to validate a copy of their vectors.
+    #[tokio::test]
+    async fn semantic_fork_first_query_revalidates_only_the_worktree_changes() {
+        let (_ollama, _primary, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        let root = worktree.path().canonicalize().unwrap();
+        crate::server_adapters::test_seams::record_revalidations(&root);
+
+        semantic_fork_query(&session).await;
+        let revalidated = crate::server_adapters::test_seams::revalidations(&root);
+        let shared = revalidated
+            .iter()
+            .filter(|path| {
+                *path != "src/area_1/file_1.rs" && *path != "src/area_2/worktree_added.rs"
+            })
+            .count();
+        assert_eq!(
+            shared, 0,
+            "the first query re-read {shared} files it shares with the primary"
+        );
+    }
+
     const BENCH_TOPICS: [&str; 10] = [
         "invoice", "payment", "ledger", "account", "session", "token", "order", "shipment",
         "report", "refund",

@@ -13,7 +13,8 @@ use crate::core::walker::walk_with_config;
 use crate::error::Result;
 use crate::server::{SharedState, build_embedding_document, cache_name};
 use crate::tools::semantic_search::{
-    CachedSearchIndex, EmbedFn, SearchDocument, WalkAndIndexFn, semantic_embedding_content,
+    CachedSearchIndex, EmbedFn, IndexFingerprint, SearchDocument, SearchIndex, WalkAndIndexFn,
+    semantic_embedding_content,
 };
 
 #[cfg(test)]
@@ -124,6 +125,33 @@ pub(crate) mod test_seams {
             pause.entered.add_permits(1);
             pause.resume.acquire().await.unwrap().forget();
         }
+    }
+
+    fn revalidation_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<String>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Records the paths whose content is checked on disk under `root` from now on.
+    pub(crate) fn record_revalidations(root: &Path) {
+        revalidation_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Vec::new());
+    }
+
+    pub(crate) fn revalidated(root: &Path, path: &str) {
+        if let Some(paths) = revalidation_slots().lock().unwrap().get_mut(root) {
+            paths.push(path.to_string());
+        }
+    }
+
+    pub(crate) fn revalidations(root: &Path) -> Vec<String> {
+        revalidation_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
     }
 
     pub(crate) async fn seed_pending(
@@ -489,9 +517,15 @@ impl CachedWalkerIndexer {
             let doc_shape = config.embed_doc_shape;
             let seed_config = config.clone();
             let seed_ref = Arc::clone(&ref_index);
-            // A worktree takes the documents of files identical to its parent's.
-            let parent_index = match ref_index.parent_ref_id {
-                Some(parent_id) => match self.state.ref_index(parent_id).await {
+            // A worktree takes the documents of files identical to its parent's,
+            // and forks the parent's index when it can.
+            let base = match &fork_parent {
+                Some(parent) => forkable_base(parent).await,
+                None => None,
+            };
+            let parent_index = match (&base, ref_index.parent_ref_id) {
+                (Some(base), _) => Some(Arc::clone(base)),
+                (None, Some(parent_id)) => match self.state.ref_index(parent_id).await {
                     Some(parent) => parent
                         .search_index_cache
                         .read()
@@ -500,7 +534,7 @@ impl CachedWalkerIndexer {
                         .filter(|cached| cached.search_root() == parent.canonical_root),
                     None => None,
                 },
-                None => None,
+                (None, None) => None,
             };
             let (mut docs, content_hashes, embedding_texts, reused) =
                 tokio::task::spawn_blocking(move || {
@@ -577,6 +611,19 @@ impl CachedWalkerIndexer {
             if docs.is_empty() {
                 return Ok((docs, Vec::new()));
             }
+            let replacement_dims = ref_index
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .and_then(|entry| entry.pending_vector_dimensions());
+            // Documents identical to the forked parent's keep its vectors, which
+            // live in its shared store; only the worktree's changes need theirs.
+            let shared = base
+                .as_ref()
+                .filter(|base| replacement_dims.is_none_or(|dims| dims == base.index.dims()))
+                .and_then(|base| Shared::of(&base.index, &docs));
+            let mut borrowed = vec![false; docs.len()];
 
             let parent_vectors = match ref_index.parent_ref_id {
                 Some(parent_id) => self
@@ -637,6 +684,14 @@ impl CachedWalkerIndexer {
             let mut uncached_texts: Vec<String> = Vec::new();
 
             for (i, (rel_path, hash)) in content_hashes.iter().enumerate() {
+                if let (Some(shared), Some(base)) = (&shared, &base)
+                    && let Some(vector) =
+                        shared.positions[i].and_then(|at| base.index.vector_at(at))
+                {
+                    vectors.push(Some(vector.to_vec()));
+                    borrowed[i] = true;
+                    continue;
+                }
                 if let Some(entry) = cache_read.get(rel_path)
                     && entry.hash == *hash
                 {
@@ -669,7 +724,12 @@ impl CachedWalkerIndexer {
                         && let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash)
                     {
                         vectors[idx] = Some(entry.vector.clone());
-                        inherited.push((idx, entry.clone()));
+                        // A fork keeps only its own vectors in its cache.
+                        if shared.is_some() {
+                            borrowed[idx] = true;
+                        } else {
+                            inherited.push((idx, entry.clone()));
+                        }
                     }
                 }
                 tracing::info!(
@@ -778,7 +838,7 @@ impl CachedWalkerIndexer {
             let cache = embedding_cache.read().await;
             let mut pending = Vec::new();
             for (idx, (path, hash)) in content_hashes.iter().enumerate() {
-                if !current[idx] {
+                if !current[idx] || borrowed[idx] {
                     continue;
                 }
                 if let Some(entry) = cache.get(path).filter(|entry| entry.hash == *hash) {
@@ -928,7 +988,9 @@ impl CachedWalkerIndexer {
                 let missing: Vec<_> = vectors
                     .iter()
                     .enumerate()
-                    .filter(|(_, vector)| vector.as_ref().is_none_or(|v| v.len() != dims))
+                    .filter(|(i, vector)| {
+                        !borrowed[*i] && vector.as_ref().is_none_or(|v| v.len() != dims)
+                    })
                     .map(|(i, _)| i)
                     .collect();
                 if !missing.is_empty() {
@@ -960,14 +1022,92 @@ impl CachedWalkerIndexer {
                     }
                 }
             }
-            match fork_parent {
-                Some(parent) => self
+            match (fork_parent, base.zip(shared)) {
+                (Some(parent), Some((base, shared))) => self
+                    .install_fork(
+                        &ref_index, &parent, base, shared, canonical, docs, vectors, walk_start,
+                    )
+                    .await
+                    .map(|(docs, vectors, _)| (docs, vectors)),
+                (Some(parent), None) => self
                     .seed_fork(&ref_index, &parent, canonical, docs, vectors, walk_start)
                     .await
                     .map(|(docs, vectors, _)| (docs, vectors)),
-                None => Ok((docs, vectors)),
+                (None, _) => Ok((docs, vectors)),
             }
         })
+    }
+
+    /// Installs `base` forked over a worktree walk's changes as the worktree's
+    /// index, unless the worktree's entry already shares `base`'s store.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_fork(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+        parent: &crate::ref_index::RefIndex,
+        base: Arc<CachedSearchIndex>,
+        shared: Shared,
+        root: std::path::PathBuf,
+        docs: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        start: WalkStart,
+    ) -> Result<(Vec<SearchDocument>, Vec<Option<Vec<f32>>>, bool)> {
+        // Recorded once forked or refused, so a fork dropped by a changed slot is retried.
+        let store = base.index.vector_store().map(Arc::downgrade);
+        let record = || {
+            if let Some(store) = &store {
+                *ref_index.fork_base.lock().unwrap() = store.clone();
+            }
+        };
+        if ref_index
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.index.shares_vector_store(&base.index))
+        {
+            record();
+            return Ok((docs, vectors, false));
+        }
+        let started = std::time::Instant::now();
+        let (generation, vector_generation) = (start.generation, start.vector_generation);
+        let changed: Vec<usize> = (0..docs.len())
+            .filter(|&i| shared.positions[i].is_none())
+            .collect();
+        let (docs, vectors, fork) = tokio::task::spawn_blocking(move || {
+            let fork = base.fork_delta(
+                &root,
+                changed.iter().map(|&i| docs[i].clone()).collect(),
+                changed.iter().map(|&i| vectors[i].clone()).collect(),
+                &shared.deleted,
+                IndexFingerprint::from_docs(&docs),
+                generation,
+                vector_generation,
+            );
+            (docs, vectors, fork)
+        })
+        .await
+        .map_err(|e| crate::error::ContextPlusError::Other(e.to_string()))?;
+        let Some(fork) = fork else {
+            record();
+            return Ok((docs, vectors, false));
+        };
+        let installed = fork.install(
+            &mut *ref_index.search_index_cache.write().await,
+            start.seen.as_ref(),
+        );
+        if installed {
+            record();
+        }
+        tracing::info!(
+            phase = "semantic_fork",
+            ref_id = %ref_index.cas_ref_id_hex,
+            parent_ref_id = %parent.cas_ref_id_hex,
+            installed,
+            elapsed_ms = started.elapsed().as_millis(),
+            "cold-start phase"
+        );
+        Ok((docs, vectors, installed))
     }
 
     /// Builds the parent's index of its whole root when the parent holds none,
@@ -1434,6 +1574,52 @@ impl WalkStart {
     }
 }
 
+/// A worktree walk's documents identical to its parent's, which a fork of the
+/// parent's index keeps with their vectors, and the parent's documents the
+/// walk no longer has.
+struct Shared {
+    /// For each walked document, the position of the parent's identical one.
+    positions: Vec<Option<usize>>,
+    deleted: Vec<String>,
+}
+
+impl Shared {
+    /// `None` when the walk's own changes pass the promotion threshold.
+    fn of(base: &SearchIndex, docs: &[SearchDocument]) -> Option<Self> {
+        let held: HashMap<&str, usize> = base
+            .documents()
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| (doc.path.as_str(), i))
+            .collect();
+        let positions: Vec<Option<usize>> = docs
+            .iter()
+            .map(|doc| {
+                held.get(doc.path.as_str()).copied().filter(|&i| {
+                    let old = &base.documents()[i];
+                    old.source_hash == doc.source_hash
+                        && old.content == doc.content
+                        && old.search_text == doc.search_text
+                        && base.vector_at(i).is_some()
+                })
+            })
+            .collect();
+        let walked: std::collections::HashSet<&str> =
+            docs.iter().map(|doc| doc.path.as_str()).collect();
+        let deleted: Vec<String> = base
+            .documents()
+            .iter()
+            .filter(|doc| !walked.contains(doc.path.as_str()))
+            .map(|doc| doc.path.clone())
+            .collect();
+        let changed = positions.iter().filter(|at| at.is_none()).count();
+        ((changed + deleted.len()) as f64
+            <= base.documents().len() as f64
+                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION)
+            .then_some(Self { positions, deleted })
+    }
+}
+
 /// The parent's semantic index when a worktree can fork it.
 async fn forkable_base(parent: &crate::ref_index::RefIndex) -> Option<Arc<CachedSearchIndex>> {
     let base = parent.search_index_cache.read().await.clone();
@@ -1450,6 +1636,8 @@ struct FillDocument {
 
 impl FillDocument {
     async fn is_current(&self, root: &Path, max_size: usize) -> bool {
+        #[cfg(test)]
+        test_seams::revalidated(root, &self.path);
         let path = root.join(&self.path);
         let hash = self.hash.clone();
         tokio::task::spawn_blocking(move || {

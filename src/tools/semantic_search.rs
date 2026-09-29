@@ -1283,6 +1283,26 @@ impl CachedSearchIndex {
         Some(entry)
     }
 
+    /// [`Self::fork`] from the worktree walk's `changed` documents and
+    /// `deleted` paths alone; `fingerprint` is the whole walk's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fork_delta(
+        &self,
+        root: &Path,
+        changed: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        deleted: &[String],
+        fingerprint: IndexFingerprint,
+        generation: u64,
+        vector_generation: u64,
+    ) -> Option<Self> {
+        let index = self.index.fork_delta(changed, vectors, deleted)?;
+        let mut entry = Self::new(index, fingerprint, generation);
+        entry.search_root = root.to_path_buf();
+        entry.vector_generation = vector_generation;
+        Some(entry)
+    }
+
     #[cfg(feature = "memory-profile")]
     pub(crate) fn resident_file_vector_bytes(&self) -> usize {
         self.index.resident_file_vector_bytes()
@@ -1702,11 +1722,15 @@ impl SearchIndex {
         &self.documents
     }
 
+    pub(crate) fn dims(&self) -> usize {
+        self.dims
+    }
+
     pub fn full_rebuild_count(&self) -> u64 {
         self.full_rebuilds
     }
 
-    fn vector_at(&self, i: usize) -> Option<&[f32]> {
+    pub(crate) fn vector_at(&self, i: usize) -> Option<&[f32]> {
         if !self.has_vector[i] {
             return None;
         }
@@ -1865,17 +1889,29 @@ impl SearchIndex {
             return None;
         }
         let (changed, deleted) = self.changes_from(docs, vectors);
-        if (changed.len() + deleted.len()) as f64
-            > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
+        self.fork_delta(
+            changed.iter().map(|&i| docs[i].clone()).collect(),
+            changed.iter().map(|&i| vectors[i].clone()).collect(),
+            &deleted,
+        )
+    }
+
+    /// This index moved to a checkout that differs from it by the `changed`
+    /// documents, with their `vectors`, and the `deleted` paths; see [`Self::fork`].
+    pub(crate) fn fork_delta(
+        &self,
+        changed: Vec<SearchDocument>,
+        vectors: Vec<Option<Vec<f32>>>,
+        deleted: &[String],
+    ) -> Option<SearchIndex> {
+        if vectors.iter().flatten().any(|v| v.len() != self.dims)
+            || (changed.len() + deleted.len()) as f64
+                > self.documents.len() as f64 * FULL_REBUILD_CHANGE_FRACTION
         {
             return None;
         }
         let mut fork = self.clone();
-        fork.apply_incremental(
-            changed.iter().map(|&i| docs[i].clone()).collect(),
-            changed.iter().map(|&i| vectors[i].clone()).collect(),
-            &deleted,
-        );
+        fork.apply_incremental(changed, vectors, deleted);
         Some(fork)
     }
 
