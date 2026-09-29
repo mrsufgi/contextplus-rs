@@ -939,11 +939,13 @@ impl ResidentSnapshot {
             ));
         }
         if let Some(index) = &self.search_index {
-            components.push((
-                Arc::as_ptr(index) as usize,
-                index.own_resident_bytes(),
-                "semantic_index",
-            ));
+            let (own, shared) = index.resident_split();
+            components.push((Arc::as_ptr(index) as usize, own, "semantic_index"));
+            components.extend(
+                shared
+                    .into_iter()
+                    .map(|(ptr, bytes)| (ptr, bytes, "semantic_documents")),
+            );
             // Forks share the store, and keep an old one alive after the primary replaces it.
             if let Some(store) = index.index.vector_store() {
                 components.push((
@@ -1269,6 +1271,8 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
         .cache_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     *owner.semantic_fill.lock().await = Default::default();
+    // Before the vectors: a parent's persist that still sees the entry is cleared after.
+    *owner.search_index_cache.write().await = None;
     owner.embedding_cache.write().await.clear();
     *owner.identifier_index.write().await = None;
     *owner.identifier_source.write().await = None;
@@ -1304,7 +1308,6 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
         .store(false, std::sync::atomic::Ordering::Release);
     drop(overlay);
     drop(save_lock);
-    *owner.search_index_cache.write().await = None;
     *owner.lexical_search_cache.write().await = None;
     *owner.project_cache.write().await = None;
 }
@@ -1956,7 +1959,9 @@ impl ContextPlusServer {
     /// Shallow warmup (U20 contract):
     /// 1. Walks the ref's `root_dir` via `walk_with_config`.
     /// 2. Reads all non-directory files into `ref.project_cache`.
-    /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`.
+    /// 3. Runs tree-sitter parsing and populates `identifier_index.docs`; a
+    ///    worktree parses only the files that differ from an embedded
+    ///    primary identifier index.
     /// 4. Calls `import_baseline_for_ref` — for every chunk a fork of the
     ///    parent's index does not share, looks up the BLAKE3 hash in the CAS
     ///    parent chain.  Hits are loaded into `embedding_cache` and used to
@@ -2076,26 +2081,7 @@ impl ContextPlusServer {
             // We run the full parse pipeline (flatten_symbols + token_set) but
             // skip the embedding step.  The identifier search handler will rebuild
             // with embeddings on the first real tool call.
-            let cache_for_parse = Arc::clone(&new_cache);
-            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    cache_for_parse
-                        .file_entries
-                        .par_iter()
-                        .filter(|e| !e.is_directory)
-                        .filter_map(|entry| {
-                            let content = cache_for_parse.file_content.get(&entry.relative_path)?;
-                            crate::tools::semantic_identifiers::identifier_docs_for_file(
-                                &entry.relative_path,
-                                content,
-                            )
-                        })
-                        .flatten()
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+            let docs = server.warmup_identifier_docs(&ref_index, &new_cache).await;
             let file_count = new_cache
                 .file_entries
                 .iter()
@@ -2113,7 +2099,7 @@ impl ContextPlusServer {
                     };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
-                        docs: doc_list.into(),
+                        docs,
                         // vectors + dims left empty — shallow mode omits
                         // embedding calls.  Full mode (or first real tool call)
                         // will populate these fields.
@@ -2262,26 +2248,7 @@ impl ContextPlusServer {
             }
 
             // --- Phase 2: tree-sitter parse ---
-            let cache_for_parse = Arc::clone(&new_cache);
-            let doc_list: Vec<crate::tools::semantic_identifiers::IdentifierDoc> =
-                tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    cache_for_parse
-                        .file_entries
-                        .par_iter()
-                        .filter(|e| !e.is_directory)
-                        .filter_map(|entry| {
-                            let content = cache_for_parse.file_content.get(&entry.relative_path)?;
-                            crate::tools::semantic_identifiers::identifier_docs_for_file(
-                                &entry.relative_path,
-                                content,
-                            )
-                        })
-                        .flatten()
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+            let docs = server.warmup_identifier_docs(&ref_index, &new_cache).await;
             let file_count = new_cache
                 .file_entries
                 .iter()
@@ -2299,7 +2266,7 @@ impl ContextPlusServer {
                     };
                 if needs_update {
                     *guard = Some(Arc::new(IdentifierIndex {
-                        docs: doc_list.into(),
+                        docs,
                         vectors: IdentifierVectorIndex::empty(),
                         dims: 0,
                         file_count,
@@ -2847,6 +2814,13 @@ impl ContextPlusServer {
         // bound. Build the snapshot inside the write-guard scope, drop the
         // guard, then run the save off the Tokio worker via spawn_blocking.
         if !embed_failed {
+            crate::server_adapters::keep_moved_off_vectors(
+                &self.state,
+                &ref_index,
+                &self.state.config,
+                &deletions,
+            )
+            .await;
             let store_to_save = {
                 let cache = ref_index.embedding_cache.read().await;
                 let store = crate::core::embeddings::VectorStore::from_cache(&cache);
@@ -3061,25 +3035,82 @@ impl ContextPlusServer {
         &self,
         ref_index: &crate::ref_index::RefIndex,
     ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
-        let parent_id = ref_index.parent_ref_id?;
-        let parent = self.state.ref_index(parent_id).await?;
-        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
-            return None;
-        }
-        let parent_server = self.with_session(parent_id);
+        let parent = self.identifier_parent(ref_index).await?;
+        let parent_server = self.with_session(ref_index.parent_ref_id?);
         let parent_cache = parent_server.ensure_project_cache().await.ok()?;
         parent_server
             .ensure_identifier_index(&parent_cache)
             .await
             .ok()?;
-        let index = parent.identifier_index.read().await;
-        let source = parent.identifier_source.read().await;
+        Self::built_identifier_index(&parent).await
+    }
+
+    /// The primary checkout a linked worktree's identifier index seeds from.
+    async fn identifier_parent(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<Arc<crate::ref_index::RefIndex>> {
+        let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return None;
+        }
+        Some(parent)
+    }
+
+    /// A ref's embedded identifier index, paired with the project cache it
+    /// was built from, without building either.
+    async fn built_identifier_index(
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
+        let index = ref_index.identifier_index.read().await;
+        let source = ref_index.identifier_source.read().await;
         match (index.as_ref(), source.as_ref()) {
             (Some(index), Some(source)) if index.dims > 0 => {
                 Some((Arc::clone(index), Arc::clone(source)))
             }
             _ => None,
         }
+    }
+
+    /// The identifier documents of a warmup's project cache. A linked
+    /// worktree whose primary has an embedded identifier index takes the
+    /// primary's documents of every identical file and parses only the files
+    /// that differ; a missing primary index is never built here.
+    async fn warmup_identifier_docs(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+        cache: &Arc<ProjectCache>,
+    ) -> Segmented<crate::tools::semantic_identifiers::IdentifierDoc> {
+        let seed = match self.identifier_parent(ref_index).await {
+            Some(parent) => Self::built_identifier_index(&parent).await,
+            None => None,
+        };
+        let cache = Arc::clone(cache);
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let files: std::collections::BTreeMap<_, _> = cache
+                .file_entries
+                .par_iter()
+                .filter(|entry| !entry.is_directory)
+                .filter_map(|entry| {
+                    let path = &entry.relative_path;
+                    let content = cache.file_content.get(path)?;
+                    if let Some((index, source)) = &seed
+                        && source.file_content.get(path) == Some(content)
+                    {
+                        let docs = index.docs.files.get(path)?;
+                        return Some((path.clone(), Arc::clone(docs)));
+                    }
+                    let docs = crate::tools::semantic_identifiers::identifier_docs_for_file(
+                        path, content,
+                    )?;
+                    Some((path.clone(), Arc::new(docs)))
+                })
+                .collect();
+            Segmented::from_files(files)
+        })
+        .await
+        .unwrap_or_else(|_| Vec::new().into())
     }
 
     async fn build_identifier_index(
@@ -12053,40 +12084,42 @@ mod tests {
         assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
     }
 
+    /// Every field of an identifier index's documents, in index order.
+    fn identifier_documents(index: &IdentifierIndex) -> Vec<String> {
+        let sorted = |tokens: &std::collections::HashSet<String>| {
+            let mut tokens: Vec<_> = tokens.iter().cloned().collect();
+            tokens.sort();
+            tokens
+        };
+        index
+            .docs
+            .iter()
+            .map(|doc| {
+                format!(
+                    "{} {} {} {} {} {} {} {} {:?} {} {:?} {:?} {:?}",
+                    doc.id,
+                    doc.path,
+                    doc.header,
+                    doc.name,
+                    doc.kind,
+                    doc.line,
+                    doc.end_line,
+                    doc.signature,
+                    doc.parent_name,
+                    doc.text,
+                    sorted(&doc.name_token_set),
+                    sorted(&doc.signature_token_set),
+                    sorted(&doc.parent_token_set),
+                )
+            })
+            .collect()
+    }
+
     /// A worktree build seeded from the primary's identifier index answers
     /// exactly as a full parse of the worktree does, whether its files are
     /// identical, changed, added or deleted.
     #[tokio::test]
     async fn worktree_identifier_build_from_primary_equals_full_parse() {
-        fn documents(index: &IdentifierIndex) -> Vec<String> {
-            let sorted = |tokens: &std::collections::HashSet<String>| {
-                let mut tokens: Vec<_> = tokens.iter().cloned().collect();
-                tokens.sort();
-                tokens
-            };
-            index
-                .docs
-                .iter()
-                .map(|doc| {
-                    format!(
-                        "{} {} {} {} {} {} {} {} {:?} {} {:?} {:?} {:?}",
-                        doc.id,
-                        doc.path,
-                        doc.header,
-                        doc.name,
-                        doc.kind,
-                        doc.line,
-                        doc.end_line,
-                        doc.signature,
-                        doc.parent_name,
-                        doc.text,
-                        sorted(&doc.name_token_set),
-                        sorted(&doc.signature_token_set),
-                        sorted(&doc.parent_token_set),
-                    )
-                })
-                .collect()
-        }
         fn vectors(index: &IdentifierIndex) -> Vec<(String, Vec<Vec<f32>>)> {
             index
                 .vectors
@@ -12137,10 +12170,115 @@ mod tests {
             .unwrap();
 
         assert!(!seeded.docs.files.contains_key("deleted.rs"));
-        assert_eq!(documents(&seeded), documents(&full));
+        assert_eq!(identifier_documents(&seeded), identifier_documents(&full));
         assert_eq!(vectors(&seeded), vectors(&full));
         assert_eq!(seeded.dims, full.dims);
         assert_eq!(seeded.file_count, full.file_count);
+    }
+
+    /// Writes the primary, worktree and reference trees of the shallow warmup
+    /// tests: the worktree and the reference keep one primary file, change
+    /// one, delete one and add one.
+    fn identifier_warmup_trees(
+        primary: &std::path::Path,
+        worktree: &std::path::Path,
+        reference: &std::path::Path,
+    ) {
+        std::fs::write(
+            primary.join("same.rs"),
+            "struct Kept;\nimpl Kept {\n    fn kept(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(primary.join("changed.rs"), "fn before() {}\n").unwrap();
+        std::fs::write(primary.join("deleted.rs"), "fn deleted() {}\n").unwrap();
+        for dir in [worktree, reference] {
+            std::fs::copy(primary.join("same.rs"), dir.join("same.rs")).unwrap();
+            std::fs::write(
+                dir.join("changed.rs"),
+                "fn after() {}\nfn after_too(x: u8) {}\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("added.rs"), "fn added() {}\n").unwrap();
+        }
+    }
+
+    /// Runs the shallow warmup of `server`'s ref and returns the identifier
+    /// index it installs.
+    async fn identifier_shallow_warmup(server: &ContextPlusServer) -> Arc<IdentifierIndex> {
+        let owner = server.current_ref().await;
+        server.spawn_shallow_warmup_task(crate::ref_index::RefId::for_canonical_path(
+            &owner.canonical_root,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(index) = owner.identifier_index.read().await.as_ref() {
+                    return Arc::clone(index);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the shallow warmup installed no identifier index")
+    }
+
+    /// A worktree's shallow warmup over a primary with an identifier index
+    /// takes the primary's documents of every identical file, parses only the
+    /// files that differ, calls no Ollama, and matches a standalone warmup.
+    #[tokio::test]
+    async fn worktree_shallow_warmup_seeds_identifiers_from_the_primary() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        identifier_warmup_trees(primary.path(), worktree.path(), reference.path());
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        // Attached first, as after a restart, so it inherits no index.
+        let session = attached_worktree(&server, worktree.path()).await;
+        let primary_cache = server.ensure_project_cache().await.unwrap();
+        let primary_index = server
+            .ensure_identifier_index(&primary_cache)
+            .await
+            .unwrap();
+        let embedded = ollama.received_requests().await.unwrap().len();
+
+        let seeded = identifier_shallow_warmup(&session).await;
+        assert!(
+            seeded
+                .docs
+                .files
+                .get("same.rs")
+                .is_some_and(|docs| Arc::ptr_eq(docs, &primary_index.docs.files["same.rs"])),
+            "the warmup parsed same.rs instead of taking the primary's documents"
+        );
+        assert!(!seeded.docs.files.contains_key("deleted.rs"));
+        assert_eq!(ollama.received_requests().await.unwrap().len(), embedded);
+
+        let standalone = identifier_test_server(&ollama, reference.path()).await;
+        let full = identifier_shallow_warmup(&standalone).await;
+        assert_eq!(identifier_documents(&seeded), identifier_documents(&full));
+        assert_eq!(seeded.file_count, full.file_count);
+    }
+
+    /// A worktree's shallow warmup over a primary with no identifier index
+    /// parses the whole worktree and builds nothing of the primary's.
+    #[tokio::test]
+    async fn worktree_shallow_warmup_over_a_primary_without_identifiers_parses_it_all() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        identifier_warmup_trees(primary.path(), worktree.path(), reference.path());
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+
+        let index = identifier_shallow_warmup(&session).await;
+        let primary_ref = server.state.default_ref().unwrap();
+        assert!(primary_ref.identifier_index.read().await.is_none());
+        assert_eq!(ollama.received_requests().await.unwrap().len(), 0);
+
+        let standalone = identifier_test_server(&ollama, reference.path()).await;
+        let full = identifier_shallow_warmup(&standalone).await;
+        assert_eq!(identifier_documents(&index), identifier_documents(&full));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17247,6 +17385,49 @@ mod tests {
         assert!(result.contains("1. src/"), "{result}");
     }
 
+    /// A fork's unchanged documents are the primary's, measured once.
+    #[tokio::test]
+    async fn semantic_fork_resident_estimate_excludes_the_primary_documents() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&semantic_fork_index(&server).await.index)
+        );
+
+        let semantic = |components: Vec<ResidentComponent>| {
+            components
+                .into_iter()
+                .filter(|(_, _, name)| name.starts_with("semantic"))
+                .collect::<Vec<_>>()
+        };
+        let primary = semantic(
+            ResidentSnapshot::capture(&server.state.default_ref().unwrap())
+                .await
+                .measure(),
+        );
+        let worktree = semantic(
+            ResidentSnapshot::capture(&*session.current_ref().await)
+                .await
+                .measure(),
+        );
+        let primary_bytes: usize = primary.iter().map(|(_, bytes, _)| bytes).sum();
+        let unique_bytes: usize = worktree
+            .iter()
+            .filter(|(ptr, _, _)| !primary.iter().any(|(shared, _, _)| shared == ptr))
+            .map(|(_, bytes, _)| bytes)
+            .sum();
+        assert!(primary_bytes > 0);
+        assert!(
+            unique_bytes * 20 < primary_bytes,
+            "a small fork holds {unique_bytes} unique bytes against a {primary_bytes}-byte primary"
+        );
+    }
+
     fn semantic_fork_walker(
         server: &ContextPlusServer,
         ref_index: Arc<crate::ref_index::RefIndex>,
@@ -17825,6 +18006,265 @@ mod tests {
         );
     }
 
+    /// The file vectors persisted under `root`.
+    fn semantic_fork_persisted(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+    ) -> HashMap<String, CacheEntry> {
+        let name = cache_name("embeddings", &server.state.config);
+        rkyv_store::mmap_vector_store(root, &name)
+            .unwrap()
+            .map(|store| store.to_cache())
+            .unwrap_or_default()
+    }
+
+    /// Waits until the vector of `path` at `content` is persisted under `root`.
+    async fn semantic_fork_await_persisted(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+        path: &str,
+        content: &str,
+    ) {
+        let hash = crate::core::embeddings::content_hash(content);
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while semantic_fork_persisted(server, root)
+                .get(path)
+                .is_none_or(|entry| entry.hash != hash)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{path} was never persisted"));
+    }
+
+    /// A vector the worktree shares with the primary survives a restart after
+    /// the primary moves off its content.
+    #[tokio::test]
+    async fn semantic_fork_restarted_worktree_keeps_a_vector_the_primary_moved_off() {
+        let (ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        let edited = "pub fn primaryedited() {}\n";
+        std::fs::write(primary_root.path().join("src/area_1/file_5.rs"), edited).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), "src/area_1/file_5.rs", edited)
+            .await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file whose vector the primary moved off"
+        );
+    }
+
+    /// The worktree's embeds of `src/area_1/file_5.rs` at its first query
+    /// after a restart.
+    async fn semantic_fork_restarted_worktree_embeds(
+        ollama: &wiremock::MockServer,
+        primary: &std::path::Path,
+        worktree: &std::path::Path,
+    ) -> usize {
+        let embedded = matching_embed_input_count(ollama, "shared_symbol_5(").await;
+        let restarted = identifier_test_server(ollama, primary).await;
+        let session = attached_worktree(&restarted, worktree).await;
+        semantic_fork_query(&session).await;
+        matching_embed_input_count(ollama, "shared_symbol_5(").await - embedded
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_restarted_worktree_keeps_a_vector_a_tracked_primary_edit_moved_off() {
+        let (ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        let file = primary_root.path().join("src/area_1/file_5.rs");
+        std::fs::write(&file, "pub fn primaryedited() {}\n").unwrap();
+        server.incremental_reembed(&[file]).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file whose vector the primary moved off"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_restarted_worktree_keeps_a_vector_of_a_file_the_primary_deleted() {
+        let (ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        let file = primary_root.path().join("src/area_1/file_5.rs");
+        std::fs::remove_file(&file).unwrap();
+        server.incremental_reembed(&[file]).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file the primary deleted"
+        );
+    }
+
+    /// A worktree keeps only its own vectors while the primary still holds
+    /// the ones it shares.
+    #[tokio::test]
+    async fn semantic_fork_worktree_copies_no_vector_the_primary_still_holds() {
+        let (_ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        let added = "pub fn primaryadded() {}\n";
+        std::fs::write(
+            primary_root.path().join("src/area_2/primary_added.rs"),
+            added,
+        )
+        .unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(
+            &server,
+            primary_root.path(),
+            "src/area_2/primary_added.rs",
+            added,
+        )
+        .await;
+
+        let own = ["src/area_1/file_1.rs", "src/area_2/worktree_added.rs"];
+        let cached: Vec<_> = session
+            .current_ref()
+            .await
+            .embedding_cache
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        let persisted: Vec<_> = semantic_fork_persisted(&server, worktree.path())
+            .into_keys()
+            .collect();
+        for path in cached.iter().chain(&persisted) {
+            assert!(
+                own.contains(&path.as_str()),
+                "the worktree holds its own copy of shared {path}"
+            );
+        }
+    }
+
+    /// Below `ANN_THRESHOLD` a worktree builds its own index over vectors it
+    /// copied from the primary, which it persists only once the primary moves
+    /// off them.
+    #[tokio::test]
+    async fn restarted_small_worktree_keeps_a_copied_vector_the_primary_moved_off() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), 40);
+        lexdelta_corpus(worktree.path(), 40);
+        lexdelta_edit_worktree(worktree.path());
+        let server = identifier_test_server(&ollama, primary_root.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(primary_root.path().join(file)).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, &original).await;
+        semantic_fork_query(&session).await;
+        assert_eq!(
+            session.current_ref().await.embedding_cache.read().await[file].hash,
+            crate::core::embeddings::content_hash(&original),
+            "the worktree did not copy the primary's vector"
+        );
+        let edited = "pub fn primaryedited() {}\n";
+        std::fs::write(primary_root.path().join(file), edited).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, edited).await;
+        assert_eq!(
+            semantic_fork_persisted(&server, worktree.path())
+                .get(file)
+                .map(|entry| entry.hash.clone()),
+            Some(crate::core::embeddings::content_hash(&original)),
+            "the worktree did not persist a copied vector the primary moved off"
+        );
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file whose copied vector the primary moved off"
+        );
+    }
+
+    /// A worktree that edits a file and then restores the primary's content
+    /// keeps the shared vector, not its stale own one.
+    #[tokio::test]
+    async fn semantic_fork_restarted_worktree_keeps_a_vector_it_reverted_to() {
+        let (ollama, primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let file = "src/area_1/file_5.rs";
+        let original = std::fs::read_to_string(primary_root.path().join(file)).unwrap();
+        let own = "pub fn worktreeedited() {}\n";
+        std::fs::write(worktree.path().join(file), own).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_await_persisted(&server, worktree.path(), file, own).await;
+        std::fs::write(worktree.path().join(file), &original).unwrap();
+        semantic_fork_query(&session).await;
+        let edited = "pub fn primaryedited() {}\n";
+        std::fs::write(primary_root.path().join(file), edited).unwrap();
+        semantic_fork_query(&server).await;
+        semantic_fork_await_persisted(&server, primary_root.path(), file, edited).await;
+        assert_eq!(
+            semantic_fork_restarted_worktree_embeds(&ollama, primary_root.path(), worktree.path())
+                .await,
+            0,
+            "the restarted worktree re-embedded a file it reverted to the primary's content"
+        );
+    }
+
+    /// The primary persisting while a worktree is evicted does not reload the
+    /// worktree's vectors into memory.
+    #[tokio::test]
+    async fn semantic_fork_primary_persist_leaves_an_evicting_worktree_cache_empty() {
+        let (_ollama, _primary_root, worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_query(&session).await;
+        semantic_fork_await_persisted(
+            &server,
+            worktree.path(),
+            "src/area_2/worktree_added.rs",
+            "pub fn worktreeadded() {}\n// shared symbol vary\n",
+        )
+        .await;
+        let primary = server.current_ref().await;
+        let child = session.current_ref().await;
+        let flush = Arc::clone(&child.identifier_save_lock).lock_owned().await;
+        let evicting = {
+            let child = Arc::clone(&child);
+            let name = cache_name("identifier-embeddings", &server.state.config);
+            tokio::spawn(async move { clear_ref_heavy_caches(&child, &name).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !child.embedding_cache.read().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the eviction never cleared the worktree's vectors");
+        crate::server_adapters::keep_moved_off_vectors(
+            &server.state,
+            &primary,
+            &server.state.config,
+            &[],
+        )
+        .await;
+        drop(flush);
+        evicting.await.unwrap();
+        assert!(
+            child.embedding_cache.read().await.is_empty(),
+            "the primary's persist reloaded the evicted worktree's vectors"
+        );
+    }
+
     /// The budget's pointer-keyed components of the refs behind `servers`.
     async fn semantic_fork_resident(servers: &[&ContextPlusServer]) -> HashMap<usize, usize> {
         let mut holders = HashMap::new();
@@ -17869,7 +18309,7 @@ mod tests {
             .sum();
         let store_bytes = store.estimated_resident_bytes();
         assert!(store_bytes > 0);
-        let own: usize = entries.iter().map(|entry| entry.own_resident_bytes()).sum();
+        let own: usize = entries.iter().map(|entry| entry.resident_split().0).sum();
         assert_eq!(
             charged,
             own + store_bytes,
@@ -18303,7 +18743,12 @@ mod tests {
         // while its first fill runs, so the worktree's changes pass the threshold.
         let owner = server.current_ref().await;
         let current = semantic_fork_index(&server).await;
-        let docs = current.index.documents().to_vec();
+        let docs: Vec<_> = current
+            .index
+            .documents()
+            .iter()
+            .map(|doc| (**doc).clone())
+            .collect();
         let vectors = docs
             .iter()
             .enumerate()
