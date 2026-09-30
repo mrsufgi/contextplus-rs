@@ -426,6 +426,36 @@ impl RefWalkerIndexer {
             .walk_for_ref_candidates(root, self.ref_index.clone(), Some(candidates))
     }
 
+    /// The ref's semantic entry when it is current for `root`, with `root`'s
+    /// path inside it: walked from `root` or an ancestor, settled, and
+    /// unchanged since by the tracker's generation or, with the tracker off,
+    /// by its files' metadata.
+    pub(crate) async fn current_index(
+        &self,
+        root: &Path,
+    ) -> Option<(Arc<CachedSearchIndex>, std::path::PathBuf)> {
+        use std::sync::atomic::Ordering;
+        let ref_index = &self.ref_index;
+        let entry = ref_index.search_index_cache.read().await.clone()?;
+        let canonical = tokio::fs::canonicalize(root).await.ok()?;
+        let search_root = entry.search_root();
+        if !search_root.is_absolute() {
+            return None;
+        }
+        let prefix = canonical.strip_prefix(search_root).ok()?.to_path_buf();
+        if !entry.is_settled(ref_index.semantic_vector_generation.load(Ordering::Acquire)) {
+            return None;
+        }
+        let current = if self.walker.config.embed_tracker_mode != crate::config::TrackerMode::Off {
+            entry.generation.load(Ordering::Acquire)
+                == ref_index.cache_generation.load(Ordering::Acquire)
+        } else {
+            let metadata = self.walker.metadata_fingerprint(search_root).await.ok()?;
+            metadata.is_some() && *entry.metadata.read().unwrap() == metadata
+        };
+        current.then_some((entry, prefix))
+    }
+
     /// Expires a worktree's semantic entry when its parent holds a forkable
     /// vector store the worktree has not forked or been refused, so a query of
     /// its whole `root` walks and re-forks.

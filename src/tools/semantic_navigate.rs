@@ -452,20 +452,41 @@ pub async fn semantic_navigate(
                 "Query navigation requires a search indexer".into(),
             )
         })?;
-        let eligible = files.iter().map(|f| f.relative_path.clone()).collect();
-        let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
-        let mut index = SearchIndex::new();
-        index.index_with_vectors(docs, vectors);
-        let query_vector = ollama.embed_query(query).await?;
-        let results = index.search(
-            query,
-            &query_vector,
-            &ResolvedSearchOptions {
-                top_k: QUERY_CLUSTER_FILE_LIMIT,
-                root_dir: root.clone(),
-                ..Default::default()
-            },
-        );
+        let eligible: HashSet<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+        let search_options = ResolvedSearchOptions {
+            top_k: QUERY_CLUSTER_FILE_LIMIT,
+            root_dir: root.clone(),
+            ..Default::default()
+        };
+        // The ref's current index scores the eligible files under `root`
+        // without a walk or an index of their own.
+        let results = match indexer.current_index(&root).await {
+            Some((entry, prefix)) => {
+                let query_vector = ollama.embed_query(query).await?;
+                let relative = |path: &str| {
+                    Path::new(path)
+                        .strip_prefix(&prefix)
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                };
+                let keep = |path: &str| relative(path).is_some_and(|path| eligible.contains(&path));
+                let mut results =
+                    entry
+                        .index
+                        .search_where(query, &query_vector, &search_options, Some(&keep));
+                for result in &mut results {
+                    result.path = relative(&result.path).unwrap_or_default();
+                }
+                results
+            }
+            None => {
+                let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
+                let mut index = SearchIndex::new();
+                index.index_with_vectors(docs, vectors);
+                let query_vector = ollama.embed_query(query).await?;
+                index.search(query, &query_vector, &search_options)
+            }
+        };
         relevance = results.into_iter().map(|r| (r.path, r.score)).collect();
         files.retain(|f| relevance.contains_key(&f.relative_path));
         files.sort_by(|a, b| relevance[&b.relative_path].total_cmp(&relevance[&a.relative_path]));

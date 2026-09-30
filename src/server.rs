@@ -3463,8 +3463,8 @@ impl ContextPlusServer {
             let save_lock = Arc::clone(&ref_index.identifier_save_lock);
             let unsaved = Arc::clone(&ref_index.identifier_unsaved);
             let resident_set = Arc::downgrade(&target);
-            let pruner = (!is_worktree)
-                .then(|| (Arc::downgrade(&self.state), Arc::downgrade(&ref_index)));
+            let pruner =
+                (!is_worktree).then(|| (Arc::downgrade(&self.state), Arc::downgrade(&ref_index)));
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 // Serialized with the budget flush: both merge into the same file.
@@ -6882,7 +6882,10 @@ mod tests {
         .unwrap_or_else(|_| {
             panic!(
                 "the vectors of the renamed identifiers were never saved: {:?}",
-                rkyv_store::load_cache(repo, name).ok().flatten().map(|data| data.keys)
+                rkyv_store::load_cache(repo, name)
+                    .ok()
+                    .flatten()
+                    .map(|data| data.keys)
             )
         })
     }
@@ -7571,6 +7574,84 @@ mod tests {
             first_group.contains("projection"),
             "the most relevant group must be first, got {first_group:?}\n{output}"
         );
+    }
+
+    /// A clusters query with no semantic index, then with a current one,
+    /// scoped to `scope`; the semantic walks each made, and both outputs.
+    async fn clusters_query_cold_then_warm(scope: Option<&str>) -> (usize, usize, String, String) {
+        let events = (0..8).map(|i| {
+            (
+                format!("packages/events/projection_rebuild_{i}.rs"),
+                format!("pub fn projection_rebuild_{i}() {{}}"),
+            )
+        });
+        let billing = (0..8).map(|i| {
+            (
+                format!("packages/billing/invoice_{i}.rs"),
+                format!("pub fn invoice_{i}() {{}}"),
+            )
+        });
+        let (_tmp, _provider, server) = cluster_facade_server(events.chain(billing)).await;
+        let args = || {
+            let mut args = serde_json::Map::from_iter([
+                ("query".to_string(), json!("projection rebuild")),
+                ("kind".to_string(), json!("clusters")),
+                ("max_clusters".to_string(), json!(2)),
+                ("min_clusters".to_string(), json!(1)),
+            ]);
+            if let Some(scope) = scope {
+                args.insert("path".to_string(), json!(scope));
+            }
+            args
+        };
+        let owner = server.current_ref().await;
+        let walks = || {
+            owner
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert!(owner.search_index_cache.read().await.is_none());
+
+        let before = walks();
+        let cold = server.dispatch("explore", args()).await;
+        assert_eq!(cold.is_error, Some(false), "{}", text_of(&cold));
+        let cold_walks = walks() - before;
+
+        server
+            .handle_semantic_code_search(semantic_args("projection rebuild"))
+            .await
+            .unwrap();
+        assert!(owner.search_index_cache.read().await.is_some());
+        let before = walks();
+        let warm = server.dispatch("explore", args()).await;
+        assert_eq!(warm.is_error, Some(false), "{}", text_of(&warm));
+        // Files tied on score keep the order their reads completed in.
+        let lines = |result: &CallToolResult| {
+            let mut lines: Vec<String> = text_of(result).lines().map(str::to_string).collect();
+            lines.sort();
+            lines.join("\n")
+        };
+        (cold_walks, walks() - before, lines(&cold), lines(&warm))
+    }
+
+    #[tokio::test]
+    async fn explore_clusters_query_answers_from_the_current_semantic_index() {
+        let (cold_walks, warm_walks, cold, warm) = clusters_query_cold_then_warm(None).await;
+        assert_eq!(cold_walks, 1, "without an index the query walks its files");
+        assert!(cold.contains("projection_rebuild_0.rs"), "{cold}");
+        assert_eq!(warm_walks, 0, "a current index must pick the query's files");
+        assert_eq!(warm, cold, "the index must pick the same files and labels");
+    }
+
+    #[tokio::test]
+    async fn explore_clusters_query_from_the_semantic_index_keeps_its_path_scope() {
+        let (cold_walks, warm_walks, cold, warm) =
+            clusters_query_cold_then_warm(Some("packages/events")).await;
+        assert_eq!(cold_walks, 1, "without an index the query walks its files");
+        assert!(cold.contains("projection_rebuild_0.rs"), "{cold}");
+        assert!(!cold.contains("invoice_"), "{cold}");
+        assert_eq!(warm_walks, 0, "a current index must pick the query's files");
+        assert_eq!(warm, cold, "the index must pick the same scoped files");
     }
 
     #[tokio::test]
