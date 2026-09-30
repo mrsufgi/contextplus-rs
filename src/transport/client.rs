@@ -1124,6 +1124,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_timeout_returns_error_while_host_input_is_open() {
         use tokio::net::UnixListener;
+        const RECONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -1156,7 +1157,7 @@ mod tests {
                 bridge_input,
                 bridge_output,
                 BridgeOptions {
-                    reconnect_timeout: Duration::from_millis(100),
+                    reconnect_timeout: RECONNECT_TIMEOUT,
                     reconnect_backoff: Duration::from_millis(10),
                 },
             )
@@ -1166,6 +1167,7 @@ mod tests {
         host.write_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
             .await;
         assert_eq!(host.read_json().await["id"], 1);
+        let started = Instant::now();
         host.write_json(json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"never-finishes","arguments":{}}}))
             .await;
 
@@ -1173,9 +1175,17 @@ mod tests {
             .await
             .expect("bridge exceeded its reconnect deadline")
             .unwrap();
+        let elapsed = started.elapsed();
+        let error = result.expect_err("bridge returned success after reconnect timeout");
         assert!(
-            result.is_err(),
-            "bridge returned success after reconnect timeout"
+            format!("{error:#}").contains("daemon reconnect deadline exceeded"),
+            "bridge ended for another reason: {error:#}"
+        );
+        // As much slack again as the deadline covers a loaded runner, and no
+        // other deadline fits in that window.
+        assert!(
+            elapsed >= RECONNECT_TIMEOUT && elapsed < RECONNECT_TIMEOUT * 2,
+            "bridge gave up after {elapsed:?}, not its {RECONNECT_TIMEOUT:?} deadline"
         );
         drop(host.input);
         daemon.abort();

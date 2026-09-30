@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Bumped whenever the payload layout of any kind changes: nothing else
-/// keeps a snapshot of the old layout from being read.
-pub const FORMAT_VERSION: u32 = 1;
+/// keeps a snapshot of the old layout from being read. The payload golden
+/// test in `server::snapshots` fails on a layout change until it is.
+pub const FORMAT_VERSION: u32 = 2;
 const MAGIC: [u8; 8] = *b"CPSNAPSH";
 const CHECKSUM_LEN: usize = 32;
 const SNAPSHOT_DIR: &str = "snapshots";
@@ -384,6 +385,12 @@ impl<'a> SnapshotReader<'a> {
     /// Whether the whole payload has been read.
     pub fn is_empty(&self) -> bool {
         self.pos == self.bytes.len()
+    }
+
+    /// The payload not read yet.
+    #[cfg(test)]
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
     }
 }
 
