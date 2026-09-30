@@ -1045,6 +1045,76 @@ fn identifier_cache_data(vectors: &IdentifierVectors) -> Option<rkyv_store::Cach
     Some(data)
 }
 
+/// Share of unused vectors past which the resident identifier set is pruned,
+/// so a save rewrites the file without them only once they are worth it.
+const IDENTIFIER_PRUNE_DEAD_FRACTION: f64 = 0.2;
+
+/// Drops the vectors of the primary's resident identifier set that no
+/// identifier index of a ref sharing that set uses, once they pass
+/// [`IDENTIFIER_PRUNE_DEAD_FRACTION`]; returns their keys.
+async fn prune_identifier_vectors(
+    state: &SharedState,
+    owner: &crate::ref_index::RefIndex,
+) -> Vec<String> {
+    let Some(resident) = owner.identifier_vectors.get() else {
+        return Vec::new();
+    };
+    let sharing: Vec<Arc<crate::ref_index::RefIndex>> = state
+        .refs
+        .read()
+        .await
+        .values()
+        .filter(|other| {
+            other
+                .identifier_vectors
+                .get()
+                .is_some_and(|vectors| Arc::ptr_eq(vectors, resident))
+        })
+        .cloned()
+        .collect();
+    // A build in flight holds vectors its index does not publish yet; the
+    // held locks also keep new builds out until the unused ones are gone.
+    let mut builds = Vec::with_capacity(sharing.len());
+    for other in &sharing {
+        match other.identifier_update.try_lock() {
+            Ok(guard) => builds.push(guard),
+            Err(_) => return Vec::new(),
+        }
+    }
+    // Without the primary's embedded index every vector would look unused.
+    match owner.identifier_index.read().await.as_ref() {
+        Some(index) if index.dims > 0 => {}
+        _ => return Vec::new(),
+    }
+    let mut indexes = Vec::with_capacity(sharing.len());
+    for other in &sharing {
+        if let Some(index) = other.identifier_index.read().await.clone() {
+            indexes.push(index);
+        }
+    }
+    let live: std::collections::HashSet<&str> = indexes
+        .iter()
+        .flat_map(|index| index.docs.iter())
+        .map(|doc| doc.text.as_str())
+        .collect();
+    let mut resident = resident.write().await;
+    // A vector embedded but not saved yet belongs to a build still installing.
+    let unsaved = owner.identifier_unsaved.lock().unwrap();
+    let dead: Vec<String> = resident
+        .keys()
+        .filter(|key| !live.contains(key.as_str()) && !unsaved.contains_key(*key))
+        .cloned()
+        .collect();
+    drop(unsaved);
+    if (dead.len() as f64) <= resident.len() as f64 * IDENTIFIER_PRUNE_DEAD_FRACTION {
+        return Vec::new();
+    }
+    for key in &dead {
+        resident.remove(key);
+    }
+    dead
+}
+
 /// O(1) estimate: vectors of one map share a width.
 fn identifier_vector_bytes(vectors: &IdentifierVectors) -> usize {
     vectors.values().next().map_or(0, |vector| {
@@ -1292,7 +1362,7 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
         let root = owner.root_dir.clone();
         let name = id_cache_name.to_string();
         let saved = tokio::task::spawn_blocking(move || {
-            rkyv_store::save_cache_rebuilding(&root, &name, &data, || {
+            rkyv_store::save_cache_rebuilding(&root, &name, &data, &[], || {
                 let mut all = resident;
                 all.extend(pending);
                 identifier_cache_data(&all)
@@ -3393,6 +3463,8 @@ impl ContextPlusServer {
             let save_lock = Arc::clone(&ref_index.identifier_save_lock);
             let unsaved = Arc::clone(&ref_index.identifier_unsaved);
             let resident_set = Arc::downgrade(&target);
+            let pruner = (!is_worktree)
+                .then(|| (Arc::downgrade(&self.state), Arc::downgrade(&ref_index)));
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 // Serialized with the budget flush: both merge into the same file.
@@ -3400,18 +3472,40 @@ impl ContextPlusServer {
                 if persist_generation.load(std::sync::atomic::Ordering::Acquire) != ticket {
                     return;
                 }
+                let mut pruned = match pruner
+                    .as_ref()
+                    .and_then(|(state, owner)| Some((state.upgrade()?, owner.upgrade()?)))
+                {
+                    Some((state, owner)) => prune_identifier_vectors(&state, &owner).await,
+                    None => Vec::new(),
+                };
                 // Only the vectors embedded since the last save: the save merges
                 // them into what is already on disk, or rebuilds a missing file
                 // from the whole resident set.
                 let pending = std::mem::take(&mut *unsaved.lock().unwrap());
-                let Some(data) = identifier_cache_data(&pending) else {
-                    return;
+                // Embedded again since the prune: the save keeps it.
+                pruned.retain(|key| !pending.contains_key(key));
+                let data = match identifier_cache_data(&pending) {
+                    Some(data) => data,
+                    None if pruned.is_empty() => return,
+                    None => rkyv_store::CacheData {
+                        dims: 0,
+                        keys: Vec::new(),
+                        hashes: Vec::new(),
+                        vectors: Vec::new(),
+                    },
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    rkyv_store::save_cache_rebuilding(&persist_root, &id_cache_name, &data, || {
-                        let vectors = resident_set.upgrade()?;
-                        identifier_cache_data(&vectors.blocking_read())
-                    })
+                    rkyv_store::save_cache_rebuilding(
+                        &persist_root,
+                        &id_cache_name,
+                        &data,
+                        &pruned,
+                        || {
+                            let vectors = resident_set.upgrade()?;
+                            identifier_cache_data(&vectors.blocking_read())
+                        },
+                    )
                 })
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
@@ -6720,6 +6814,195 @@ mod tests {
             "eviction left {flushed} identifier entries on disk, not the {} in memory",
             saved + 1
         );
+    }
+
+    fn numbered_functions(prefix: &str, count: usize) -> String {
+        (0..count)
+            .map(|i| format!("pub fn {prefix}_{i}() {{}}\n"))
+            .collect()
+    }
+
+    /// A primary whose identifier cache on disk holds the functions of
+    /// `src/retired.rs` and `src/kept.rs`.
+    async fn primary_with_saved_names(
+        retired: usize,
+        kept: usize,
+    ) -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        String,
+    ) {
+        let retired_source = numbered_functions("retired_name", retired);
+        let kept_source = numbered_functions("kept_name", kept);
+        let (repo, ollama, server) = identifier_server(&[
+            ("src/retired.rs", retired_source.as_str()),
+            ("src/kept.rs", kept_source.as_str()),
+        ])
+        .await;
+        let name = cache_name("identifier-embeddings", &server.state.config);
+        explore_identifier(&server, "kept_name_0", None).await;
+        assert_eq!(
+            wait_for_identifier_cache(repo.path(), &name, retired + kept).await,
+            retired + kept
+        );
+        (repo, ollama, server, name)
+    }
+
+    /// Renames the retired functions and returns the keys on disk once the
+    /// vectors of the new names are saved.
+    async fn rename_retired_names(
+        repo: &std::path::Path,
+        server: &ContextPlusServer,
+        name: &str,
+        retired: usize,
+    ) -> Vec<String> {
+        std::fs::write(
+            repo.join("src/retired.rs"),
+            numbered_functions("renamed_name", retired),
+        )
+        .unwrap();
+        let callback = server.build_tracker_callback().await;
+        callback(repo.to_path_buf(), vec!["src/retired.rs".to_string()])
+            .await
+            .unwrap();
+        let output = explore_identifier(server, "renamed_name_0", None).await;
+        assert!(output.contains("renamed_name_0"), "{output}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some(data)) = rkyv_store::load_cache(repo, name)
+                    && count_named(&data.keys, "renamed_name") == retired
+                {
+                    return data.keys;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the vectors of the renamed identifiers were never saved: {:?}",
+                rkyv_store::load_cache(repo, name).ok().flatten().map(|data| data.keys)
+            )
+        })
+    }
+
+    async fn resident_identifier_keys(server: &ContextPlusServer) -> Vec<String> {
+        let primary = server.state.default_ref().unwrap();
+        let resident = primary.identifier_vectors.get().unwrap().read().await;
+        resident.keys().cloned().collect()
+    }
+
+    fn count_named(keys: &[String], prefix: &str) -> usize {
+        keys.iter().filter(|key| key.starts_with(prefix)).count()
+    }
+
+    #[tokio::test]
+    async fn identifier_save_prunes_vectors_of_renamed_identifiers() {
+        let (repo, _ollama, server, name) = primary_with_saved_names(5, 5).await;
+
+        let on_disk = rename_retired_names(repo.path(), &server, &name, 5).await;
+
+        let resident = resident_identifier_keys(&server).await;
+        for keys in [&on_disk, &resident] {
+            assert_eq!(count_named(keys, "retired_name"), 0, "{keys:?}");
+            assert_eq!(count_named(keys, "kept_name"), 5, "{keys:?}");
+            assert_eq!(count_named(keys, "renamed_name"), 5, "{keys:?}");
+        }
+    }
+
+    /// A linked worktree attached to the primary; it inherits the primary's
+    /// identifier index and shares its resident vectors.
+    async fn attach_named_worktree(
+        server: &ContextPlusServer,
+        name: &str,
+    ) -> Arc<crate::ref_index::RefIndex> {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let path = PathBuf::from(format!("/tmp/identifier-prune-{name}"));
+        let id = RefId::for_canonical_path(&path);
+        let worktree = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        assert!(worktree.identifier_index.read().await.is_some());
+        worktree
+    }
+
+    #[tokio::test]
+    async fn identifier_prune_keeps_vectors_an_attached_worktree_uses() {
+        let (repo, _ollama, server, name) = primary_with_saved_names(5, 5).await;
+        let _worktree = attach_named_worktree(&server, "attached").await;
+
+        let on_disk = rename_retired_names(repo.path(), &server, &name, 5).await;
+
+        let resident = resident_identifier_keys(&server).await;
+        for keys in [&on_disk, &resident] {
+            assert_eq!(count_named(keys, "retired_name"), 5, "{keys:?}");
+            assert_eq!(count_named(keys, "renamed_name"), 5, "{keys:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn identifier_save_keeps_unused_vectors_below_the_prune_share() {
+        let (repo, _ollama, server, name) = primary_with_saved_names(1, 9).await;
+
+        let on_disk = rename_retired_names(repo.path(), &server, &name, 1).await;
+
+        let resident = resident_identifier_keys(&server).await;
+        for keys in [&on_disk, &resident] {
+            assert_eq!(count_named(keys, "retired_name"), 1, "{keys:?}");
+            assert_eq!(count_named(keys, "kept_name"), 9, "{keys:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn identifier_prune_keeps_an_embedded_vector_no_index_holds_yet() {
+        let (repo, _ollama, server, name) = primary_with_saved_names(5, 5).await;
+        let primary = server.state.default_ref().unwrap();
+        let embedded: Arc<[f32]> = Arc::from(vec![1.0, 0.0]);
+        primary
+            .identifier_vectors
+            .get()
+            .unwrap()
+            .write()
+            .await
+            .insert("in_flight_name".into(), Arc::clone(&embedded));
+        primary
+            .identifier_unsaved
+            .lock()
+            .unwrap()
+            .insert("in_flight_name".into(), embedded);
+
+        let on_disk = rename_retired_names(repo.path(), &server, &name, 5).await;
+
+        let resident = resident_identifier_keys(&server).await;
+        for keys in [&on_disk, &resident] {
+            assert_eq!(count_named(keys, "in_flight_name"), 1, "{keys:?}");
+            assert_eq!(count_named(keys, "retired_name"), 0, "{keys:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn identifier_prune_skips_while_a_sharing_build_is_in_flight() {
+        let (repo, _ollama, server, name) = primary_with_saved_names(5, 5).await;
+        let worktree = attach_named_worktree(&server, "building").await;
+        *worktree.identifier_index.write().await = None;
+        let building = worktree.identifier_update.lock().await;
+
+        let on_disk = rename_retired_names(repo.path(), &server, &name, 5).await;
+
+        let resident = resident_identifier_keys(&server).await;
+        drop(building);
+        for keys in [&on_disk, &resident] {
+            assert_eq!(count_named(keys, "retired_name"), 5, "{keys:?}");
+        }
     }
 
     #[test]

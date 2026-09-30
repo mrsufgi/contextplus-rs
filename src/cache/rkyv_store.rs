@@ -274,17 +274,18 @@ pub fn save_cache_with_deletions(
     save_merged(root_dir, name, data, deletions, || None)
 }
 
-/// Same as [`save_cache`] for a caller that saves only its new entries: when
-/// no readable cache is on disk (missing, or rotated aside as corrupt), the
-/// file is rebuilt from `full()`, the caller's whole in-memory set, with
-/// `data` over it.
+/// Same as [`save_cache_with_deletions`] for a caller that saves only its new
+/// entries: when no readable cache is on disk (missing, or rotated aside as
+/// corrupt), the file is rebuilt from `full()`, the caller's whole in-memory
+/// set, with `data` over it.
 pub fn save_cache_rebuilding(
     root_dir: &Path,
     name: &str,
     data: &CacheData,
+    deletions: &[String],
     full: impl FnOnce() -> Option<CacheData>,
 ) -> Result<()> {
-    save_merged(root_dir, name, data, &[], full)
+    save_merged(root_dir, name, data, deletions, full)
 }
 
 fn save_merged(
