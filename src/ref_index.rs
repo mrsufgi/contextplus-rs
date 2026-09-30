@@ -194,6 +194,8 @@ pub struct RefIndex {
     pub(crate) semantic_walks: AtomicUsize,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
     pub(crate) identifier_rebuilding: Arc<std::sync::atomic::AtomicBool>,
+    /// When each resident identifier vector no index uses was first seen unused.
+    pub(crate) identifier_unused_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     pub(crate) lexical_update: tokio::sync::Mutex<()>,
     pub(crate) lexical_rebuilding: Arc<std::sync::atomic::AtomicBool>,
 
@@ -272,6 +274,7 @@ impl RefIndex {
             semantic_walks: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
@@ -323,6 +326,7 @@ impl RefIndex {
             semantic_walks: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
@@ -376,6 +380,7 @@ impl RefIndex {
             semantic_walks: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),

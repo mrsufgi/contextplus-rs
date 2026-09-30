@@ -385,6 +385,25 @@ pub struct SemanticNavigateOptions {
     pub mode: Option<String>,
 }
 
+/// Whether `index` holds an embedded document for each `eligible` path,
+/// relative to `prefix` inside it.
+fn embeds_every(
+    index: &super::semantic_search::SearchIndex,
+    prefix: &Path,
+    eligible: &HashSet<String>,
+) -> bool {
+    let embedded: HashSet<&str> = index
+        .documents()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| index.vector_at(*i).is_some())
+        .map(|(_, doc)| doc.path.as_str())
+        .collect();
+    eligible
+        .iter()
+        .all(|path| embedded.contains(prefix.join(path).to_string_lossy().as_ref()))
+}
+
 /// Information about a source file for clustering.
 #[derive(Debug, Clone, Default)]
 pub struct FileInfo {
@@ -459,8 +478,16 @@ pub async fn semantic_navigate(
             ..Default::default()
         };
         // The ref's current index scores the eligible files under `root`
-        // without a walk or an index of their own.
-        let results = match indexer.current_index(&root).await {
+        // without a walk or an index of their own, when it embeds every one:
+        // the root's walk skips paths under ignored or hidden directories, and
+        // a file created since the index settled is not in it yet. A file
+        // edited while the tracker re-embeds it scores as last indexed, as in
+        // semantic_code_search.
+        let current = indexer
+            .current_index(&root)
+            .await
+            .filter(|(entry, prefix)| embeds_every(&entry.index, prefix, &eligible));
+        let results = match current {
             Some((entry, prefix)) => {
                 let query_vector = ollama.embed_query(query).await?;
                 let relative = |path: &str| {
