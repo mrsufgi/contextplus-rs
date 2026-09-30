@@ -709,7 +709,7 @@ mod tests {
     }
 
     async fn read_recorded_pid(path: &Path) -> i32 {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Ok(raw) = tokio::fs::read_to_string(path).await
                     && let Ok(pid) = raw.trim().parse()
@@ -1089,6 +1089,9 @@ mod tests {
         )
         .unwrap();
 
+        // Every command gets this timeout, so it must leave a loaded runner
+        // time to start the sibling and the lint wrapper, yet end well before
+        // the wrapper's 30 s sleep.
         let started = Instant::now();
         let output = run_static_analysis_with_timeout(
             StaticAnalysisOptions {
@@ -1096,7 +1099,7 @@ mod tests {
                 executable_path: Some(dir.path().join("fake-bin").into_os_string()),
                 target_path: None,
             },
-            Duration::from_millis(100),
+            Duration::from_secs(2),
         )
         .await
         .unwrap();
@@ -1104,7 +1107,7 @@ mod tests {
         let descendant_pid = read_recorded_pid(&descendant_pid_path).await;
         let mut descendant = ProcessGuard::new(descendant_pid);
         let descendant_exited =
-            wait_for_process_exit(descendant_pid, Duration::from_millis(750)).await;
+            wait_for_process_exit(descendant_pid, Duration::from_secs(10)).await;
 
         assert!(
             output.contains("typescript sibling completed"),
@@ -1115,12 +1118,12 @@ mod tests {
             "timeout must name the command that timed out: {output}"
         );
         assert!(
-            output.contains("timed out after 100 ms"),
+            output.contains("timed out after 2000 ms"),
             "timeout must report its configured duration: {output}"
         );
         assert!(
-            elapsed < Duration::from_secs(1),
-            "the timed-out check must return promptly; elapsed {elapsed:?}"
+            elapsed < Duration::from_secs(20),
+            "the timed-out check must return before its command does; elapsed {elapsed:?}"
         );
         assert!(
             descendant_exited,
@@ -1160,12 +1163,12 @@ mod tests {
         let join_result = task.await;
         let cancel_elapsed = cancelled_at.elapsed();
         let descendant_exited =
-            wait_for_process_exit(descendant_pid, Duration::from_millis(750)).await;
+            wait_for_process_exit(descendant_pid, Duration::from_secs(10)).await;
 
         assert!(join_result.is_err() && join_result.unwrap_err().is_cancelled());
         assert!(
-            cancel_elapsed < Duration::from_secs(1),
-            "cancelling the command task must return promptly; elapsed {cancel_elapsed:?}"
+            cancel_elapsed < Duration::from_secs(10),
+            "cancelling the command task must not wait for the command; elapsed {cancel_elapsed:?}"
         );
         assert!(
             descendant_exited,

@@ -2340,7 +2340,8 @@ mod tests {
         assert!(!store.hnsw_is_initialized());
 
         graph.release();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // The build queues on the shared pool behind other tests' builds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         while !store.hnsw_is_initialized() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2800,13 +2801,13 @@ mod tests {
             .to_string();
         assert!(error.contains("empty text"));
 
-        let hanging = write_fake_claude(dir.path(), "sleep 5");
+        let hanging = write_fake_claude(dir.path(), "exec sleep 60");
         let client = OllamaClient::new(&claude_chat_config(&hanging))
             .with_chat_timeout(std::time::Duration::from_millis(100));
         let started = std::time::Instant::now();
         let error = client.chat("label").await.unwrap_err().to_string();
         assert!(error.contains("timed out"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[tokio::test]

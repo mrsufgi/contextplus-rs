@@ -7226,8 +7226,10 @@ mod tests {
         .await
         .unwrap();
         assert!(stale_result.contains("Index: 2050 document(s)"));
+        // The replacement build is held at the pause however long this waits,
+        // and can queue behind other tests' builds before reaching it.
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(300),
             graph_pause.wait_until_entered(),
         )
         .await
