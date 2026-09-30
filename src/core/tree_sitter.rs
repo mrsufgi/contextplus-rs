@@ -13,36 +13,86 @@ thread_local! {
     static PARSER_CACHE: RefCell<HashMap<&'static str, Parser>> = RefCell::new(HashMap::new());
 }
 
-/// Extension-to-grammar mapping for the 16 supported native grammars.
+/// A grammar's name, the file extensions it parses and its language.
+type Grammar = (&'static str, &'static [&'static str], fn() -> Language);
+
+/// The 16 supported native grammars.
+const GRAMMARS: [Grammar; 16] = [
+    ("typescript", &["ts"], || {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+    }),
+    ("tsx", &["tsx"], || {
+        tree_sitter_typescript::LANGUAGE_TSX.into()
+    }),
+    ("javascript", &["js", "jsx", "mjs", "cjs"], || {
+        tree_sitter_javascript::LANGUAGE.into()
+    }),
+    ("python", &["py"], || tree_sitter_python::LANGUAGE.into()),
+    ("rust", &["rs"], || tree_sitter_rust::LANGUAGE.into()),
+    ("go", &["go"], || tree_sitter_go::LANGUAGE.into()),
+    ("java", &["java"], || tree_sitter_java::LANGUAGE.into()),
+    ("c", &["c", "h"], || tree_sitter_c::LANGUAGE.into()),
+    ("cpp", &["cpp", "hpp", "cc"], || {
+        tree_sitter_cpp::LANGUAGE.into()
+    }),
+    ("bash", &["sh", "bash", "zsh"], || {
+        tree_sitter_bash::LANGUAGE.into()
+    }),
+    ("ruby", &["rb"], || tree_sitter_ruby::LANGUAGE.into()),
+    ("php", &["php"], || tree_sitter_php::LANGUAGE_PHP.into()),
+    ("c_sharp", &["cs"], || tree_sitter_c_sharp::LANGUAGE.into()),
+    ("kotlin", &["kt", "kts"], || {
+        tree_sitter_kotlin_ng::LANGUAGE.into()
+    }),
+    ("html", &["html", "htm"], || {
+        tree_sitter_html::LANGUAGE.into()
+    }),
+    ("css", &["css"], || tree_sitter_css::LANGUAGE.into()),
+];
+
+/// Grammar of files with extension `ext`, with or without its leading dot.
 fn grammar_for_ext(ext: &str) -> Option<(&'static str, Language)> {
-    match ext {
-        ".ts" | "ts" => Some((
-            "typescript",
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        )),
-        ".tsx" | "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
-        ".js" | "js" | ".jsx" | "jsx" | ".mjs" | "mjs" | ".cjs" | "cjs" => {
-            Some(("javascript", tree_sitter_javascript::LANGUAGE.into()))
+    let ext = ext.strip_prefix('.').unwrap_or(ext);
+    GRAMMARS
+        .iter()
+        .find(|(_, exts, _)| exts.contains(&ext))
+        .map(|(name, _, language)| (*name, language()))
+}
+
+/// Digest of the grammar set: each grammar's extensions, definition node
+/// types, ABI version, node kinds and fields. Changes when a grammar is
+/// added, maps other extensions or is replaced by one with other nodes.
+pub(crate) fn grammar_identity() -> &'static str {
+    static IDENTITY: LazyLock<String> = LazyLock::new(|| {
+        let mut hasher = blake3::Hasher::new();
+        for (name, exts, language) in &GRAMMARS {
+            let language = language();
+            let mut text = format!(
+                "{name} {exts:?} {:?} abi{}",
+                definition_types(name),
+                language.abi_version()
+            );
+            for id in 0..language.node_kind_count() as u16 {
+                text.push(' ');
+                text.push_str(language.node_kind_for_id(id).unwrap_or(""));
+            }
+            for id in 1..=language.field_count() as u16 {
+                text.push(' ');
+                text.push_str(language.field_name_for_id(id).unwrap_or(""));
+            }
+            hasher.update(text.as_bytes());
+            hasher.update(b"\n");
         }
-        ".py" | "py" => Some(("python", tree_sitter_python::LANGUAGE.into())),
-        ".rs" | "rs" => Some(("rust", tree_sitter_rust::LANGUAGE.into())),
-        ".go" | "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
-        ".java" | "java" => Some(("java", tree_sitter_java::LANGUAGE.into())),
-        ".c" | "c" | ".h" | "h" => Some(("c", tree_sitter_c::LANGUAGE.into())),
-        ".cpp" | "cpp" | ".hpp" | "hpp" | ".cc" | "cc" => {
-            Some(("cpp", tree_sitter_cpp::LANGUAGE.into()))
-        }
-        ".sh" | "sh" | ".bash" | "bash" | ".zsh" | "zsh" => {
-            Some(("bash", tree_sitter_bash::LANGUAGE.into()))
-        }
-        ".rb" | "rb" => Some(("ruby", tree_sitter_ruby::LANGUAGE.into())),
-        ".php" | "php" => Some(("php", tree_sitter_php::LANGUAGE_PHP.into())),
-        ".cs" | "cs" => Some(("c_sharp", tree_sitter_c_sharp::LANGUAGE.into())),
-        ".kt" | "kt" | ".kts" | "kts" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
-        ".html" | "html" | ".htm" | "htm" => Some(("html", tree_sitter_html::LANGUAGE.into())),
-        ".css" | "css" => Some(("css", tree_sitter_css::LANGUAGE.into())),
-        _ => None,
-    }
+        hasher.finalize().to_hex()[..16].to_owned()
+    });
+    &IDENTITY
+}
+
+/// Each grammar's name with the extensions it parses.
+#[cfg(test)]
+pub(crate) fn grammar_extensions() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    GRAMMARS.iter().map(|(name, exts, _)| (*name, *exts))
 }
 
 /// AST node types that represent definitions, mapped to our symbol kinds.

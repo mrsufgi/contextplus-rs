@@ -4,8 +4,8 @@
 //! A snapshot is one file under `.mcp_data/snapshots/`: a magic tag, a
 //! fingerprint string, a payload written by the index that owns it, and a
 //! BLAKE3 checksum of everything before it. The fingerprint names the index
-//! kind, the snapshot format version, the identity of the code the payload is
-//! derived from, and the configuration that shapes it; a snapshot whose
+//! kind, the snapshot format version, the version of what the kind's builders
+//! derive, and the configuration that shapes it; a snapshot whose
 //! fingerprint differs, whose checksum fails or whose payload does not decode
 //! is ignored and the index is built as before. Files are written to a
 //! temporary path and renamed into place, so an interrupted write leaves the
@@ -17,8 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// Bumped whenever the payload layout of any kind changes.
-pub const FORMAT_VERSION: u32 = 1;
+/// Bumped whenever the payload layout of any kind changes: nothing else
+/// keeps a snapshot of the old layout from being read. The payload golden
+/// test in `server::snapshots` fails on a layout change until it is.
+pub const FORMAT_VERSION: u32 = 2;
 const MAGIC: [u8; 8] = *b"CPSNAPSH";
 const CHECKSUM_LEN: usize = 32;
 const SNAPSHOT_DIR: &str = "snapshots";
@@ -42,42 +44,12 @@ pub fn digest(bytes: &[u8]) -> Digest {
     out
 }
 
-/// Sources of the code snapshot payloads are derived from: tokenizers,
-/// parsers and document builders. What these derive through dependencies,
-/// such as the tree-sitter grammars, is pinned per kind by a derivation
-/// version and a golden digest test instead.
-fn derivation_sources() -> [&'static str; 7] {
-    [
-        include_str!("snapshot.rs"),
-        include_str!("../server/snapshots.rs"),
-        include_str!("../tools/lexical_search.rs"),
-        include_str!("../tools/semantic_identifiers.rs"),
-        include_str!("../tools/semantic_search.rs"),
-        include_str!("../core/tree_sitter.rs"),
-        include_str!("../core/parser.rs"),
-    ]
-}
-
-/// Identity of the code snapshot payloads are derived from. A binary whose
-/// derivation code differs reads none of an older binary's snapshots.
-fn derivation_identity() -> &'static str {
-    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        let mut hasher = blake3::Hasher::new();
-        for source in derivation_sources() {
-            hasher.update(&(source.len() as u64).to_le_bytes());
-            hasher.update(source.as_bytes());
-        }
-        hasher.finalize().to_hex()[..16].to_string()
-    })
-}
-
-/// Fingerprint of a snapshot of `kind` built under `config_identity`.
+/// Fingerprint of a snapshot of `kind` built under `config_identity`, which
+/// carries the version of what the kind's builders derive. It names no code
+/// identity, so a release that changes neither the payload layout nor a
+/// kind's builder output reads the previous release's snapshot of that kind.
 pub fn fingerprint(kind: &str, config_identity: &str) -> String {
-    format!(
-        "{kind}|v{FORMAT_VERSION}|{}|{config_identity}",
-        derivation_identity()
-    )
+    format!("{kind}|v{FORMAT_VERSION}|{config_identity}")
 }
 
 /// Where the snapshot of `kind` for the checkout at `root` lives.
@@ -413,6 +385,12 @@ impl<'a> SnapshotReader<'a> {
     /// Whether the whole payload has been read.
     pub fn is_empty(&self) -> bool {
         self.pos == self.bytes.len()
+    }
+
+    /// The payload not read yet.
+    #[cfg(test)]
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
     }
 }
 
@@ -819,19 +797,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_derivation_identity_covers_every_payload_builder() {
-        let sources = derivation_sources();
-        for builder in ["lexical_term_counts(", "lexical_updates<", "file_document("] {
-            let definition = format!("fn {builder}");
-            assert!(
-                sources.iter().any(|source| source.contains(&definition)),
-                "`{definition}` is not in a hashed source"
-            );
-        }
-        let lockfile = ["@generated", " by Cargo"].concat();
-        assert!(
-            !sources.iter().any(|source| source.contains(&lockfile)),
-            "a packaged crate has no Cargo.lock"
-        );
+    fn cold_start_snapshot_from_a_release_with_other_code_still_loads() {
+        // What another release writes for the same kind, format version and
+        // configuration, whatever else its code changed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = snapshot_path(dir.path(), "kind");
+        write(&path, &format!("kind|v{FORMAT_VERSION}|model-a"), &[1]);
+        assert_eq!(read(&path, &fingerprint("kind", "model-a")), Some(vec![1]));
     }
 }

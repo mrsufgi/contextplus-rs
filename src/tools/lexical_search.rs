@@ -608,6 +608,10 @@ impl LexicalIndex {
         self.posting.iter_mut().for_each(PostingList::shrink_to_fit);
         self.documents.shrink_to_fit();
         self.document_terms.shrink_to_fit();
+        self.set_average_lengths();
+    }
+
+    fn set_average_lengths(&mut self) {
         self.average_lengths = if self.doc_count == 0 {
             [1.0; 4]
         } else {
@@ -745,7 +749,8 @@ impl LexicalIndex {
         index
     }
 
-    /// Writes the whole index, read back by [`read_snapshot`](Self::read_snapshot).
+    /// Writes the whole index but what the current code derives from paths
+    /// and lengths, read back by [`read_snapshot`](Self::read_snapshot).
     pub(crate) fn write_snapshot(
         &self,
         out: &mut crate::cache::snapshot::SnapshotWriter,
@@ -774,11 +779,6 @@ impl LexicalIndex {
             for length in fields.lengths {
                 out.u32(length)?;
             }
-            out.f64(fields.prior)?;
-            out.bool(fields.is_test)?;
-        }
-        for value in self.average_lengths.iter().chain(&self.total_lengths) {
-            out.f64(*value)?;
         }
         let term_values = self
             .document_terms
@@ -794,10 +794,12 @@ impl LexicalIndex {
         out.usize(self.doc_count)
     }
 
-    /// An index written by [`write_snapshot`](Self::write_snapshot), or `None`
-    /// when the payload is inconsistent.
+    /// An index written by [`write_snapshot`](Self::write_snapshot) for
+    /// `document_paths`, one per slot, or `None` when the payload is
+    /// inconsistent. Path priors and average lengths are derived again.
     pub(crate) fn read_snapshot(
         input: &mut crate::cache::snapshot::SnapshotReader<'_>,
+        document_paths: &[String],
     ) -> Option<Self> {
         let text = input.str()?.to_owned();
         let ends = input.u32s()?;
@@ -876,21 +878,20 @@ impl LexicalIndex {
         }
 
         let documents_len = input.usize()?;
+        if documents_len != document_paths.len() {
+            return None;
+        }
         let mut documents = Vec::with_capacity(documents_len);
-        for _ in 0..documents_len {
+        let mut total_lengths = [0.0; 4];
+        for path in document_paths {
             let lengths = [input.u32()?, input.u32()?, input.u32()?, input.u32()?];
-            documents.push(DocumentFields {
-                lengths,
-                prior: input.f64()?,
-                is_test: input.bool()?,
-            });
+            for (total, length) in total_lengths.iter_mut().zip(lengths) {
+                *total += f64::from(length);
+            }
+            documents.push(document_fields(path, lengths));
         }
         if max_doc.is_some_and(|doc| doc as usize >= documents_len) {
             return None;
-        }
-        let mut lengths = [0.0; 8];
-        for value in &mut lengths {
-            *value = input.f64()?;
         }
         let mut values = input.u32_seq()?;
         let mut document_terms = Vec::with_capacity(documents_len);
@@ -916,22 +917,31 @@ impl LexicalIndex {
         if doc_count > documents_len {
             return None;
         }
-        Some(Self {
+        let mut index = Self {
             terms,
             posting,
             documents,
-            average_lengths: lengths[..4].try_into().unwrap(),
-            total_lengths: lengths[4..].try_into().unwrap(),
+            average_lengths: [1.0; 4],
+            total_lengths,
             document_terms,
             doc_count,
             #[cfg(test)]
             last_update_work: UpdateWork::default(),
-        })
+        };
+        index.set_average_lengths();
+        Some(index)
     }
 
     #[cfg(test)]
     pub(crate) fn last_update_work(&self) -> UpdateWork {
         self.last_update_work
+    }
+
+    /// Path prior and test flag of the document at `slot`.
+    #[cfg(test)]
+    pub(crate) fn document_prior(&self, slot: usize) -> (f64, bool) {
+        let fields = &self.documents[slot];
+        (fields.prior, fields.is_test)
     }
 
     /// Number of documents in the index.

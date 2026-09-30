@@ -345,20 +345,22 @@ async fn claude_timeout_kills_child_and_removes_cwd() {
     let script = write_fake_claude(
         dir.path(),
         &format!(
-            "echo $$ > '{}'; pwd > '{}'; exec sleep 10",
+            "echo $$ > '{}'; pwd > '{}'; exec sleep 60",
             pid_file.display(),
             cwd_file.display()
         ),
     );
+    // Long enough for a loaded runner to start the shell and record its PID
+    // before the timeout kills it.
     let client = OllamaClient::new(&claude_chat_config(&script))
-        .with_chat_timeout(std::time::Duration::from_millis(200));
+        .with_chat_timeout(std::time::Duration::from_secs(3));
     assert!(client.chat("q").await.is_err());
     let pid: i32 = std::fs::read_to_string(pid_file)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    for _ in 0..100 {
+    for _ in 0..1000 {
         // SAFETY: signal zero only checks the existence of this test's child.
         if unsafe { libc::kill(pid, 0) } == -1 {
             break;

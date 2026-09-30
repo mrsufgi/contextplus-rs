@@ -1269,6 +1269,17 @@ mod tests {
 
         let (handle, mut rx) = tracker_with_capture(root.clone());
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // FSEvents can report the setup writes after the watch starts; a
+        // later write arriving proves those are delivered, then drain them.
+        std::fs::write(root.join("src/settle.rs"), "").unwrap();
+        assert!(
+            wait_for_file(&mut rx, "settle.rs", 10).await,
+            "the watcher reported no write"
+        );
+        while tokio::time::timeout(Duration::from_millis(1000), rx.recv())
+            .await
+            .is_ok_and(|batch| batch.is_some())
+        {}
 
         for _ in 0..3 {
             for entry in WalkBuilder::new(&root).build().flatten() {
@@ -1285,7 +1296,7 @@ mod tests {
         assert!(quiet, "reading the tree produced a refresh batch");
 
         std::fs::write(root.join("src/lib.rs"), "mod a; mod b;").unwrap();
-        let seen = wait_for_file(&mut rx, "lib.rs", 5).await;
+        let seen = wait_for_file(&mut rx, "lib.rs", 10).await;
         handle.stop().await;
         assert!(seen, "a real write was not reported");
     }

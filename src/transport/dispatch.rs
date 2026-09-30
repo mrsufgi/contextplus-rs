@@ -1829,7 +1829,7 @@ mod tests {
         tokio::task::yield_now().await;
         drop(writer);
 
-        let roots = tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
+        let roots = tokio::time::timeout(std::time::Duration::from_secs(10), lookup)
             .await
             .expect("foreign-root lookup did not finish after the writer released")
             .expect("foreign-root lookup panicked during registry contention");

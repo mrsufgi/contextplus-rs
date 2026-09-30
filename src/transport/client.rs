@@ -876,9 +876,11 @@ mod tests {
         }
     }
 
-    fn short_reconnect_policy() -> BridgeOptions {
+    /// Retries quickly, with a deadline no test reaches: a reconnect here
+    /// waits on the fake daemon's task, which a loaded runner can delay.
+    fn quick_retry_policy() -> BridgeOptions {
         BridgeOptions {
-            reconnect_timeout: Duration::from_millis(250),
+            reconnect_timeout: Duration::from_secs(30),
             reconnect_backoff: Duration::from_millis(10),
         }
     }
@@ -941,7 +943,8 @@ mod tests {
             )
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Held open until the test ends, so only host EOF can stop the bridge.
+            std::future::pending::<()>().await;
         });
 
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -957,7 +960,7 @@ mod tests {
             .spawn()
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !socket_path.exists() {
                 tokio::task::yield_now().await;
             }
@@ -975,7 +978,7 @@ mod tests {
         .unwrap_or_else(|_| {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("bridge child did not exit within 1s after host stdin closed")
+            panic!("bridge child did not exit after host stdin closed")
         });
 
         daemon.abort();
@@ -1059,7 +1062,7 @@ mod tests {
                 &config,
                 bridge_input,
                 bridge_output,
-                short_reconnect_policy(),
+                quick_retry_policy(),
             )
             .await
         });
@@ -1109,7 +1112,7 @@ mod tests {
         );
 
         drop(host.input);
-        tokio::time::timeout(Duration::from_secs(1), bridge)
+        tokio::time::timeout(Duration::from_secs(10), bridge)
             .await
             .expect("bridge did not stop after host input closed")
             .unwrap()
@@ -1121,6 +1124,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reconnect_timeout_returns_error_while_host_input_is_open() {
         use tokio::net::UnixListener;
+        const RECONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -1139,12 +1143,12 @@ mod tests {
 
             let (mut reconnect, _) = listener.accept().await.unwrap();
             let _: RegisterSession = read_frame(&mut reconnect).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Never answers, so only the bridge's own deadline can end it.
+            std::future::pending::<()>().await;
         });
 
         let (bridge_input, bridge_output, mut host) = host_io();
         let config = crate::config::Config::from_env();
-        let started = Instant::now();
         let bridge_root = root.clone();
         let bridge = tokio::spawn(async move {
             run_with_io(
@@ -1153,7 +1157,7 @@ mod tests {
                 bridge_input,
                 bridge_output,
                 BridgeOptions {
-                    reconnect_timeout: Duration::from_millis(100),
+                    reconnect_timeout: RECONNECT_TIMEOUT,
                     reconnect_backoff: Duration::from_millis(10),
                 },
             )
@@ -1163,18 +1167,26 @@ mod tests {
         host.write_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
             .await;
         assert_eq!(host.read_json().await["id"], 1);
+        let started = Instant::now();
         host.write_json(json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"never-finishes","arguments":{}}}))
             .await;
 
-        let result = tokio::time::timeout(Duration::from_secs(1), bridge)
+        let result = tokio::time::timeout(Duration::from_secs(30), bridge)
             .await
             .expect("bridge exceeded its reconnect deadline")
             .unwrap();
+        let elapsed = started.elapsed();
+        let error = result.expect_err("bridge returned success after reconnect timeout");
         assert!(
-            result.is_err(),
-            "bridge returned success after reconnect timeout"
+            format!("{error:#}").contains("daemon reconnect deadline exceeded"),
+            "bridge ended for another reason: {error:#}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // As much slack again as the deadline covers a loaded runner, and no
+        // other deadline fits in that window.
+        assert!(
+            elapsed >= RECONNECT_TIMEOUT && elapsed < RECONNECT_TIMEOUT * 2,
+            "bridge gave up after {elapsed:?}, not its {RECONNECT_TIMEOUT:?} deadline"
+        );
         drop(host.input);
         daemon.abort();
     }
@@ -1238,7 +1250,7 @@ mod tests {
                 &config,
                 bridge_input,
                 bridge_output,
-                short_reconnect_policy(),
+                quick_retry_policy(),
             )
             .await
         });
@@ -1271,14 +1283,14 @@ mod tests {
             .await
             .expect("daemon did not receive the complete host request")
             .unwrap();
-        let request_response = tokio::time::timeout(Duration::from_secs(1), host.read_json())
+        let request_response = tokio::time::timeout(Duration::from_secs(10), host.read_json())
             .await
             .expect("host did not receive the large request's response");
         assert_eq!(request_response["id"], 42);
         assert_eq!(request_response["result"]["received"], true);
 
         drop(host.input);
-        tokio::time::timeout(Duration::from_secs(1), bridge)
+        tokio::time::timeout(Duration::from_secs(10), bridge)
             .await
             .expect("bridge did not stop after host EOF")
             .unwrap()
@@ -1334,7 +1346,7 @@ mod tests {
                 &config,
                 bridge_input,
                 bridge_output,
-                short_reconnect_policy(),
+                quick_retry_policy(),
             )
             .await
         });
@@ -1348,14 +1360,14 @@ mod tests {
         dropped_rx.await.unwrap();
         host.write_json(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"after-drain","arguments":{}}}))
             .await;
-        let resumed = tokio::time::timeout(Duration::from_secs(1), host.read_json())
+        let resumed = tokio::time::timeout(Duration::from_secs(10), host.read_json())
             .await
             .expect("session did not resume after RejectedDraining");
         assert_eq!(resumed["id"], 5);
         assert_eq!(resumed["result"]["daemon"], "c");
 
         drop(host.input);
-        tokio::time::timeout(Duration::from_secs(1), bridge)
+        tokio::time::timeout(Duration::from_secs(10), bridge)
             .await
             .unwrap()
             .unwrap()

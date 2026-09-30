@@ -932,7 +932,7 @@ mod tests {
         .await
         .unwrap();
         let ready: SessionReady =
-            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut bridge_stream))
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut bridge_stream))
                 .await
                 .expect("daemon did not register the linked-worktree session")
                 .unwrap();

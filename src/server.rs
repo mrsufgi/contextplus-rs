@@ -15918,7 +15918,9 @@ mod tests {
             "fn FILL_COMPLETES_in_background() {}\n",
         )
         .unwrap();
-        let mut config = semantic_fill_config(&ollama.uri, 1_200, 2_000);
+        // The fresh query's embed never returns, so a long budget keeps it in
+        // flight for as long as the wait below takes.
+        let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
         config.ollama_max_concurrent = 2;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 
@@ -15948,7 +15950,7 @@ mod tests {
         ollama.slow_query_started.acquire().await.unwrap().forget();
         ollama.release_fill.add_permits(1);
 
-        tokio::time::timeout(std::time::Duration::from_millis(150), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if server
                     .current_ref()
@@ -15965,6 +15967,10 @@ mod tests {
         })
         .await
         .expect("a released filler response must install while the fresh query is embedding");
+        assert!(
+            !slow_query.is_finished(),
+            "the filler installed only once the fresh query had given up"
+        );
 
         slow_query.abort();
     }
@@ -20209,6 +20215,9 @@ mod cold_start_tests {
             base: None,
         };
         assert!(snapshots::write_keywords(tmp.path(), &config, &cached).unwrap());
+        // The first read of a root registers it in the test-only load
+        // counter, whose map would otherwise be charged to the loaded index.
+        drop(snapshots::read_keywords(tmp.path(), &config).unwrap());
 
         let ((loaded, loaded_retained), loaded_peak) = crate::alloc_probe::peak_bytes(|| {
             crate::alloc_probe::retained_bytes(|| {
@@ -20272,6 +20281,9 @@ mod cold_start_tests {
                 )
             })
             .collect();
+        // The first read of a root registers it in the test-only load
+        // counter, whose map would otherwise be charged to the loaded documents.
+        drop(snapshots::read_identifiers(tmp.path(), &config, &digests).unwrap());
 
         let ((loaded, to_parse), loaded_retained) = crate::alloc_probe::retained_bytes(|| {
             snapshots::read_identifiers(tmp.path(), &config, &digests).unwrap()

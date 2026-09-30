@@ -33,13 +33,21 @@ fn derivation_version(kind: &str) -> u32 {
 
 fn fingerprint(kind: &str, config: &Config) -> String {
     // Keyword documents depend on file contents alone; the others belong to
-    // an embedding space.
+    // an embedding space. Every kind holds symbols of the grammar set, which
+    // the golden corpus cannot cover for a language it has no parser for yet.
     let identity = if kind == KEYWORDS {
         String::new()
     } else {
         config.document_cache_identity()
     };
-    snapshot::fingerprint(kind, &format!("d{}|{identity}", derivation_version(kind)))
+    snapshot::fingerprint(
+        kind,
+        &format!(
+            "d{}|g{}|{identity}",
+            derivation_version(kind),
+            crate::core::tree_sitter::grammar_identity()
+        ),
+    )
 }
 
 /// Whether `ref_index` persists snapshots: only a primary checkout does; a
@@ -164,7 +172,8 @@ pub(super) fn read_keywords(
     let digests = (0..document_paths.len())
         .map(|_| input.digest())
         .collect::<Option<Vec<_>>>()?;
-    let index = crate::tools::lexical_search::LexicalIndex::read_snapshot(&mut input)?;
+    let index =
+        crate::tools::lexical_search::LexicalIndex::read_snapshot(&mut input, &document_paths)?;
     if !input.is_empty() || index.slot_count() != document_paths.len() {
         return None;
     }
@@ -690,9 +699,9 @@ mod tests {
     /// derivation version. When a builder's output changes, bump that kind's
     /// `*_DERIVATION` and record the new digest here.
     const GOLDEN: [(&str, u32, &str); 3] = [
-        (KEYWORDS, 1, "0d0df364f06ffb9a"),
-        (IDENTIFIERS, 1, "bd71e59c4c864953"),
-        (FILES, 1, "7fd8205168a77f23"),
+        (KEYWORDS, 1, "98f58731ff5fa4e7"),
+        (IDENTIFIERS, 1, "30d17ad82e762170"),
+        (FILES, 1, "d405d7a42c24b63d"),
     ];
 
     fn golden_corpus() -> Vec<(&'static str, &'static str)> {
@@ -728,6 +737,95 @@ mod tests {
             (
                 "config/app.json",
                 "{\n  \"refundWindowDays\": 30,\n  \"currency\": \"usd\"\n}\n",
+            ),
+            (
+                "web/RefundPanel.tsx",
+                "// Refund panel\n\
+                 export interface PanelProps { amount: number }\n\
+                 export function RefundPanel(props: PanelProps) { return <div>{props.amount}</div>; }\n\
+                 export class PanelStore { load(id: string): void {} }\n",
+            ),
+            (
+                "web/cart.js",
+                "// Shopping cart helpers\n\
+                 export class Cart {\n  addItem(item) { this.items.push(item); }\n}\n\
+                 export function cartTotal(cart) { return cart.items.length; }\n\
+                 var cartLimit = 10;\n",
+            ),
+            (
+                "svc/payout.go",
+                "// Package payout schedules payouts.\n\
+                 package payout\n\n\
+                 type Payout struct { Amount int64 }\n\n\
+                 func (p *Payout) Settle(account string) error { return nil }\n\n\
+                 func NewPayout(amount int64) *Payout { return &Payout{Amount: amount} }\n",
+            ),
+            (
+                "svc/Invoice.java",
+                "// Invoices for accounts\n\
+                 public class Invoice {\n    public long total(int count) { return count; }\n}\n\
+                 interface Payable { void pay(); }\n\
+                 enum InvoiceState { OPEN, PAID }\n",
+            ),
+            (
+                "native/ledger.c",
+                "/* Ledger in C */\n\
+                 struct entry { int amount; };\n\
+                 enum kind { DEBIT, CREDIT };\n\
+                 int ledger_sum(struct entry *entries, int count) { return count; }\n",
+            ),
+            (
+                "native/ledger.cpp",
+                "// Ledger in C++\n\
+                 class Ledger {\n public:\n  int total() { return 0; }\n};\n\
+                 struct Row { int amount; };\n\
+                 int sum_rows(int count) { return count; }\n",
+            ),
+            (
+                "scripts/deploy.sh",
+                "#!/bin/bash\n# Deploy the service\n\
+                 build_image() {\n  docker build .\n}\n\
+                 function push_image {\n  docker push \"$1\"\n}\n",
+            ),
+            (
+                "lib/billing.rb",
+                "# Billing helpers\n\
+                 module Billing\n  class Charge\n    def capture(amount)\n      amount\n    end\n\n    \
+                 def self.build(id)\n      new\n    end\n  end\nend\n",
+            ),
+            (
+                "app/Refund.php",
+                "<?php\n// Refunds\n\
+                 interface Refundable { public function refund(int $amount): bool; }\n\
+                 class Refund {\n    public function issue(string $reason): void {}\n}\n\
+                 function refund_total(array $rows): int { return count($rows); }\n",
+            ),
+            (
+                "app/Account.cs",
+                "// Accounts\n\
+                 public class Account {\n    public decimal Balance(int days) { return 0; }\n}\n\
+                 public interface IAccount { void Close(); }\n\
+                 public struct Money { public int Cents; }\n\
+                 public enum Tier { Free, Pro }\n",
+            ),
+            (
+                "app/Wallet.kt",
+                "// Wallet\n\
+                 class Wallet(val owner: String) {\n    fun deposit(amount: Long): Long = amount\n}\n\
+                 object WalletRegistry\n\
+                 fun openWallet(owner: String): Wallet = Wallet(owner)\n",
+            ),
+            (
+                "site/index.html",
+                "<!doctype html>\n<html>\n<head><style>body { margin: 0; }</style></head>\n\
+                 <body><div id=\"app\">Invoices</div><script>start();</script></body>\n</html>\n",
+            ),
+            (
+                "site/theme.css",
+                "/* Theme */\n\
+                 .invoice { color: black; }\n\
+                 @media (max-width: 600px) { .invoice { color: gray; } }\n\
+                 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }\n",
             ),
         ]
     }
@@ -849,6 +947,309 @@ mod tests {
              its new digest in GOLDEN:\n{}",
             mismatches.join("\n")
         );
+    }
+
+    #[test]
+    fn cold_start_snapshots_name_the_grammar_set_that_parsed_them() {
+        let config = Config::from_env();
+        let grammars = format!("|g{}|", crate::core::tree_sitter::grammar_identity());
+        for kind in [KEYWORDS, IDENTIFIERS, FILES] {
+            assert!(
+                fingerprint(kind, &config).contains(&grammars),
+                "{kind} snapshots outlive a change of grammars"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_golden_corpus_parses_every_grammar() {
+        let corpus = golden_corpus();
+        let missing: Vec<&str> = crate::core::tree_sitter::grammar_extensions()
+            .filter(|(_, exts)| {
+                !corpus.iter().any(|(path, content)| {
+                    let ext = path.rsplit('.').next().unwrap_or("");
+                    exts.contains(&ext)
+                        && !crate::core::tree_sitter::parse_with_tree_sitter(content, ext)
+                            .unwrap_or_default()
+                            .is_empty()
+                })
+            })
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "golden_corpus has no file with symbols for grammars {missing:?}; add one and \
+             record the new GOLDEN digests"
+        );
+    }
+
+    /// Digest of each kind's payload for [`payload_digests`]' fixed contents
+    /// at [`snapshot::FORMAT_VERSION`]. When a payload layout changes, bump
+    /// `FORMAT_VERSION` and record the new digests here.
+    const PAYLOAD_GOLDEN: (u32, [(&str, &str); 3]) = (
+        2,
+        [
+            (KEYWORDS, "f3ca98332e3884e0"),
+            (IDENTIFIERS, "54092fb534a037e2"),
+            (FILES, "17a7b28000777c56"),
+        ],
+    );
+
+    /// Digest of the payload each kind writes for fixed contents, independent
+    /// of what the builders derive.
+    fn payload_digests() -> HashMap<&'static str, String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let config = Config::from_env();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for (path, content) in [("src/a.rs", "alpha\n"), ("src/b.rs", "alpha beta\n")] {
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        let cache = Arc::new(load_project_cache(root, &config, None, false));
+
+        // One term per document, so term ids do not depend on hash order.
+        let mut index = crate::tools::lexical_search::LexicalIndex::with_capacity(3);
+        for (path, term, counts) in [
+            ("src/a.rs", "alpha", [1, 0, 0, 2]),
+            ("src/b.rs", "alpha", [0, 1, 0, 0]),
+            ("src/c.rs", "beta", [0, 0, 3, 1]),
+        ] {
+            index.push_counted(path, (HashMap::from([(term.to_owned(), counts)]), counts));
+        }
+        index.finish_build();
+        let cached = CachedLexicalIndex {
+            index,
+            document_paths: ["src/a.rs", "src/b.rs", "src/c.rs"]
+                .map(str::to_owned)
+                .to_vec(),
+            project_cache: Arc::clone(&cache),
+            generation: 0,
+            base: None,
+        };
+        assert!(write_keywords(root, &config, &cached).unwrap());
+
+        let tokens = |tokens: &[&str]| tokens.iter().map(|token| (*token).to_owned()).collect();
+        let docs = vec![
+            IdentifierDoc::assemble(
+                "src/a.rs",
+                "alpha header",
+                "Alpha".to_owned(),
+                "struct".to_owned(),
+                1,
+                4,
+                "pub struct Alpha".to_owned(),
+                None,
+                tokens(&["alpha"]),
+                tokens(&["pub", "struct", "alpha"]),
+                tokens(&[]),
+            ),
+            IdentifierDoc::assemble(
+                "src/a.rs",
+                "alpha header",
+                "run".to_owned(),
+                "method".to_owned(),
+                2,
+                3,
+                "fn run(&self)".to_owned(),
+                Some("Alpha".to_owned()),
+                tokens(&["run"]),
+                tokens(&["fn", "run", "self"]),
+                tokens(&["alpha"]),
+            ),
+        ];
+        let identifiers = IdentifierIndex {
+            docs: Segmented::from_files(BTreeMap::from([("src/a.rs".to_owned(), Arc::new(docs))])),
+            vectors: IdentifierVectorIndex::empty(),
+            dims: 2,
+            file_count: 2,
+            built_at: Instant::now(),
+        };
+        assert!(write_identifiers(root, &config, &identifiers, &cache).unwrap());
+
+        let mut seeded = crate::tools::semantic_search::SearchDocument::new(
+            "src/a.rs".to_owned(),
+            "alpha header".to_owned(),
+            vec!["Alpha".to_owned(), "run".to_owned()],
+            vec![
+                crate::tools::semantic_search::SymbolSearchEntry {
+                    name: "Alpha".to_owned(),
+                    kind: Some("struct".to_owned()),
+                    line: 1,
+                    end_line: Some(4),
+                    signature: Some("pub struct Alpha".to_owned()),
+                },
+                crate::tools::semantic_search::SymbolSearchEntry {
+                    name: "run".to_owned(),
+                    kind: None,
+                    line: 2,
+                    end_line: None,
+                    signature: None,
+                },
+            ],
+            "alpha\n".to_owned(),
+        );
+        seeded.source_hash = "source-hash".to_owned();
+        let mut out = SnapshotWriter::create(
+            &snapshot::snapshot_path(root, FILES),
+            &fingerprint(FILES, &config),
+        )
+        .unwrap();
+        crate::tools::semantic_search::write_document_seeds(&mut out, &[Arc::new(seeded)]).unwrap();
+        out.commit().unwrap();
+
+        [KEYWORDS, IDENTIFIERS, FILES]
+            .into_iter()
+            .map(|kind| {
+                let snapshot = Snapshot::open(
+                    &snapshot::snapshot_path(root, kind),
+                    &fingerprint(kind, &config),
+                )
+                .unwrap();
+                let digest = blake3::hash(snapshot.reader().rest()).to_hex()[..16].to_owned();
+                (kind, digest)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cold_start_snapshot_payload_layout_matches_its_format_version() {
+        let digests = payload_digests();
+        let (version, golden) = PAYLOAD_GOLDEN;
+        let mismatches: Vec<String> = golden
+            .iter()
+            .filter(|(kind, digest)| {
+                version != snapshot::FORMAT_VERSION || digests[kind] != *digest
+            })
+            .map(|(kind, _)| {
+                format!(
+                    "{kind}: format v{} now writes {}",
+                    snapshot::FORMAT_VERSION,
+                    digests[kind]
+                )
+            })
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "a snapshot payload layout changed; bump FORMAT_VERSION and record the new \
+             digests in PAYLOAD_GOLDEN:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// Writes a snapshot of every kind for a one-file checkout at `root`.
+    fn write_every_kind(root: &Path, config: &Config) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
+        let cache = Arc::new(load_project_cache(root, config, None, false));
+        let (index, document_paths) =
+            build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content);
+        let cached = CachedLexicalIndex {
+            index,
+            document_paths,
+            project_cache: cache,
+            generation: 0,
+            base: None,
+        };
+        assert!(write_keywords(root, config, &cached).unwrap());
+        for kind in [IDENTIFIERS, FILES] {
+            let path = snapshot::snapshot_path(root, kind);
+            let mut out = SnapshotWriter::create(&path, &fingerprint(kind, config)).unwrap();
+            out.usize(0).unwrap();
+            out.commit().unwrap();
+        }
+    }
+
+    /// Whether the keyword, identifier and file snapshots at `root` load.
+    fn loadable(root: &Path, config: &Config) -> [bool; 3] {
+        let files = Snapshot::open(
+            &snapshot::snapshot_path(root, FILES),
+            &fingerprint(FILES, config),
+        )
+        .and_then(|snapshot| {
+            crate::tools::semantic_search::read_document_seeds(&mut snapshot.reader())
+        })
+        .is_some();
+        [
+            read_keywords(root, config).is_some(),
+            read_identifiers(root, config, &HashMap::new()).is_some(),
+            files,
+        ]
+    }
+
+    #[test]
+    fn cold_start_bumped_derivation_or_other_config_invalidates_a_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::from_env();
+        write_every_kind(tmp.path(), &config);
+        assert_eq!(loadable(tmp.path(), &config), [true; 3]);
+
+        let mut other = config.clone();
+        other.embed_doc_prefix.push_str("other: ");
+        assert_eq!(
+            loadable(tmp.path(), &other),
+            [true, false, false],
+            "only keyword documents are independent of the embedding configuration"
+        );
+
+        for kind in [KEYWORDS, IDENTIFIERS, FILES] {
+            let version = derivation_version(kind);
+            let bumped = fingerprint(kind, &config)
+                .replace(&format!("|d{version}|"), &format!("|d{}|", version + 1));
+            let path = snapshot::snapshot_path(tmp.path(), kind);
+            let mut out = SnapshotWriter::create(&path, &bumped).unwrap();
+            out.usize(0).unwrap();
+            out.commit().unwrap();
+            assert!(Snapshot::open(&path, &bumped).is_some());
+            assert!(
+                Snapshot::open(&path, &fingerprint(kind, &config)).is_none(),
+                "{kind} loaded a snapshot of another derivation version"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_keyword_snapshot_takes_path_priors_from_the_current_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::from_env();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn shared() {}\n").unwrap();
+        let cache = Arc::new(load_project_cache(tmp.path(), &config, None, false));
+        let (index, _) = build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content);
+        assert_eq!(index.document_prior(0), (1.0, false));
+        // A document classified by other code than the current: its path now
+        // reads as a generated test file.
+        let cached = CachedLexicalIndex {
+            index,
+            document_paths: vec!["src/generated/lib.test.rs".to_owned()],
+            project_cache: cache,
+            generation: 0,
+            base: None,
+        };
+        assert!(write_keywords(tmp.path(), &config, &cached).unwrap());
+
+        let (loaded, _, _) = read_keywords(tmp.path(), &config).unwrap();
+        let (prior, is_test) = loaded.document_prior(0);
+        assert!(
+            is_test,
+            "the snapshot kept the test flag of the code that wrote it"
+        );
+        assert!(
+            prior < 1.0,
+            "the snapshot kept the prior of the code that wrote it"
+        );
+    }
+
+    #[test]
+    fn cold_start_one_unusable_snapshot_leaves_the_other_kinds_loading() {
+        let config = Config::from_env();
+        for (unusable, kind) in [KEYWORDS, IDENTIFIERS, FILES].into_iter().enumerate() {
+            let tmp = tempfile::tempdir().unwrap();
+            write_every_kind(tmp.path(), &config);
+            std::fs::write(snapshot::snapshot_path(tmp.path(), kind), b"stale").unwrap();
+            let mut expected = [true; 3];
+            expected[unusable] = false;
+            assert_eq!(loadable(tmp.path(), &config), expected, "{kind} unusable");
+        }
     }
 
     #[test]
