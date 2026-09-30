@@ -851,6 +851,90 @@ mod tests {
         );
     }
 
+    /// Writes a snapshot of every kind for a one-file checkout at `root`.
+    fn write_every_kind(root: &Path, config: &Config) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
+        let cache = Arc::new(load_project_cache(root, config, None, false));
+        let (index, document_paths) =
+            build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content);
+        let cached = CachedLexicalIndex {
+            index,
+            document_paths,
+            project_cache: cache,
+            generation: 0,
+            base: None,
+        };
+        assert!(write_keywords(root, config, &cached).unwrap());
+        for kind in [IDENTIFIERS, FILES] {
+            let path = snapshot::snapshot_path(root, kind);
+            let mut out = SnapshotWriter::create(&path, &fingerprint(kind, config)).unwrap();
+            out.usize(0).unwrap();
+            out.commit().unwrap();
+        }
+    }
+
+    /// Whether the keyword, identifier and file snapshots at `root` load.
+    fn loadable(root: &Path, config: &Config) -> [bool; 3] {
+        let files = Snapshot::open(
+            &snapshot::snapshot_path(root, FILES),
+            &fingerprint(FILES, config),
+        )
+        .and_then(|snapshot| {
+            crate::tools::semantic_search::read_document_seeds(&mut snapshot.reader())
+        })
+        .is_some();
+        [
+            read_keywords(root, config).is_some(),
+            read_identifiers(root, config, &HashMap::new()).is_some(),
+            files,
+        ]
+    }
+
+    #[test]
+    fn cold_start_bumped_derivation_or_other_config_invalidates_a_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::from_env();
+        write_every_kind(tmp.path(), &config);
+        assert_eq!(loadable(tmp.path(), &config), [true; 3]);
+
+        let mut other = config.clone();
+        other.embed_doc_prefix.push_str("other: ");
+        assert_eq!(
+            loadable(tmp.path(), &other),
+            [true, false, false],
+            "only keyword documents are independent of the embedding configuration"
+        );
+
+        for kind in [KEYWORDS, IDENTIFIERS, FILES] {
+            let version = derivation_version(kind);
+            let bumped = fingerprint(kind, &config)
+                .replace(&format!("|d{version}|"), &format!("|d{}|", version + 1));
+            let path = snapshot::snapshot_path(tmp.path(), kind);
+            let mut out = SnapshotWriter::create(&path, &bumped).unwrap();
+            out.usize(0).unwrap();
+            out.commit().unwrap();
+            assert!(Snapshot::open(&path, &bumped).is_some());
+            assert!(
+                Snapshot::open(&path, &fingerprint(kind, &config)).is_none(),
+                "{kind} loaded a snapshot of another derivation version"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_one_unusable_snapshot_leaves_the_other_kinds_loading() {
+        let config = Config::from_env();
+        for (unusable, kind) in [KEYWORDS, IDENTIFIERS, FILES].into_iter().enumerate() {
+            let tmp = tempfile::tempdir().unwrap();
+            write_every_kind(tmp.path(), &config);
+            std::fs::write(snapshot::snapshot_path(tmp.path(), kind), b"stale").unwrap();
+            let mut expected = [true; 3];
+            expected[unusable] = false;
+            assert_eq!(loadable(tmp.path(), &config), expected, "{kind} unusable");
+        }
+    }
+
     #[test]
     fn cold_start_identifier_snapshot_never_pairs_an_old_index_with_a_new_source() {
         let index = Arc::new(tokio::sync::RwLock::new(Some(1_u32)));
