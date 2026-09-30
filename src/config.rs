@@ -162,6 +162,8 @@ pub struct Config {
     pub embed_tracker_max_files: usize,
     pub ignore_dirs: HashSet<String>,
     pub cache_ttl_secs: u64,
+    /// How long an identifier vector goes unused before a save may prune it.
+    pub identifier_prune_grace_secs: u64,
     pub resident_memory_budget_bytes: usize,
     pub max_embed_file_size: usize,
     pub embed_num_gpu: Option<i32>,
@@ -237,6 +239,7 @@ const DEFAULT_EMBED_BATCH_SIZE: usize = 50;
 const DEFAULT_EMBED_TRACKER_DEBOUNCE_MS: u64 = 700;
 const DEFAULT_EMBED_TRACKER_MAX_FILES: usize = 8;
 const DEFAULT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_IDENTIFIER_PRUNE_GRACE_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_EMBED_CHUNK_CHARS: usize = 2000;
 const MIN_EMBED_CHUNK_CHARS: usize = 256;
 const MAX_EMBED_CHUNK_CHARS: usize = 8000;
@@ -605,6 +608,11 @@ impl Config {
             ),
             ignore_dirs: build_ignore_dirs(env),
             cache_ttl_secs: env_parse(env, "CONTEXTPLUS_CACHE_TTL_SECS", DEFAULT_CACHE_TTL_SECS),
+            identifier_prune_grace_secs: env_parse(
+                env,
+                "CONTEXTPLUS_IDENTIFIER_PRUNE_GRACE_SECS",
+                DEFAULT_IDENTIFIER_PRUNE_GRACE_SECS,
+            ),
             resident_memory_budget_bytes: env_parse(
                 env,
                 "CONTEXTPLUS_MEMORY_BUDGET_MB",

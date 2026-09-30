@@ -200,6 +200,7 @@ All runtime knobs are read from environment variables by `Config::from_env()` (`
 | `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `51200` (50 KB) | Skip files larger than this (bytes) for embedding |
 | `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated) |
 | `CONTEXTPLUS_CACHE_TTL_SECS` | `300` | Embedding cache TTL in seconds |
+| `CONTEXTPLUS_IDENTIFIER_PRUNE_GRACE_SECS` | `86400` | How long an identifier embedding goes unused by every attached ref before a save drops it from the cache |
 | `CONTEXTPLUS_EMBED_NUM_GPU` | _(none)_ | Ollama `num_gpu` option |
 | `CONTEXTPLUS_EMBED_MAIN_GPU` | _(none)_ | Ollama `main_gpu` option |
 | `CONTEXTPLUS_EMBED_NUM_THREAD` | _(none)_ | Ollama `num_thread` option |

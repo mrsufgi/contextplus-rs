@@ -1213,6 +1213,13 @@ impl CachedSearchIndex {
         &self.search_root
     }
 
+    /// Whether this entry was built at `vector_generation` with no batches
+    /// queued.
+    pub(crate) fn is_settled(&self, vector_generation: u64) -> bool {
+        self.vector_generation == vector_generation
+            && self.pending.lock().unwrap().batches.is_empty()
+    }
+
     /// A parent entry a worktree can fork: walked from its whole `root`, over
     /// a vector store worth sharing, with no queued batches or rebuild.
     pub(crate) fn forkable_at(&self, root: &Path) -> bool {
@@ -2040,6 +2047,18 @@ impl SearchIndex {
         query_vec: &[f32],
         opts: &ResolvedSearchOptions,
     ) -> Vec<SearchResult> {
+        self.search_where(query, query_vec, opts, None)
+    }
+
+    /// [`Self::search`] over only the documents whose path `keep` accepts,
+    /// every one scored, as an index of just those documents would.
+    pub(crate) fn search_where(
+        &self,
+        query: &str,
+        query_vec: &[f32],
+        opts: &ResolvedSearchOptions,
+        keep: Option<&(dyn Fn(&str) -> bool + Sync)>,
+    ) -> Vec<SearchResult> {
         if self.dims != 0 && query_vec.len() != self.dims {
             // The previous model cannot score queries from the replacement vector space.
             return Vec::new();
@@ -2090,7 +2109,7 @@ impl SearchIndex {
         let ann_candidate_set: Option<std::collections::HashSet<usize>> =
             self.graph_store().and_then(|store| {
                 // A global ANN shortlist can omit the requested document class.
-                if opts.scope != SearchScope::All {
+                if opts.scope != SearchScope::All || keep.is_some() {
                     return None;
                 }
                 // Read optional runtime multiplier override.
@@ -2149,7 +2168,8 @@ impl SearchIndex {
                 if ann_candidate_set.as_ref().is_some_and(|c| !c.contains(&i)) {
                     return None;
                 }
-                if !document_passes_filters(doc, opts) {
+                if !document_passes_filters(doc, opts) || keep.is_some_and(|keep| !keep(&doc.path))
+                {
                     return None;
                 }
                 // When ann_store owns the vectors (corpus ≥ ANN_THRESHOLD) the
@@ -2231,7 +2251,8 @@ impl SearchIndex {
                 if self.has_vector[i] {
                     return None; // already handled above
                 }
-                if !document_passes_filters(doc, opts) {
+                if !document_passes_filters(doc, opts) || keep.is_some_and(|keep| !keep(&doc.path))
+                {
                     return None;
                 }
                 // Semantic score is 0 for docs with no embedding.

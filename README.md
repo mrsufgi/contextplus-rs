@@ -148,6 +148,7 @@ Embedding batching, adaptive context-length retries, chunk-and-merge, prefixes, 
 | `CONTEXTPLUS_MAX_EMBED_FILE_SIZE` | `51200` (50 KB) | Skip files larger than this (bytes) for embedding. Min 1 KB |
 | `CONTEXTPLUS_IGNORE_DIRS` | _(none)_ | Extra directories to ignore (comma-separated), appended to the built-in list |
 | `CONTEXTPLUS_CACHE_TTL_SECS` | `300` | Embedding cache TTL in seconds |
+| `CONTEXTPLUS_IDENTIFIER_PRUNE_GRACE_SECS` | `86400` | How long an identifier embedding goes unused by every attached ref before a save drops it from the cache |
 | `CONTEXTPLUS_EMBED_NUM_GPU` | _(none)_ | Ollama `num_gpu` option (GPU layer count) |
 | `CONTEXTPLUS_EMBED_MAIN_GPU` | _(none)_ | Ollama `main_gpu` option (primary GPU index) |
 | `CONTEXTPLUS_EMBED_NUM_THREAD` | _(none)_ | Ollama `num_thread` option |

@@ -385,6 +385,25 @@ pub struct SemanticNavigateOptions {
     pub mode: Option<String>,
 }
 
+/// Whether `index` holds an embedded document for each `eligible` path,
+/// relative to `prefix` inside it.
+fn embeds_every(
+    index: &super::semantic_search::SearchIndex,
+    prefix: &Path,
+    eligible: &HashSet<String>,
+) -> bool {
+    let embedded: HashSet<&str> = index
+        .documents()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| index.vector_at(*i).is_some())
+        .map(|(_, doc)| doc.path.as_str())
+        .collect();
+    eligible
+        .iter()
+        .all(|path| embedded.contains(prefix.join(path).to_string_lossy().as_ref()))
+}
+
 /// Information about a source file for clustering.
 #[derive(Debug, Clone, Default)]
 pub struct FileInfo {
@@ -452,20 +471,49 @@ pub async fn semantic_navigate(
                 "Query navigation requires a search indexer".into(),
             )
         })?;
-        let eligible = files.iter().map(|f| f.relative_path.clone()).collect();
-        let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
-        let mut index = SearchIndex::new();
-        index.index_with_vectors(docs, vectors);
-        let query_vector = ollama.embed_query(query).await?;
-        let results = index.search(
-            query,
-            &query_vector,
-            &ResolvedSearchOptions {
-                top_k: QUERY_CLUSTER_FILE_LIMIT,
-                root_dir: root.clone(),
-                ..Default::default()
-            },
-        );
+        let eligible: HashSet<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+        let search_options = ResolvedSearchOptions {
+            top_k: QUERY_CLUSTER_FILE_LIMIT,
+            root_dir: root.clone(),
+            ..Default::default()
+        };
+        // The ref's current index scores the eligible files under `root`
+        // without a walk or an index of their own, when it embeds every one:
+        // the root's walk skips paths under ignored or hidden directories, and
+        // a file created since the index settled is not in it yet. A file
+        // edited while the tracker re-embeds it scores as last indexed, as in
+        // semantic_code_search.
+        let current = indexer
+            .current_index(&root)
+            .await
+            .filter(|(entry, prefix)| embeds_every(&entry.index, prefix, &eligible));
+        let results = match current {
+            Some((entry, prefix)) => {
+                let query_vector = ollama.embed_query(query).await?;
+                let relative = |path: &str| {
+                    Path::new(path)
+                        .strip_prefix(&prefix)
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                };
+                let keep = |path: &str| relative(path).is_some_and(|path| eligible.contains(&path));
+                let mut results =
+                    entry
+                        .index
+                        .search_where(query, &query_vector, &search_options, Some(&keep));
+                for result in &mut results {
+                    result.path = relative(&result.path).unwrap_or_default();
+                }
+                results
+            }
+            None => {
+                let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
+                let mut index = SearchIndex::new();
+                index.index_with_vectors(docs, vectors);
+                let query_vector = ollama.embed_query(query).await?;
+                index.search(query, &query_vector, &search_options)
+            }
+        };
         relevance = results.into_iter().map(|r| (r.path, r.score)).collect();
         files.retain(|f| relevance.contains_key(&f.relative_path));
         files.sort_by(|a, b| relevance[&b.relative_path].total_cmp(&relevance[&a.relative_path]));
