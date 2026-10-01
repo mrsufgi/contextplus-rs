@@ -770,10 +770,12 @@ impl SharedState {
         }
         let low_watermark = budget / 5 * 4;
         let emergency = measured > budget.saturating_mul(2);
+        let configured_idle =
+            std::time::Duration::from_secs(self.config.memory_budget_min_idle_secs);
         let min_idle = if emergency {
-            MEMORY_BUDGET_MIN_IDLE
+            MEMORY_BUDGET_MIN_IDLE.min(configured_idle)
         } else {
-            std::time::Duration::from_secs(self.config.memory_budget_min_idle_secs)
+            configured_idle
         };
         let in_use_before = if self.trim_due() {
             sample_allocator_in_use().await
@@ -15643,6 +15645,14 @@ mod tests {
         assert!(
             !residency_evicts(100, 70, RESIDENCY_BUDGET, RESIDENCY_BUDGET / 2 * 3).await,
             "a worktree used 70 s ago was evicted under a 100 s residency"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_never_waits_longer_than_the_configured_idle() {
+        assert!(
+            residency_evicts(30, 45, RESIDENCY_BUDGET, RESIDENCY_BUDGET * 3).await,
+            "an emergency kept a worktree idle past its 30 s residency"
         );
     }
 
