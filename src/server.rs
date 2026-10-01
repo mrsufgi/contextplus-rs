@@ -155,7 +155,7 @@ static NEXT_IDENTIFIER_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) struct IdentifierBuild {
     id: u64,
     /// The parsed documents, without vectors, once parsing is done.
-    parsed: Arc<std::sync::OnceLock<Arc<IdentifierIndex>>>,
+    parsed: tokio::sync::watch::Receiver<Option<Arc<IdentifierIndex>>>,
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
 }
 
@@ -177,6 +177,21 @@ impl IdentifierBuild {
             Some(Ok(index)) => Ok(Arc::clone(index)),
             Some(Err(error)) => Err(ContextPlusError::Other(error.clone())),
             None => Err(cancelled()),
+        }
+    }
+
+    /// The parsed documents once parsing is done, or the index when the
+    /// build finishes without parsing.
+    async fn documents(mut self) -> Result<Arc<IdentifierIndex>> {
+        let parsed = self
+            .parsed
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|parsed| parsed.clone());
+        match parsed {
+            Some(parsed) => Ok(parsed),
+            None => self.finished().await,
         }
     }
 }
@@ -3451,9 +3466,10 @@ impl ContextPlusServer {
             return build.clone();
         }
         let (done, receiver) = tokio::sync::watch::channel(None);
+        let (parsed, parsed_receiver) = tokio::sync::watch::channel(None);
         let build = IdentifierBuild {
             id: NEXT_IDENTIFIER_BUILD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            parsed: Arc::default(),
+            parsed: parsed_receiver,
             done: receiver,
         };
         *slot = Some(build.clone());
@@ -3462,7 +3478,6 @@ impl ContextPlusServer {
         let owner = Arc::clone(ref_index);
         let cache = Arc::clone(cache);
         let id = build.id;
-        let parsed = Arc::clone(&build.parsed);
         let task = tokio::spawn(async move {
             let result = server
                 .build_identifier_index_seeded(&cache, false, true, Some(&parsed))
@@ -3582,7 +3597,7 @@ impl ContextPlusServer {
         cache: &Arc<ProjectCache>,
         background: bool,
         seed_from_parent: bool,
-        parsed: Option<&std::sync::OnceLock<Arc<IdentifierIndex>>>,
+        parsed: Option<&tokio::sync::watch::Sender<Option<Arc<IdentifierIndex>>>>,
     ) -> Result<Arc<IdentifierIndex>> {
         let ref_index = self.current_ref().await;
         let update_guard = ref_index.identifier_update.lock().await;
@@ -3823,13 +3838,13 @@ impl ContextPlusServer {
         );
         let docs = Segmented::from_files(docs);
         if let Some(parsed) = parsed {
-            let _ = parsed.set(Arc::new(IdentifierIndex {
+            parsed.send_replace(Some(Arc::new(IdentifierIndex {
                 docs: docs.clone(),
                 vectors: IdentifierVectorIndex::empty(),
                 dims: 0,
                 file_count,
                 built_at: Instant::now(),
-            }));
+            })));
         }
 
         // Each batch's vectors are kept as it completes and saved at most every
@@ -4718,12 +4733,18 @@ impl ContextPlusServer {
         let cache = self.ensure_project_cache().await?;
 
         // A build waits at most the embed budget; past it, the parsed
-        // documents answer by keyword while the build keeps embedding.
+        // documents answer by keyword while the build keeps embedding. A
+        // keyword ranking needs only the parsed documents.
         let (idx, partial) = match self.identifier_index_or_build(&cache, true).await? {
             IdentifierLookup::Ready(index) => (index, None),
             IdentifierLookup::Building(build) => {
                 let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
-                match tokio::time::timeout(budget, build.clone().finished()).await {
+                let waited = if Self::ranks_identifiers_by_keyword(&args) {
+                    tokio::time::timeout(budget, build.clone().documents()).await
+                } else {
+                    tokio::time::timeout(budget, build.clone().finished()).await
+                };
+                match waited {
                     Ok(Ok(index)) => (index, None),
                     waited => {
                         let reason = match waited {
@@ -4752,8 +4773,9 @@ impl ContextPlusServer {
         &self,
         build: &IdentifierBuild,
     ) -> Option<Arc<IdentifierIndex>> {
-        if let Some(parsed) = build.parsed.get() {
-            return Some(Arc::clone(parsed));
+        let parsed = build.parsed.borrow().clone();
+        if parsed.is_some() {
+            return parsed;
         }
         let ref_index = self.current_ref().await;
         if ref_index
@@ -4763,6 +4785,12 @@ impl ContextPlusServer {
             return None;
         }
         ref_index.identifier_index.read().await.as_ref().cloned()
+    }
+
+    /// Whether identifier search `args` rank by keyword alone.
+    fn ranks_identifiers_by_keyword(args: &serde_json::Map<String, Value>) -> bool {
+        Self::get_f64(args, "semantic_weight") == Some(0.0)
+            && Self::get_f64(args, "keyword_weight") != Some(0.0)
     }
 
     /// Searches `idx`; with a `partial` reason, by keyword only and without
@@ -4784,13 +4812,17 @@ impl ContextPlusServer {
             ));
         }
 
+        let by_keyword = Self::ranks_identifiers_by_keyword(&args);
         let partial = match partial {
-            None if idx.dims > 0 && !self.query_embedded_within_budget(&query).await? => {
+            None if !by_keyword
+                && idx.dims > 0
+                && !self.query_embedded_within_budget(&query).await? =>
+            {
                 Some(self.query_embed_overdue())
             }
             partial => partial,
         };
-        let keyword_only = partial.is_some();
+        let keyword_only = by_keyword || partial.is_some();
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
             query,
@@ -6964,6 +6996,7 @@ mod tests {
         text_of(&result)
     }
 
+    /// Explores identifiers by keyword once the index is built.
     async fn explore_identifier(
         server: &ContextPlusServer,
         query: &str,
@@ -6978,6 +7011,8 @@ mod tests {
         if let Some(path) = path {
             args.insert("path".into(), json!(path));
         }
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
         let result = server.dispatch("explore", args).await;
         assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
         text_of(&result)
@@ -7916,13 +7951,14 @@ mod tests {
     }
 
     async fn wait_until_parsed(build: &IdentifierBuild) {
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            while build.parsed.get().is_none() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
+        let mut parsed = build.parsed.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            parsed.wait_for(Option::is_some),
+        )
         .await
-        .expect("the identifier build never parsed");
+        .expect("the identifier build never parsed")
+        .expect("the identifier build ended before parsing");
     }
 
     #[tokio::test]
@@ -7964,6 +8000,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_keyword_identifier_query_needs_neither_vectors_nor_a_query_embed() {
+        let (_repo, ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let mut keyword_args = serde_json::Map::new();
+        keyword_args.insert("semantic_weight".into(), json!(0.0));
+        keyword_args.insert("keyword_weight".into(), json!(1.0));
+        let ranked_by_keyword = server
+            .search_identifiers(
+                keyword_args,
+                server.resolve_root(&serde_json::Map::new()).await,
+                "open_account".into(),
+                &server.ensure_project_cache().await.unwrap(),
+                &server.parsed_identifier_docs(&build).await.unwrap(),
+                Some("held".into()),
+            )
+            .await
+            .unwrap();
+        let expected = text_of(&ranked_by_keyword)
+            .split_once("\n\n")
+            .unwrap()
+            .1
+            .to_string();
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        assert_eq!(text_of(&answered), expected);
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(60), build.finished())
+            .await
+            .expect("the identifier build never finished")
+            .unwrap();
+        let requests = ollama.received_requests().await.unwrap().len();
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "keywords"))
+            .await;
+        assert_eq!(text_of(&answered), expected);
+        assert_eq!(
+            ollama.received_requests().await.unwrap().len(),
+            requests,
+            "the keyword query embedded its query"
+        );
+    }
+
+    #[tokio::test]
     async fn a_caller_that_gives_up_leaves_the_identifier_build_to_the_next_caller() {
         let (_repo, ollama, server) = scripted_identifier_server(
             LEDGER_FILES,
@@ -7976,7 +8067,7 @@ mod tests {
             let server = server.clone();
             tokio::spawn(async move {
                 server
-                    .dispatch("explore", identifier_args("open_account", "keywords"))
+                    .dispatch("explore", identifier_args("open_account", "meaning"))
                     .await
             })
         };
@@ -7985,7 +8076,7 @@ mod tests {
             let server = server.clone();
             tokio::spawn(async move {
                 server
-                    .dispatch("explore", identifier_args("open_account", "keywords"))
+                    .dispatch("explore", identifier_args("open_account", "meaning"))
                     .await
             })
         };
@@ -8014,7 +8105,7 @@ mod tests {
         .await;
 
         server
-            .dispatch("explore", identifier_args("open_account", "keywords"))
+            .dispatch("explore", identifier_args("open_account", "meaning"))
             .await;
 
         let logs = crate::test_logs::logs_as_string(&logs);
@@ -8051,7 +8142,7 @@ mod tests {
         .await;
 
         let answered = server
-            .dispatch("explore", identifier_args("open_account", "keywords"))
+            .dispatch("explore", identifier_args("open_account", "meaning"))
             .await;
 
         let text = text_of(&answered);
@@ -8095,7 +8186,7 @@ mod tests {
         .await;
 
         server
-            .dispatch("explore", identifier_args("alpha_one", "keywords"))
+            .dispatch("explore", identifier_args("alpha_one", "meaning"))
             .await;
         let before_failure = std::mem::take(&mut *embedded.lock().unwrap());
         assert!(
@@ -8104,7 +8195,7 @@ mod tests {
         );
         failing.store(false, Ordering::SeqCst);
         let answered = server
-            .dispatch("explore", identifier_args("alpha_one", "keywords"))
+            .dispatch("explore", identifier_args("alpha_one", "meaning"))
             .await;
 
         assert_eq!(answered.is_error, Some(false), "{}", text_of(&answered));
@@ -9435,7 +9526,7 @@ mod tests {
             .unwrap_or("");
         assert!(first.contains("verify_token"), "{text}");
         assert!(
-            text.contains("Score: 100% | Semantic: 100% | Keyword: 100%"),
+            text.contains("Score: 100% | Semantic: 0% | Keyword: 100%"),
             "keyword-only weighting must make the score equal the keyword coverage:\n{text}"
         );
     }
