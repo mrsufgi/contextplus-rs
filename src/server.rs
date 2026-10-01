@@ -948,18 +948,33 @@ fn trim_retained_free_memory(measured: usize, threshold: usize) -> bool {
     if retained_free <= threshold {
         return false;
     }
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    trim_allocator();
     true
 }
 
 /// Returns memory the allocator holds free to the OS.
 async fn release_free_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+    let _ = tokio::task::spawn_blocking(trim_allocator).await;
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Allocator trims run on this thread.
+    static ALLOCATOR_TRIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns memory the allocator holds free to the OS. Walks every arena under
+/// its lock, so callers bound how often it runs.
+fn trim_allocator() {
+    #[cfg(test)]
+    ALLOCATOR_TRIMS.with(|trims| trims.set(trims.get() + 1));
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// A worktree used more recently than this is never evicted, so concurrently
 /// active worktrees cannot evict each other into repeated cold rebuilds.
 const MEMORY_BUDGET_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1460,10 +1475,7 @@ fn build_lexical_index<'a>(
     });
     // Parsing on the pool threads left their allocator arenas holding the
     // freed parse state; hand it back rather than keep it resident.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    trim_allocator();
     built
 }
 
@@ -5923,7 +5935,6 @@ fn outline_files(
             })
             .collect()
     });
-    let parsed = outlined.iter().flatten().any(|(_, parsed)| *parsed);
     let mut outlines = ref_index.file_outlines.lock().unwrap();
     outlines.retain(|path, _| files.get(path).is_some());
     let mut analyses = BTreeMap::new();
@@ -5939,14 +5950,6 @@ fn outline_files(
         }
     }
     drop(outlines);
-    // Parsing on the pool threads left their allocator arenas holding the
-    // freed parse state; hand it back rather than keep it resident.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if parsed {
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
     analyses
 }
 
@@ -8929,6 +8932,29 @@ mod tests {
                 .iter()
                 .any(|(_, bytes, name)| *name == "outlines" && *bytes > 0),
             "{components:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_outline_leaves_returning_freed_memory_to_the_budget_check() {
+        let (_repo, server) = outline_server();
+        let cache = server.ensure_project_cache().await.unwrap();
+        let paths: Vec<&str> = cache
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        let ref_index = server.current_ref().await;
+        let trims = ALLOCATOR_TRIMS.with(std::cell::Cell::get);
+
+        outline_files(&ref_index, &paths, &cache.file_content);
+
+        assert!(outline_parses(&server).await > 0);
+        assert_eq!(
+            ALLOCATOR_TRIMS.with(std::cell::Cell::get),
+            trims,
+            "the outline walked the allocator's arenas itself"
         );
     }
 
