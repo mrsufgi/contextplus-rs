@@ -203,7 +203,8 @@ impl IdentifierBuild {
 
     /// `docs`, documents of this build, as of the project cache `cache`: each
     /// file whose content differs from the build's project cache is parsed
-    /// again. `None` once the build's project cache is gone.
+    /// again. `None` once the build's project cache is gone, or when more
+    /// than `FULL_REBUILD_CHANGE_FRACTION` of its files differ.
     async fn documents_for(
         &self,
         docs: &Arc<IdentifierIndex>,
@@ -223,6 +224,12 @@ impl IdentifierBuild {
                 .chain(source.file_content.keys())
                 .filter(|path| cache.file_content.get(path) != source.file_content.get(path))
                 .collect();
+            if differing.len() as f64
+                > source.file_content.len() as f64
+                    * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
+            {
+                return None;
+            }
             let mut files = docs.docs.files.clone();
             for path in &differing {
                 files.remove(*path);
@@ -233,7 +240,7 @@ impl IdentifierBuild {
                     crate::tools::semantic_identifiers::identifier_docs_for_file(path, content)?;
                 Some((path.clone(), Arc::new(file_docs)))
             }));
-            Arc::new(IdentifierIndex {
+            Some(Arc::new(IdentifierIndex {
                 docs: Segmented::from_files(files),
                 vectors: IdentifierVectorIndex::empty(),
                 dims: 0,
@@ -243,10 +250,11 @@ impl IdentifierBuild {
                     .filter(|entry| !entry.is_directory)
                     .count(),
                 built_at: Instant::now(),
-            })
+            }))
         })
         .await
         .ok()
+        .flatten()
     }
 }
 
@@ -8161,6 +8169,19 @@ mod tests {
         "pub fn open_account() {}\npub fn close_account() {}\n",
     )];
 
+    /// `src/ledger.rs` among five other files.
+    const LEDGER_TREE: &[(&str, &str)] = &[
+        (
+            "src/ledger.rs",
+            "pub fn open_account() {}\npub fn close_account() {}\n",
+        ),
+        ("src/parcel.rs", "pub fn ship_parcel() {}\n"),
+        ("src/route.rs", "pub fn plan_route() {}\n"),
+        ("src/depot.rs", "pub fn stock_depot() {}\n"),
+        ("src/driver.rs", "pub fn assign_driver() {}\n"),
+        ("src/fleet.rs", "pub fn service_fleet() {}\n"),
+    ];
+
     #[tokio::test]
     async fn identifier_query_answers_by_keyword_within_the_budget_while_the_build_embeds() {
         let (_repo, _ollama, server) =
@@ -8317,7 +8338,7 @@ mod tests {
     #[tokio::test]
     async fn a_partial_identifier_answer_after_an_edit_parses_the_edited_files_again() {
         let (repo, _ollama, server) =
-            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
                 config.embed_budget_ms = 0
             })
             .await;
@@ -8366,7 +8387,7 @@ mod tests {
         tokio::sync::OwnedSemaphorePermit,
     ) {
         let (repo, ollama, server) =
-            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
                 config.embed_budget_ms = 600_000;
                 config.query_embed_budget_ms = 600_000;
             })
@@ -8463,6 +8484,42 @@ mod tests {
             .as_ref()
             .map(|build| build.id);
         assert_eq!(after, running, "the query started a second build");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_after_edits_to_most_of_the_tree_is_outdated() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        for (path, source) in &LEDGER_TREE[..3] {
+            std::fs::write(
+                repo.path().join(path),
+                format!("{source}pub fn audit_account() {{}}\n"),
+            )
+            .unwrap();
+        }
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("audit_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        assert!(build.running(), "the build ended before the query answered");
         drop(held);
     }
 
@@ -14890,7 +14947,13 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
         for dir in [primary.path(), worktree.path()] {
-            std::fs::write(dir.join("same_a.rs"), "fn same_a() {}\n").unwrap();
+            for name in ["same_a", "same_b", "same_c", "same_d", "same_e"] {
+                std::fs::write(
+                    dir.join(format!("{name}.rs")),
+                    format!("fn {name}() {{}}\n"),
+                )
+                .unwrap();
+            }
         }
         std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
         std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
