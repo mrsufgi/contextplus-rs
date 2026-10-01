@@ -24328,6 +24328,7 @@ mod tests {
         let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
         semantic_fork_query(&server).await;
         let primary = server.state.default_ref().unwrap();
+        let before = semantic_fork_index(&server).await;
         primary
             .cache_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -24362,15 +24363,20 @@ mod tests {
             .semantic_walks
             .load(std::sync::atomic::Ordering::Relaxed)
             - walks;
+        assert_eq!(walked, 1, "two subdirectory searches walked {walked} times");
+        let after = semantic_fork_index(&server).await;
         assert!(
-            walked <= 1,
-            "two subdirectory searches walked {walked} times"
+            !Arc::ptr_eq(&before, &after),
+            "the stale whole-root entry was not rebuilt"
         );
         assert!(
-            semantic_fork_index(&server)
-                .await
-                .forkable_at(&primary.canonical_root)
+            !after.is_behind(
+                primary
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+            )
         );
+        assert!(after.forkable_at(&primary.canonical_root));
     }
 
     /// With the tracker off, subdirectory searches a stale whole-root entry
