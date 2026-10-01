@@ -4768,35 +4768,46 @@ impl ContextPlusServer {
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
         // keyword ranking needs only the parsed documents. A build of the
-        // tree before an edit answers only partially.
-        let (idx, partial) = match self.identifier_index_or_build(&cache, true).await? {
-            IdentifierLookup::Ready(index) => (index, None),
-            IdentifierLookup::Building(build) => {
-                let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
-                let waited = if Self::ranks_identifiers_by_keyword(&args) {
-                    tokio::time::timeout(budget, build.clone().documents()).await
-                } else {
-                    tokio::time::timeout(budget, build.clone().finished()).await
-                };
-                match waited {
-                    Ok(Ok(index)) if build.built_from(&cache) => (index, None),
-                    Ok(Ok(index)) => (
+        // tree before an edit answers only partially, and once it ends, a
+        // build of this tree takes the rest of the budget.
+        let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
+        let started = tokio::time::Instant::now();
+        let mut lookup = self.identifier_index_or_build(&cache, true).await?;
+        let (idx, partial) = loop {
+            let build = match lookup {
+                IdentifierLookup::Ready(index) => break (index, None),
+                IdentifierLookup::Building(build) => build,
+            };
+            let remaining = budget.saturating_sub(started.elapsed());
+            let waited = if Self::ranks_identifiers_by_keyword(&args) {
+                tokio::time::timeout(remaining, build.clone().documents()).await
+            } else {
+                tokio::time::timeout(remaining, build.clone().finished()).await
+            };
+            match waited {
+                Ok(Ok(index)) if build.built_from(&cache) => break (index, None),
+                Ok(Ok(_)) if !build.running() => {
+                    lookup = self.identifier_index_or_build(&cache, true).await?;
+                }
+                Ok(Ok(index)) => {
+                    break (
                         index,
                         Some("identifiers reflect the tree before the latest edits".to_string()),
-                    ),
-                    waited => {
-                        let reason = match waited {
-                            Ok(Err(error)) => format!("identifier embedding failed ({error})"),
-                            _ => "identifier embeddings are still building in the background"
-                                .to_string(),
-                        };
-                        let Some(index) = self.parsed_identifier_docs(&build).await else {
-                            return Ok(Self::ok_text(format!(
-                                "Partial results: {reason}, and no identifiers are parsed yet. Retry shortly."
-                            )));
-                        };
-                        (index, Some(reason))
-                    }
+                    );
+                }
+                waited => {
+                    let reason = match waited {
+                        Ok(Err(error)) => format!("identifier embedding failed ({error})"),
+                        _ => {
+                            "identifier embeddings are still building in the background".to_string()
+                        }
+                    };
+                    let Some(index) = self.parsed_identifier_docs(&build).await else {
+                        return Ok(Self::ok_text(format!(
+                            "Partial results: {reason}, and no identifiers are parsed yet. Retry shortly."
+                        )));
+                    };
+                    break (index, Some(reason));
                 }
             }
         };
@@ -8125,6 +8136,21 @@ mod tests {
                 "keywords:\n{by_keyword}\n\nmeaning:\n{by_meaning}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_builds_the_edited_tree_when_its_joined_build_ends() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+
+        let text = identifier_query_joining_the_build(
+            &server,
+            held,
+            identifier_args("audit_account", "meaning"),
+        )
+        .await;
+
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
     }
 
     #[tokio::test]
