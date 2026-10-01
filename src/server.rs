@@ -769,6 +769,12 @@ impl SharedState {
             return;
         }
         let low_watermark = budget / 5 * 4;
+        let emergency = measured > budget.saturating_mul(2);
+        let min_idle = if emergency {
+            MEMORY_BUDGET_MIN_IDLE
+        } else {
+            std::time::Duration::from_secs(self.config.memory_budget_min_idle_secs)
+        };
         let in_use_before = if self.trim_due() {
             sample_allocator_in_use().await
         } else {
@@ -784,7 +790,7 @@ impl SharedState {
                 let Some(&(tick, last_used)) = access.get(&id) else {
                     return Some((0, i));
                 };
-                (last_used.elapsed() >= MEMORY_BUDGET_MIN_IDLE).then_some((tick, i))
+                (last_used.elapsed() >= min_idle).then_some((tick, i))
             })
             .collect();
         candidates.sort_unstable();
@@ -813,7 +819,7 @@ impl SharedState {
                 .unwrap()
                 .get(&id)
                 .map(|(_, last_used)| last_used.elapsed());
-            if idle.is_some_and(|idle| idle < MEMORY_BUDGET_MIN_IDLE) {
+            if idle.is_some_and(|idle| idle < min_idle) {
                 continue;
             }
             let idle_secs = idle.map_or(-1, |idle| idle.as_secs() as i64);
@@ -14149,6 +14155,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let path = PathBuf::from("/tmp/lane-m-identifier-only-budget");
@@ -14215,6 +14222,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 11 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let primary = server.state.default_ref().unwrap();
@@ -14282,6 +14290,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let path = PathBuf::from("/tmp/lane-m-budget-serving");
@@ -14328,6 +14337,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 10 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let primary = server.state.default_ref().unwrap();
@@ -15161,6 +15171,7 @@ mod tests {
         config.embed_tracker_mode = TrackerMode::Off;
         config.ref_warmup_mode = RefWarmupMode::Off;
         config.resident_memory_budget_bytes = 1;
+        config.memory_budget_min_idle_secs = 60;
         let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
         let canonical = worktree.path().canonicalize().unwrap();
         let mut attach = serde_json::Map::new();
@@ -15324,6 +15335,7 @@ mod tests {
     async fn review_r3_memory_budget_evicts_only_idle_worktrees() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id_a, ref_a) = attach_budget_worktree(&server, "a").await;
@@ -15362,6 +15374,7 @@ mod tests {
     ) {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id, worktree) = attach_budget_worktree(&server, name).await;
@@ -15467,6 +15480,7 @@ mod tests {
             .config
             .clone();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
         let session = attached_worktree(&server, worktree.path()).await;
         let id = session.session_ref_id.unwrap();
@@ -15511,6 +15525,7 @@ mod tests {
     async fn memory_budget_spares_a_ref_touched_while_an_earlier_candidate_is_cleared() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id_a, ref_a) = attach_budget_worktree(&server, "cleared-first").await;
@@ -15541,6 +15556,7 @@ mod tests {
             semantic_fork_servers(lexdelta_edit_worktree).await;
         let mut config = untracked.state.config.clone();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
         let session = attached_worktree(&server, worktree.path()).await;
         semantic_fork_query(&server).await;
@@ -15586,6 +15602,50 @@ mod tests {
         );
     }
 
+    fn mark_ref_idle_for(
+        state: &SharedState,
+        ref_id: crate::ref_index::RefId,
+        idle: std::time::Duration,
+    ) {
+        let idle_since = Instant::now().checked_sub(idle).unwrap();
+        if let Some(access) = state.ref_access.lock().unwrap().get_mut(&ref_id) {
+            access.1 = idle_since;
+        }
+    }
+
+    /// Whether one budget pass at `measured` bytes evicts a worktree unused
+    /// for `idle_secs`.
+    async fn residency_evicts(
+        min_idle_secs: u64,
+        idle_secs: u64,
+        budget: usize,
+        measured: usize,
+    ) -> bool {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = budget;
+        config.memory_budget_min_idle_secs = min_idle_secs;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let name = format!("residency-{min_idle_secs}-{idle_secs}-{budget}-{measured}");
+        let (id, worktree) = attach_budget_worktree(&server, &name).await;
+        mark_ref_idle_for(&server.state, id, std::time::Duration::from_secs(idle_secs));
+        *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+
+        server.state.enforce_memory_budget().await;
+
+        worktree.embedding_cache.read().await.is_empty()
+    }
+
+    const RESIDENCY_BUDGET: usize = 1024 * 1024;
+
+    #[tokio::test]
+    async fn memory_budget_keeps_a_worktree_used_within_the_residency() {
+        assert!(
+            !residency_evicts(100, 70, RESIDENCY_BUDGET, RESIDENCY_BUDGET / 2 * 3).await,
+            "a worktree used 70 s ago was evicted under a 100 s residency"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_resident_bytes_reads_this_process() {
@@ -15598,6 +15658,7 @@ mod tests {
     async fn memory_budget_triggers_on_measured_memory_when_estimates_are_under_it() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id, worktree) = attach_budget_worktree(&server, "measured-over").await;
@@ -15654,6 +15715,7 @@ mod tests {
     async fn memory_budget_ignores_estimates_while_measured_memory_is_under_it() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id, worktree) = attach_budget_worktree(&server, "measured-under").await;
@@ -15704,6 +15766,7 @@ mod tests {
     async fn review_r3_memory_budget_evicts_down_to_low_watermark() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 40_000;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let mut refs = Vec::new();
