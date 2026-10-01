@@ -4773,13 +4773,13 @@ impl ContextPlusServer {
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         let root = self.resolve_root(&args).await;
 
-        let cache = self.ensure_project_cache().await?;
+        let mut cache = self.ensure_project_cache().await?;
 
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
         // keyword ranking needs only the parsed documents. A build of the
         // tree before an edit answers only partially, and once it ends, a
-        // build of this tree takes the rest of the budget.
+        // build of the current tree takes the rest of the budget.
         let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
         let started = tokio::time::Instant::now();
         let mut lookup = self.identifier_index_or_build(&cache, true).await?;
@@ -4797,6 +4797,7 @@ impl ContextPlusServer {
             match waited {
                 Ok(Ok(index)) if build.built_from(&cache) => break (index, None),
                 Ok(Ok(_)) if !build.running() => {
+                    cache = self.ensure_project_cache().await?;
                     lookup = self.identifier_index_or_build(&cache, true).await?;
                 }
                 Ok(Ok(index)) => {
@@ -8161,6 +8162,40 @@ mod tests {
 
         assert!(!text.starts_with("Partial results"), "{text}");
         assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_builds_the_current_tree_after_a_second_edit() {
+        let (repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&edited);
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("reconcile_account", "meaning"))
+                    .await
+            })
+        };
+        wait_until_held(&edited, holders).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn reconcile_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("second test edit")
+            .await;
+        drop(held);
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("reconcile_account - src/ledger.rs"), "{text}");
     }
 
     #[tokio::test]
