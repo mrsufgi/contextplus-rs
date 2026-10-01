@@ -1106,8 +1106,6 @@ pub(crate) async fn register_fork_base(
         server.state.detach_ref(ref_id, Duration::ZERO).await;
         return;
     }
-    prepare_ref(server, ref_id, &ref_arc).await;
-    server.ensure_tracker_started_for(ref_id).await;
     tracing::info!(
         phase = "fork_base",
         ref_id = %ref_arc.cas_ref_id_hex,
@@ -1117,6 +1115,8 @@ pub(crate) async fn register_fork_base(
     );
     *server.state.fork_base.lock().unwrap() = Some(base);
     let _ = server.state.fork_base_ref_id.set(ref_id);
+    prepare_ref(server, ref_id, &ref_arc).await;
+    server.ensure_tracker_started_for(ref_id).await;
     // Indexes the checkout, and moves it first when its ref moved since.
     let _advance = server.advance_fork_base();
 }

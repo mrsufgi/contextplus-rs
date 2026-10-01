@@ -2830,10 +2830,22 @@ impl ContextPlusServer {
             ignore_dirs: self.state.config.ignore_dirs.clone(),
         };
         let callback = self.build_tracker_callback_for_root(ref_index.root_dir.clone());
-        match crate::core::embedding_tracker::start_tracker(
+        // The fork base follows its ref when a fetch moves it.
+        let fork_base = self.state.fork_base_ref_id.get()
+            == Some(&crate::ref_index::RefId::for_canonical_path(
+                &ref_index.canonical_root,
+            ));
+        let on_remote_ref = fork_base.then(|| {
+            let server = self.clone();
+            Arc::new(move || {
+                let _advance = server.advance_fork_base();
+            }) as crate::core::embedding_tracker::RemoteRefCallback
+        });
+        match crate::core::embedding_tracker::start_tracker_with_remote_refs(
             ref_index.root_dir.clone(),
             tracker_config,
             callback,
+            on_remote_ref,
         ) {
             Ok(handle) => {
                 tracing::info!(
@@ -8765,6 +8777,18 @@ mod tests {
         tempfile::TempDir,
         ContextPlusServer,
     ) {
+        fork_base_server_tracked(min_advance_secs, TrackerMode::Off).await
+    }
+
+    async fn fork_base_server_tracked(
+        min_advance_secs: u64,
+        tracker_mode: TrackerMode,
+    ) -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+    ) {
         let ollama = wiremock::MockServer::start().await;
         let (primary, _holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
         lexdelta_git(
@@ -8780,6 +8804,7 @@ mod tests {
         config.fork_base = Some("origin/main".into());
         config.fork_base_dir = Some(bases.path().to_path_buf());
         config.fork_base_min_advance_secs = min_advance_secs;
+        config.embed_tracker_mode = tracker_mode;
         let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
         let root = primary.path().to_path_buf();
         let base = tokio::task::spawn_blocking(move || {
@@ -8911,6 +8936,33 @@ mod tests {
             fork_base_state(&server, "advanced").await,
             (advanced.clone(), Some(advanced), true),
             "attaching a worktree did not advance the fork base"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_base_tracker_advances_on_a_moved_remote_ref() {
+        let (_ollama, primary, _bases, server) =
+            fork_base_server_tracked(0, TrackerMode::Lazy).await;
+        let first = server.state.fork_base_advance_task().expect("an advance");
+        first.clone().await;
+
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        let next = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(next) = server.state.fork_base_advance_task()
+                    && !next.ptr_eq(&first)
+                {
+                    return Some(next);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the moved remote ref started no advance");
+        next.unwrap().await;
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true)
         );
     }
 

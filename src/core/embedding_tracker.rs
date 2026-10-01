@@ -282,6 +282,9 @@ pub struct EmbeddingTrackerHandle {
     // Set by notify before the embedding queue can block or drop a batch.
     source_dirty: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    /// Whether this tracker watches the repository's remote-tracking refs.
+    #[cfg(test)]
+    pub(crate) remote_refs_watched: bool,
 }
 
 impl EmbeddingTrackerHandle {
@@ -322,6 +325,9 @@ impl Drop for EmbeddingTrackerHandle {
 pub type RefreshCallback =
     Arc<dyn Fn(PathBuf, Vec<String>) -> tokio::task::JoinHandle<(usize, usize)> + Send + Sync>;
 
+/// Called when a remote-tracking ref of the tracked repository moves.
+pub type RemoteRefCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Starts the embedding tracker watching for file changes in `root_dir`.
 ///
 /// The `refresh_callback` is invoked with batches of changed files (up to
@@ -333,6 +339,17 @@ pub fn start_tracker(
     root_dir: PathBuf,
     config: EmbeddingTrackerConfig,
     refresh_callback: RefreshCallback,
+) -> Result<EmbeddingTrackerHandle, notify_debouncer_full::notify::Error> {
+    start_tracker_with_remote_refs(root_dir, config, refresh_callback, None)
+}
+
+/// [`start_tracker`], also calling `on_remote_ref` when a remote-tracking ref
+/// of the repository moves, loose under `refs/remotes` or packed.
+pub fn start_tracker_with_remote_refs(
+    root_dir: PathBuf,
+    config: EmbeddingTrackerConfig,
+    refresh_callback: RefreshCallback,
+    on_remote_ref: Option<RemoteRefCallback>,
 ) -> Result<EmbeddingTrackerHandle, notify_debouncer_full::notify::Error> {
     let source_dirty = Arc::new(AtomicBool::new(true));
     let pending_watches = Arc::new(AtomicUsize::new(0));
@@ -390,8 +407,18 @@ pub fn start_tracker(
         crate::core::head_watcher::resolve_head_sha(&root_dir),
     ));
 
+    // Remote-tracking refs, loose and packed, when a caller follows them.
+    let remote_refs = on_remote_ref.as_ref().and(git_dirs.as_ref()).map(|dirs| {
+        (
+            dirs.common_dir.join("refs").join("remotes"),
+            dirs.common_dir.join("packed-refs"),
+        )
+    });
+    let (remote_tx, mut remote_rx) = mpsc::channel::<()>(1);
+
     // Set up notify debouncer with an event handler that filters and collects paths
     let handler_root = root_dir.clone();
+    let handler_remote_refs = remote_refs.clone();
     let handler_git_dirs = git_dirs.clone();
     let handler_meta_cache = metadata_cache.clone();
     let handler_sentinel_dir = sentinel_dir.clone();
@@ -432,6 +459,16 @@ pub fn start_tracker(
                             handler_healthy.store(false, Ordering::Release);
                         }
                         continue;
+                    }
+
+                    if let Some((remotes, packed)) = &handler_remote_refs
+                        && (path.starts_with(remotes) || path == packed)
+                    {
+                        // A full channel already holds a call to come.
+                        let _ = remote_tx.try_send(());
+                        if path.starts_with(remotes) {
+                            continue;
+                        }
                     }
 
                     if let Some(dirs) = &handler_git_dirs
@@ -591,6 +628,28 @@ pub fn start_tracker(
                 );
             }
         }
+    }
+
+    #[cfg_attr(not(test), allow(unused_variables))]
+    let remote_refs_watched = remote_refs.as_ref().is_some_and(|(remotes, _)| {
+        match debouncer.watch(remotes, RecursiveMode::Recursive) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Could not watch remote refs {}: {} — moved remote refs are seen only at registration",
+                    remotes.display(),
+                    e
+                );
+                false
+            }
+        }
+    });
+    if let Some(on_remote_ref) = on_remote_ref {
+        tokio::spawn(async move {
+            while remote_rx.recv().await.is_some() {
+                on_remote_ref();
+            }
+        });
     }
 
     let resolver_root = root_dir.clone();
@@ -774,6 +833,8 @@ pub fn start_tracker(
         pending_watches,
         source_dirty,
         healthy,
+        #[cfg(test)]
+        remote_refs_watched,
     })
 }
 
@@ -1345,6 +1406,57 @@ mod tests {
         }
 
         handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn tracker_watches_remote_refs_only_when_asked() {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git runs")
+                .success();
+            assert!(ok, "git {:?} failed", args);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let (callback, _rx) = capture_callback();
+        let plain = start_tracker(root.clone(), test_config(), Arc::clone(&callback))
+            .expect("tracker should start");
+        assert!(
+            !plain.remote_refs_watched,
+            "a plain tracker watches remote refs"
+        );
+        plain.stop().await;
+
+        let (tx, mut rx) = mpsc::channel::<()>(4);
+        let on_remote: RemoteRefCallback = Arc::new(move || {
+            let _ = tx.try_send(());
+        });
+        let base =
+            start_tracker_with_remote_refs(root.clone(), test_config(), callback, Some(on_remote))
+                .expect("tracker should start");
+        assert!(base.remote_refs_watched);
+        git(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("no call for a moved remote ref")
+            .unwrap();
+        base.stop().await;
     }
 
     fn capture_callback() -> (RefreshCallback, mpsc::Receiver<Vec<String>>) {
