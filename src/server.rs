@@ -16715,6 +16715,35 @@ mod tests {
         navigate.abort();
     }
 
+    #[tokio::test]
+    async fn a_navigate_query_embeds_its_fresh_files_beside_a_background_batch() {
+        let (_root, ollama, server) =
+            slow_marker_server(&[("src/fresh.rs", "pub fn fresh_needle() {}\n")], 2).await;
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+        let navigate = {
+            let server = server.clone();
+            let mut args = serde_json::Map::new();
+            args.insert("query".into(), json!("fresh needle"));
+            tokio::spawn(async move { server.dispatch("semantic_navigate", args).await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "fresh_needle")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate's fresh files queued behind a background batch");
+
+        navigate.abort();
+        server.current_ref().await.cancel_background_tasks();
+    }
+
     // -----------------------------------------------------------------------
     // U18: per-ref warmup tests
     // -----------------------------------------------------------------------

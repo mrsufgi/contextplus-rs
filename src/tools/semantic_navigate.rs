@@ -507,7 +507,11 @@ pub async fn semantic_navigate(
                 results
             }
             None => {
-                let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
+                // The query's own fresh files embed in the interactive lane;
+                // the corpus below takes the batch lane.
+                let (docs, vectors) =
+                    crate::core::embeddings::interactive(indexer.walk_candidates(&root, eligible))
+                        .await?;
                 let mut index = SearchIndex::new();
                 index.index_with_vectors(docs, vectors);
                 let query_vector = ollama.embed_query(query).await?;
