@@ -1206,6 +1206,28 @@ mod tests {
     }
 
     #[test]
+    fn bounded_log_truncates_when_the_previous_generation_cannot_be_replaced() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        std::fs::create_dir(previous_log(&log_path)).unwrap();
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        let mut log = bounded_log_writer(&log_path).unwrap();
+        log.write_all(&generation).unwrap();
+        log.write_all(b"b\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "b\n");
+        assert!(previous_log(&log_path).is_dir());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("daemon.log.1.") && name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "rotation left {leftovers:?} behind");
+    }
+
+    #[test]
     fn bounded_log_rotation_keeps_every_writer_on_the_live_file() {
         use std::io::Write;
 
