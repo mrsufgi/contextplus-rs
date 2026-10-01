@@ -9375,7 +9375,7 @@ mod tests {
     #[tokio::test]
     async fn attach_worktree_checks_the_fork_base_ref() {
         let (_ollama, primary, _bases, server) = fork_base_server(0).await;
-        server.advance_fork_base().expect("an advance").await;
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
         let advanced = fork_base_move_origin(primary.path(), "advanced");
         let worktree = tempfile::tempdir().unwrap();
 

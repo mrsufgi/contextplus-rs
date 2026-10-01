@@ -348,6 +348,33 @@ pub(crate) mod test_seams {
             .unwrap_or_default()
     }
 
+    /// Waits out the fork base's fills, the parent rebuilds they started and
+    /// the advances they triggered, until none is left running.
+    pub(crate) async fn settle_fork_base(state: &crate::server::SharedState) {
+        let base_id = *state.fork_base_ref_id.get().expect("a fork base");
+        let root = state
+            .ref_index(base_id)
+            .await
+            .unwrap()
+            .canonical_root
+            .clone();
+        loop {
+            if let Some(advance) = state.fork_base_advance_task() {
+                advance.await;
+            }
+            let tasks: Vec<_> = take_fills(&root)
+                .into_iter()
+                .chain(take_parent_refreshes(&root))
+                .collect();
+            if tasks.is_empty() {
+                return;
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        }
+    }
+
     fn stale_install_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
