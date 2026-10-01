@@ -5132,11 +5132,14 @@ impl ContextPlusServer {
                         }
                         _ => self.parsed_identifier_docs(&build, &cache).await,
                     };
-                    let Some(index) = parsed else {
+                    let Some((index, stale)) = parsed else {
                         return Ok(Self::ok_text(format!(
                             "Partial results: {reason}, and no identifiers are parsed yet. Retry shortly."
                         )));
                     };
+                    if stale {
+                        break (index, Some(format!("{reason}, and {OUTDATED}")));
+                    }
                     break (index, Some(reason));
                 }
             }
@@ -5148,15 +5151,19 @@ impl ContextPlusServer {
     /// The documents of a build that has not finished: its own once parsed,
     /// with the files that differ in `cache` parsed again once a request has
     /// parsed them, else the index this ref already holds, unless that
-    /// answers for the parent's tree.
+    /// answers for the parent's tree. Paired with whether they are the
+    /// build's documents of the tree before the edits in `cache`.
     async fn parsed_identifier_docs(
         &self,
         build: &IdentifierBuild,
         cache: &Arc<ProjectCache>,
-    ) -> Option<Arc<IdentifierIndex>> {
+    ) -> Option<(Arc<IdentifierIndex>, bool)> {
         let parsed = build.parsed.borrow().clone();
         if let Some(parsed) = parsed {
-            return Some(build.documents_for_now(&parsed, cache).unwrap_or(parsed));
+            return Some(match build.documents_for_now(&parsed, cache) {
+                Some(current) => (current, false),
+                None => (parsed, true),
+            });
         }
         let ref_index = self.current_ref().await;
         if ref_index
@@ -5165,7 +5172,8 @@ impl ContextPlusServer {
         {
             return None;
         }
-        ref_index.identifier_index.read().await.as_ref().cloned()
+        let index = ref_index.identifier_index.read().await.as_ref().cloned()?;
+        Some((index, false))
     }
 
     /// Whether identifier search `args` rank by keyword alone.
@@ -8746,6 +8754,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_partial_identifier_answer_from_documents_before_an_edit_says_so() {
+        let (_repo, _ollama, server, held, stalled) =
+            identifier_build_with_a_stalled_reparse().await;
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_partial_identifier_answer_after_edits_to_most_of_the_tree_says_so() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        for (path, source) in &LEDGER_TREE[..3] {
+            std::fs::write(
+                repo.path().join(path),
+                format!("{source}pub fn audit_account() {{}}\n"),
+            )
+            .unwrap();
+        }
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let parsed = build.parsed.borrow().clone().unwrap();
+        assert!(build.documents_for(&parsed, &edited).await.is_none());
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        assert!(build.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    #[tokio::test]
     async fn a_reparse_of_a_few_edited_files_never_waits_on_the_rayon_pool() {
         let tree: Vec<(String, String)> = (0..20)
             .map(|i| {
@@ -9057,7 +9116,11 @@ mod tests {
                 server.resolve_root(&serde_json::Map::new()).await,
                 "open_account".into(),
                 &cache,
-                &server.parsed_identifier_docs(&build, &cache).await.unwrap(),
+                &server
+                    .parsed_identifier_docs(&build, &cache)
+                    .await
+                    .unwrap()
+                    .0,
                 Some("held".into()),
             )
             .await
