@@ -35,7 +35,7 @@
 //! files are deleted, a `migration_in_progress` marker is written, and embeddings
 //! rebuild fresh. The marker makes the operation idempotent on crash.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -187,6 +187,8 @@ const MIGRATION_MARKER: &str = "migration_in_progress";
 /// Manifest header size (same layout as rkyv_store's HEADER_SIZE).
 const MANIFEST_HEADER_SIZE: usize = 16;
 const MANIFEST_VERSION: u8 = 1;
+/// Parent-chain levels a lookup reads; guards against cycles.
+const MAX_CHAIN_DEPTH: usize = 128;
 
 fn cas_root(mcp_data: &Path, model: &str) -> PathBuf {
     mcp_data.join(CAS_DIR).join(model_slug(model))
@@ -384,7 +386,6 @@ impl CasStore {
     pub fn lookup_chunk(&self, ref_id_hex: &str, key: &ChunkKey) -> Result<Option<ChunkHash>> {
         let mut current = ref_id_hex.to_string();
         let mut depth = 0usize;
-        const MAX_CHAIN_DEPTH: usize = 128; // guard against cycles
 
         loop {
             if depth >= MAX_CHAIN_DEPTH {
@@ -414,6 +415,63 @@ impl CasStore {
                 None => return Ok(None), // root ref, no hit
             }
         }
+    }
+
+    /// Every chunk hash the ref's parent chain records, answering each key as
+    /// [`Self::lookup_chunk`] does: a ref's entry shadows its ancestors', and
+    /// the levels before an unreadable manifest or parent pointer, a cycle or
+    /// the depth limit still answer. Those stops log one warning.
+    pub fn chain_map(&self, ref_id_hex: &str) -> HashMap<ChunkKey, ChunkHash> {
+        let mut chain = HashMap::new();
+        let mut visited = HashSet::new();
+        let mut current = ref_id_hex.to_string();
+        loop {
+            if visited.len() >= MAX_CHAIN_DEPTH {
+                tracing::warn!(
+                    ref_id = ref_id_hex,
+                    depth = visited.len(),
+                    "CAS parent chain depth limit exceeded — deeper levels miss"
+                );
+                break;
+            }
+            if !visited.insert(current.clone()) {
+                tracing::warn!(
+                    ref_id = ref_id_hex,
+                    revisited = %current,
+                    "CAS parent chain has a cycle — levels past it miss"
+                );
+                break;
+            }
+            let manifest = match self.load_manifest(&current) {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    tracing::warn!(
+                        ref_id = ref_id_hex,
+                        level = %current,
+                        error = %e,
+                        "CAS manifest unreadable — it and its ancestors miss"
+                    );
+                    break;
+                }
+            };
+            for (key, hash) in manifest.keys.into_iter().zip(manifest.hashes) {
+                chain.entry(key).or_insert(hash);
+            }
+            match self.read_parent(&current) {
+                Ok(Some(parent)) => current = parent,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        ref_id = ref_id_hex,
+                        level = %current,
+                        error = %e,
+                        "CAS parent pointer unreadable — ancestors miss"
+                    );
+                    break;
+                }
+            }
+        }
+        chain
     }
 
     /// Full lookup: find the chunk hash via parent chain, then fetch the blob.
@@ -841,6 +899,63 @@ mod tests {
             .lookup_chunk("noref", &ChunkKey::new("not/there.rs", 0))
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn chain_map_answers_like_lookup_chunk() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        let (parent_id, child_id) = ("parent_map", "child_map");
+        let keys: Vec<_> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| ChunkKey::new(format!("src/{name}.rs"), 0))
+            .collect();
+        let parent_entries = [
+            (keys[0].clone(), ChunkHash::of("parent a")),
+            (keys[1].clone(), ChunkHash::of("parent b")),
+        ];
+        store.update_manifest(parent_id, &parent_entries).unwrap();
+        store.fork_ref(child_id, parent_id).unwrap();
+        store
+            .update_manifest(
+                child_id,
+                &[
+                    (keys[1].clone(), ChunkHash::of("child b")),
+                    (keys[2].clone(), ChunkHash::of("child c")),
+                ],
+            )
+            .unwrap();
+        let assert_answers_like_lookup_chunk = |chain: &HashMap<ChunkKey, ChunkHash>| {
+            for key in &keys {
+                assert_eq!(
+                    chain.get(key).cloned(),
+                    store.lookup_chunk(child_id, key).ok().flatten(),
+                    "{key:?}"
+                );
+            }
+        };
+
+        let chain = store.chain_map(child_id);
+        assert_answers_like_lookup_chunk(&chain);
+        assert_eq!(chain.get(&keys[1]), Some(&ChunkHash::of("child b")));
+        assert_eq!(chain.len(), 3);
+
+        std::fs::write(manifest_path(store.mcp_data(), parent_id), [0xFF; 20]).unwrap();
+        let chain = store.chain_map(child_id);
+        assert_answers_like_lookup_chunk(&chain);
+        assert_eq!(chain.get(&keys[1]), Some(&ChunkHash::of("child b")));
+        assert_eq!(chain.get(&keys[2]), Some(&ChunkHash::of("child c")));
+        assert!(!chain.contains_key(&keys[0]) && !chain.contains_key(&keys[3]));
+
+        std::fs::remove_file(manifest_path(store.mcp_data(), parent_id)).unwrap();
+        store.update_manifest(parent_id, &parent_entries).unwrap();
+        store.write_parent(parent_id, child_id).unwrap();
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        let chain = store.chain_map(child_id);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert_eq!(chain.len(), 3);
+        assert_answers_like_lookup_chunk(&chain);
     }
 
     #[test]
