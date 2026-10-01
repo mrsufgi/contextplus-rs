@@ -769,6 +769,11 @@ impl SharedState {
             return;
         }
         let low_watermark = budget / 5 * 4;
+        let in_use_before = if self.trim_due() {
+            sample_allocator_in_use().await
+        } else {
+            None
+        };
         let access = self.ref_access.lock().unwrap().clone();
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
@@ -784,6 +789,7 @@ impl SharedState {
             .collect();
         candidates.sort_unstable();
         let id_cache_name = cache_name("identifier-embeddings", &self.config);
+        let mib = |bytes: usize| bytes / (1024 * 1024);
         let mut expected = measured;
         let mut evicted = 0usize;
         for (_, i) in candidates {
@@ -800,15 +806,31 @@ impl SharedState {
             {
                 continue;
             }
+            let id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
+            let idle_secs = self
+                .ref_access
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map_or(-1, |(_, last_used)| last_used.elapsed().as_secs() as i64);
             clear_ref_heavy_caches(owner, &id_cache_name).await;
             evicted += 1;
+            let mut unique = 0usize;
             for (ptr, _, _) in &components[i] {
                 let holder = holders.get_mut(ptr).unwrap();
                 holder.1 -= 1;
                 if holder.1 == 0 {
                     expected = expected.saturating_sub(holder.0);
+                    unique = unique.saturating_add(holder.0);
                 }
             }
+            tracing::info!(
+                ref_id = id.0,
+                root = %owner.canonical_root.display(),
+                idle_secs,
+                unique_estimated_mib = mib(unique),
+                "ref caches evicted for memory budget"
+            );
         }
         if evicted > 0 || self.trim_due() {
             self.trim_free_memory().await;
@@ -818,6 +840,23 @@ impl SharedState {
             .filter(|(_, count)| *count > 0)
             .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
         let measured_after = self.measured_resident_bytes(estimated_after);
+        if evicted > 0 {
+            let in_use_after = match in_use_before {
+                Some(_) => sample_allocator_in_use().await,
+                None => None,
+            };
+            let in_use = in_use_before.zip(in_use_after);
+            tracing::info!(
+                evicted,
+                measured_before_mib = mib(measured),
+                measured_after_mib = mib(measured_after),
+                in_use_sampled = in_use.is_some(),
+                in_use_before_mib = in_use.map_or(0, |(before, _)| mib(before)),
+                in_use_after_mib = in_use.map_or(0, |(_, after)| mib(after)),
+                budget_mib = mib(budget),
+                "memory budget pass evicted worktrees"
+            );
+        }
         if measured_after <= budget {
             self.budget_warned
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -829,7 +868,6 @@ impl SharedState {
         {
             return;
         }
-        let mib = |bytes: usize| bytes / (1024 * 1024);
         let primary = refs
             .iter()
             .position(|owner| Arc::ptr_eq(owner, &self.default_ref));
@@ -926,6 +964,14 @@ fn process_resident_bytes() -> Option<usize> {
 /// Freed memory the allocator may keep before it is returned to the OS while
 /// the process is under budget.
 const MEMORY_RETAINED_FREE_TRIM_BYTES: usize = 256 * 1024 * 1024;
+
+/// Walks every arena under its lock, so it runs off the async runtime.
+async fn sample_allocator_in_use() -> Option<usize> {
+    tokio::task::spawn_blocking(allocator_in_use_bytes)
+        .await
+        .ok()
+        .flatten()
+}
 
 /// Bytes the allocator has handed out and not had back.
 fn allocator_in_use_bytes() -> Option<usize> {
@@ -6276,6 +6322,8 @@ async fn import_baseline_for_ref(
                 tokio::task::spawn_blocking(move || {
                     let mut hits: Vec<HitEntry> = Vec::new();
                     let mut misses: Vec<MissedChunk> = Vec::new();
+                    // The chain's manifests, read once on the first wanted file.
+                    let mut chain = None;
 
                     for (rel_path, content) in &project_cache.file_content {
                         // Skip files that exceed the max embed size, and those not wanted.
@@ -6288,11 +6336,12 @@ async fn import_baseline_for_ref(
 
                         let chunk_hash = ChunkHash::of(&embed_text);
                         let key = ChunkKey::new(rel_path.clone(), 0);
+                        let chain = chain.get_or_insert_with(|| cas.chain_map(&ref_id_hex));
 
-                        match cas.lookup_chunk(&ref_id_hex, &key) {
-                            Ok(Some(h)) if h == chunk_hash => {
+                        match chain.get(&key) {
+                            Some(h) if *h == chunk_hash => {
                                 // Chunk hash matches manifest entry — try to load the blob.
-                                match cas.read_blob(&h) {
+                                match cas.read_blob(h) {
                                     Ok(Some(vec)) => {
                                         hits.push((rel_path.clone(), content_hash, vec));
                                     }
@@ -15263,6 +15312,109 @@ mod tests {
         );
     }
 
+    fn log_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
+    }
+
+    async fn over_budget_eviction_server(
+        name: &str,
+    ) -> (
+        ContextPlusServer,
+        crate::ref_index::RefId,
+        tempfile::TempDir,
+    ) {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (id, worktree) = attach_budget_worktree(&server, name).await;
+        worktree.embedding_cache.write().await.insert(
+            format!("{name}.rs"),
+            crate::core::embeddings::CacheEntry {
+                hash: format!("{name}-hash"),
+                vector: vec![0.5; 256 * 1024],
+            },
+        );
+        *server.state.measured_resident_override.lock().unwrap() = Some(2 * 1024 * 1024);
+        (server, id, root)
+    }
+
+    #[tokio::test]
+    async fn budget_eviction_logs_each_evicted_ref_and_the_pass() {
+        let (server, id, _root) = over_budget_eviction_server("eviction-logged").await;
+        mark_ref_idle(&server.state, id);
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+        server.state.enforce_memory_budget().await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let evictions: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("ref caches evicted for memory budget"))
+            .collect();
+        assert_eq!(evictions.len(), 1, "{logs}");
+        let ref_id = id.0.to_string();
+        assert_eq!(
+            log_field(evictions[0], "ref_id"),
+            Some(&ref_id[..]),
+            "{logs}"
+        );
+        assert_eq!(
+            log_field(evictions[0], "unique_estimated_mib"),
+            Some("1"),
+            "{logs}"
+        );
+        let idle_secs: i64 = log_field(evictions[0], "idle_secs")
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or(-1);
+        assert!(
+            idle_secs >= MEMORY_BUDGET_MIN_IDLE.as_secs() as i64,
+            "{logs}"
+        );
+        let passes: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("memory budget pass evicted worktrees"))
+            .collect();
+        assert_eq!(passes.len(), 1, "{logs}");
+        assert_eq!(log_field(passes[0], "evicted"), Some("1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn budget_eviction_logs_a_ref_never_accessed_as_idle_minus_one() {
+        let (server, id, _root) = over_budget_eviction_server("never-accessed").await;
+        server.state.ref_access.lock().unwrap().remove(&id);
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+        server.state.enforce_memory_budget().await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let eviction = logs
+            .lines()
+            .find(|line| line.contains("ref caches evicted for memory budget"))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert_eq!(log_field(eviction, "idle_secs"), Some("-1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn budget_pass_that_evicts_nothing_logs_no_summary() {
+        let (server, _, _root) = over_budget_eviction_server("recently-used").await;
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+        server.state.enforce_memory_budget().await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert!(
+            logs.contains("Resident memory is over CONTEXTPLUS_MEMORY_BUDGET_MB"),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains("ref caches evicted for memory budget")
+                && !logs.contains("memory budget pass evicted worktrees"),
+            "{logs}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_resident_bytes_reads_this_process() {
@@ -22102,6 +22254,31 @@ mod tests {
         assert_eq!(
             semantic_fork_query(&session).await,
             semantic_fork_standalone(&server, worktree.path()).await
+        );
+    }
+
+    /// A worktree whose parent has no index to fork looks up every file, and
+    /// reads each manifest of its CAS chain once, not once per file.
+    #[tokio::test]
+    async fn baseline_import_reads_each_manifest_once_per_pass() {
+        const FILES: usize = 50;
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), FILES);
+        lexdelta_corpus(worktree.path(), FILES);
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let mcp_data = server.state.root_dir.join(".mcp_data");
+        crate::cache::cas::test_seams::record_manifest_loads(&mcp_data);
+
+        let report = semantic_fork_warmup(&session).await;
+
+        assert_eq!(report.hits + report.misses.len(), FILES);
+        let loads = crate::cache::cas::test_seams::manifest_loads(&mcp_data);
+        assert_eq!(
+            loads, 2,
+            "the warmup loaded {loads} manifests for {FILES} lookups, not one per level"
         );
     }
 

@@ -68,42 +68,239 @@ pub fn open_log_file(path: &Path) -> Result<std::fs::File> {
         .create(true)
         .append(true)
         .open(path)?;
-    if file.metadata()?.len() > DAEMON_LOG_MAX_BYTES {
-        file.set_len(0)?;
-    }
+    append_locked(&file, path, 0, LogLockWait::Block, || Ok(()))?;
     Ok(file)
 }
 
-pub fn bounded_log_writer(path: &Path) -> Result<impl std::io::Write + Send + 'static> {
-    struct BoundedLog(std::fs::File);
-    impl std::io::Write for BoundedLog {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0.metadata()?.len() + bytes.len() as u64 > DAEMON_LOG_MAX_BYTES {
-                self.0.set_len(0)?;
-            }
-            self.0.write(bytes)
-        }
+fn log_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.0.flush()
+/// Keeps the log's previous generation in `<path>.1`. The live file is
+/// copied and emptied in place, never renamed, so every descriptor that
+/// appends to it, in this process or another, stays on the live file.
+fn rotate(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let copy = log_sibling(path, &format!(".1.{}.tmp", std::process::id()));
+    if std::fs::copy(path, &copy)
+        .and_then(|_| std::fs::rename(&copy, log_sibling(path, ".1")))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&copy);
+    }
+    file.set_len(0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogLockWait {
+    Block,
+    /// Gives up after about a second and appends without rotating. A panic
+    /// hook runs before unwinding, possibly inside its own thread's rotation.
+    Bounded,
+}
+
+const LOG_LOCK_ATTEMPTS: u32 = 100;
+const LOG_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// An exclusive `flock` on one log descriptor, released on drop. Writers in
+/// this process and in others rotate the log one at a time.
+struct LogLock<'a>(&'a std::fs::File);
+
+impl<'a> LogLock<'a> {
+    fn acquire(file: &'a std::fs::File, wait: LogLockWait) -> Option<Self> {
+        match wait {
+            LogLockWait::Block => loop {
+                match flock_log(file, true) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => break result.ok(),
+                }
+            },
+            LogLockWait::Bounded => (0..LOG_LOCK_ATTEMPTS).find_map(|attempt| {
+                if attempt > 0 {
+                    std::thread::sleep(LOG_LOCK_RETRY);
+                }
+                flock_log(file, false).ok()
+            }),
+        }
+        .map(|()| Self(file))
+    }
+}
+
+impl Drop for LogLock<'_> {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: the descriptor stays open while the lock borrows it.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
     }
-    Ok(BoundedLog(open_log_file(path)?))
+}
+
+fn flock_log(file: &std::fs::File, block: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let operation = if block {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_EX | libc::LOCK_NB
+        };
+        // SAFETY: `file` is open for the whole call; failure sets errno.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, block);
+        Ok(())
+    }
+}
+
+/// Runs `append` with the log locked, rotating it first when `incoming` more
+/// bytes would take it past `DAEMON_LOG_MAX_BYTES`. The length is read under
+/// the lock, so a writer that waited behind a rotation does not rotate again.
+fn append_locked<T>(
+    file: &std::fs::File,
+    path: &Path,
+    incoming: u64,
+    wait: LogLockWait,
+    append: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    #[cfg(test)]
+    test_seams::before_log_lock(path);
+    let lock = LogLock::acquire(file, wait);
+    #[cfg(test)]
+    test_seams::after_log_lock(path);
+    if (lock.is_some() || wait == LogLockWait::Block)
+        && file.metadata()?.len() + incoming > DAEMON_LOG_MAX_BYTES
+    {
+        rotate(file, path)?;
+    }
+    append()
+}
+
+struct BoundedLog {
+    file: std::fs::File,
+    path: PathBuf,
+    wait: LogLockWait,
+}
+
+impl BoundedLog {
+    fn open(path: &Path, wait: LogLockWait) -> Result<Self> {
+        Ok(Self {
+            file: open_log_file(path)?,
+            path: path.to_path_buf(),
+            wait,
+        })
+    }
+}
+
+impl std::io::Write for BoundedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut file = &self.file;
+        append_locked(
+            &self.file,
+            &self.path,
+            bytes.len() as u64,
+            self.wait,
+            || file.write(bytes),
+        )
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+pub fn bounded_log_writer(path: &Path) -> Result<impl std::io::Write + Send + 'static> {
+    BoundedLog::open(path, LogLockWait::Block)
+}
+
+fn panic_log_writer(path: &Path) -> Result<BoundedLog> {
+    BoundedLog::open(path, LogLockWait::Bounded)
 }
 
 pub fn install_panic_hook(log_path: &Path) -> Result<()> {
     use std::io::Write;
-    let file = std::sync::Mutex::new(bounded_log_writer(log_path)?);
+    let file = std::sync::Mutex::new(panic_log_writer(log_path)?);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Ok(mut file) = file.lock() {
             let backtrace = std::backtrace::Backtrace::force_capture();
-            let _ = writeln!(file, "PANIC: {info}\n{backtrace}");
+            let _ = file.write_all(format!("PANIC: {info}\n{backtrace}\n").as_bytes());
             let _ = file.flush();
         }
         previous(info);
     }));
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+    pub(crate) struct RotationPause {
+        locked: Barrier,
+        resume: Barrier,
+        held: AtomicBool,
+    }
+
+    impl RotationPause {
+        pub(crate) fn wait_until_locked(&self) {
+            self.locked.wait();
+        }
+    }
+
+    fn rotation_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<RotationPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<RotationPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Holds the next writer of the log at `path` that takes its lock until
+    /// another writer of `path` reaches the lock.
+    pub(crate) fn pause_rotation_after_lock(path: &Path) -> Arc<RotationPause> {
+        let pause = Arc::new(RotationPause {
+            locked: Barrier::new(2),
+            resume: Barrier::new(2),
+            held: AtomicBool::new(false),
+        });
+        rotation_slots()
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) fn before_log_lock(path: &Path) {
+        let pause = {
+            let mut slots = rotation_slots().lock().unwrap();
+            let held = slots
+                .get(path)
+                .is_some_and(|pause| pause.held.load(Ordering::Acquire));
+            held.then(|| slots.remove(path).unwrap())
+        };
+        if let Some(pause) = pause {
+            pause.resume.wait();
+        }
+    }
+
+    pub(crate) fn after_log_lock(path: &Path) {
+        let pause = rotation_slots()
+            .lock()
+            .unwrap()
+            .get(path)
+            .filter(|pause| !pause.held.swap(true, Ordering::AcqRel))
+            .cloned();
+        if let Some(pause) = pause {
+            pause.locked.wait();
+            pause.resume.wait();
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -983,6 +1180,152 @@ mod tests {
         }
     }
 
+    fn previous_log(path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.1", path.display()))
+    }
+
+    #[test]
+    fn bounded_log_keeps_the_previous_generation() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        let mut log = bounded_log_writer(&log_path).unwrap();
+        log.write_all(&generation).unwrap();
+        log.write_all(b"b\n").unwrap();
+
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == generation,
+            "the previous generation holds {} bytes, not the {} written before the rotation",
+            previous.len(),
+            generation.len()
+        );
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn bounded_log_truncates_when_the_previous_generation_cannot_be_replaced() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        std::fs::create_dir(previous_log(&log_path)).unwrap();
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        let mut log = bounded_log_writer(&log_path).unwrap();
+        log.write_all(&generation).unwrap();
+        log.write_all(b"b\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "b\n");
+        assert!(previous_log(&log_path).is_dir());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("daemon.log.1.") && name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "rotation left {leftovers:?} behind");
+    }
+
+    #[test]
+    fn bounded_log_rotation_keeps_every_writer_on_the_live_file() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        let mut tracing_log = bounded_log_writer(&log_path).unwrap();
+        let mut panic_log = panic_log_writer(&log_path).unwrap();
+        tracing_log.write_all(&generation).unwrap();
+        tracing_log.write_all(b"after rotation\n").unwrap();
+        panic_log.write_all(b"PANIC: sentinel\n").unwrap();
+
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == generation,
+            "the previous generation holds {} bytes, not exactly the first generation",
+            previous.len()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "after rotation\nPANIC: sentinel\n"
+        );
+    }
+
+    #[test]
+    fn bounded_log_rotation_rechecks_under_the_lock() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        std::fs::write(&log_path, &generation).unwrap();
+        let mut writer_a = bounded_log_writer(&log_path).unwrap();
+        let mut writer_b = bounded_log_writer(&log_path).unwrap();
+        let pause = test_seams::pause_rotation_after_lock(&log_path);
+
+        std::thread::scope(|scope| {
+            let rotating = scope.spawn(|| writer_a.write_all(b"from a\n").unwrap());
+            pause.wait_until_locked();
+            // B reaches the lock A holds, which lets A rotate.
+            writer_b.write_all(b"from b\n").unwrap();
+            rotating.join().unwrap();
+        });
+
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == generation,
+            "the previous generation holds {} bytes, not the {} A rotated",
+            previous.len(),
+            generation.len()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "from a\nfrom b\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panic_log_appends_without_rotating_while_another_descriptor_holds_the_lock() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        std::fs::write(&log_path, &generation).unwrap();
+        let mut panic_log = panic_log_writer(&log_path).unwrap();
+        let holder = std::fs::File::open(&log_path).unwrap();
+        let lock = LogLock::acquire(&holder, LogLockWait::Block).unwrap();
+
+        let (written, returned) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let panic_log = &mut panic_log;
+            scope.spawn(move || {
+                panic_log.write_all(b"PANIC: sentinel\n").unwrap();
+                written.send(()).unwrap();
+            });
+            // Only a guard against a hang: the bounded wait gives up after about a second.
+            let gave_up = returned.recv_timeout(Duration::from_secs(60)).is_ok();
+            drop(lock);
+            assert!(
+                gave_up,
+                "the panic writer waited on a lock another descriptor holds"
+            );
+        });
+
+        assert!(
+            !previous_log(&log_path).exists(),
+            "the panic writer rotated the log without holding its lock"
+        );
+        let mut expected = generation;
+        expected.extend_from_slice(b"PANIC: sentinel\n");
+        assert!(
+            std::fs::read(&log_path).unwrap() == expected,
+            "the panic text was not appended to the live log"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn panic_log_child_process_helper() {
@@ -1013,6 +1356,12 @@ mod tests {
         assert!(
             std::fs::metadata(&log_path).unwrap().len() <= DAEMON_LOG_MAX_BYTES,
             "oversized daemon log was not truncated or rotated"
+        );
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == vec![b'x'; DAEMON_LOG_MAX_BYTES as usize + 1],
+            "the previous generation holds {} bytes, not the oversized log",
+            previous.len()
         );
 
         let status = Command::new(std::env::current_exe().unwrap())
