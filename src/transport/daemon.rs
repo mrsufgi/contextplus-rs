@@ -68,19 +68,39 @@ pub fn open_log_file(path: &Path) -> Result<std::fs::File> {
         .create(true)
         .append(true)
         .open(path)?;
-    if file.metadata()?.len() > DAEMON_LOG_MAX_BYTES {
-        file.set_len(0)?;
-    }
+    rotate_when_full(&file, path, 0)?;
     Ok(file)
 }
 
+fn log_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Keeps the log's previous generation in `<path>.1` when `incoming` bytes
+/// would take it past `DAEMON_LOG_MAX_BYTES`. The live file is copied and
+/// emptied in place, never renamed, so every descriptor that appends to it,
+/// in this process or another, stays on the live file.
+fn rotate_when_full(file: &std::fs::File, path: &Path, incoming: u64) -> std::io::Result<()> {
+    if file.metadata()?.len() + incoming <= DAEMON_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    let copy = log_sibling(path, &format!(".1.{}.tmp", std::process::id()));
+    if std::fs::copy(path, &copy)
+        .and_then(|_| std::fs::rename(&copy, log_sibling(path, ".1")))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&copy);
+    }
+    file.set_len(0)
+}
+
 pub fn bounded_log_writer(path: &Path) -> Result<impl std::io::Write + Send + 'static> {
-    struct BoundedLog(std::fs::File);
+    struct BoundedLog(std::fs::File, PathBuf);
     impl std::io::Write for BoundedLog {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0.metadata()?.len() + bytes.len() as u64 > DAEMON_LOG_MAX_BYTES {
-                self.0.set_len(0)?;
-            }
+            rotate_when_full(&self.0, &self.1, bytes.len() as u64)?;
             self.0.write(bytes)
         }
 
@@ -88,7 +108,7 @@ pub fn bounded_log_writer(path: &Path) -> Result<impl std::io::Write + Send + 's
             self.0.flush()
         }
     }
-    Ok(BoundedLog(open_log_file(path)?))
+    Ok(BoundedLog(open_log_file(path)?, path.to_path_buf()))
 }
 
 pub fn install_panic_hook(log_path: &Path) -> Result<()> {
@@ -983,6 +1003,56 @@ mod tests {
         }
     }
 
+    fn previous_log(path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.1", path.display()))
+    }
+
+    #[test]
+    fn bounded_log_keeps_the_previous_generation() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        let mut log = bounded_log_writer(&log_path).unwrap();
+        log.write_all(&generation).unwrap();
+        log.write_all(b"b\n").unwrap();
+
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == generation,
+            "the previous generation holds {} bytes, not the {} written before the rotation",
+            previous.len(),
+            generation.len()
+        );
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn bounded_log_rotation_keeps_every_writer_on_the_live_file() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        let mut tracing_log = bounded_log_writer(&log_path).unwrap();
+        let mut panic_log = bounded_log_writer(&log_path).unwrap();
+        tracing_log.write_all(&generation).unwrap();
+        tracing_log.write_all(b"after rotation\n").unwrap();
+        panic_log.write_all(b"PANIC: sentinel\n").unwrap();
+
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == generation,
+            "the previous generation holds {} bytes, not exactly the first generation",
+            previous.len()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            "after rotation\nPANIC: sentinel\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn panic_log_child_process_helper() {
@@ -1013,6 +1083,12 @@ mod tests {
         assert!(
             std::fs::metadata(&log_path).unwrap().len() <= DAEMON_LOG_MAX_BYTES,
             "oversized daemon log was not truncated or rotated"
+        );
+        let previous = std::fs::read(previous_log(&log_path)).unwrap_or_default();
+        assert!(
+            previous == vec![b'x'; DAEMON_LOG_MAX_BYTES as usize + 1],
+            "the previous generation holds {} bytes, not the oversized log",
+            previous.len()
         );
 
         let status = Command::new(std::env::current_exe().unwrap())
