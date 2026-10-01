@@ -160,11 +160,22 @@ pub(crate) struct IdentifierBuild {
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
     /// The documents as of the latest project cache a request asked for.
     current: Arc<std::sync::Mutex<Option<CurrentIdentifierDocs>>>,
+    /// The documents the latest finished reparse produced.
+    latest: Arc<std::sync::Mutex<Option<ReparsedIdentifierDocs>>>,
+    /// The ref whose background tasks reparse the documents.
+    owner: std::sync::Weak<crate::ref_index::RefIndex>,
 }
 
 type CurrentIdentifierDocs = (
     std::sync::Weak<ProjectCache>,
     tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>,
+);
+
+/// A build's documents as of an edited project cache, with the content each
+/// file that differs from the build's project cache was parsed from.
+type ReparsedIdentifierDocs = (
+    Arc<IdentifierIndex>,
+    Arc<HashMap<String, Option<Arc<String>>>>,
 );
 
 impl IdentifierBuild {
@@ -256,7 +267,8 @@ impl IdentifierBuild {
         self.reparse(docs, cache)?.borrow().clone().flatten()
     }
 
-    /// The reparse of `docs` as of `cache`, started unless one is already.
+    /// The reparse of `docs` as of `cache`, started unless one is already,
+    /// after the reparse it replaces.
     fn reparse(
         &self,
         docs: &Arc<IdentifierIndex>,
@@ -269,12 +281,17 @@ impl IdentifierBuild {
             }
             _ => {
                 let source = self.source.upgrade()?;
+                let owner = self.owner.upgrade()?;
+                let previous = slot.take().map(|(_, current)| current);
                 let (sender, current) = tokio::sync::watch::channel(None);
                 let docs = Arc::clone(docs);
                 let edited = Arc::clone(cache);
-                tokio::task::spawn_blocking(move || {
-                    let reparsed = Self::reparsed(&docs, &source, &edited);
-                    drop((docs, source, edited));
+                let latest = Arc::clone(&self.latest);
+                owner.spawn_background_task(async move {
+                    if let Some(mut previous) = previous {
+                        let _ = previous.wait_for(Option::is_some).await;
+                    }
+                    let reparsed = Self::reparse_after_latest(&latest, docs, source, edited).await;
                     sender.send_replace(Some(reparsed));
                 });
                 *slot = Some((Arc::downgrade(cache), current.clone()));
@@ -283,13 +300,33 @@ impl IdentifierBuild {
         }
     }
 
+    /// `reparsed` on a blocking thread, reusing the files the latest finished
+    /// reparse parsed, and recorded as the latest.
+    async fn reparse_after_latest(
+        latest: &std::sync::Mutex<Option<ReparsedIdentifierDocs>>,
+        docs: Arc<IdentifierIndex>,
+        source: Arc<ProjectCache>,
+        cache: Arc<ProjectCache>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        let previous = latest.lock().unwrap().clone();
+        let reparsed = tokio::task::spawn_blocking(move || {
+            Self::reparsed(&docs, &source, &cache, previous.as_ref())
+        })
+        .await
+        .ok()??;
+        let index = Arc::clone(&reparsed.0);
+        *latest.lock().unwrap() = Some(reparsed);
+        Some(index)
+    }
+
     /// `docs`, parsed from `source`, with each file whose content differs in
-    /// `cache` parsed again.
+    /// `cache` parsed again, unless `previous` parsed the same content.
     fn reparsed(
         docs: &IdentifierIndex,
         source: &ProjectCache,
         cache: &ProjectCache,
-    ) -> Option<Arc<IdentifierIndex>> {
+        previous: Option<&ReparsedIdentifierDocs>,
+    ) -> Option<ReparsedIdentifierDocs> {
         use rayon::prelude::*;
         let differing: std::collections::BTreeSet<&String> = cache
             .file_content
@@ -307,6 +344,21 @@ impl IdentifierBuild {
         for path in &differing {
             files.remove(*path);
         }
+        let parsed_from: HashMap<String, Option<Arc<String>>> = differing
+            .iter()
+            .map(|path| ((*path).clone(), cache.file_content.get(path).cloned()))
+            .collect();
+        let mut unparsed = Vec::new();
+        for path in differing {
+            match previous.filter(|(_, from)| from.get(path) == parsed_from.get(path)) {
+                Some((index, _)) => {
+                    if let Some(file_docs) = index.docs.files.get(path) {
+                        files.insert(path.clone(), Arc::clone(file_docs));
+                    }
+                }
+                None => unparsed.push(path),
+            }
+        }
         let parse = |path: &String| {
             let content = cache.file_content.get(path)?;
             let file_docs =
@@ -316,12 +368,12 @@ impl IdentifierBuild {
         // A few files parse here rather than queue behind unrelated work in
         // the shared rayon pool.
         const PARALLEL_THRESHOLD: usize = 64;
-        if differing.len() >= PARALLEL_THRESHOLD {
-            files.par_extend(differing.into_par_iter().filter_map(parse));
+        if unparsed.len() >= PARALLEL_THRESHOLD {
+            files.par_extend(unparsed.into_par_iter().filter_map(parse));
         } else {
-            files.extend(differing.into_iter().filter_map(parse));
+            files.extend(unparsed.into_iter().filter_map(parse));
         }
-        Some(Arc::new(IdentifierIndex {
+        let index = Arc::new(IdentifierIndex {
             docs: Segmented::from_files(files),
             vectors: IdentifierVectorIndex::empty(),
             dims: 0,
@@ -331,7 +383,8 @@ impl IdentifierBuild {
                 .filter(|entry| !entry.is_directory)
                 .count(),
             built_at: Instant::now(),
-        }))
+        });
+        Some((index, Arc::new(parsed_from)))
     }
 }
 
@@ -3741,6 +3794,8 @@ impl ContextPlusServer {
             parsed: parsed_receiver,
             done: receiver,
             current: Arc::default(),
+            latest: Arc::default(),
+            owner: Arc::downgrade(ref_index),
         };
         let server = self.clone();
         let owner = Arc::clone(ref_index);
@@ -8854,12 +8909,12 @@ mod tests {
 
         let (reparsed_tx, reparsed) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = reparsed_tx.send(IdentifierBuild::reparsed(&parsed, &source, &edited));
+            let _ = reparsed_tx.send(IdentifierBuild::reparsed(&parsed, &source, &edited, None));
         });
         let reparsed = reparsed.recv_timeout(std::time::Duration::from_secs(60));
         drop(closed);
 
-        let reparsed = reparsed
+        let (reparsed, _) = reparsed
             .expect("the reparse queued behind unrelated rayon work")
             .unwrap();
         let names: Vec<String> = reparsed.docs.iter().map(|doc| doc.name.clone()).collect();
@@ -8913,6 +8968,99 @@ mod tests {
             build.running(),
             "the build ended before the requests answered"
         );
+        drop(held);
+    }
+
+    /// An identifier server of twenty `src/depot_{i}.rs` files whose cold
+    /// build has parsed them and holds every embed permit.
+    async fn parsed_depot_build() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        tokio::sync::OwnedSemaphorePermit,
+        IdentifierBuild,
+    ) {
+        let tree: Vec<(String, String)> = (0..20)
+            .map(|i| {
+                (
+                    format!("src/depot_{i}.rs"),
+                    format!("pub fn stock_{i}() {{}}\n"),
+                )
+            })
+            .collect();
+        let tree: Vec<(&str, &str)> = tree
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let (repo, ollama, server) =
+            scripted_identifier_server(&tree, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        (repo, ollama, server, held, build)
+    }
+
+    /// Adds `audit_{i}` to `src/depot_{i}.rs` and returns the edited tree.
+    async fn edit_depot(
+        repo: &tempfile::TempDir,
+        server: &ContextPlusServer,
+        i: usize,
+    ) -> Arc<ProjectCache> {
+        std::fs::write(
+            repo.path().join(format!("src/depot_{i}.rs")),
+            format!("pub fn stock_{i}() {{}}\npub fn audit_{i}() {{}}\n"),
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        server.ensure_project_cache().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reparse_after_a_further_edit_reuses_the_files_the_last_one_parsed() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let first = build.documents_for(&parsed, &first_edit).await.unwrap();
+        let second_edit = edit_depot(&repo, &server, 1).await;
+
+        let second = build.documents_for(&parsed, &second_edit).await.unwrap();
+
+        let names: Vec<String> = second.docs.iter().map(|doc| doc.name.clone()).collect();
+        assert!(names.contains(&"audit_0".to_string()), "{names:?}");
+        assert!(names.contains(&"audit_1".to_string()), "{names:?}");
+        assert!(
+            Arc::ptr_eq(
+                &first.docs.files["src/depot_0.rs"],
+                &second.docs.files["src/depot_0.rs"]
+            ),
+            "the second reparse parsed src/depot_0.rs again"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_reparse_stops_with_the_ref_background_tasks() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = Some((Arc::downgrade(&first_edit), first));
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let mut second = build.reparse(&parsed, &second_edit).unwrap();
+
+        server.current_ref().await.cancel_background_tasks();
+
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            second.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the cancelled reparse neither published nor stopped")
+        .map(|reparsed| reparsed.clone());
+        assert!(published.is_err(), "the reparse outlived its ref's tasks");
+        drop(stalled);
         drop(held);
     }
 
