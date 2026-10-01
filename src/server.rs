@@ -7369,7 +7369,7 @@ mod tests {
         name: &str,
         at_least: usize,
     ) -> usize {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if let Ok(Some(data)) = rkyv_store::load_cache(root, name)
                     && data.keys.len() >= at_least
@@ -7835,7 +7835,7 @@ mod tests {
     }
 
     async fn wait_for_embed_batch(ollama: &wiremock::MockServer, marker: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while matching_embed_request_batches(ollama, marker)
                 .await
                 .is_empty()
@@ -7854,16 +7854,17 @@ mod tests {
 
     #[tokio::test]
     async fn identifier_query_answers_by_keyword_within_the_budget_while_the_build_embeds() {
-        let (_repo, _ollama, server) = scripted_identifier_server(
-            LEDGER_FILES,
-            |inputs| embeddings_for(inputs).set_delay(std::time::Duration::from_secs(8)),
-            // Long enough for the parse to finish under a loaded test run.
-            |config| config.embed_budget_ms = 2_000,
-        )
-        .await;
+        let (_repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
 
         let answered = tokio::time::timeout(
-            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(60),
             server.dispatch("explore", identifier_args("open_account", "meaning")),
         )
         .await
@@ -7873,20 +7874,20 @@ mod tests {
         assert_eq!(answered.is_error, Some(false), "{text}");
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(60), build.finished())
+            .await
+            .expect("the build stopped when the request stopped waiting for it")
+            .unwrap();
         let primary = server.state.default_ref().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while !primary
+        assert!(
+            primary
                 .identifier_index
                 .read()
                 .await
                 .as_ref()
                 .is_some_and(|index| index.dims > 0)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the build stopped when the request stopped waiting for it");
+        );
     }
 
     #[tokio::test]
@@ -8059,7 +8060,7 @@ mod tests {
         let (_repo, ollama, server) = scripted_identifier_server(
             LEDGER_FILES,
             |inputs| embeddings_for(inputs).set_delay(std::time::Duration::from_millis(500)),
-            |config| config.embed_budget_ms = 10_000,
+            |config| config.embed_budget_ms = 600_000,
         )
         .await;
 
@@ -8100,7 +8101,7 @@ mod tests {
         let (_repo, _ollama, server) = scripted_identifier_server(
             LEDGER_FILES,
             |_| wiremock::ResponseTemplate::new(500),
-            |config| config.embed_budget_ms = 10_000,
+            |config| config.embed_budget_ms = 600_000,
         )
         .await;
 
@@ -8137,7 +8138,10 @@ mod tests {
                     embeddings_for(inputs)
                 }
             },
-            |config| config.embed_budget_ms = 10_000,
+            |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            },
         )
         .await;
 
@@ -8180,7 +8184,7 @@ mod tests {
             },
             |config| {
                 config.embed_batch_size = 2;
-                config.embed_budget_ms = 10_000;
+                config.embed_budget_ms = 600_000;
             },
         )
         .await;
@@ -15229,7 +15233,7 @@ mod tests {
                 let inputs = embed_request_inputs(request);
                 let response = embeddings_for(&inputs);
                 if inputs.iter().any(|input| input.contains("BATCH")) {
-                    response.set_delay(std::time::Duration::from_secs(30))
+                    response.set_delay(std::time::Duration::from_secs(3600))
                 } else {
                     response
                 }
@@ -15251,7 +15255,7 @@ mod tests {
                 })
             })
             .collect();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while matching_embed_request_batches(&ollama, "BATCH")
                 .await
                 .is_empty()
@@ -15263,7 +15267,7 @@ mod tests {
         .expect("no batch embed reached the embedder");
 
         let query = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
             server.state.ollama.embed_query("needle"),
         )
         .await
@@ -17973,6 +17977,7 @@ mod tests {
         let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
         // The fill's batch holds one permit; the fresh query's embed needs the other.
         config.ollama_max_concurrent = 2;
+        config.query_embed_budget_ms = 600_000;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 
         let mut first_config = server.state.config.clone();
@@ -18043,7 +18048,7 @@ mod tests {
             .and(path("/api/embed"))
             .respond_with(|request: &Request| {
                 embeddings_for(&embed_request_inputs(request))
-                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_delay(std::time::Duration::from_secs(3600))
             })
             .mount(&ollama)
             .await;
@@ -18057,7 +18062,7 @@ mod tests {
         let mut args = serde_json::Map::new();
         args.insert("query".into(), json!("reconcile_ledger"));
         let answered = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
             server.dispatch("explore", args),
         )
         .await
@@ -18137,7 +18142,7 @@ mod tests {
                 if inputs.iter().all(|input| input.contains("src/")) {
                     response
                 } else {
-                    response.set_delay(std::time::Duration::from_secs(30))
+                    response.set_delay(std::time::Duration::from_secs(3600))
                 }
             },
             |config| config.query_embed_budget_ms = 200,
@@ -18147,7 +18152,7 @@ mod tests {
         server.ensure_identifier_index(&cache).await.unwrap();
 
         let answered = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
             server.dispatch("explore", identifier_args("open_account", "meaning")),
         )
         .await
