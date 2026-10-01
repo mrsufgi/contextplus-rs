@@ -9264,6 +9264,98 @@ mod tests {
         );
     }
 
+    /// A worktree cut from `origin/main`, far from the primary, forks the fork
+    /// base's index with only its own changes and shares its vector store.
+    #[tokio::test]
+    async fn fork_base_worktree_forks_the_fork_base_with_its_own_delta() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        lexdelta_git(primary.path(), &["checkout", "-q", "-b", "upstream"]);
+        for i in 0..SEMANTIC_FORK_FILES / 4 {
+            std::fs::write(
+                primary
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn upstream_{i}() -> usize {{ {i} }}\n// shared symbol\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary.path(), &["commit", "-qam", "upstream"]);
+        let upstream = choose_parent_rev(primary.path(), "HEAD");
+        lexdelta_git(primary.path(), &["checkout", "-q", "main"]);
+        lexdelta_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", &upstream],
+        );
+        let bases = tempfile::tempdir().unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.fork_base = Some("origin/main".into());
+        config.fork_base_dir = Some(bases.path().to_path_buf());
+        config.fork_base_min_advance_secs = 0;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
+        let root = primary.path().to_path_buf();
+        let base = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a fork base checkout");
+        crate::transport::daemon::register_fork_base(&server, base).await;
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        assert_eq!(
+            fork_base_state(&server, "none").await.1,
+            Some(upstream.clone())
+        );
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &upstream);
+        std::fs::write(
+            cut.join("src/area_1/file_1.rs"),
+            "pub fn worktreechanged() -> usize { 1 }\n// shared symbol\n",
+        )
+        .unwrap();
+
+        let session = attached_worktree(&server, &cut).await;
+        let owner = session.current_ref().await;
+        assert_eq!(owner.parent_ref_id, Some(base_id));
+        let ref_id = format!("ref_id={} ", owner.cas_ref_id_hex);
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        semantic_fork_query(&session).await;
+        drop(capture);
+
+        let lines: Vec<String> = crate::test_logs::logs_as_string(&logs)
+            .lines()
+            .filter(|line| line.contains(&ref_id) && line.contains("phase=\"semantic_fork"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("phase=\"semantic_fork\"")
+                    && line.contains(&format!("parent_ref_id={}", base.cas_ref_id_hex))
+                    && line.contains("installed=true")
+                    && line.contains("changed=1 deleted=0")),
+            "the worktree did not fork the fork base with its own delta: {lines:#?}"
+        );
+        let base_entry = base.search_index_cache.read().await.clone().unwrap();
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&base_entry.index),
+            "the worktree's index does not share the fork base's vector store"
+        );
+    }
+
     #[tokio::test]
     async fn fork_base_advance_waits_for_the_minimum_interval() {
         let (_ollama, primary, _bases, server) = fork_base_server(3600).await;
