@@ -17325,8 +17325,10 @@ mod tests {
         (root, ollama, server)
     }
 
-    #[tokio::test]
-    async fn a_query_embed_proceeds_while_navigate_embeds_its_corpus_beside_a_batch() {
+    /// A `slow_marker_server` of two permits over a corpus larger than one
+    /// embed batch, whose `src/navigate.rs` embeds never answer.
+    async fn slow_navigate_corpus_server()
+    -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
         let corpus: Vec<(String, String)> = (0..32)
             .map(|i| {
                 (
@@ -17343,7 +17345,12 @@ mod tests {
             .iter()
             .map(|(path, source)| (path.as_str(), source.as_str()))
             .collect();
-        let (_root, ollama, server) = slow_marker_server(&corpus, 2).await;
+        slow_marker_server(&corpus, 2).await
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_navigate_embeds_its_corpus_beside_a_batch() {
+        let (_root, ollama, server) = slow_navigate_corpus_server().await;
         let navigate = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -17375,6 +17382,41 @@ mod tests {
 
         assert!(query.is_ok(), "{query:?}");
         navigate.abort();
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_a_navigate_query_embeds_its_corpus_beside_a_batch() {
+        let (_root, ollama, server) = slow_navigate_corpus_server().await;
+        let navigate = {
+            let server = server.clone();
+            let mut args = serde_json::Map::new();
+            args.insert("query".into(), json!("route"));
+            tokio::spawn(async move { server.dispatch("semantic_navigate", args).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "navigate_corpus")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate never embedded its corpus");
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind navigate's corpus and a background batch");
+
+        assert!(query.is_ok(), "{query:?}");
+        navigate.abort();
+        server.current_ref().await.cancel_background_tasks();
     }
 
     #[tokio::test]

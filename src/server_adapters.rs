@@ -1050,12 +1050,19 @@ impl CachedWalkerIndexer {
         drop(fill);
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(config.embed_budget_ms);
+        let delta = pending.len() <= config.embed_batch_size.max(1);
         for chunk in pending.chunks(config.embed_batch_size.max(1)) {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
             let texts: Vec<_> = chunk.iter().map(|(_, d)| d.text.clone()).collect();
-            match tokio::time::timeout_at(deadline, ollama.embed_documents(&texts)).await {
+            let embedded = tokio::time::timeout_at(deadline, ollama.embed_documents(&texts));
+            let embedded = if delta {
+                crate::core::embeddings::delta(embedded).await
+            } else {
+                embedded.await
+            };
+            match embedded {
                 Ok(Ok(result)) if result.len() == chunk.len() => {
                     let mut current = Vec::with_capacity(chunk.len());
                     for (_, doc) in chunk {
