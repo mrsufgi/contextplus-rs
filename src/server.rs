@@ -17840,7 +17840,7 @@ mod tests {
     /// Waits for `ref_index`'s background fill to persist and stop.
     async fn fill_settled(ref_index: &Arc<crate::ref_index::RefIndex>) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while ref_index.semantic_fill.lock().await.running() {
+            while crate::server_adapters::test_seams::fill_running(ref_index).await {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })

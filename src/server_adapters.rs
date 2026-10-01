@@ -2611,11 +2611,6 @@ pub(crate) struct SemanticFill {
 }
 
 impl SemanticFill {
-    #[cfg(test)]
-    pub(crate) fn running(&self) -> bool {
-        self.running
-    }
-
     fn failed(&self, doc: &FillDocument) -> bool {
         self.failures
             .get(&doc.path)
