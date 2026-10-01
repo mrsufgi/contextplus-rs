@@ -2457,6 +2457,13 @@ impl ContextPlusServer {
                     return;
                 }
             };
+            let _serving = WarmupServing {
+                state: Arc::clone(&state),
+                ref_id,
+                _serving: crate::core::process_lifecycle::InflightGuard::new(Arc::clone(
+                    &ref_index.active_requests,
+                )),
+            };
 
             // --- Skip if already warm ---
             {
@@ -6232,6 +6239,28 @@ impl Drop for WarmupGuard {
         // will remove the entry shortly anyway on its own unlock path).
         if let Ok(mut inflight) = self.state.warmup_in_flight.try_lock() {
             inflight.remove(&self.ref_id);
+        }
+    }
+}
+
+/// Holds a ref in use while its shallow warmup runs, so the memory budget
+/// does not evict it. On drop the warmup counts as the ref's last use, unless
+/// the ref has since been evicted from the registry.
+struct WarmupServing {
+    state: Arc<SharedState>,
+    ref_id: crate::ref_index::RefId,
+    _serving: crate::core::process_lifecycle::InflightGuard,
+}
+
+impl Drop for WarmupServing {
+    fn drop(&mut self) {
+        let tick = self
+            .state
+            .access_clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        if let Some(access) = self.state.ref_access.lock().unwrap().get_mut(&self.ref_id) {
+            *access = (tick, Instant::now());
         }
     }
 }
@@ -15503,6 +15532,57 @@ mod tests {
         assert!(
             !ref_b.embedding_cache.read().await.is_empty(),
             "the budget evicted a worktree used after the pass took its snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_spares_a_worktree_while_its_warmup_runs() {
+        let (_ollama, primary_root, worktree, untracked, _) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let mut config = untracked.state.config.clone();
+        config.resident_memory_budget_bytes = 1024;
+        let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
+        let session = attached_worktree(&server, worktree.path()).await;
+        semantic_fork_query(&server).await;
+        let id = session.session_ref_id.unwrap();
+        let owner = session.current_ref().await;
+        assert!(owner.project_cache.read().await.is_none());
+        owner.embedding_cache.write().await.insert(
+            "resident.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "resident-hash".to_string(),
+                vector: vec![0.5; 4096],
+            },
+        );
+        let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(&owner.root_dir);
+        session.spawn_shallow_warmup_task(id);
+        pause.wait_until_entered().await;
+        mark_ref_idle(&server.state, id);
+        let generation = owner
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            owner
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == generation
+                && !owner.embedding_cache.read().await.is_empty(),
+            "the budget evicted a worktree during its warmup"
+        );
+        pause.resume();
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            while server.state.warmup_in_flight.lock().await.contains(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the warmup never finished");
+        assert!(
+            owner.project_cache.read().await.is_some(),
+            "the warmup's project cache did not survive the budget pass"
         );
     }
 
