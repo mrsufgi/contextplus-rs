@@ -299,6 +299,55 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn fill_start_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next background fill of the ref at `root` before its first
+    /// batch.
+    pub(crate) fn pause_fill_start(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fill_start_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn fill_start(root: &Path) {
+        let pause = fill_start_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn fill_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the task of a background fill of the ref at `root`.
+    pub(crate) fn fill_started(root: &Path, task: tokio::task::JoinHandle<()>) {
+        fill_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(task);
+    }
+
+    /// The background fills of the ref at `root` started.
+    pub(crate) fn take_fills(root: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+        fill_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     fn stale_install_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1285,6 +1334,8 @@ impl CachedWalkerIndexer {
                 run_fill(state, owner, ollama, config, parent_vectors).await;
             });
             ref_index.track_background_task(&task);
+            #[cfg(test)]
+            test_seams::fill_started(&ref_index.canonical_root, task);
         }
         drop(fill);
         let deadline =
@@ -2953,10 +3004,7 @@ pub(crate) async fn refresh_fork_parent(
     ref_index: &Arc<crate::ref_index::RefIndex>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use std::sync::atomic::Ordering;
-    let fork_base = state.fork_base_ref_id.get()
-        == Some(&crate::ref_index::RefId::for_canonical_path(
-            &ref_index.canonical_root,
-        ));
+    let fork_base = state.is_fork_base(ref_index);
     if ref_index.parent_ref_id.is_some()
         || !fork_base && state.attached_children(ref_index).await.is_empty()
     {
@@ -2978,13 +3026,21 @@ pub(crate) async fn refresh_fork_parent(
         },
         ref_index: Arc::clone(ref_index),
     });
-    crate::tools::semantic_search::spawn_stale_rebuild(
+    let rebuild = crate::tools::semantic_search::spawn_stale_rebuild(
         &entry,
         &ref_index.search_index_cache,
         generation,
         &walker,
         &ref_index.canonical_root,
-    )
+    )?;
+    if !fork_base {
+        return Some(rebuild);
+    }
+    let state = Arc::clone(state);
+    Some(tokio::spawn(async move {
+        let _ = rebuild.await;
+        state.recheck_fork_base();
+    }))
 }
 
 /// The tracker generations `parent` moved since its entry `base` was built,
@@ -3302,6 +3358,8 @@ async fn run_fill(
     parent_vectors: Option<Arc<FileVectors>>,
 ) {
     let mut completed = 0usize;
+    #[cfg(test)]
+    test_seams::fill_start(&ref_index.canonical_root).await;
     loop {
         let batch: Vec<_> = {
             let fill = ref_index.semantic_fill.lock().await;
@@ -3325,6 +3383,10 @@ async fn run_fill(
             let mut fill = ref_index.semantic_fill.lock().await;
             if fill.pending.is_empty() {
                 fill.running = false;
+                drop(fill);
+                if state.is_fork_base(&ref_index) {
+                    state.recheck_fork_base();
+                }
                 return;
             }
             continue;

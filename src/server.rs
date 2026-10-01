@@ -746,6 +746,25 @@ impl SharedState {
             .map(|(_, advance)| advance.clone())
     }
 
+    /// Whether `ref_index` is the fork base checkout's ref.
+    pub(crate) fn is_fork_base(&self, ref_index: &crate::ref_index::RefIndex) -> bool {
+        self.fork_base_ref_id.get()
+            == Some(&crate::ref_index::RefId::for_canonical_path(
+                &ref_index.canonical_root,
+            ))
+    }
+
+    /// Checks the fork base once more, so the head its index holds is recorded
+    /// once its vectors fill or a rebuild catches it up.
+    pub(crate) fn recheck_fork_base(self: &Arc<Self>) {
+        let server = ContextPlusServer {
+            state: Arc::clone(self),
+            session_ref_id: None,
+            session_config_warning: None,
+        };
+        let _advance = server.advance_fork_base();
+    }
+
     /// Whether the daemon owns `ref_id` for its lifetime and never evicts or
     /// detaches it: the primary or the fork base.
     pub(crate) fn pinned(&self, ref_id: crate::ref_index::RefId) -> bool {
@@ -9086,6 +9105,78 @@ mod tests {
             parent,
             Some(base_id),
             "a worktree registered during an advance was parented on the primary"
+        );
+    }
+
+    /// A fork base whose vectors fill after its advance ends is a worktree's
+    /// parent once they fill, with nothing else checking it again.
+    #[tokio::test]
+    async fn choose_parent_takes_the_fork_base_once_its_fill_drains() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        lexdelta_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let origin = choose_parent_rev(primary.path(), "origin/main");
+        let bases = tempfile::tempdir().unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.fork_base = Some("origin/main".into());
+        config.fork_base_dir = Some(bases.path().to_path_buf());
+        config.fork_base_min_advance_secs = 0;
+        config.embed_budget_ms = 0;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
+        let root = primary.path().to_path_buf();
+        let base = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a fork base checkout");
+        let base_root = base.dir.canonicalize().unwrap();
+        let fill = crate::server_adapters::test_seams::pause_fill_start(&base_root);
+        crate::transport::daemon::register_fork_base(&server, base).await;
+        fill.wait_until_entered().await;
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        assert_eq!(fork_base_state(&server, "none").await.1, None);
+        for i in 10..20 {
+            std::fs::write(
+                primary
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn primary_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary.path(), &["commit", "-qam", "primary"]);
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &origin);
+
+        fill.resume();
+        for task in crate::server_adapters::test_seams::take_fills(&base_root) {
+            task.await.unwrap();
+        }
+        for task in crate::server_adapters::test_seams::take_parent_refreshes(&base_root) {
+            task.await.unwrap();
+        }
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+
+        assert_eq!(
+            server.state.choose_parent(&cut).await,
+            Some(*server.state.fork_base_ref_id.get().unwrap()),
+            "a worktree was parented on the primary after the fork base filled"
         );
     }
 
