@@ -807,13 +807,19 @@ impl SharedState {
                 continue;
             }
             let id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
-            let idle_secs = self
+            let idle = self
                 .ref_access
                 .lock()
                 .unwrap()
                 .get(&id)
-                .map_or(-1, |(_, last_used)| last_used.elapsed().as_secs() as i64);
+                .map(|(_, last_used)| last_used.elapsed());
+            if idle.is_some_and(|idle| idle < MEMORY_BUDGET_MIN_IDLE) {
+                continue;
+            }
+            let idle_secs = idle.map_or(-1, |idle| idle.as_secs() as i64);
             clear_ref_heavy_caches(owner, &id_cache_name).await;
+            #[cfg(test)]
+            crate::server_adapters::test_seams::after_budget_clear(&owner.root_dir).await;
             evicted += 1;
             let mut unique = 0usize;
             for (ptr, _, _) in &components[i] {
@@ -15469,6 +15475,34 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Acquire)
                     == generation,
             "the budget evicted a worktree whose request had just ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_spares_a_ref_touched_while_an_earlier_candidate_is_cleared() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (id_a, ref_a) = attach_budget_worktree(&server, "cleared-first").await;
+        let (id_b, ref_b) = attach_budget_worktree(&server, "touched-during-clear").await;
+        mark_ref_idle(&server.state, id_a);
+        mark_ref_idle(&server.state, id_b);
+        *server.state.measured_resident_override.lock().unwrap() = Some(2 * 1024 * 1024);
+        let pause = crate::server_adapters::test_seams::pause_after_budget_clear(&ref_a.root_dir);
+        let pass = tokio::spawn({
+            let state = Arc::clone(&server.state);
+            async move { state.enforce_memory_budget().await }
+        });
+        pause.wait_until_entered().await;
+        server.state.touch_ref(id_b);
+        pause.resume();
+        pass.await.unwrap();
+
+        assert!(ref_a.embedding_cache.read().await.is_empty());
+        assert!(
+            !ref_b.embedding_cache.read().await.is_empty(),
+            "the budget evicted a worktree used after the pass took its snapshot"
         );
     }
 
