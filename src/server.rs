@@ -1734,7 +1734,11 @@ const ADVANCE_RETRIGGERED: u8 = 1;
 const ADVANCE_EXITING: u8 = 2;
 
 /// How long choosing a worktree's parent may run git on the registration path.
+/// Tests share loaded runners, so there it waits for git however long it takes.
+#[cfg(not(test))]
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// How often an identifier build saves the vectors it has embedded so far; it
 /// saves the rest when it ends.
