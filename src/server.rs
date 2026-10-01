@@ -288,12 +288,20 @@ impl IdentifierBuild {
         for path in &differing {
             files.remove(*path);
         }
-        files.par_extend(differing.into_par_iter().filter_map(|path| {
+        let parse = |path: &String| {
             let content = cache.file_content.get(path)?;
             let file_docs =
                 crate::tools::semantic_identifiers::identifier_docs_for_file(path, content)?;
             Some((path.clone(), Arc::new(file_docs)))
-        }));
+        };
+        // A few files parse here rather than queue behind unrelated work in
+        // the shared rayon pool.
+        const PARALLEL_THRESHOLD: usize = 64;
+        if differing.len() >= PARALLEL_THRESHOLD {
+            files.par_extend(differing.into_par_iter().filter_map(parse));
+        } else {
+            files.extend(differing.into_iter().filter_map(parse));
+        }
         Some(Arc::new(IdentifierIndex {
             docs: Segmented::from_files(files),
             vectors: IdentifierVectorIndex::empty(),
@@ -8658,6 +8666,70 @@ mod tests {
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("open_account - src/ledger.rs"), "{text}");
         drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_reparse_of_a_few_edited_files_never_waits_on_the_rayon_pool() {
+        let tree: Vec<(String, String)> = (0..20)
+            .map(|i| {
+                (
+                    format!("src/depot_{i}.rs"),
+                    format!("pub fn stock_{i}() {{}}\n"),
+                )
+            })
+            .collect();
+        let tree: Vec<(&str, &str)> = tree
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let (repo, _ollama, server) =
+            scripted_identifier_server(&tree, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let source = server.ensure_project_cache().await.unwrap();
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        for i in 0..2 {
+            std::fs::write(
+                repo.path().join(format!("src/depot_{i}.rs")),
+                format!("pub fn audit_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let gate = Arc::new(std::sync::RwLock::new(()));
+        let closed = gate.write().unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        {
+            let gate = Arc::clone(&gate);
+            rayon::spawn_broadcast(move |_| {
+                entered_tx.send(()).unwrap();
+                drop(gate.read().unwrap());
+            });
+        }
+        for _ in 0..rayon::current_num_threads() {
+            entered
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a rayon worker never took the blocking job");
+        }
+
+        let (reparsed_tx, reparsed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = reparsed_tx.send(IdentifierBuild::reparsed(&parsed, &source, &edited));
+        });
+        let reparsed = reparsed.recv_timeout(std::time::Duration::from_secs(60));
+        drop(closed);
+
+        let reparsed = reparsed
+            .expect("the reparse queued behind unrelated rayon work")
+            .unwrap();
+        let names: Vec<String> = reparsed.docs.iter().map(|doc| doc.name.clone()).collect();
+        assert!(names.contains(&"audit_0".to_string()), "{names:?}");
+        assert!(names.contains(&"audit_1".to_string()), "{names:?}");
         drop(held);
     }
 
