@@ -1575,6 +1575,7 @@ impl CachedWalkerIndexer {
         let threshold =
             ForkRefusal::threshold(changed_count, deleted_count, base.index.document_count());
         let store_of_base = base.index.vector_store().cloned();
+        let (lag, whole_root) = parent_lag(parent, &base);
         let fork = tokio::task::spawn_blocking(move || {
             base.fork_delta(
                 &root,
@@ -1613,6 +1614,8 @@ impl CachedWalkerIndexer {
             installed = installed.is_some(),
             changed = changed_count,
             deleted = deleted_count,
+            parent_generation_lag = lag,
+            parent_whole_root = whole_root,
             elapsed_ms = started.elapsed().as_millis(),
             "cold-start phase"
         );
@@ -1713,6 +1716,7 @@ impl CachedWalkerIndexer {
         }
         let started = std::time::Instant::now();
         let (generation, vector_generation) = (start.generation, start.vector_generation);
+        let (lag, whole_root) = parent_lag(parent, &base);
         let (docs, vectors, fork) = tokio::task::spawn_blocking(move || {
             let fork = base.fork(&root, &docs, &vectors, generation, vector_generation);
             (docs, vectors, fork)
@@ -1736,6 +1740,8 @@ impl CachedWalkerIndexer {
             ref_id = %ref_index.cas_ref_id_hex,
             parent_ref_id = %parent.cas_ref_id_hex,
             installed,
+            parent_generation_lag = lag,
+            parent_whole_root = whole_root,
             elapsed_ms = started.elapsed().as_millis(),
             "cold-start phase"
         );
@@ -2696,6 +2702,19 @@ fn log_fork_refusal(
         limit = refusal.limit,
         "cold-start phase"
     );
+}
+
+/// The tracker generations `parent` moved since its entry `base` was built,
+/// and whether `base` indexes its whole root.
+fn parent_lag(parent: &crate::ref_index::RefIndex, base: &CachedSearchIndex) -> (u64, bool) {
+    use std::sync::atomic::Ordering;
+    (
+        parent
+            .cache_generation
+            .load(Ordering::Acquire)
+            .saturating_sub(base.generation.load(Ordering::Acquire)),
+        base.search_root() == parent.canonical_root,
+    )
 }
 
 /// The parent's semantic index when a worktree can fork it.

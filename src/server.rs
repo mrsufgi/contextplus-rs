@@ -22915,6 +22915,35 @@ mod tests {
         assert_eq!(all, first, "a second walk logged the same refusals again");
     }
 
+    #[tokio::test]
+    async fn semantic_fork_logs_the_parent_generation_lag() {
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        server
+            .current_ref()
+            .await
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let ref_id = format!("ref_id={} ", session.current_ref().await.cas_ref_id_hex);
+
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        semantic_fork_query(&session).await;
+        drop(capture);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let forks: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("phase=\"semantic_fork\"") && line.contains(&ref_id))
+            .collect();
+        assert_eq!(forks.len(), 1, "{logs}");
+        assert!(
+            forks[0].contains("installed=true")
+                && forks[0].contains("parent_generation_lag=1")
+                && forks[0].contains("parent_whole_root=true"),
+            "{forks:?}"
+        );
+    }
+
     /// Replaces the primary's vector store with a fresh build, as after an eviction.
     async fn semantic_fork_rebuild_primary(
         server: &ContextPlusServer,
