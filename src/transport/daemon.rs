@@ -1265,6 +1265,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn panic_log_appends_without_rotating_while_another_descriptor_holds_the_lock() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        let generation = vec![b'a'; DAEMON_LOG_MAX_BYTES as usize];
+        std::fs::write(&log_path, &generation).unwrap();
+        let mut panic_log = panic_log_writer(&log_path).unwrap();
+        let holder = std::fs::File::open(&log_path).unwrap();
+        let lock = LogLock::acquire(&holder, LogLockWait::Block).unwrap();
+
+        let (written, returned) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let panic_log = &mut panic_log;
+            scope.spawn(move || {
+                panic_log.write_all(b"PANIC: sentinel\n").unwrap();
+                written.send(()).unwrap();
+            });
+            // Only a guard against a hang: the bounded wait gives up after about a second.
+            let gave_up = returned.recv_timeout(Duration::from_secs(60)).is_ok();
+            drop(lock);
+            assert!(
+                gave_up,
+                "the panic writer waited on a lock another descriptor holds"
+            );
+        });
+
+        assert!(
+            !previous_log(&log_path).exists(),
+            "the panic writer rotated the log without holding its lock"
+        );
+        let mut expected = generation;
+        expected.extend_from_slice(b"PANIC: sentinel\n");
+        assert!(
+            std::fs::read(&log_path).unwrap() == expected,
+            "the panic text was not appended to the live log"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn panic_log_child_process_helper() {
         let Some(root_dir) = std::env::var_os("CONTEXTPLUS_TEST_PANIC_LOG_ROOT") else {
             return;
