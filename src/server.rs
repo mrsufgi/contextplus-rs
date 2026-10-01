@@ -24263,26 +24263,33 @@ mod tests {
         semantic_fork_query(&server).await;
         let whole = semantic_fork_index(&server).await;
         let primary = server.state.default_ref().unwrap();
-        let scoped_query = || {
-            let mut args = semantic_args("shared symbol");
+        let scoped_query = |query: &str| {
+            let mut args = semantic_args(query);
             args.insert("scope".into(), json!("code"));
             args.insert("rootDir".into(), json!("src/area_1"));
+            args.insert("semantic_weight".into(), json!(0.5));
+            args.insert("keyword_weight".into(), json!(0.5));
             server.handle_semantic_code_search(args)
         };
 
-        let current = text_of(&scoped_query().await.unwrap());
+        let current = text_of(&scoped_query("scopedstale").await.unwrap());
         std::fs::write(
             primary_root.path().join("src/area_1/file_5.rs"),
             "pub fn scopedstale() -> usize { 5 }\n// shared symbol\n",
         )
         .unwrap();
-        let stale = text_of(&scoped_query().await.unwrap());
+        let stale = text_of(&scoped_query("scopedstale").await.unwrap());
         for result in [&current, &stale] {
             assert!(
                 result.contains("1. file_") && !result.contains(". src/"),
                 "{result}"
             );
         }
+        let edited = "Header: pub fn scopedstale()";
+        assert!(
+            !current.contains(edited) && stale.contains(edited),
+            "the stale case did not answer from the edited file_5: {current}\n---\n{stale}"
+        );
         assert!(
             Arc::ptr_eq(&whole, &semantic_fork_index(&server).await),
             "a subdirectory search replaced the whole-root entry"
