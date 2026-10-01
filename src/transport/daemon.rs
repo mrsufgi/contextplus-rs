@@ -1280,8 +1280,31 @@ mod tests {
     }
 
     /// A repository with `refs/remotes/origin/main` at its one commit, and a
-    /// daemon server over it with the fork base on.
-    fn fork_base_daemon() -> (tempfile::TempDir, tempfile::TempDir, ContextPlusServer) {
+    /// daemon server over it with the fork base on, embedding through a mock.
+    async fn fork_base_daemon() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, Request, ResponseTemplate};
+
+        let ollama = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or_default();
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "embeddings": vec![vec![1.0, 0.0, 0.0]; inputs] }),
+                )
+            })
+            .mount(&ollama)
+            .await;
         let primary = tempfile::tempdir().unwrap();
         fork_base_git(primary.path(), &["init", "-q", "-b", "main"]);
         std::fs::write(primary.path().join("lib.rs"), "pub fn base() {}\n").unwrap();
@@ -1299,14 +1322,15 @@ mod tests {
             ("CONTEXTPLUS_EMBED_TRACKER", "lazy"),
             ("CONTEXTPLUS_REF_WARMUP_MODE", "off"),
             ("CONTEXTPLUS_WARMUP_ON_START", "false"),
+            ("OLLAMA_HOST", &ollama.uri()),
         ]));
         let server = daemon_server(primary.path(), config);
-        (primary, bases, server)
+        (ollama, primary, bases, server)
     }
 
     #[tokio::test]
     async fn daemon_registers_a_parentless_fork_base() {
-        let (_primary, bases, server) = fork_base_daemon();
+        let (_ollama, _primary, bases, server) = fork_base_daemon().await;
 
         if let Some(task) = start_fork_base(&server).await {
             task.await.unwrap();
@@ -1338,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_fork_base_registers_an_existing_checkout_in_the_background() {
-        let (_primary, _bases, server) = fork_base_daemon();
+        let (_ollama, _primary, _bases, server) = fork_base_daemon().await;
         let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
         let existing = tokio::task::spawn_blocking(move || {
             crate::git::fork_base::ensure_fork_base(&config, &root)
@@ -1362,7 +1386,7 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_and_attaches_on_the_fork_base_dir_get_no_parent() {
-        let (primary, _bases, server) = fork_base_daemon();
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
         let dir =
             crate::git::fork_base::fork_base_dir(&server.state.config, primary.path()).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -1408,12 +1432,12 @@ mod tests {
 
     #[tokio::test]
     async fn register_session_checks_the_fork_base_ref() {
-        let (primary, _bases, server) = fork_base_daemon();
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
         if let Some(task) = start_fork_base(&server).await {
             task.await.unwrap();
         }
-        let checked = server.advance_fork_base().expect("an advance");
-        checked.clone().await;
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
+        let checked = server.state.fork_base_advance_task().expect("an advance");
         // Only the session's registration may see the moved ref.
         let base_id = *server.state.fork_base_ref_id.get().unwrap();
         let base = server.state.ref_index(base_id).await.unwrap();
