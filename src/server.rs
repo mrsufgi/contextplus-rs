@@ -863,6 +863,8 @@ impl SharedState {
                 root = %owner.canonical_root.display(),
                 idle_secs,
                 unique_estimated_mib = mib(unique),
+                min_idle_secs = min_idle.as_secs(),
+                emergency,
                 "ref caches evicted for memory budget"
             );
         }
@@ -888,6 +890,8 @@ impl SharedState {
                 in_use_before_mib = in_use.map_or(0, |(before, _)| mib(before)),
                 in_use_after_mib = in_use.map_or(0, |(_, after)| mib(after)),
                 budget_mib = mib(budget),
+                min_idle_secs = min_idle.as_secs(),
+                emergency,
                 "memory budget pass evicted worktrees"
             );
         }
@@ -15754,6 +15758,43 @@ mod tests {
             2,
             "{logs}"
         );
+    }
+
+    #[tokio::test]
+    async fn budget_eviction_logs_carry_the_idle_threshold_in_force() {
+        for (measured, min_idle_secs, emergency) in [
+            (RESIDENCY_BUDGET / 2 * 3, "100", "false"),
+            (RESIDENCY_BUDGET * 3, "60", "true"),
+        ] {
+            let mut config = Config::from_env();
+            config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+            config.memory_budget_min_idle_secs = 100;
+            let root = tempfile::tempdir().unwrap();
+            let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+            let (id, _) = attach_budget_worktree(&server, &format!("threshold-{measured}")).await;
+            mark_ref_idle_for(&server.state, id, std::time::Duration::from_secs(120));
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+            let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+            server.state.enforce_memory_budget().await;
+
+            let logs = crate::test_logs::logs_as_string(&logs);
+            for message in [
+                "ref caches evicted for memory budget",
+                "memory budget pass evicted worktrees",
+            ] {
+                let line = logs
+                    .lines()
+                    .find(|line| line.contains(message))
+                    .unwrap_or_else(|| panic!("{logs}"));
+                assert_eq!(
+                    log_field(line, "min_idle_secs"),
+                    Some(min_idle_secs),
+                    "{logs}"
+                );
+                assert_eq!(log_field(line, "emergency"), Some(emergency), "{logs}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
