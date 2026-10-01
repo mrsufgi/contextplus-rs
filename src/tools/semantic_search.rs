@@ -2517,7 +2517,8 @@ pub fn format_search_results_with_freshness(
 
 /// Rebuilds `stale`, the entry in `lock`, in the background from a walk of
 /// `root` and the batches queued on it from `generation` on, unless a rebuild
-/// of it already runs. The rebuild's task, when this call started it.
+/// of it already runs, and again while the entry it installs has batches
+/// queued during its build. The rebuild's task, when this call started it.
 pub(crate) fn spawn_stale_rebuild(
     stale: &Arc<CachedSearchIndex>,
     lock: &Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
@@ -2530,79 +2531,97 @@ pub(crate) fn spawn_stale_rebuild(
         .rebuild_in_progress
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
-    let previous = Arc::clone(stale);
+    let mut previous = Arc::clone(stale);
     let lock = Arc::clone(lock);
     let walker = Arc::clone(walk_and_index_fn);
     let root = root.to_path_buf();
-    let build_generation = generation;
+    let mut build_generation = generation;
     let task = tokio::spawn(async move {
-        let _reset = RebuildGuard(Arc::clone(&previous));
-        let vector_generation = walker.vector_generation(&root).await;
-        match walker.walk_or_install(&root).await {
-            // The walk replaced `previous` with an index of its own.
-            Ok(WalkOutcome::Installed(_)) => {}
-            Ok(WalkOutcome::Documents(docs, vectors)) => {
-                let base = Arc::clone(&previous);
-                let built = tokio::task::spawn_blocking(move || {
-                    let pending = base.pending.lock().unwrap();
-                    let mut snapshot: std::collections::BTreeMap<_, _> = docs
-                        .into_iter()
-                        .zip(vectors)
-                        .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
-                        .collect();
-                    let mut ready_generation = build_generation;
-                    let mut ready_vector_generation = vector_generation;
-                    for RefreshBatch {
-                        docs,
-                        vectors,
-                        deleted,
-                        generation,
-                        vector_generation: batch_vector_generation,
-                    } in &pending.batches
-                    {
-                        if *generation < build_generation {
-                            continue;
-                        }
-                        for path in deleted {
-                            snapshot.remove(path);
-                        }
-                        for (doc, vector) in docs.iter().zip(vectors) {
-                            snapshot.insert(doc.path.clone(), (doc.clone(), vector.clone()));
-                        }
-                        ready_generation = ready_generation.max(*generation);
-                        ready_vector_generation =
-                            ready_vector_generation.max(batch_vector_generation.unwrap_or(0));
-                    }
-                    let consumed = pending.batches.len();
-                    drop(pending);
-                    let (docs, vectors) = snapshot.into_values().unzip();
-                    let (changed, vectors, deleted) = base.index.delta_from(docs, vectors);
-                    let mut index = base.index.clone();
-                    index.apply_delta(changed, vectors, &deleted);
-                    index.prepare_ann();
-                    (index, ready_generation, ready_vector_generation, consumed)
-                })
-                .await;
-                if let Ok((index, ready_generation, ready_vector_generation, consumed)) = built {
-                    if index.dims != previous.index.dims
-                        && index.has_vector.iter().any(|ready| !ready)
-                    {
-                        // A newer shape batch may have arrived after the walker snapshot.
-                        return;
-                    }
-                    let mut guard = lock.write().await;
-                    if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
-                        let fp = index.fingerprint();
-                        let mut entry = CachedSearchIndex::new(index, fp, ready_generation);
-                        entry.pending.get_mut().unwrap().batches =
-                            previous.pending.lock().unwrap().batches[consumed..].to_vec();
-                        entry.search_root = previous.search_root.clone();
-                        entry.vector_generation = ready_vector_generation;
-                        *guard = Some(Arc::new(entry));
-                    }
+        loop {
+            let _reset = RebuildGuard(Arc::clone(&previous));
+            let vector_generation = walker.vector_generation(&root).await;
+            let (docs, vectors) = match walker.walk_or_install(&root).await {
+                // The walk replaced `previous` with an index of its own.
+                Ok(WalkOutcome::Installed(_)) => return,
+                Ok(WalkOutcome::Documents(docs, vectors)) => (docs, vectors),
+                Err(error) => {
+                    tracing::warn!(%error, "Background index refresh failed");
+                    return;
                 }
+            };
+            let base = Arc::clone(&previous);
+            let built = tokio::task::spawn_blocking(move || {
+                let pending = base.pending.lock().unwrap();
+                let mut snapshot: std::collections::BTreeMap<_, _> = docs
+                    .into_iter()
+                    .zip(vectors)
+                    .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
+                    .collect();
+                let mut ready_generation = build_generation;
+                let mut ready_vector_generation = vector_generation;
+                for RefreshBatch {
+                    docs,
+                    vectors,
+                    deleted,
+                    generation,
+                    vector_generation: batch_vector_generation,
+                } in &pending.batches
+                {
+                    if *generation < build_generation {
+                        continue;
+                    }
+                    for path in deleted {
+                        snapshot.remove(path);
+                    }
+                    for (doc, vector) in docs.iter().zip(vectors) {
+                        snapshot.insert(doc.path.clone(), (doc.clone(), vector.clone()));
+                    }
+                    ready_generation = ready_generation.max(*generation);
+                    ready_vector_generation =
+                        ready_vector_generation.max(batch_vector_generation.unwrap_or(0));
+                }
+                let consumed = pending.batches.len();
+                drop(pending);
+                let (docs, vectors) = snapshot.into_values().unzip();
+                let (changed, vectors, deleted) = base.index.delta_from(docs, vectors);
+                let mut index = base.index.clone();
+                index.apply_delta(changed, vectors, &deleted);
+                index.prepare_ann();
+                (index, ready_generation, ready_vector_generation, consumed)
+            })
+            .await;
+            let Ok((index, ready_generation, ready_vector_generation, consumed)) = built else {
+                return;
+            };
+            if index.dims != previous.index.dims && index.has_vector.iter().any(|ready| !ready) {
+                // A newer shape batch may have arrived after the walker snapshot.
+                return;
             }
-            Err(error) => tracing::warn!(%error, "Background index refresh failed"),
+            #[cfg(test)]
+            crate::server_adapters::test_seams::before_stale_install(&root).await;
+            let mut guard = lock.write().await;
+            if !guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
+                return;
+            }
+            let fp = index.fingerprint();
+            let mut entry = CachedSearchIndex::new(index, fp, ready_generation);
+            entry.pending.get_mut().unwrap().batches =
+                previous.pending.lock().unwrap().batches[consumed..].to_vec();
+            entry.search_root = previous.search_root.clone();
+            entry.vector_generation = ready_vector_generation;
+            let installed = Arc::new(entry);
+            *guard = Some(Arc::clone(&installed));
+            drop(guard);
+            if installed.pending.lock().unwrap().batches.is_empty()
+                || installed
+                    .rebuild_in_progress
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return;
+            }
+            previous = installed;
+            build_generation = ready_generation;
         }
     });
     walk_and_index_fn.track_background_task(&task);

@@ -247,6 +247,29 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn stale_install_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next stale rebuild of `root` once built, before it installs.
+    pub(crate) fn pause_before_stale_install(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        stale_install_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_stale_install(root: &Path) {
+        let pause = stale_install_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn store_read_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))

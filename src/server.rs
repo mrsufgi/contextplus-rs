@@ -24234,9 +24234,9 @@ mod tests {
             .cache_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1;
-        entry
+        let rebuilding = entry
             .rebuild_in_progress
-            .store(true, std::sync::atomic::Ordering::Release);
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
         CachedSearchIndex::refresh_paths(
             &mut entry,
             &primary.canonical_root,
@@ -24247,7 +24247,7 @@ mod tests {
         );
         entry
             .rebuild_in_progress
-            .store(false, std::sync::atomic::Ordering::Release);
+            .store(rebuilding, std::sync::atomic::Ordering::Release);
         assert!(!entry.forkable_at(&primary.canonical_root));
     }
 
@@ -24276,6 +24276,34 @@ mod tests {
             ollama.received_requests().await.unwrap().len(),
             embedded,
             "the parent's rebuild called Ollama"
+        );
+    }
+
+    /// A parent rebuild that installs with a batch queued while it ran
+    /// rebuilds again, so the parent ends forkable.
+    #[tokio::test]
+    async fn semantic_fork_parent_rebuild_catches_up_with_a_batch_queued_while_it_ran() {
+        let (_ollama, _primary, _worktree, server, _session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_queue_primary_batch(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let pause =
+            crate::server_adapters::test_seams::pause_before_stale_install(&primary.canonical_root);
+
+        let rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent");
+        pause.wait_until_entered().await;
+        semantic_fork_queue_primary_batch(&server).await;
+        pause.resume();
+        rebuild.await.unwrap();
+
+        let after = semantic_fork_index(&server).await;
+        assert!(
+            after.forkable_at(&primary.canonical_root),
+            "the parent was left {:?}",
+            after.unforkable_clause(&primary.canonical_root)
         );
     }
 
