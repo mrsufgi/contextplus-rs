@@ -218,6 +218,9 @@ pub struct RefIndex {
     pub(crate) fork_refused:
         std::sync::Mutex<std::collections::HashSet<crate::server_adapters::ForkRefusalKey>>,
     pub search_index_cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
+    /// The index of a subdirectory searched while `search_index_cache` holds
+    /// the whole root's.
+    pub(crate) scoped_search_index_cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
 
     /// Monotonic counter incremented by the embedding tracker on each file-change
     /// event batch. `semantic_code_search` compares this against
@@ -302,6 +305,7 @@ impl RefIndex {
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
+            scoped_search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
@@ -361,6 +365,7 @@ impl RefIndex {
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
+            scoped_search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
@@ -422,6 +427,7 @@ impl RefIndex {
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
+            scoped_search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),

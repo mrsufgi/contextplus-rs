@@ -1442,6 +1442,7 @@ struct ResidentSnapshot {
     components: Vec<ResidentComponent>,
     identifier_index: Option<Arc<IdentifierIndex>>,
     search_index: Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>,
+    scoped_search_index: Option<Arc<crate::tools::semantic_search::CachedSearchIndex>>,
     project_cache: Option<Arc<ProjectCache>>,
     lexical: Option<Arc<CachedLexicalIndex>>,
 }
@@ -1474,12 +1475,14 @@ impl ResidentSnapshot {
         // One statement per lock so no guard is held while the next is awaited.
         let identifier_index = owner.identifier_index.read().await.clone();
         let search_index = owner.search_index_cache.read().await.clone();
+        let scoped_search_index = owner.scoped_search_index_cache.read().await.clone();
         let project_cache = owner.project_cache.read().await.clone();
         let lexical = owner.lexical_search_cache.read().await.clone();
         Self {
             components,
             identifier_index,
             search_index,
+            scoped_search_index,
             project_cache,
             lexical,
         }
@@ -1495,7 +1498,10 @@ impl ResidentSnapshot {
                 "identifier_index",
             ));
         }
-        if let Some(index) = &self.search_index {
+        for index in [&self.search_index, &self.scoped_search_index]
+            .into_iter()
+            .flatten()
+        {
             let (own, shared) = index.resident_split();
             components.push((Arc::as_ptr(index) as usize, own, "semantic_index"));
             components.extend(
@@ -2120,6 +2126,7 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
     *owner.semantic_fill.lock().await = Default::default();
     // Before the vectors: a parent's persist that still sees the entry is cleared after.
     *owner.search_index_cache.write().await = None;
+    *owner.scoped_search_index_cache.write().await = None;
     owner.embedding_cache.write().await.clear();
     *owner.identifier_index.write().await = None;
     *owner.identifier_source.write().await = None;
@@ -5544,12 +5551,20 @@ impl ContextPlusServer {
             .await?;
             return Ok(Self::ok_text(result));
         }
+        // A subdirectory the whole-root entry does not answer keeps an index of
+        // its own beside it, current by its files' metadata.
+        let (slot, cache_gen) = match walker.whole_root_index(&root).await {
+            Some((_, prefix)) if !prefix.as_os_str().is_empty() => {
+                (&ref_index.scoped_search_index_cache, None)
+            }
+            _ => (&ref_index.search_index_cache, cache_gen),
+        };
         let result = crate::core::embeddings::interactive(
             crate::tools::semantic_search::semantic_code_search_owned(
                 options,
                 &embedder,
                 Arc::new(walker),
-                Some(Arc::clone(&ref_index.search_index_cache)),
+                Some(Arc::clone(slot)),
                 cache_gen.cloned(),
             ),
         )
@@ -24355,6 +24370,48 @@ mod tests {
             semantic_fork_index(&server)
                 .await
                 .forkable_at(&primary.canonical_root)
+        );
+    }
+
+    /// With the tracker off, subdirectory searches a stale whole-root entry
+    /// cannot answer build an index of their own once, and keep the entry.
+    #[tokio::test]
+    async fn semantic_scoped_searches_without_a_tracker_reuse_their_own_index() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), 40);
+        let server = identifier_test_server(&ollama, primary_root.path()).await;
+        semantic_fork_query(&server).await;
+        let whole = semantic_fork_index(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        std::fs::write(
+            primary_root.path().join("src/area_2/file_2.rs"),
+            "pub fn elsewhere() -> usize { 2 }\n// shared symbol\n",
+        )
+        .unwrap();
+        let walks = primary
+            .semantic_walks
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..2 {
+            let mut args = semantic_args("shared symbol");
+            args.insert("scope".into(), json!("code"));
+            args.insert("rootDir".into(), json!("src/area_1"));
+            let result = text_of(&server.handle_semantic_code_search(args).await.unwrap());
+            assert!(
+                result.contains("1. file_") && !result.contains(". src/"),
+                "{result}"
+            );
+        }
+
+        let walked = primary
+            .semantic_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - walks;
+        assert_eq!(walked, 1, "two subdirectory searches walked {walked} times");
+        assert!(
+            Arc::ptr_eq(&whole, &semantic_fork_index(&server).await),
+            "a subdirectory search replaced the whole-root entry"
         );
     }
 
