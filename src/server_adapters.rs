@@ -81,6 +81,29 @@ pub(crate) mod test_seams {
         pause
     }
 
+    fn budget_clear_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next memory budget pass after it clears the ref rooted at `root`.
+    pub(crate) fn pause_after_budget_clear(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        budget_clear_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_budget_clear(root: &Path) {
+        let pause = budget_clear_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     pub(crate) async fn after_file_snapshot(root: &Path, hashes: &[(String, String)]) {
         let pause = {
             let mut slots = file_snapshot_slots().lock().unwrap();

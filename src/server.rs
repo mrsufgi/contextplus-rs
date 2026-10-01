@@ -455,6 +455,8 @@ pub struct SharedState {
     last_free_memory_check: std::sync::Mutex<Option<Instant>>,
     /// Set once the over-budget warning is logged, until memory is back under budget.
     budget_warned: std::sync::atomic::AtomicBool,
+    /// Set while measured memory is over twice the budget.
+    budget_emergency: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) measured_resident_override: std::sync::Mutex<Option<usize>>,
     #[cfg(test)]
@@ -746,6 +748,14 @@ impl SharedState {
             .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
         let budget = self.config.resident_memory_budget_bytes;
         let measured = self.measured_resident_bytes(estimated);
+        let emergency = measured > budget.saturating_mul(2);
+        if !emergency
+            && self
+                .budget_emergency
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            tracing::info!("Resident memory is under twice CONTEXTPLUS_MEMORY_BUDGET_MB again");
+        }
         if measured <= budget {
             self.budget_warned
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -769,6 +779,24 @@ impl SharedState {
             return;
         }
         let low_watermark = budget / 5 * 4;
+        let configured_idle =
+            std::time::Duration::from_secs(self.config.memory_budget_min_idle_secs);
+        let min_idle = if emergency {
+            MEMORY_BUDGET_MIN_IDLE.min(configured_idle)
+        } else {
+            configured_idle
+        };
+        if emergency
+            && !self
+                .budget_emergency
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            tracing::warn!(
+                "Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB; worktrees idle for \
+                 {} s are evicted",
+                min_idle.as_secs()
+            );
+        }
         let in_use_before = if self.trim_due() {
             sample_allocator_in_use().await
         } else {
@@ -784,7 +812,7 @@ impl SharedState {
                 let Some(&(tick, last_used)) = access.get(&id) else {
                     return Some((0, i));
                 };
-                (last_used.elapsed() >= MEMORY_BUDGET_MIN_IDLE).then_some((tick, i))
+                (last_used.elapsed() >= min_idle).then_some((tick, i))
             })
             .collect();
         candidates.sort_unstable();
@@ -807,13 +835,19 @@ impl SharedState {
                 continue;
             }
             let id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
-            let idle_secs = self
+            let idle = self
                 .ref_access
                 .lock()
                 .unwrap()
                 .get(&id)
-                .map_or(-1, |(_, last_used)| last_used.elapsed().as_secs() as i64);
+                .map(|(_, last_used)| last_used.elapsed());
+            if idle.is_some_and(|idle| idle < min_idle) {
+                continue;
+            }
+            let idle_secs = idle.map_or(-1, |idle| idle.as_secs() as i64);
             clear_ref_heavy_caches(owner, &id_cache_name).await;
+            #[cfg(test)]
+            crate::server_adapters::test_seams::after_budget_clear(&owner.root_dir).await;
             evicted += 1;
             let mut unique = 0usize;
             for (ptr, _, _) in &components[i] {
@@ -829,6 +863,8 @@ impl SharedState {
                 root = %owner.canonical_root.display(),
                 idle_secs,
                 unique_estimated_mib = mib(unique),
+                min_idle_secs = min_idle.as_secs(),
+                emergency,
                 "ref caches evicted for memory budget"
             );
         }
@@ -854,6 +890,8 @@ impl SharedState {
                 in_use_before_mib = in_use.map_or(0, |(before, _)| mib(before)),
                 in_use_after_mib = in_use.map_or(0, |(_, after)| mib(after)),
                 budget_mib = mib(budget),
+                min_idle_secs = min_idle.as_secs(),
+                emergency,
                 "memory budget pass evicted worktrees"
             );
         }
@@ -2085,6 +2123,7 @@ impl ContextPlusServer {
             last_budget_trim: std::sync::Mutex::new(None),
             last_free_memory_check: std::sync::Mutex::new(None),
             budget_warned: std::sync::atomic::AtomicBool::new(false),
+            budget_emergency: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2450,6 +2489,13 @@ impl ContextPlusServer {
                     tracing::warn!(ref_id = ref_id.0, "ref_warmup shallow: ref not found");
                     return;
                 }
+            };
+            let _serving = WarmupServing {
+                state: Arc::clone(&state),
+                ref_id,
+                _serving: crate::core::process_lifecycle::InflightGuard::new(Arc::clone(
+                    &ref_index.active_requests,
+                )),
             };
 
             // --- Skip if already warm ---
@@ -4541,6 +4587,7 @@ impl ContextPlusServer {
             Ok(result) => result,
             Err(e) => Self::err_text(format!("Error: {}", e)),
         };
+        self.state.touch_ref(ref_id);
         drop(serving);
         self.state.schedule_memory_budget_enforcement();
         result
@@ -6225,6 +6272,28 @@ impl Drop for WarmupGuard {
         // will remove the entry shortly anyway on its own unlock path).
         if let Ok(mut inflight) = self.state.warmup_in_flight.try_lock() {
             inflight.remove(&self.ref_id);
+        }
+    }
+}
+
+/// Holds a ref in use while its shallow warmup runs, so the memory budget
+/// does not evict it. On drop the warmup counts as the ref's last use, unless
+/// the ref has since been evicted from the registry.
+struct WarmupServing {
+    state: Arc<SharedState>,
+    ref_id: crate::ref_index::RefId,
+    _serving: crate::core::process_lifecycle::InflightGuard,
+}
+
+impl Drop for WarmupServing {
+    fn drop(&mut self) {
+        let tick = self
+            .state
+            .access_clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        if let Some(access) = self.state.ref_access.lock().unwrap().get_mut(&self.ref_id) {
+            *access = (tick, Instant::now());
         }
     }
 }
@@ -14113,6 +14182,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let path = PathBuf::from("/tmp/lane-m-identifier-only-budget");
@@ -14179,6 +14249,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 11 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let primary = server.state.default_ref().unwrap();
@@ -14246,6 +14317,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let path = PathBuf::from("/tmp/lane-m-budget-serving");
@@ -14292,6 +14364,7 @@ mod tests {
 
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 10 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let primary = server.state.default_ref().unwrap();
@@ -15125,6 +15198,7 @@ mod tests {
         config.embed_tracker_mode = TrackerMode::Off;
         config.ref_warmup_mode = RefWarmupMode::Off;
         config.resident_memory_budget_bytes = 1;
+        config.memory_budget_min_idle_secs = 60;
         let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
         let canonical = worktree.path().canonicalize().unwrap();
         let mut attach = serde_json::Map::new();
@@ -15288,6 +15362,7 @@ mod tests {
     async fn review_r3_memory_budget_evicts_only_idle_worktrees() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id_a, ref_a) = attach_budget_worktree(&server, "a").await;
@@ -15326,6 +15401,7 @@ mod tests {
     ) {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id, worktree) = attach_budget_worktree(&server, name).await;
@@ -15415,6 +15491,341 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn memory_budget_spares_a_worktree_whose_request_outlasted_the_idle_window() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("served.rs"),
+            "fn served_request() {}\n",
+        )
+        .unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let session = attached_worktree(&server, worktree.path()).await;
+        let id = session.session_ref_id.unwrap();
+        let owner = session.current_ref().await;
+        owner.embedding_cache.write().await.insert(
+            "resident.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "resident-hash".to_string(),
+                vector: vec![0.5; 4096],
+            },
+        );
+        let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(&owner.root_dir);
+        let request = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .dispatch("semantic_code_search", semantic_args("served request"))
+                    .await
+            }
+        });
+        pause.wait_until_entered().await;
+        mark_ref_idle(&server.state, id);
+        pause.resume();
+        request.await.unwrap();
+        let generation = owner
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            !owner.embedding_cache.read().await.is_empty()
+                && owner
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == generation,
+            "the budget evicted a worktree whose request had just ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_spares_a_ref_touched_while_an_earlier_candidate_is_cleared() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024 * 1024;
+        config.memory_budget_min_idle_secs = 60;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (id_a, ref_a) = attach_budget_worktree(&server, "cleared-first").await;
+        let (id_b, ref_b) = attach_budget_worktree(&server, "touched-during-clear").await;
+        mark_ref_idle(&server.state, id_a);
+        mark_ref_idle(&server.state, id_b);
+        *server.state.measured_resident_override.lock().unwrap() = Some(2 * 1024 * 1024);
+        let pause = crate::server_adapters::test_seams::pause_after_budget_clear(&ref_a.root_dir);
+        let pass = tokio::spawn({
+            let state = Arc::clone(&server.state);
+            async move { state.enforce_memory_budget().await }
+        });
+        pause.wait_until_entered().await;
+        server.state.touch_ref(id_b);
+        pause.resume();
+        pass.await.unwrap();
+
+        assert!(ref_a.embedding_cache.read().await.is_empty());
+        assert!(
+            !ref_b.embedding_cache.read().await.is_empty(),
+            "the budget evicted a worktree used after the pass took its snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_spares_a_worktree_while_its_warmup_runs() {
+        let (_ollama, primary_root, worktree, untracked, _) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        let mut config = untracked.state.config.clone();
+        config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
+        let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
+        let session = attached_worktree(&server, worktree.path()).await;
+        semantic_fork_query(&server).await;
+        let id = session.session_ref_id.unwrap();
+        let owner = session.current_ref().await;
+        assert!(owner.project_cache.read().await.is_none());
+        owner.embedding_cache.write().await.insert(
+            "resident.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "resident-hash".to_string(),
+                vector: vec![0.5; 4096],
+            },
+        );
+        let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(&owner.root_dir);
+        session.spawn_shallow_warmup_task(id);
+        pause.wait_until_entered().await;
+        mark_ref_idle(&server.state, id);
+        let generation = owner
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            owner
+                .cache_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == generation
+                && !owner.embedding_cache.read().await.is_empty(),
+            "the budget evicted a worktree during its warmup"
+        );
+        pause.resume();
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            while server.state.warmup_in_flight.lock().await.contains(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the warmup never finished");
+        assert_eq!(
+            owner
+                .active_requests
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the warmup still holds its worktree in use"
+        );
+        let generation = owner
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            owner.project_cache.read().await.is_some()
+                && owner
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == generation,
+            "the budget evicted a worktree whose warmup had just ended"
+        );
+        mark_ref_idle(&server.state, id);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            owner.project_cache.read().await.is_none()
+                && owner
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != generation,
+            "the budget spared an idle worktree after its warmup ended"
+        );
+    }
+
+    fn mark_ref_idle_for(
+        state: &SharedState,
+        ref_id: crate::ref_index::RefId,
+        idle: std::time::Duration,
+    ) {
+        let idle_since = Instant::now().checked_sub(idle).unwrap();
+        if let Some(access) = state.ref_access.lock().unwrap().get_mut(&ref_id) {
+            access.1 = idle_since;
+        }
+    }
+
+    /// Whether one budget pass at `measured` bytes evicts a worktree unused
+    /// for `idle_secs`.
+    async fn residency_evicts(
+        min_idle_secs: u64,
+        idle_secs: u64,
+        budget: usize,
+        measured: usize,
+    ) -> bool {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = budget;
+        config.memory_budget_min_idle_secs = min_idle_secs;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let name = format!("residency-{min_idle_secs}-{idle_secs}-{budget}-{measured}");
+        let (id, worktree) = attach_budget_worktree(&server, &name).await;
+        mark_ref_idle_for(&server.state, id, std::time::Duration::from_secs(idle_secs));
+        *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+
+        server.state.enforce_memory_budget().await;
+
+        worktree.embedding_cache.read().await.is_empty()
+    }
+
+    const RESIDENCY_BUDGET: usize = 1024 * 1024;
+
+    #[tokio::test]
+    async fn memory_budget_keeps_a_worktree_used_within_the_residency() {
+        assert!(
+            !residency_evicts(100, 70, RESIDENCY_BUDGET, RESIDENCY_BUDGET / 2 * 3).await,
+            "a worktree used 70 s ago was evicted under a 100 s residency"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_never_waits_longer_than_the_configured_idle() {
+        assert!(
+            residency_evicts(30, 45, RESIDENCY_BUDGET, RESIDENCY_BUDGET * 3).await,
+            "an emergency kept a worktree idle past its 30 s residency"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_evicts_a_worktree_idle_past_the_residency() {
+        assert!(
+            residency_evicts(100, 120, RESIDENCY_BUDGET, RESIDENCY_BUDGET / 2 * 3).await,
+            "a worktree idle past its 100 s residency was kept over the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_evicts_a_worktree_idle_for_a_minute() {
+        assert!(
+            residency_evicts(100, 70, RESIDENCY_BUDGET, RESIDENCY_BUDGET * 3).await,
+            "an emergency kept a worktree idle for 70 s"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_trigger_saturates_on_a_huge_budget() {
+        assert!(
+            !residency_evicts(100, 70, usize::MAX / 2 + 1, usize::MAX).await,
+            "measured memory under a saturated twice-the-budget was taken as an emergency"
+        );
+    }
+
+    /// Runs one budget pass at each measured size and returns its logs.
+    async fn budget_passes_logs(measured: &[usize]) -> String {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 100;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        for &measured in measured {
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+            server.state.enforce_memory_budget().await;
+        }
+        crate::test_logs::logs_as_string(&logs)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_logs_an_emergency_once_when_it_begins() {
+        let logs = budget_passes_logs(&[RESIDENCY_BUDGET * 3, RESIDENCY_BUDGET * 3]).await;
+
+        assert_eq!(
+            logs.matches(
+                "Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB; worktrees idle for \
+                 60 s are evicted"
+            )
+            .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_logs_the_end_of_each_emergency_once() {
+        let logs = budget_passes_logs(&[
+            RESIDENCY_BUDGET * 3,
+            RESIDENCY_BUDGET / 2 * 3,
+            RESIDENCY_BUDGET / 2 * 3,
+            RESIDENCY_BUDGET * 3,
+            RESIDENCY_BUDGET / 2,
+        ])
+        .await;
+
+        assert_eq!(
+            logs.matches("Resident memory is under twice CONTEXTPLUS_MEMORY_BUDGET_MB again")
+                .count(),
+            2,
+            "{logs}"
+        );
+        assert_eq!(
+            logs.matches("Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB")
+                .count(),
+            2,
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_eviction_logs_carry_the_idle_threshold_in_force() {
+        for (measured, min_idle_secs, emergency) in [
+            (RESIDENCY_BUDGET / 2 * 3, "100", "false"),
+            (RESIDENCY_BUDGET * 3, "60", "true"),
+        ] {
+            let mut config = Config::from_env();
+            config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+            config.memory_budget_min_idle_secs = 100;
+            let root = tempfile::tempdir().unwrap();
+            let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+            let (id, _) = attach_budget_worktree(&server, &format!("threshold-{measured}")).await;
+            mark_ref_idle_for(&server.state, id, std::time::Duration::from_secs(120));
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+            let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+            server.state.enforce_memory_budget().await;
+
+            let logs = crate::test_logs::logs_as_string(&logs);
+            for message in [
+                "ref caches evicted for memory budget",
+                "memory budget pass evicted worktrees",
+            ] {
+                let line = logs
+                    .lines()
+                    .find(|line| line.contains(message))
+                    .unwrap_or_else(|| panic!("{logs}"));
+                assert_eq!(
+                    log_field(line, "min_idle_secs"),
+                    Some(min_idle_secs),
+                    "{logs}"
+                );
+                assert_eq!(log_field(line, "emergency"), Some(emergency), "{logs}");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_resident_bytes_reads_this_process() {
@@ -15427,6 +15838,7 @@ mod tests {
     async fn memory_budget_triggers_on_measured_memory_when_estimates_are_under_it() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024 * 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id, worktree) = attach_budget_worktree(&server, "measured-over").await;
@@ -15483,6 +15895,7 @@ mod tests {
     async fn memory_budget_ignores_estimates_while_measured_memory_is_under_it() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let (id, worktree) = attach_budget_worktree(&server, "measured-under").await;
@@ -15533,6 +15946,7 @@ mod tests {
     async fn review_r3_memory_budget_evicts_down_to_low_watermark() {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 40_000;
+        config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
         let mut refs = Vec::new();
@@ -17423,9 +17837,20 @@ mod tests {
         vectors[idx].clone()
     }
 
+    /// Waits for `ref_index`'s background fill to persist and stop.
+    async fn fill_settled(ref_index: &Arc<crate::ref_index::RefIndex>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while crate::server_adapters::test_seams::fill_running(ref_index).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background fill never stopped");
+    }
+
     /// A primary holding `merged.rs` at [`MERGED_PRIMARY`], and an attached
     /// worktree that has embedded `worktree_path` at `worktree_content`, its
-    /// vector then marked [`WORKTREE_VECTOR`].
+    /// vector marked [`WORKTREE_VECTOR`] once both background fills stopped.
     async fn primary_with_worktree_vector(
         ollama: &wiremock::MockServer,
         worktree_path: &str,
@@ -17454,6 +17879,8 @@ mod tests {
             .unwrap();
         let worktree_ref = worktree_server.current_ref().await;
         cached_vector(&worktree_ref, worktree_path, worktree_content).await;
+        fill_settled(&server.current_ref().await).await;
+        fill_settled(&worktree_ref).await;
         worktree_ref.embedding_cache.write().await.insert(
             worktree_path.to_string(),
             CacheEntry {

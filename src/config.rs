@@ -167,6 +167,9 @@ pub struct Config {
     /// How long an identifier vector goes unused before a save may prune it.
     pub identifier_prune_grace_secs: u64,
     pub resident_memory_budget_bytes: usize,
+    /// How long a worktree goes unused before the memory budget may evict it.
+    /// Controlled by `CONTEXTPLUS_MEMORY_MIN_IDLE_SECS` (default: 900).
+    pub memory_budget_min_idle_secs: u64,
     pub max_embed_file_size: usize,
     pub embed_num_gpu: Option<i32>,
     pub embed_main_gpu: Option<i32>,
@@ -213,6 +216,7 @@ const DEFAULT_OLLAMA_MAX_CONCURRENT: usize = 4;
 /// about 8.7k files and 105k identifiers holds 1.3 GiB and peaks near 2 GiB
 /// while it builds, so this leaves room for several worktrees.
 const DEFAULT_RESIDENT_MEMORY_BUDGET_MB: usize = 4096;
+const DEFAULT_MEMORY_BUDGET_MIN_IDLE_SECS: u64 = 900;
 const MIN_OLLAMA_MAX_CONCURRENT: usize = 1;
 const MAX_OLLAMA_MAX_CONCURRENT: usize = 64;
 
@@ -625,6 +629,11 @@ impl Config {
                 DEFAULT_RESIDENT_MEMORY_BUDGET_MB,
             )
             .saturating_mul(1024 * 1024),
+            memory_budget_min_idle_secs: env_parse(
+                env,
+                "CONTEXTPLUS_MEMORY_MIN_IDLE_SECS",
+                DEFAULT_MEMORY_BUDGET_MIN_IDLE_SECS,
+            ),
             max_embed_file_size: env_parse(
                 env,
                 "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",
@@ -1596,5 +1605,16 @@ mod tests {
             let c = Config::from_env();
             assert_eq!(c.ollama_max_concurrent, 64);
         });
+    }
+
+    #[test]
+    fn config_memory_min_idle_reads_the_env_map() {
+        let unset = Config::from_env_map(&HashMap::new());
+        assert_eq!(unset.memory_budget_min_idle_secs, 900);
+        let env = HashMap::from([(
+            "CONTEXTPLUS_MEMORY_MIN_IDLE_SECS".to_string(),
+            "120".to_string(),
+        )]);
+        assert_eq!(Config::from_env_map(&env).memory_budget_min_idle_secs, 120);
     }
 }
