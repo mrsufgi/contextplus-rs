@@ -15623,9 +15623,19 @@ mod tests {
         })
         .await
         .expect("the warmup never finished");
+        let generation = owner
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        server.state.enforce_memory_budget().await;
+
         assert!(
-            owner.project_cache.read().await.is_some(),
-            "the warmup's project cache did not survive the budget pass"
+            owner.project_cache.read().await.is_some()
+                && owner
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == generation,
+            "the budget evicted a worktree whose warmup had just ended"
         );
     }
 
