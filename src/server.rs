@@ -5039,7 +5039,7 @@ impl ContextPlusServer {
                         Some(index) if build.parsed.borrow().is_none() => {
                             break (index, Some(OUTDATED.to_string()));
                         }
-                        _ => self.parsed_identifier_docs(&build).await,
+                        _ => self.parsed_identifier_docs(&build, &cache).await,
                     };
                     let Some(index) = parsed else {
                         return Ok(Self::ok_text(format!(
@@ -5055,15 +5055,16 @@ impl ContextPlusServer {
     }
 
     /// The documents of a build that has not finished: its own once parsed,
-    /// else the index this ref already holds, unless that answers for the
-    /// parent's tree.
+    /// with the files that differ in `cache` parsed again, else the index
+    /// this ref already holds, unless that answers for the parent's tree.
     async fn parsed_identifier_docs(
         &self,
         build: &IdentifierBuild,
+        cache: &Arc<ProjectCache>,
     ) -> Option<Arc<IdentifierIndex>> {
         let parsed = build.parsed.borrow().clone();
-        if parsed.is_some() {
-            return parsed;
+        if let Some(parsed) = parsed {
+            return Some(build.documents_for(&parsed, cache).await.unwrap_or(parsed));
         }
         let ref_index = self.current_ref().await;
         if ref_index
@@ -8315,6 +8316,37 @@ mod tests {
         drop(held);
     }
 
+    #[tokio::test]
+    async fn a_partial_identifier_answer_after_an_edit_parses_the_edited_files_again() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let first = started_identifier_build(&server).await;
+        wait_until_parsed(&first).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = server
+            .dispatch("explore", identifier_args("audit_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+        assert!(!text.contains("close_account"), "{text}");
+        assert!(first.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
     /// Waits until a request holds `cache` beyond its `holders`, as an
     /// identifier query does from just before it joins a build.
     async fn wait_until_held(cache: &Arc<ProjectCache>, holders: usize) {
@@ -8581,6 +8613,7 @@ mod tests {
         let held = hold_embeds(&server).await;
         let build = started_identifier_build(&server).await;
         wait_until_parsed(&build).await;
+        let cache = server.ensure_project_cache().await.unwrap();
         let mut keyword_args = serde_json::Map::new();
         keyword_args.insert("semantic_weight".into(), json!(0.0));
         keyword_args.insert("keyword_weight".into(), json!(1.0));
@@ -8589,8 +8622,8 @@ mod tests {
                 keyword_args,
                 server.resolve_root(&serde_json::Map::new()).await,
                 "open_account".into(),
-                &server.ensure_project_cache().await.unwrap(),
-                &server.parsed_identifier_docs(&build).await.unwrap(),
+                &cache,
+                &server.parsed_identifier_docs(&build, &cache).await.unwrap(),
                 Some("held".into()),
             )
             .await
