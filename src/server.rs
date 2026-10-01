@@ -3395,19 +3395,14 @@ impl ContextPlusServer {
         build
     }
 
-    /// The identifier index of a linked worktree's parent, built first when
-    /// missing, paired with the project cache it was built from.
+    /// The embedded identifier index of a linked worktree's parent, paired
+    /// with the project cache it was built from; a missing one is never
+    /// built or waited for here.
     async fn parent_identifier_index(
         &self,
         ref_index: &crate::ref_index::RefIndex,
     ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
         let parent = self.identifier_parent(ref_index).await?;
-        let parent_server = self.with_session(ref_index.parent_ref_id?);
-        let parent_cache = parent_server.ensure_project_cache().await.ok()?;
-        parent_server
-            .ensure_identifier_index(&parent_cache)
-            .await
-            .ok()?;
         Self::built_identifier_index(&parent).await
     }
 
@@ -13665,9 +13660,14 @@ mod tests {
         server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical))
     }
 
-    /// After a restart a worktree may query before the primary has built its
-    /// identifier index; its build then shares the primary's documents of
-    /// every identical file and parses only the files that differ.
+    async fn build_primary_identifier_index(server: &ContextPlusServer) {
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
+    }
+
+    /// A worktree's first build over a primary with an embedded identifier
+    /// index shares the primary's documents of every identical file and
+    /// parses only the files that differ.
     #[tokio::test]
     async fn worktree_identifier_build_reuses_primary_documents_of_identical_files() {
         let ollama = wiremock::MockServer::start().await;
@@ -13680,6 +13680,7 @@ mod tests {
         std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
         std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
         let server = identifier_test_server(&ollama, primary.path()).await;
+        build_primary_identifier_index(&server).await;
         let worktree_server = attached_worktree(&server, worktree.path()).await;
 
         let cache = worktree_server.ensure_project_cache().await.unwrap();
@@ -13715,6 +13716,49 @@ mod tests {
             &primary_index.docs.files["differs.rs"]
         ));
         assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
+    }
+
+    /// A worktree whose primary has no embedded identifier index parses all
+    /// of its own files rather than wait for the primary to build one.
+    #[tokio::test]
+    async fn worktree_identifier_build_never_builds_the_primary_index() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            std::fs::write(dir.join("same.rs"), "fn same() {}\n").unwrap();
+        }
+        std::fs::write(
+            primary.path().join("primary_only.rs"),
+            "fn primary_only() {}\n",
+        )
+        .unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let index = worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        assert_eq!(index.docs.files["same.rs"][0].name, "same");
+        assert!(
+            server
+                .state
+                .default_ref()
+                .unwrap()
+                .identifier_index
+                .read()
+                .await
+                .is_none(),
+            "the worktree build built the primary's identifier index"
+        );
+        assert!(
+            matching_embed_request_batches(&ollama, "primary_only")
+                .await
+                .is_empty()
+        );
     }
 
     /// Every field of an identifier index's documents, in index order.
@@ -13788,6 +13832,7 @@ mod tests {
             std::fs::write(dir.join("added.rs"), "fn added() {}\n").unwrap();
         }
         let server = identifier_test_server(&ollama, primary.path()).await;
+        build_primary_identifier_index(&server).await;
         let worktree_server = attached_worktree(&server, worktree.path()).await;
         let cache = worktree_server.ensure_project_cache().await.unwrap();
         let seeded = worktree_server
@@ -13802,6 +13847,20 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(Arc::ptr_eq(
+            &seeded.docs.files["same.rs"],
+            &server
+                .state
+                .default_ref()
+                .unwrap()
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .docs
+                .files["same.rs"]
+        ));
         assert!(!seeded.docs.files.contains_key("deleted.rs"));
         assert_eq!(identifier_documents(&seeded), identifier_documents(&full));
         assert_eq!(vectors(&seeded), vectors(&full));
