@@ -324,7 +324,9 @@ impl OllamaClient {
             // TCP keepalive pings every 30 s so NAT/firewall state is preserved
             // even when the connection is otherwise silent.
             .tcp_keepalive(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(120))
+            // No client timeout: each request runs under its own deadline,
+            // `request_timeout` or `chat_timeout`, which a client timeout
+            // would cut short.
             .build()
             .expect("reqwest client build");
 
@@ -3530,6 +3532,34 @@ mod tests {
             }
             other => panic!("expected Ollama deadline error, got {:?}", other),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_embed_request_is_cut_off_only_at_its_deadline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[1.0, 2.0, 3.0]]}))
+                    .set_delay(std::time::Duration::from_secs(3600)),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+
+        let started = tokio::time::Instant::now();
+        let result = client.embed_documents(&["hello".to_string()]).await;
+
+        assert!(
+            started.elapsed() >= EMBED_REQUEST_TIMEOUT,
+            "the request was cut off after {:?}, before its {:?} deadline: {result:?}",
+            started.elapsed(),
+            EMBED_REQUEST_TIMEOUT
+        );
     }
 
     #[tokio::test]
