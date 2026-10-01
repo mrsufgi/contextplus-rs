@@ -561,6 +561,9 @@ struct IncrementalReembedOutcome {
     updated: usize,
     skipped: usize,
     content_changed: bool,
+    /// The changed files another re-embed was sending, each a path and its
+    /// content hash.
+    sent_elsewhere: Vec<(String, String)>,
 }
 
 /// The changed files one re-embed sends to Ollama, released when it ends.
@@ -580,6 +583,25 @@ impl ReembedClaims<'_> {
         self.claimed.push((path.to_string(), hash.to_string()));
         true
     }
+
+    /// Waits until no re-embed of `ref_index` sends any of `files`, each a
+    /// path and its content hash.
+    async fn released(ref_index: &crate::ref_index::RefIndex, files: &[(String, String)]) {
+        loop {
+            let mut released = std::pin::pin!(ref_index.reembedding_released.notified());
+            released.as_mut().enable();
+            let sending = {
+                let reembedding = ref_index.reembedding.lock().unwrap();
+                files
+                    .iter()
+                    .any(|(path, hash)| reembedding.get(path) == Some(hash))
+            };
+            if !sending {
+                return;
+            }
+            released.await;
+        }
+    }
 }
 
 impl Drop for ReembedClaims<'_> {
@@ -589,6 +611,10 @@ impl Drop for ReembedClaims<'_> {
             if reembedding.get(path) == Some(hash) {
                 reembedding.remove(path);
             }
+        }
+        drop(reembedding);
+        if !self.claimed.is_empty() {
+            self.ref_index.reembedding_released.notify_waiters();
         }
     }
 }
@@ -2814,9 +2840,10 @@ impl ContextPlusServer {
     }
 
     /// Re-embeds the tracked `files` of this session's ref, at
-    /// `changed_files` on disk, and refreshes its indexes when their content
-    /// changed. The re-embedded and skipped counts, and the task of a parent
-    /// rebuild the refresh started.
+    /// `changed_files` on disk, waits for those another re-embed is sending,
+    /// and refreshes its indexes when their content changed. The re-embedded
+    /// and skipped counts, and the task of a parent rebuild the refresh
+    /// started.
     async fn refresh_tracked_files(
         &self,
         files: Vec<String>,
@@ -2829,6 +2856,11 @@ impl ContextPlusServer {
             "Embedding tracker refresh batch started"
         );
         let outcome = self.incremental_reembed_detailed(&changed_files).await;
+        if !outcome.sent_elsewhere.is_empty() {
+            #[cfg(test)]
+            crate::server_adapters::test_seams::before_embeds_wait(&ref_index.canonical_root).await;
+            ReembedClaims::released(&ref_index, &outcome.sent_elsewhere).await;
+        }
         let updated = outcome.updated;
         let skipped = outcome.skipped;
         tracing::debug!(
@@ -3799,6 +3831,7 @@ impl ContextPlusServer {
             ref_index: &ref_index,
             claimed: Vec::new(),
         };
+        let mut sent_elsewhere = Vec::new();
 
         // CAS setup for diff-only embedding via U6 content-addressed store.
         let mcp_data_dir = ref_index.root_dir.join(".mcp_data");
@@ -3863,6 +3896,8 @@ impl ContextPlusServer {
                 continue;
             }
             if !oversized && !embedding_cache_matches && !claims.claim(&rel_path, &hash) {
+                sent_elsewhere.push((rel_path, hash));
+                content_changed = true;
                 skipped += 1;
                 continue;
             }
@@ -3967,6 +4002,7 @@ impl ContextPlusServer {
                     updated,
                     skipped,
                     content_changed,
+                    sent_elsewhere,
                 };
             }
             // Fall through to persist the updated in-memory cache to disk.
@@ -4002,6 +4038,12 @@ impl ContextPlusServer {
                                 cas_manifest_updates.push((key, chunk_hash));
                             }
                         }
+                    }
+                    drop(cache);
+                    // The refresh after this re-embed indexes these vectors.
+                    let mut fill = ref_index.semantic_fill.lock().await;
+                    for (rel_path, hash, _) in texts_to_embed.iter().take(vectors.len()) {
+                        fill.embedded(rel_path, hash);
                     }
                 }
                 Err(e) => {
@@ -4090,6 +4132,7 @@ impl ContextPlusServer {
             updated,
             skipped,
             content_changed,
+            sent_elsewhere,
         }
     }
 
@@ -9076,8 +9119,14 @@ mod tests {
     /// Commits an edit of five files tagged `tag` on a side branch and moves
     /// `origin/main` to it; its sha.
     fn fork_base_move_origin(primary: &std::path::Path, tag: &str) -> String {
+        fork_base_move_origin_files(primary, tag, 5)
+    }
+
+    /// Commits an edit of `files` files tagged `tag` on a side branch and
+    /// moves `origin/main` to it; its sha.
+    fn fork_base_move_origin_files(primary: &std::path::Path, tag: &str, files: usize) -> String {
         lexdelta_git(primary, &["checkout", "-q", "-b", tag]);
-        for i in 0..5 {
+        for i in 0..files {
             std::fs::write(
                 primary.join(format!("src/area_{}/file_{i}.rs", i % 4)),
                 format!("pub fn {tag}_{i}() -> usize {{ {i} }}\n"),
@@ -9570,8 +9619,8 @@ mod tests {
         );
     }
 
-    /// A tracker batch of the files an advance is still embedding sends none
-    /// of them to Ollama again.
+    /// A tracker batch of the files an advance is still embedding waits for
+    /// that embed and sends none of them to Ollama again.
     #[tokio::test]
     async fn fork_base_advance_and_its_tracker_embed_each_changed_file_once() {
         use crate::server_adapters::test_seams;
@@ -9589,13 +9638,16 @@ mod tests {
             .map(|i| format!("src/area_{}/file_{i}.rs", i % 4))
             .collect();
         let on_disk = files.iter().map(|path| base.root_dir.join(path)).collect();
-        let (_, refresh) = server
-            .with_session(base_id)
-            .refresh_tracked_files(files, on_disk)
-            .await;
+        let waits = test_seams::pause_before_embeds_wait(&base.canonical_root);
+        let tracker = {
+            let session = server.with_session(base_id);
+            tokio::spawn(async move { session.refresh_tracked_files(files, on_disk).await })
+        };
+        waits.wait_until_entered().await;
+        waits.resume();
         pause.resume();
         advance.await;
-        if let Some(task) = refresh {
+        if let (_, Some(task)) = tracker.await.unwrap() {
             task.await.unwrap();
         }
         test_seams::settle_fork_base(&server.state).await;
@@ -9611,6 +9663,160 @@ mod tests {
         assert_eq!(
             embedded, 5,
             "5 changed files were embedded {embedded} times"
+        );
+    }
+
+    /// An advance that finds a changed file its tracker is still embedding
+    /// waits for that embed, and nothing, the fill included, embeds the file
+    /// again.
+    #[tokio::test]
+    async fn fork_base_advance_waits_for_a_file_its_tracker_is_embedding() {
+        use crate::server_adapters::test_seams;
+
+        let (ollama, primary, _bases, server) = fork_base_server(0).await;
+        test_seams::settle_fork_base(&server.state).await;
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+        let files = SEMANTIC_FORK_FILES / 4;
+        let advanced = fork_base_move_origin_files(primary.path(), "advanced", files);
+        let checkout = test_seams::pause_after_fork_base_checkout(&base.canonical_root);
+        let advance = server.advance_fork_base().expect("an advance");
+        checkout.wait_until_entered().await;
+        let tracker_embed = test_seams::pause_before_reembed(&base.canonical_root);
+        let tracker = {
+            let session = server.with_session(base_id);
+            let file = "src/area_0/file_0.rs".to_string();
+            let on_disk = vec![base.root_dir.join(&file)];
+            tokio::spawn(async move { session.refresh_tracked_files(vec![file], on_disk).await })
+        };
+        tracker_embed.wait_until_entered().await;
+
+        let fill = test_seams::pause_fill_start(&base.canonical_root);
+        let waits = test_seams::pause_before_embeds_wait(&base.canonical_root);
+        checkout.resume();
+        tokio::select! {
+            () = fill.wait_until_entered() => {}
+            () = waits.wait_until_entered() => {}
+        }
+        fill.resume();
+        waits.resume();
+        tracker_embed.resume();
+        advance.await;
+        if let (_, Some(task)) = tracker.await.unwrap() {
+            task.await.unwrap();
+        }
+        test_seams::settle_fork_base(&server.state).await;
+
+        let embedded = matching_embed_input_count(&ollama, "pub fn advanced_").await;
+        assert_eq!(
+            embedded, files,
+            "{files} changed files were embedded {embedded} times"
+        );
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true)
+        );
+    }
+
+    /// A server over twenty files indexed by a query, one of them then edited
+    /// to content marked `sent once marker`; the server, that file and its
+    /// content.
+    async fn embed_claim_server(
+        ollama: &wiremock::MockServer,
+        root: &std::path::Path,
+    ) -> (ContextPlusServer, PathBuf, &'static str) {
+        lexdelta_corpus(root, 20);
+        let mut config = identifier_test_server(ollama, root)
+            .await
+            .state
+            .config
+            .clone();
+        config.embed_budget_ms = 600_000;
+        config.embed_fill_batch_timeout_ms = 600_000;
+        let server = ContextPlusServer::new(root.to_path_buf(), config);
+        semantic_fork_query(&server).await;
+        let indexed = server.current_ref().await.canonical_root.clone();
+        for task in crate::server_adapters::test_seams::take_fills(&indexed) {
+            task.await.unwrap();
+        }
+        let content = "pub fn changed_five() -> usize { 5 }\n// sent once marker\n";
+        let file = root.join("src/area_1/file_5.rs");
+        std::fs::write(&file, content).unwrap();
+        (server, file, content)
+    }
+
+    /// A walk leaves a changed file a re-embed is sending to that re-embed,
+    /// so the file is embedded once.
+    #[tokio::test]
+    async fn walk_leaves_a_file_a_reembed_is_sending_to_it() {
+        use crate::server_adapters::test_seams;
+
+        let ollama = wiremock::MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let (server, file, _) = embed_claim_server(&ollama, root.path()).await;
+        let owner = server.current_ref().await;
+        let pause = test_seams::pause_before_reembed(&owner.canonical_root);
+        let reembed = {
+            let server = server.clone();
+            tokio::spawn(async move { server.incremental_reembed(&[file]).await })
+        };
+        pause.wait_until_entered().await;
+
+        semantic_fork_walker(&server, Arc::clone(&owner))
+            .walk_and_index(root.path())
+            .await
+            .unwrap();
+        pause.resume();
+        reembed.await.unwrap();
+        for task in test_seams::take_fills(&owner.canonical_root) {
+            task.await.unwrap();
+        }
+
+        let embedded = matching_embed_input_count(&ollama, "sent once marker").await;
+        assert_eq!(
+            embedded, 1,
+            "the changed file was embedded {embedded} times"
+        );
+    }
+
+    /// A fill leaves a changed file a re-embed is sending to that re-embed,
+    /// so the file is embedded once.
+    #[tokio::test]
+    async fn fill_leaves_a_file_a_reembed_is_sending_to_it() {
+        use crate::server_adapters::test_seams;
+
+        let ollama = wiremock::MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let (server, file, content) = embed_claim_server(&ollama, root.path()).await;
+        let owner = server.current_ref().await;
+        test_seams::seed_pending(
+            &owner,
+            "src/area_1/file_5.rs",
+            crate::core::parser::hash_content(content),
+            content.into(),
+        )
+        .await;
+        let pause = test_seams::pause_before_reembed(&owner.canonical_root);
+        let reembed = {
+            let server = server.clone();
+            tokio::spawn(async move { server.incremental_reembed(&[file]).await })
+        };
+        pause.wait_until_entered().await;
+
+        semantic_fork_walker(&server, Arc::clone(&owner))
+            .walk_and_index(root.path())
+            .await
+            .unwrap();
+        pause.resume();
+        reembed.await.unwrap();
+        for task in test_seams::take_fills(&owner.canonical_root) {
+            task.await.unwrap();
+        }
+
+        let embedded = matching_embed_input_count(&ollama, "sent once marker").await;
+        assert_eq!(
+            embedded, 1,
+            "the changed file was embedded {embedded} times"
         );
     }
 

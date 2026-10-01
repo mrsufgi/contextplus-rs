@@ -214,6 +214,8 @@ pub struct RefIndex {
     pub(crate) semantic_fill: tokio::sync::Mutex<crate::server_adapters::SemanticFill>,
     /// The content hash of each changed file a re-embed is sending to Ollama.
     pub(crate) reembedding: std::sync::Mutex<HashMap<String, String>>,
+    /// Notified when a re-embed stops sending its changed files.
+    pub(crate) reembedding_released: tokio::sync::Notify,
     /// The parent's vector store this worktree last forked, or was refused a fork of.
     pub(crate) fork_base: std::sync::Mutex<std::sync::Weak<crate::core::embeddings::VectorStore>>,
     /// The fork refusals logged since this worktree last forked.
@@ -305,6 +307,7 @@ impl RefIndex {
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
             reembedding: std::sync::Mutex::new(HashMap::new()),
+            reembedding_released: tokio::sync::Notify::new(),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
@@ -366,6 +369,7 @@ impl RefIndex {
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
             reembedding: std::sync::Mutex::new(HashMap::new()),
+            reembedding_released: tokio::sync::Notify::new(),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
@@ -429,6 +433,7 @@ impl RefIndex {
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
             reembedding: std::sync::Mutex::new(HashMap::new()),
+            reembedding_released: tokio::sync::Notify::new(),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),

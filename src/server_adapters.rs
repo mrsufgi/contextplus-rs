@@ -347,6 +347,30 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn embeds_wait_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next tracked refresh of the ref at `root` before it waits
+    /// for the changed files another re-embed is sending.
+    pub(crate) fn pause_before_embeds_wait(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        embeds_wait_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_embeds_wait(root: &Path) {
+        let pause = embeds_wait_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn fill_start_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1415,6 +1439,9 @@ impl CachedWalkerIndexer {
                 if current.hash == *hash {
                     continue;
                 }
+                doc.owner = None;
+            } else if ref_index.reembedding.lock().unwrap().get(path) == Some(hash) {
+                // Left to the re-embed sending it; the fill takes it if that fails.
                 doc.owner = None;
             } else {
                 pending.push((idx, doc.clone()));
@@ -3254,6 +3281,14 @@ pub(crate) struct SemanticFill {
 }
 
 impl SemanticFill {
+    /// Drops the pending document of `path` at `hash`, which a re-embed
+    /// embedded.
+    pub(crate) fn embedded(&mut self, path: &str, hash: &str) {
+        if self.pending.get(path).is_some_and(|doc| doc.hash == hash) {
+            self.pending.remove(path);
+        }
+    }
+
     fn failed(&self, doc: &FillDocument) -> bool {
         self.failures
             .get(&doc.path)
@@ -3490,12 +3525,14 @@ async fn run_fill(
     loop {
         let batch: Vec<_> = {
             let fill = ref_index.semantic_fill.lock().await;
+            let reembedding = ref_index.reembedding.lock().unwrap();
             fill.pending
                 .values()
                 .filter(|doc| {
                     doc.owner
                         .as_ref()
                         .is_none_or(|owner| owner.upgrade().is_none())
+                        && reembedding.get(&doc.path) != Some(&doc.hash)
                 })
                 .take(8)
                 .cloned()
