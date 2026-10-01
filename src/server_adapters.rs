@@ -250,35 +250,40 @@ pub(crate) mod test_seams {
         ref_index.semantic_fill.lock().await.running
     }
 
-    pub(crate) struct MetadataPause {
-        enumerated: Barrier,
+    pub(crate) struct BlockingPause {
+        entered: Barrier,
         resume: Barrier,
     }
 
-    impl MetadataPause {
+    impl BlockingPause {
         fn new() -> Self {
             Self {
-                enumerated: Barrier::new(2),
+                entered: Barrier::new(2),
                 resume: Barrier::new(2),
             }
         }
 
-        pub(crate) fn wait_until_enumerated(&self) {
-            self.enumerated.wait();
+        pub(crate) fn wait_until_entered(&self) {
+            self.entered.wait();
         }
 
         pub(crate) fn resume(&self) {
             self.resume.wait();
         }
+
+        fn enter(&self) {
+            self.entered.wait();
+            self.resume.wait();
+        }
     }
 
-    fn metadata_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<MetadataPause>>> {
-        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<MetadataPause>>>> = OnceLock::new();
+    fn metadata_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<BlockingPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<BlockingPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
 
-    pub(crate) fn pause_after_metadata_enumeration(root: &Path) -> Arc<MetadataPause> {
-        let pause = Arc::new(MetadataPause::new());
+    pub(crate) fn pause_after_metadata_enumeration(root: &Path) -> Arc<BlockingPause> {
+        let pause = Arc::new(BlockingPause::new());
         metadata_slots()
             .lock()
             .unwrap()
@@ -289,8 +294,36 @@ pub(crate) mod test_seams {
     pub(crate) fn after_metadata_enumeration(root: &Path) {
         let pause = metadata_slots().lock().unwrap().remove(root);
         if let Some(pause) = pause {
-            pause.enumerated.wait();
-            pause.resume.wait();
+            pause.enter();
+        }
+    }
+
+    fn outline_parse_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<BlockingPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<BlockingPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next file a directory outline of the ref rooted at `root`
+    /// parses, on the structural pool thread parsing it.
+    pub(crate) fn pause_outline_parse(root: &Path) -> Arc<BlockingPause> {
+        let pause = Arc::new(BlockingPause::new());
+        outline_parse_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) fn outline_parse(root: &Path) {
+        let pause = {
+            let mut slots = outline_parse_slots().lock().unwrap();
+            if slots.is_empty() {
+                return;
+            }
+            slots.remove(root)
+        };
+        if let Some(pause) = pause {
+            pause.enter();
         }
     }
 }

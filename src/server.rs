@@ -5916,9 +5916,13 @@ impl ContextPlusServer {
 
 // --- Type conversion helpers ---
 
+/// Files a directory outline parses per structural pool job, so other
+/// structural work waits behind at most one batch of a cold outline.
+const OUTLINE_BATCH: usize = 64;
+
 /// The outline of each of `paths` a parser reads. A file outlined before with
 /// the same content keeps its outline; the others are parsed in parallel on
-/// the structural pool.
+/// the structural pool, a batch at a time.
 fn outline_files(
     ref_index: &crate::ref_index::RefIndex,
     paths: &[&str],
@@ -5933,24 +5937,26 @@ fn outline_files(
             .map(|path| outlines.get(*path).cloned())
             .collect()
     };
-    let outlined: Vec<Option<(FileOutline, bool)>> = STRUCTURAL_POOL.install(|| {
-        paths
-            .par_iter()
-            .zip(known)
-            .map(|(path, known)| {
+    let mut outlined: Vec<Option<(FileOutline, bool)>> = Vec::with_capacity(paths.len());
+    for (paths, known) in paths.chunks(OUTLINE_BATCH).zip(known.chunks(OUTLINE_BATCH)) {
+        STRUCTURAL_POOL.install(|| {
+            outlined.par_extend(paths.par_iter().zip(known).map(|(path, known)| {
                 let content = files.get(path)?;
                 let digest = crate::cache::snapshot::digest(content.as_bytes());
-                if let Some(known) = known.filter(|(known, _)| *known == digest) {
-                    return Some((known, false));
+                if let Some(known) = known.as_ref().filter(|(known, _)| *known == digest) {
+                    return Some((known.clone(), false));
                 }
                 #[cfg(test)]
-                ref_index
-                    .outline_parses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                {
+                    ref_index
+                        .outline_parses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::server_adapters::test_seams::outline_parse(&ref_index.root_dir);
+                }
                 Some(((digest, file_outline(path, content).map(Arc::new)), true))
-            })
-            .collect()
-    });
+            }));
+        });
+    }
     let mut outlines = ref_index.file_outlines.lock().unwrap();
     outlines.retain(|path, _| files.get(path).is_some());
     let mut analyses = BTreeMap::new();
@@ -8979,6 +8985,67 @@ mod tests {
                 .iter()
                 .any(|(_, bytes, name)| *name == "outlines" && *bytes > 0),
             "{components:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structural_work_waits_for_at_most_one_batch_of_a_cold_outline() {
+        const FILES: usize = 512;
+        if STRUCTURAL_POOL.current_num_threads() < 2 {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        for i in 0..FILES {
+            std::fs::write(
+                repo.path().join(format!("src/file_{i}.rs")),
+                format!("pub fn function_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
+        let cache = server.ensure_project_cache().await.unwrap();
+        let ref_index = server.current_ref().await;
+        let pause = crate::server_adapters::test_seams::pause_outline_parse(&ref_index.root_dir);
+        let outline = {
+            let ref_index = Arc::clone(&ref_index);
+            tokio::task::spawn_blocking(move || {
+                let paths: Vec<&str> = cache
+                    .file_entries
+                    .iter()
+                    .filter(|entry| !entry.is_directory)
+                    .map(|entry| entry.relative_path.as_str())
+                    .collect();
+                outline_files(&ref_index, &paths, &cache.file_content).len()
+            })
+        };
+        let entered = Arc::clone(&pause);
+        tokio::task::spawn_blocking(move || entered.wait_until_entered())
+            .await
+            .unwrap();
+
+        let probe = Arc::clone(&ref_index);
+        let parsed_before_probe = tokio::task::spawn_blocking(move || {
+            STRUCTURAL_POOL.install(|| {
+                probe
+                    .outline_parses
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        })
+        .await
+        .unwrap();
+        tokio::task::spawn_blocking(move || pause.resume())
+            .await
+            .unwrap();
+
+        assert_eq!(outline.await.unwrap(), FILES);
+        assert!(
+            parsed_before_probe < FILES / 2,
+            "pool work waited until the outline had parsed {parsed_before_probe} of {FILES} files"
         );
     }
 
@@ -19304,7 +19371,7 @@ mod tests {
                 .await
         });
         let wait_pause = Arc::clone(&pause);
-        tokio::task::spawn_blocking(move || wait_pause.wait_until_enumerated())
+        tokio::task::spawn_blocking(move || wait_pause.wait_until_entered())
             .await
             .unwrap();
         std::fs::remove_file(&ephemeral).unwrap();
