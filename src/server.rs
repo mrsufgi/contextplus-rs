@@ -7933,18 +7933,19 @@ mod tests {
         attach.insert("path".into(), json!(canonical.to_string_lossy()));
         server.handle_attach_worktree(attach).await.unwrap();
         let session = server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let worktree_ref = session.current_ref().await;
         assert!(
-            session
-                .current_ref()
-                .await
+            worktree_ref
                 .identifier_inherited
                 .load(std::sync::atomic::Ordering::Acquire)
         );
+        let building = worktree_ref.identifier_update.lock().await;
 
         let answered = session
             .dispatch("explore", identifier_args("primary_only_name", "keywords"))
             .await;
 
+        drop(building);
         let text = text_of(&answered);
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(!text.contains("primary_only_name -"), "{text}");
