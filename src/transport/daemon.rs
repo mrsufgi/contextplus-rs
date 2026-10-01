@@ -40,6 +40,7 @@ use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::core::process_lifecycle;
@@ -679,8 +680,7 @@ pub async fn run(
     _lock: LockGuard,
 ) -> Result<()> {
     let client_count = Arc::new(AtomicUsize::new(0));
-    let shutdown = Arc::new(Notify::new());
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
 
     // Idle timer: when client count hits 0, after `idle_secs` of zero clients
     // we trigger drain. `idle_notify` is poked on every (dis)connect so the
@@ -689,12 +689,11 @@ pub async fn run(
     if idle_secs > 0 {
         let cc = Arc::clone(&client_count);
         let n = Arc::clone(&idle_notify);
-        let sd = Arc::clone(&shutdown);
-        let sf = Arc::clone(&shutdown_flag);
+        let sd = shutdown.clone();
         let timeout = Duration::from_secs(idle_secs);
         tokio::spawn(async move {
             loop {
-                if sf.load(Ordering::Acquire) {
+                if sd.is_cancelled() {
                     return;
                 }
                 // Wait until count == 0, then start the timeout.
@@ -709,8 +708,7 @@ pub async fn run(
                                 "daemon idle for {}s with no clients — initiating shutdown",
                                 timeout.as_secs(),
                             );
-                            sf.store(true, Ordering::Release);
-                            sd.notify_waiters();
+                            sd.cancel();
                             return;
                         }
                     }
@@ -734,8 +732,7 @@ pub async fn run(
     {
         let draining = Arc::clone(&server.state.draining);
         let inflight = Arc::clone(&server.state.inflight);
-        let sd = Arc::clone(&shutdown);
-        let sf = Arc::clone(&shutdown_flag);
+        let sd = shutdown.clone();
         // Background watcher; we never join its handle — process exit (or
         // the daemon shutdown branch) reaps it.
         drop(process_lifecycle::start_drain_watcher(
@@ -744,8 +741,7 @@ pub async fn run(
             Duration::from_secs(drain_grace_secs),
             move |reason| {
                 tracing::info!(?reason, "daemon drain watcher fired");
-                sf.store(true, Ordering::Release);
-                sd.notify_waiters();
+                sd.cancel();
             },
         ));
     }
@@ -767,13 +763,13 @@ pub async fn run(
         let server = server.clone();
         let client_count = Arc::clone(&client_count);
         let idle_notify = Arc::clone(&idle_notify);
-        let shutdown_flag = Arc::clone(&shutdown_flag);
+        let shutdown = shutdown.clone();
         async move {
             loop {
                 let (stream, _addr) = match listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
-                        if shutdown_flag.load(Ordering::Acquire) {
+                        if shutdown.is_cancelled() {
                             return;
                         }
                         tracing::warn!("accept() error: {e}");
@@ -802,7 +798,7 @@ pub async fn run(
 
     tokio::select! {
         _ = accept_loop => {}
-        _ = shutdown.notified() => {
+        _ = shutdown.cancelled() => {
             tracing::info!("daemon shutdown signal — exiting accept loop");
         }
     }

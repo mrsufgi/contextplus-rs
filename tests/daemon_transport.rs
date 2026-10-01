@@ -707,7 +707,131 @@ async fn daemon_run_shutdown_via_draining_flag() {
     draining.store(true, Ordering::Release);
 
     let result = tokio::time::timeout(Duration::from_secs(15), run_handle).await;
-    assert!(result.is_ok(), "daemon::run did not complete within 5 s");
+    assert!(result.is_ok(), "daemon::run did not complete within 15 s");
+}
+
+/// Holds `daemon::run` on its "listening" event until the drain watcher has
+/// fired and the runtime's only worker has parked again.
+#[derive(Clone, Default)]
+struct DrainBeforeListen(std::sync::Arc<DrainBeforeListenState>);
+
+#[derive(Default)]
+struct DrainBeforeListenState {
+    fired: std::sync::atomic::AtomicBool,
+    parked: std::sync::Mutex<bool>,
+    parked_changed: std::sync::Condvar,
+}
+
+impl DrainBeforeListen {
+    fn mark_parked(&self) {
+        if self.0.fired.load(Ordering::Acquire) {
+            *self.0.parked.lock().unwrap() = true;
+            self.0.parked_changed.notify_all();
+        }
+    }
+
+    fn wait_parked(&self) {
+        let parked = self.0.parked.lock().unwrap();
+        let _ = self
+            .0
+            .parked_changed
+            .wait_timeout_while(parked, Duration::from_secs(10), |parked| !*parked)
+            .unwrap();
+    }
+
+    fn ordered(&self) -> bool {
+        *self.0.parked.lock().unwrap()
+    }
+}
+
+struct EventMessage(String);
+
+impl tracing::field::Visit for EventMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for DrainBeforeListen {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = EventMessage(String::new());
+        event.record(&mut message);
+        match message.0.as_str() {
+            "daemon drain watcher fired" => self.0.fired.store(true, Ordering::Release),
+            "contextplus daemon listening" => self.wait_parked(),
+            _ => {}
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A drain that completes before the accept loop starts waiting for shutdown
+/// must still stop the daemon.
+#[test]
+fn daemon_run_exits_when_drain_fires_before_accept_loop_waits() {
+    let seam = DrainBeforeListen::default();
+    let _subscriber = tracing::subscriber::set_default(seam.clone());
+    let worker_seam = seam.clone();
+    let park_seam = seam.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .on_thread_start(move || {
+            std::mem::forget(tracing::subscriber::set_default(worker_seam.clone()));
+        })
+        .on_thread_park(move || park_seam.mark_parked())
+        .build()
+        .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let result = rt.block_on(async {
+        let lock = match daemon::acquire_lock(&root).expect("acquire_lock") {
+            AcquireOutcome::Acquired(l) => l,
+            AcquireOutcome::AlreadyRunning => panic!("fresh tempdir"),
+        };
+        let listener = daemon::bind_listener(&root).expect("bind_listener");
+        let server = ContextPlusServer::new(root.clone(), Config::from_env());
+        server.state.draining.store(true, Ordering::Release);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon::run(
+                server,
+                listener,
+                paths::daemon_socket_path(&root),
+                paths::daemon_pid_path(&root),
+                0,
+                lock,
+            ),
+        )
+        .await
+    });
+
+    assert!(
+        seam.ordered(),
+        "drain watcher did not fire before the accept loop"
+    );
+    assert!(
+        result.is_ok(),
+        "daemon::run missed a shutdown requested before its accept loop waited"
+    );
 }
 
 // ---------------------------------------------------------------------------
