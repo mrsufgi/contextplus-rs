@@ -200,6 +200,54 @@ impl IdentifierBuild {
             None => self.finished().await,
         }
     }
+
+    /// `docs`, documents of this build, as of the project cache `cache`: each
+    /// file whose content differs from the build's project cache is parsed
+    /// again. `None` once the build's project cache is gone.
+    async fn documents_for(
+        &self,
+        docs: &Arc<IdentifierIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        if self.built_from(cache) {
+            return Some(Arc::clone(docs));
+        }
+        let source = self.source.upgrade()?;
+        let docs = Arc::clone(docs);
+        let cache = Arc::clone(cache);
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            let differing: std::collections::BTreeSet<&String> = cache
+                .file_content
+                .keys()
+                .chain(source.file_content.keys())
+                .filter(|path| cache.file_content.get(path) != source.file_content.get(path))
+                .collect();
+            let mut files = docs.docs.files.clone();
+            for path in &differing {
+                files.remove(*path);
+            }
+            files.par_extend(differing.into_par_iter().filter_map(|path| {
+                let content = cache.file_content.get(path)?;
+                let file_docs =
+                    crate::tools::semantic_identifiers::identifier_docs_for_file(path, content)?;
+                Some((path.clone(), Arc::new(file_docs)))
+            }));
+            Arc::new(IdentifierIndex {
+                docs: Segmented::from_files(files),
+                vectors: IdentifierVectorIndex::empty(),
+                dims: 0,
+                file_count: cache
+                    .file_entries
+                    .iter()
+                    .filter(|entry| !entry.is_directory)
+                    .count(),
+                built_at: Instant::now(),
+            })
+        })
+        .await
+        .ok()
+    }
 }
 
 /// An identifier index ready to search, or the build that will produce it.
@@ -4948,7 +4996,8 @@ impl ContextPlusServer {
 
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
-        // keyword ranking needs only the parsed documents. A build of the
+        // keyword ranking needs only the parsed documents, with the files an
+        // edit changed since the build started parsed again. A build of the
         // tree before an edit answers only partially, and once it ends, a
         // build of the current tree takes the rest of the budget; until that
         // build parses, the ended build's index answers.
@@ -4975,7 +5024,10 @@ impl ContextPlusServer {
                     cache = self.ensure_project_cache().await?;
                     lookup = self.identifier_index_or_build(&cache, true).await?;
                 }
-                Ok(Ok(index)) => break (index, Some(OUTDATED.to_string())),
+                Ok(Ok(index)) => match build.documents_for(&index, &cache).await {
+                    Some(current) => break (current, None),
+                    None => break (index, Some(OUTDATED.to_string())),
+                },
                 waited => {
                     let reason = match waited {
                         Ok(Err(error)) => format!("identifier embedding failed ({error})"),
@@ -8348,6 +8400,40 @@ mod tests {
                 "keywords:\n{by_keyword}\n\nmeaning:\n{by_meaning}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_after_an_edit_parses_the_edited_files_again() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let running = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("audit_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+        let after = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+        assert_eq!(after, running, "the query started a second build");
+        drop(held);
     }
 
     #[tokio::test]
@@ -14763,6 +14849,44 @@ mod tests {
                 .any(|line| line.contains("cold-start phase") && line.contains("parsed_files=1")),
             "the worktree parsed its identical files again:\n{logs}"
         );
+    }
+
+    /// A keyword query of a worktree edited while its build waits on the
+    /// primary's build parses the edited files again.
+    #[tokio::test]
+    async fn a_keyword_identifier_query_of_an_edited_worktree_waiting_on_its_primary_is_current() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            std::fs::write(dir.join("same_a.rs"), "fn same_a() {}\n").unwrap();
+        }
+        std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+        let held = hold_embeds(&server).await;
+        let primary_build = started_identifier_build(&server).await;
+        wait_until_parsed(&primary_build).await;
+        let worktree_build = started_identifier_build(&worktree_server).await;
+        wait_until_parsed(&worktree_build).await;
+        std::fs::write(worktree.path().join("differs.rs"), "fn edited_name() {}\n").unwrap();
+        worktree_server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            worktree_server.dispatch("explore", identifier_args("edited_name", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("edited_name - differs.rs"), "{text}");
+        assert!(worktree_build.running(), "the worktree build ended early");
+        drop(held);
     }
 
     /// Every field of an identifier index's documents, in index order.
