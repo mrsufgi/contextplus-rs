@@ -5499,6 +5499,7 @@ impl ContextPlusServer {
         let ref_index = self.current_ref().await;
         if let Some((entry, prefix)) = walker.current_index(&root).await
             && !prefix.as_os_str().is_empty()
+            && walker.walk_enters(entry.search_root(), &prefix).await
         {
             let result = crate::core::embeddings::interactive(
                 crate::tools::semantic_search::search_entry_under(
@@ -5518,6 +5519,7 @@ impl ContextPlusServer {
         if let Some(generation) = cache_gen
             && let Some((stale, prefix)) = walker.whole_root_index(&root).await
             && !prefix.as_os_str().is_empty()
+            && walker.walk_enters(stale.search_root(), &prefix).await
         {
             let walker: Arc<dyn crate::tools::semantic_search::WalkAndIndexFn> = Arc::new(walker);
             let _rebuild = crate::tools::semantic_search::spawn_stale_rebuild(
@@ -24347,6 +24349,68 @@ mod tests {
                 .await
                 .forkable_at(&primary.canonical_root)
         );
+    }
+
+    /// A subdirectory search under a hidden or gitignored directory, which the
+    /// root's walk skips, finds the files a walk of that directory finds.
+    #[tokio::test]
+    async fn semantic_scoped_search_under_a_directory_the_root_walk_skips() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), 40);
+        lexdelta_git(primary_root.path(), &["init", "-q"]);
+        std::fs::write(primary_root.path().join(".gitignore"), "vendored/\n").unwrap();
+        for (dir, name) in [
+            (".claude/skills", "skillhidden"),
+            ("vendored/lib", "vendorkept"),
+        ] {
+            std::fs::create_dir_all(primary_root.path().join(dir)).unwrap();
+            std::fs::write(
+                primary_root.path().join(dir).join(format!("{name}.rs")),
+                format!("pub fn {name}() -> usize {{ 1 }}\n// shared symbol\n"),
+            )
+            .unwrap();
+        }
+        let mut config = identifier_test_server(&ollama, primary_root.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.embed_tracker_mode = TrackerMode::Lazy;
+        let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
+        semantic_fork_query(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        assert_eq!(
+            semantic_fork_index(&server).await.search_root(),
+            primary.canonical_root
+        );
+
+        let mut results = Vec::new();
+        for (dir, name) in [
+            (".claude/skills", "skillhidden"),
+            ("vendored/lib", "vendorkept"),
+        ] {
+            let mut args = semantic_args("shared symbol");
+            args.insert("scope".into(), json!("code"));
+            args.insert("rootDir".into(), json!(dir));
+            let result = text_of(&server.handle_semantic_code_search(args).await.unwrap());
+            results.push((dir, name, result));
+        }
+        for task in crate::server_adapters::test_seams::take_stale_rebuilds(&primary.canonical_root)
+        {
+            task.await.unwrap();
+        }
+        let tracker = primary.tracker_handle.lock().unwrap().take();
+        if let Some(tracker) = tracker {
+            tracker.stop().await;
+        }
+
+        for (dir, name, result) in results {
+            assert!(
+                result.contains(&format!("1. {name}.rs")),
+                "a search of {dir} missed {name}.rs: {result}"
+            );
+        }
     }
 
     /// Queues on the primary's entry a batch restating one of its documents,

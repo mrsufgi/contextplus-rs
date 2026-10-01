@@ -678,6 +678,18 @@ impl RefWalkerIndexer {
         Some((entry, prefix))
     }
 
+    /// Whether an entry walked from `search_root` holds every file a walk of
+    /// its subdirectory `prefix` finds.
+    pub(crate) async fn walk_enters(&self, search_root: &Path, prefix: &Path) -> bool {
+        let (root, prefix) = (search_root.to_path_buf(), prefix.to_path_buf());
+        let ignore_dirs = self.walker.config.ignore_dirs.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::core::walker::walk_enters(&root, &prefix, &ignore_dirs)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Expires a worktree's semantic entry when its parent holds a forkable
     /// vector store the worktree has not forked or been refused, so a query of
     /// its whole `root` walks and re-forks.
