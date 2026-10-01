@@ -708,6 +708,8 @@ pub struct SharedState {
     pub(crate) fork_base_registering: tokio::sync::watch::Sender<bool>,
     /// The fork base's advance task while it runs.
     fork_base_advance: std::sync::Mutex<Option<(tokio::task::AbortHandle, ForkBaseAdvance)>>,
+    /// How many of the fork base's advance tasks have exited.
+    fork_base_advance_exits: tokio::sync::watch::Sender<u64>,
     /// Whether the running advance task checks its ref once more before it
     /// exits, or exits: one of the `ADVANCE_` states.
     fork_base_advance_state: std::sync::atomic::AtomicU8,
@@ -822,7 +824,7 @@ impl SharedState {
     /// The parent of a ref registered at `canonical_root`: none for the primary
     /// and the fork base, else whichever of the fork base and the primary its
     /// HEAD differs from in fewer files, the primary on a tie or whenever the
-    /// fork base cannot serve.
+    /// fork base cannot serve once it settles or the wait for it ends.
     pub(crate) async fn choose_parent(
         self: &Arc<Self>,
         canonical_root: &std::path::Path,
@@ -849,6 +851,9 @@ impl SharedState {
         let Some(base) = self.ref_index(base_id).await else {
             return refused("base_not_ready");
         };
+        #[cfg(test)]
+        crate::server_adapters::test_seams::before_fork_base_settles(canonical_root).await;
+        let _ = tokio::time::timeout_at(deadline, self.fork_base_settled(&base)).await;
         let entry = base.search_index_cache.read().await.clone();
         let indexed = self.fork_base_indexed_head.lock().unwrap().clone();
         let Some(indexed) = indexed else {
@@ -888,6 +893,42 @@ impl SharedState {
             Ok(Ok(Err(reason))) => refused(reason),
             Ok(Err(_)) => refused("git_failed"),
             Err(_) => refused("timeout"),
+        }
+    }
+
+    /// Waits for the fork base's advance task to exit and for its fill, the
+    /// rebuild of its index or the batches queued on it to end, each of which
+    /// checks the fork base once more as it ends.
+    async fn fork_base_settled(&self, base: &crate::ref_index::RefIndex) {
+        loop {
+            let mut exits = self.fork_base_advance_exits.subscribe();
+            // Before the advance: a fill that ends has already checked the fork base.
+            let filling = crate::server_adapters::fill_running(base).await;
+            let advance = self
+                .fork_base_advance
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(task, _)| !task.is_finished())
+                .map(|(_, advance)| advance.clone());
+            if let Some(advance) = advance {
+                advance.await;
+                continue;
+            }
+            let entry = base.search_index_cache.read().await.clone();
+            let busy = filling
+                || match entry {
+                    Some(entry) => {
+                        matches!(
+                            entry.unforkable_clause(&base.canonical_root),
+                            Some("batches_queued" | "rebuild_in_progress")
+                        ) || !crate::server_adapters::vectors_filled(base, &entry).await
+                    }
+                    None => false,
+                };
+            if !busy || exits.changed().await.is_err() {
+                return;
+            }
         }
     }
 
@@ -1783,8 +1824,9 @@ const ADVANCE_RETRIGGERED: u8 = 1;
 /// The advance task exits, so the next trigger starts another.
 const ADVANCE_EXITING: u8 = 2;
 
-/// How long choosing a worktree's parent may run git on the registration path.
-/// Tests share loaded runners, so there it waits for git however long it takes.
+/// How long choosing a worktree's parent may wait for the fork base to settle
+/// and run git on the registration path. Tests share loaded runners, so there
+/// it waits however long it takes.
 #[cfg(not(test))]
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
@@ -2276,7 +2318,12 @@ impl ContextPlusServer {
             .fork_base_advance_state
             .store(ADVANCE_RUNNING, Ordering::Release);
         let base = self.with_session(base_id);
-        let task = tokio::spawn(async move { base.advance_fork_base_now().await });
+        let task = tokio::spawn(async move {
+            base.advance_fork_base_now().await;
+            base.state
+                .fork_base_advance_exits
+                .send_modify(|exits| *exits += 1);
+        });
         let abort = task.abort_handle();
         let advance = async move {
             let _ = task.await;
@@ -2723,6 +2770,7 @@ impl ContextPlusServer {
             fork_base_ref_id: std::sync::OnceLock::new(),
             fork_base_indexed_head: std::sync::Mutex::new(None),
             fork_base_advance: std::sync::Mutex::new(None),
+            fork_base_advance_exits: tokio::sync::watch::channel(0).0,
             fork_base_advance_state: std::sync::atomic::AtomicU8::new(ADVANCE_RUNNING),
             fork_base_advanced_at: std::sync::Mutex::new(None),
             fork_base_registering: tokio::sync::watch::channel(false).0,
@@ -8938,7 +8986,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// A fork base whose fill outlasts the wait for it serves no worktree.
+    #[tokio::test(start_paused = true)]
     async fn choose_parent_takes_the_primary_while_the_fork_base_fills() {
         use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument};
 
@@ -9136,13 +9185,69 @@ mod tests {
         );
     }
 
+    /// The parent chosen for the worktree at `root` while the fork base is
+    /// held busy until `release`, which runs once the choice waits for the
+    /// fork base, or once it was made without waiting.
+    async fn choose_parent_released(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+        release: impl FnOnce(),
+    ) -> Option<crate::ref_index::RefId> {
+        let settles = crate::server_adapters::test_seams::pause_before_fork_base_settles(root);
+        let mut choice = {
+            let (state, root) = (Arc::clone(&server.state), root.to_path_buf());
+            tokio::spawn(async move { state.choose_parent(&root).await })
+        };
+        let early = tokio::select! {
+            parent = &mut choice => Some(parent.unwrap()),
+            () = settles.wait_until_entered() => None,
+        };
+        settles.resume();
+        release();
+        match early {
+            Some(parent) => parent,
+            None => choice.await.unwrap(),
+        }
+    }
+
     /// A worktree registered while the fork base moves to the commit it was
-    /// cut from is parented on the fork base, at the commit its index holds.
+    /// cut from waits for the advance and is parented on the fork base at
+    /// that commit, nearer to it than to the primary only once there.
     #[tokio::test]
     async fn choose_parent_takes_the_fork_base_while_it_advances() {
         let (_ollama, primary, _bases, server) = fork_base_server(0).await;
         server.advance_fork_base().expect("an advance").await;
         let advanced = fork_base_move_origin(primary.path(), "advanced");
+        let holder = tempfile::tempdir().unwrap();
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &advanced);
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+
+        let pause = crate::server_adapters::test_seams::pause_after_fork_base_checkout(
+            &base.canonical_root,
+        );
+        let advance = server.advance_fork_base().expect("an advance");
+        pause.wait_until_entered().await;
+        let parent = choose_parent_released(&server, &cut, || pause.resume()).await;
+        advance.await;
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
+
+        assert_eq!(
+            parent,
+            Some(base_id),
+            "a worktree registered during an advance was parented on the primary"
+        );
+    }
+
+    /// A worktree registered while the fork base's index rebuilds waits for
+    /// the rebuild and is parented on the fork base.
+    #[tokio::test]
+    async fn choose_parent_takes_the_fork_base_once_its_rebuild_ends() {
+        use crate::server_adapters::test_seams;
+
+        let (_ollama, primary, _bases, server) = fork_base_server(0).await;
+        test_seams::settle_fork_base(&server.state).await;
+        let origin = choose_parent_rev(primary.path(), "origin/main");
         for i in 10..20 {
             std::fs::write(
                 primary
@@ -9154,23 +9259,25 @@ mod tests {
         }
         lexdelta_git(primary.path(), &["commit", "-qam", "primary"]);
         let holder = tempfile::tempdir().unwrap();
-        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &advanced);
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &origin);
         let base_id = *server.state.fork_base_ref_id.get().unwrap();
         let base = server.state.ref_index(base_id).await.unwrap();
+        base.cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let install = test_seams::pause_before_stale_install(&base.canonical_root);
+        let rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &base)
+            .await
+            .expect("a rebuild");
+        install.wait_until_entered().await;
 
-        let pause = crate::server_adapters::test_seams::pause_after_fork_base_checkout(
-            &base.canonical_root,
-        );
-        let advance = server.advance_fork_base().expect("an advance");
-        pause.wait_until_entered().await;
-        let parent = server.state.choose_parent(&cut).await;
-        pause.resume();
-        advance.await;
+        let parent = choose_parent_released(&server, &cut, || install.resume()).await;
+        rebuild.await.unwrap();
+        test_seams::settle_fork_base(&server.state).await;
 
         assert_eq!(
             parent,
             Some(base_id),
-            "a worktree registered during an advance was parented on the primary"
+            "a worktree registered during a rebuild of the fork base was parented on the primary"
         );
     }
 
@@ -9243,6 +9350,67 @@ mod tests {
             server.state.choose_parent(&cut).await,
             Some(*server.state.fork_base_ref_id.get().unwrap()),
             "a worktree was parented on the primary after the fork base filled"
+        );
+    }
+
+    /// A worktree registered while the fork base's first vectors fill waits
+    /// for them and is parented on the fork base.
+    #[tokio::test]
+    async fn choose_parent_takes_the_fork_base_once_the_fill_it_waits_for_drains() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        lexdelta_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let origin = choose_parent_rev(primary.path(), "origin/main");
+        let bases = tempfile::tempdir().unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.fork_base = Some("origin/main".into());
+        config.fork_base_dir = Some(bases.path().to_path_buf());
+        config.fork_base_min_advance_secs = 0;
+        config.embed_budget_ms = 0;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
+        let root = primary.path().to_path_buf();
+        let base = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a fork base checkout");
+        let base_root = base.dir.canonicalize().unwrap();
+        let fill = crate::server_adapters::test_seams::pause_fill_start(&base_root);
+        crate::transport::daemon::register_fork_base(&server, base).await;
+        fill.wait_until_entered().await;
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        for i in 10..20 {
+            std::fs::write(
+                primary
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn primary_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary.path(), &["commit", "-qam", "primary"]);
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &origin);
+
+        let parent = choose_parent_released(&server, &cut, || fill.resume()).await;
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
+
+        assert_eq!(
+            parent,
+            server.state.fork_base_ref_id.get().copied(),
+            "a worktree registered while the fork base filled was parented on the primary"
         );
     }
 
@@ -20595,7 +20763,7 @@ mod tests {
     /// Waits for `ref_index`'s background fill to persist and stop.
     async fn fill_settled(ref_index: &Arc<crate::ref_index::RefIndex>) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while crate::server_adapters::test_seams::fill_running(ref_index).await {
+            while crate::server_adapters::fill_running(ref_index).await {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -21774,7 +21942,7 @@ mod tests {
                 .await
                 .contains_key("target.rs");
             let ref_index = server.current_ref().await;
-            let fill_finished = !crate::server_adapters::test_seams::fill_running(&ref_index).await;
+            let fill_finished = !crate::server_adapters::fill_running(&ref_index).await;
             if vector_ready && fill_finished {
                 break;
             }
@@ -21871,7 +22039,7 @@ mod tests {
         ollama.release_fill.add_permits(1);
         let ref_index = server.current_ref().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while crate::server_adapters::test_seams::fill_running(&ref_index).await {
+            while crate::server_adapters::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
             }
             assert_eq!(
@@ -21913,7 +22081,7 @@ mod tests {
         ollama.release_fill.add_permits(1);
         let ref_index = server.current_ref().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while crate::server_adapters::test_seams::fill_running(&ref_index).await {
+            while crate::server_adapters::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
             }
             assert_eq!(
@@ -26607,7 +26775,7 @@ mod tests {
     }
 
     async fn bench_fill_done(ref_index: &crate::ref_index::RefIndex) {
-        while crate::server_adapters::test_seams::fill_running(ref_index).await {
+        while crate::server_adapters::fill_running(ref_index).await {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }

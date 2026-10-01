@@ -251,6 +251,30 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn fork_base_settle_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses choosing the parent of the worktree at `root` before it waits
+    /// for the fork base to settle.
+    pub(crate) fn pause_before_fork_base_settles(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fork_base_settle_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_fork_base_settles(root: &Path) {
+        let pause = fork_base_settle_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn fork_base_resolve_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -567,10 +591,6 @@ pub(crate) mod test_seams {
             .pending
             .get(path)
             .map(|document| document.hash.clone())
-    }
-
-    pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
-        ref_index.semantic_fill.lock().await.running
     }
 
     pub(crate) struct BlockingPause {
@@ -3158,6 +3178,11 @@ fn parent_lag(parent: &crate::ref_index::RefIndex, base: &CachedSearchIndex) -> 
     )
 }
 
+/// Whether the background fill of `ref_index` runs.
+pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
+    ref_index.semantic_fill.lock().await.running
+}
+
 /// Whether `entry`, the index of `ref_index`, holds the vectors its fill
 /// still owes: nothing queued to fill, or a vector for every document.
 pub(crate) async fn vectors_filled(
@@ -3484,11 +3509,11 @@ async fn run_fill(
             persist_fill(&state, &ref_index, &config, parent_vectors.as_deref()).await;
             let mut fill = ref_index.semantic_fill.lock().await;
             if fill.pending.is_empty() {
-                fill.running = false;
-                drop(fill);
+                // Before the fill reads as ended, so a wait for the fork base sees the check.
                 if state.is_fork_base(&ref_index) {
                     state.recheck_fork_base();
                 }
+                fill.running = false;
                 return;
             }
             continue;
