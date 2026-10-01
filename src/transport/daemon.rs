@@ -898,6 +898,8 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
     );
 
     prepare_ref(&server, ref_id, &ref_arc).await;
+    // A worktree cut from a fresh ref finds the fork base already moving to it.
+    let _advance = server.advance_fork_base();
 
     // ── Step 3: send session_ready ───────────────────────────────────────────
     let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
@@ -1366,6 +1368,63 @@ mod tests {
             .await
             .expect("registered");
         assert_eq!(registered.parent_ref_id, None);
+        drop(bridge_stream);
+        connection.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_checks_the_fork_base_ref() {
+        let (primary, _bases, server) = fork_base_daemon();
+        if let Some(task) = start_fork_base(&server).await {
+            task.await.unwrap();
+        }
+        server.advance_fork_base().expect("an advance").await;
+        std::fs::write(primary.path().join("lib.rs"), "pub fn moved() {}\n").unwrap();
+        fork_base_git(primary.path(), &["commit", "-qam", "moved"]);
+        let moved = fork_base_git(primary.path(), &["rev-parse", "HEAD"]);
+        fork_base_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", &moved],
+        );
+        let worktree = tempfile::tempdir().unwrap();
+
+        let inspection = server.clone();
+        let (mut bridge_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let connection = tokio::spawn(serve_connection(server, daemon_stream));
+        write_frame(
+            &mut bridge_stream,
+            &RegisterSession {
+                client_root: worktree.path().to_path_buf(),
+                head_sha: "worktree-head".into(),
+                client_pid: 42,
+                search_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: SessionReady =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut bridge_stream))
+                .await
+                .expect("daemon did not register the session")
+                .unwrap();
+        assert!(matches!(ready, SessionReady::Ready { .. }));
+        inspection
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        let base = inspection
+            .state
+            .fork_base
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|base| base.head.clone());
+        assert_eq!(
+            base,
+            Some(moved),
+            "registering a session did not advance the fork base"
+        );
         drop(bridge_stream);
         connection.abort();
     }

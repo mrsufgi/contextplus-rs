@@ -734,6 +734,16 @@ impl SharedState {
         self.refs.read().await.get(&id).cloned()
     }
 
+    /// The fork base's advance task last started, running or finished.
+    #[cfg(test)]
+    pub(crate) fn fork_base_advance_task(&self) -> Option<ForkBaseAdvance> {
+        self.fork_base_advance
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, advance)| advance.clone())
+    }
+
     /// Whether the daemon owns `ref_id` for its lifetime and never evicts or
     /// detaches it: the primary or the fork base.
     pub(crate) fn pinned(&self, ref_id: crate::ref_index::RefId) -> bool {
@@ -5827,6 +5837,7 @@ impl ContextPlusServer {
 
         // Per-ref warmup (idempotent). Off / Shallow / Full per RefWarmupMode.
         self.spawn_ref_warmup(ref_id);
+        let _advance = self.advance_fork_base();
 
         // U11: Eager mode mirrors the daemon's startup behaviour for the
         // default ref — attached worktrees should also pick up live edits
@@ -8880,6 +8891,26 @@ mod tests {
             fork_base_state(&server, "advanced").await,
             (advanced.clone(), Some(advanced), true),
             "a second move inside the interval advanced the fork base"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_worktree_checks_the_fork_base_ref() {
+        let (_ollama, primary, _bases, server) = fork_base_server(0).await;
+        server.advance_fork_base().expect("an advance").await;
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        let worktree = tempfile::tempdir().unwrap();
+
+        attached_worktree(&server, worktree.path()).await;
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true),
+            "attaching a worktree did not advance the fork base"
         );
     }
 
