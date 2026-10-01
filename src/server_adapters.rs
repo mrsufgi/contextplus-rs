@@ -348,6 +348,34 @@ pub(crate) mod test_seams {
             .unwrap_or_default()
     }
 
+    fn remote_ref_advance_slots()
+    -> &'static Mutex<BTreeMap<PathBuf, Vec<crate::server::ForkBaseAdvance>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<crate::server::ForkBaseAdvance>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the advance a move of a remote-tracking ref started for the fork
+    /// base at `root`.
+    pub(crate) fn remote_ref_advanced(root: &Path, advance: crate::server::ForkBaseAdvance) {
+        remote_ref_advance_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(advance);
+    }
+
+    /// The advances moves of remote-tracking refs started for the fork base
+    /// at `root`.
+    pub(crate) fn take_remote_ref_advances(root: &Path) -> Vec<crate::server::ForkBaseAdvance> {
+        remote_ref_advance_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     /// Waits out the fork base's fills, the parent rebuilds they started and
     /// the advances they triggered, until none is left running.
     pub(crate) async fn settle_fork_base(state: &crate::server::SharedState) {

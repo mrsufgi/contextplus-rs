@@ -2918,8 +2918,14 @@ impl ContextPlusServer {
             ));
         let on_remote_ref = fork_base.then(|| {
             let server = self.clone();
+            #[cfg(test)]
+            let root = ref_index.canonical_root.clone();
             Arc::new(move || {
                 let _advance = server.advance_fork_base();
+                #[cfg(test)]
+                if let Some(advance) = _advance {
+                    crate::server_adapters::test_seams::remote_ref_advanced(&root, advance);
+                }
             }) as crate::core::embedding_tracker::RemoteRefCallback
         });
         match crate::core::embedding_tracker::start_tracker_with_remote_refs(
@@ -9432,17 +9438,24 @@ mod tests {
 
     #[tokio::test]
     async fn fork_base_tracker_advances_on_a_moved_remote_ref() {
+        use crate::server_adapters::test_seams;
+
         let (_ollama, primary, _bases, server) =
             fork_base_server_tracked(0, TrackerMode::Lazy).await;
-        let first = server.state.fork_base_advance_task().expect("an advance");
-        first.clone().await;
+        test_seams::settle_fork_base(&server.state).await;
+        let base_root = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap()
+            .canonical_root
+            .clone();
+        test_seams::take_remote_ref_advances(&base_root);
 
         let advanced = fork_base_move_origin(primary.path(), "advanced");
         let next = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                if let Some(next) = server.state.fork_base_advance_task()
-                    && !next.ptr_eq(&first)
-                {
+                if let Some(next) = test_seams::take_remote_ref_advances(&base_root).pop() {
                     return Some(next);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
