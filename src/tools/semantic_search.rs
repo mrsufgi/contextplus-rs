@@ -1497,6 +1497,11 @@ impl CachedSearchIndex {
         self.index.dims != 0
     }
 
+    /// Whether every document of this entry holds a vector.
+    pub(crate) fn has_every_vector(&self) -> bool {
+        self.index.has_vector.iter().all(|ready| *ready)
+    }
+
     pub(crate) fn refresh_vectors(
         entry: &mut Arc<Self>,
         root: &Path,

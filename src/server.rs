@@ -671,7 +671,8 @@ pub struct SharedState {
     budget_emergency: std::sync::atomic::AtomicBool,
     /// The `RefId` of the fork base checkout, once registered.
     pub fork_base_ref_id: std::sync::OnceLock<crate::ref_index::RefId>,
-    /// The commit the fork base's installed index was built at.
+    /// The commit the fork base's installed index, its vectors filled, was
+    /// built at.
     pub(crate) fork_base_indexed_head: std::sync::Mutex<Option<String>>,
     /// The fork base's advance task while it runs.
     fork_base_advance: std::sync::Mutex<Option<(tokio::task::AbortHandle, ForkBaseAdvance)>>,
@@ -802,16 +803,19 @@ impl SharedState {
         {
             return refused("base_advancing");
         }
-        let forkable = base
+        let entry = base
             .search_index_cache
             .read()
             .await
-            .as_ref()
-            .is_some_and(|entry| entry.forkable_at(&base.canonical_root));
+            .clone()
+            .filter(|entry| entry.forkable_at(&base.canonical_root));
         let indexed = self.fork_base_indexed_head.lock().unwrap().clone();
-        let Some(indexed) = indexed.filter(|_| forkable) else {
+        let (Some(entry), Some(indexed)) = (entry, indexed) else {
             return refused("base_cold");
         };
+        if !crate::server_adapters::vectors_filled(&base, &entry).await {
+            return refused("base_filling");
+        }
         let (root, primary_root) = (canonical_root.to_path_buf(), self.canonical_root.clone());
         let nearer = tokio::time::timeout(
             CHOOSE_PARENT_TIMEOUT,
@@ -2303,15 +2307,16 @@ impl ContextPlusServer {
                 let _ = task.await;
             }
             let head = if moved { target } else { head };
-            let indexed = owner
-                .search_index_cache
-                .read()
-                .await
-                .as_ref()
-                .is_some_and(|entry| {
-                    entry.forkable_at(&owner.canonical_root)
-                        && !entry.is_behind(owner.cache_generation.load(Ordering::Acquire))
-                });
+            let entry = owner.search_index_cache.read().await.clone();
+            let indexed = match entry {
+                Some(entry)
+                    if entry.forkable_at(&owner.canonical_root)
+                        && !entry.is_behind(owner.cache_generation.load(Ordering::Acquire)) =>
+                {
+                    crate::server_adapters::vectors_filled(&owner, &entry).await
+                }
+                _ => false,
+            };
             if indexed {
                 *state.fork_base_indexed_head.lock().unwrap() = Some(head.clone());
             }
@@ -8804,6 +8809,41 @@ mod tests {
         assert_eq!(
             cold.state.choose_parent(&cut).await,
             Some(cold.state.default_ref_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn choose_parent_takes_the_primary_while_the_fork_base_fills() {
+        use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument};
+
+        let (primary, holder, _a, b) = choose_parent_repository();
+        let server = choose_parent_server(primary.path());
+        let base_id = choose_parent_base(&server, holder.path(), &b, false).await;
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
+        let base = server.state.ref_index(base_id).await.unwrap();
+        let docs = (0..SEMANTIC_FORK_FILES)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("f{i}.rs"),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    "x".into(),
+                )
+            })
+            .collect();
+        let vectors = (0..SEMANTIC_FORK_FILES)
+            .map(|i| (i >= 50).then(|| vec![1.0, 0.0, 0.0]))
+            .collect();
+        let filling = CachedSearchIndex::build(&base.canonical_root, docs, vectors, 0, 0, None);
+        *base.search_index_cache.write().await = Some(Arc::new(filling));
+        crate::server_adapters::test_seams::seed_pending(&base, "f0.rs", "f0".into(), "x".into())
+            .await;
+
+        assert_eq!(
+            server.state.choose_parent(&cut).await,
+            Some(server.state.default_ref_id),
+            "a worktree was parented on a fork base whose vectors are still filling"
         );
     }
 

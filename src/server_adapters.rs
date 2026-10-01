@@ -2886,6 +2886,15 @@ fn parent_lag(parent: &crate::ref_index::RefIndex, base: &CachedSearchIndex) -> 
     )
 }
 
+/// Whether `entry`, the index of `ref_index`, holds the vectors its fill
+/// still owes: nothing queued to fill, or a vector for every document.
+pub(crate) async fn vectors_filled(
+    ref_index: &crate::ref_index::RefIndex,
+    entry: &CachedSearchIndex,
+) -> bool {
+    entry.has_every_vector() || ref_index.semantic_fill.lock().await.pending.is_empty()
+}
+
 /// The parent's semantic index when a worktree can fork it.
 async fn forkable_base(parent: &crate::ref_index::RefIndex) -> Option<Arc<CachedSearchIndex>> {
     let base = parent.search_index_cache.read().await.clone();
