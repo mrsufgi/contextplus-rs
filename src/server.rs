@@ -15312,15 +15312,38 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn budget_eviction_logs_each_evicted_ref_and_the_pass() {
+    fn log_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
+    }
+
+    async fn over_budget_eviction_server(
+        name: &str,
+    ) -> (
+        ContextPlusServer,
+        crate::ref_index::RefId,
+        tempfile::TempDir,
+    ) {
         let mut config = Config::from_env();
         config.resident_memory_budget_bytes = 1024 * 1024;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
-        let (id, _) = attach_budget_worktree(&server, "eviction-logged").await;
-        mark_ref_idle(&server.state, id);
+        let (id, worktree) = attach_budget_worktree(&server, name).await;
+        worktree.embedding_cache.write().await.insert(
+            format!("{name}.rs"),
+            crate::core::embeddings::CacheEntry {
+                hash: format!("{name}-hash"),
+                vector: vec![0.5; 256 * 1024],
+            },
+        );
         *server.state.measured_resident_override.lock().unwrap() = Some(2 * 1024 * 1024);
+        (server, id, root)
+    }
+
+    #[tokio::test]
+    async fn budget_eviction_logs_each_evicted_ref_and_the_pass() {
+        let (server, id, _root) = over_budget_eviction_server("eviction-logged").await;
+        mark_ref_idle(&server.state, id);
         let (logs, _capture) = crate::test_logs::captured_info_logs();
 
         server.state.enforce_memory_budget().await;
@@ -15331,9 +15354,22 @@ mod tests {
             .filter(|line| line.contains("ref caches evicted for memory budget"))
             .collect();
         assert_eq!(evictions.len(), 1, "{logs}");
+        let ref_id = id.0.to_string();
+        assert_eq!(
+            log_field(evictions[0], "ref_id"),
+            Some(&ref_id[..]),
+            "{logs}"
+        );
+        assert_eq!(
+            log_field(evictions[0], "unique_estimated_mib"),
+            Some("1"),
+            "{logs}"
+        );
+        let idle_secs: i64 = log_field(evictions[0], "idle_secs")
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or(-1);
         assert!(
-            evictions[0].contains(&format!("ref_id={}", id.0))
-                && evictions[0].contains("unique_estimated_mib="),
+            idle_secs >= MEMORY_BUDGET_MIN_IDLE.as_secs() as i64,
             "{logs}"
         );
         let passes: Vec<_> = logs
@@ -15341,7 +15377,42 @@ mod tests {
             .filter(|line| line.contains("memory budget pass evicted worktrees"))
             .collect();
         assert_eq!(passes.len(), 1, "{logs}");
-        assert!(passes[0].contains("evicted=1"), "{logs}");
+        assert_eq!(log_field(passes[0], "evicted"), Some("1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn budget_eviction_logs_a_ref_never_accessed_as_idle_minus_one() {
+        let (server, id, _root) = over_budget_eviction_server("never-accessed").await;
+        server.state.ref_access.lock().unwrap().remove(&id);
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+        server.state.enforce_memory_budget().await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let eviction = logs
+            .lines()
+            .find(|line| line.contains("ref caches evicted for memory budget"))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert_eq!(log_field(eviction, "idle_secs"), Some("-1"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn budget_pass_that_evicts_nothing_logs_no_summary() {
+        let (server, _, _root) = over_budget_eviction_server("recently-used").await;
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+
+        server.state.enforce_memory_budget().await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert!(
+            logs.contains("Resident memory is over CONTEXTPLUS_MEMORY_BUDGET_MB"),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains("ref caches evicted for memory budget")
+                && !logs.contains("memory budget pass evicted worktrees"),
+            "{logs}"
+        );
     }
 
     #[cfg(target_os = "linux")]
