@@ -5139,6 +5139,17 @@ impl ContextPlusServer {
         // fingerprint-based fallback is used instead.
         walker.expire_stale_fork(&root).await;
         let ref_index = self.current_ref().await;
+        if let Some((entry, prefix)) = walker.current_index(&root).await
+            && !prefix.as_os_str().is_empty()
+        {
+            let result = crate::core::embeddings::interactive(
+                crate::tools::semantic_search::search_entry_under(
+                    entry, prefix, options, &embedder,
+                ),
+            )
+            .await?;
+            return Ok(Self::ok_text(result));
+        }
         let cache_gen = if self.state.config.embed_tracker_mode != crate::config::TrackerMode::Off {
             Some(&ref_index.cache_generation)
         } else {
@@ -22987,6 +22998,126 @@ mod tests {
                 "no {phase} line names the worktree:\n{logs}"
             );
         }
+    }
+
+    /// A git primary with its whole-root index, moved by a commit that edits
+    /// `edits` files and deletes `deletions` through the tracker with no
+    /// primary query after it, then a worktree at the moved HEAD forked by
+    /// its first query; after a subdirectory search first when `scoped`. The
+    /// worktree's fork and refusal lines.
+    async fn semantic_fork_after_a_primary_move(
+        scoped: bool,
+        edits: usize,
+        deletions: usize,
+    ) -> Vec<String> {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _holder, worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        server.ensure_project_cache().await.unwrap();
+        semantic_fork_query(&server).await;
+        if scoped {
+            let mut args = semantic_args("shared symbol");
+            args.insert("scope".into(), json!("code"));
+            args.insert("rootDir".into(), json!("src/area_1"));
+            server.handle_semantic_code_search(args).await.unwrap();
+        }
+
+        lexdelta_git(primary.path(), &["checkout", "-q", "-b", "pulled"]);
+        let mut moved = Vec::new();
+        for i in 0..edits + deletions {
+            let file = i * 4 + i % 4;
+            let path = format!("src/area_{}/file_{file}.rs", file % 4);
+            if i < edits {
+                std::fs::write(
+                    primary.path().join(&path),
+                    format!("pub fn pulled_{i}() -> usize {{ {i} }}\n// shared symbol pulled\n"),
+                )
+                .unwrap();
+            } else {
+                std::fs::remove_file(primary.path().join(&path)).unwrap();
+            }
+            moved.push(path);
+        }
+        lexdelta_git(primary.path(), &["add", "-A"]);
+        lexdelta_git(primary.path(), &["commit", "-qm", "pulled"]);
+        server.build_tracker_callback().await(primary.path().to_path_buf(), moved)
+            .await
+            .unwrap();
+        lexdelta_add_worktree(primary.path(), &worktree, "pulled");
+
+        let session = attached_worktree(&server, &worktree).await;
+        let owner = session.current_ref().await;
+        let ref_id = format!("ref_id={} ", owner.cas_ref_id_hex);
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        semantic_fork_query(&session).await;
+        drop(capture);
+        crate::test_logs::logs_as_string(&logs)
+            .lines()
+            .filter(|line| {
+                line.contains(&ref_id)
+                    && (line.contains("phase=\"semantic_fork\"")
+                        || line.contains("phase=\"semantic_fork_refused\""))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn semantic_fork_assert_no_delta(lines: &[String]) {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("phase=\"semantic_fork\"")
+                    && line.contains("installed=true")
+                    && line.contains("changed=0 deleted=0")),
+            "the worktree at the primary's HEAD did not fork it with no delta: {lines:#?}"
+        );
+    }
+
+    /// A subdirectory search on a ref with a whole-root entry answers from it
+    /// while it is current, and from an index of its own it does not install
+    /// while it is stale.
+    #[tokio::test]
+    async fn semantic_scoped_search_keeps_the_whole_root_entry() {
+        let (_ollama, primary_root, _worktree, server, _session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        let whole = semantic_fork_index(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let scoped_query = || {
+            let mut args = semantic_args("shared symbol");
+            args.insert("scope".into(), json!("code"));
+            args.insert("rootDir".into(), json!("src/area_1"));
+            server.handle_semantic_code_search(args)
+        };
+
+        let current = text_of(&scoped_query().await.unwrap());
+        std::fs::write(
+            primary_root.path().join("src/area_1/file_5.rs"),
+            "pub fn scopedstale() -> usize { 5 }\n// shared symbol\n",
+        )
+        .unwrap();
+        let stale = text_of(&scoped_query().await.unwrap());
+        for result in [&current, &stale] {
+            assert!(
+                result.contains("1. file_") && !result.contains(". src/"),
+                "{result}"
+            );
+        }
+        assert!(
+            Arc::ptr_eq(&whole, &semantic_fork_index(&server).await),
+            "a subdirectory search replaced the whole-root entry"
+        );
+        assert!(whole.forkable_at(&primary.canonical_root));
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_after_a_small_primary_move_has_no_delta() {
+        semantic_fork_assert_no_delta(&semantic_fork_after_a_primary_move(false, 150, 50).await);
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_after_a_scoped_search_and_a_primary_move_has_no_delta() {
+        semantic_fork_assert_no_delta(&semantic_fork_after_a_primary_move(true, 150, 50).await);
     }
 
     /// Replaces the primary's vector store with a fresh build, as after an eviction.

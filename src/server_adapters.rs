@@ -617,6 +617,10 @@ impl WalkAndIndexFn for RefWalkerIndexer {
     fn ref_id(&self) -> &str {
         &self.ref_index.cas_ref_id_hex
     }
+
+    fn ref_root(&self) -> Option<&Path> {
+        Some(&self.ref_index.canonical_root)
+    }
 }
 
 impl CachedWalkerIndexer {

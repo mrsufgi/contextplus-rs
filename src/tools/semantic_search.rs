@@ -2656,6 +2656,60 @@ pub(crate) async fn semantic_code_search_owned(
     .await
 }
 
+/// Answers `options`, whose root is at `prefix` in `entry`'s root, from
+/// `entry`'s documents under it, as an index of the root would.
+pub(crate) async fn search_entry_under(
+    entry: Arc<CachedSearchIndex>,
+    prefix: PathBuf,
+    options: SemanticSearchOptions,
+    embed_fn: &dyn EmbedFn,
+) -> Result<String> {
+    let query = sanitize_query(&options.query).into_owned();
+    if query.is_empty() {
+        return Ok("No matching files found for the given query.".to_string());
+    }
+    let query_vec = embed_fn
+        .embed(std::slice::from_ref(&query))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
+    let keep = result_path_filter(&options, prefix.clone());
+    let mut resolved = resolve_search_options(&options);
+    resolved.include_globs.clear();
+    resolved.exclude_globs.clear();
+    resolved.root_dir = entry.search_root.clone();
+    let documents = entry
+        .index
+        .documents()
+        .iter()
+        .filter(|doc| Path::new(&doc.path).starts_with(&prefix))
+        .count();
+    let root_dir = options.root_dir.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        let mut results = entry
+            .index
+            .search_where(&query, &query_vec, &resolved, Some(&keep));
+        for result in &mut results {
+            result.path = Path::new(&result.path)
+                .strip_prefix(&prefix)
+                .unwrap_or(Path::new(&result.path))
+                .to_string_lossy()
+                .into_owned();
+        }
+        fill_result_snippets(&root_dir, &mut results);
+        (query, results)
+    })
+    .await
+    .map_err(|err| ContextPlusError::Other(format!("Snippet task failed: {err}")))?;
+    let (query, results) = results;
+    Ok(format_search_results_with_freshness(
+        &query,
+        &results,
+        Some(documents),
+    ))
+}
+
 pub async fn semantic_code_search(
     options: SemanticSearchOptions,
     embed_fn: &dyn EmbedFn,
@@ -3005,7 +3059,15 @@ pub async fn semantic_code_search(
             entry.search_root = search_root;
             *entry.metadata.write().unwrap() = metadata;
             let arc = Arc::new(entry);
-            *guard = Some(Arc::clone(&arc));
+            // A scoped index answers this query but never replaces the
+            // ref's index of its whole root.
+            let ref_root = walk_and_index_fn.ref_root();
+            if !guard.as_ref().is_some_and(|current| {
+                ref_root == Some(current.search_root.as_path())
+                    && current.search_root != arc.search_root
+            }) {
+                *guard = Some(Arc::clone(&arc));
+            }
             arc
         }
     };
@@ -3064,6 +3126,10 @@ pub trait WalkAndIndexFn: Send + Sync {
     /// The ref this walker indexes, for log lines.
     fn ref_id(&self) -> &str {
         ""
+    }
+    /// The canonical root of the ref this walker indexes.
+    fn ref_root(&self) -> Option<&Path> {
+        None
     }
 }
 
