@@ -17837,9 +17837,20 @@ mod tests {
         vectors[idx].clone()
     }
 
+    /// Waits for `ref_index`'s background fill to persist and stop.
+    async fn fill_settled(ref_index: &Arc<crate::ref_index::RefIndex>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ref_index.semantic_fill.lock().await.running() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background fill never stopped");
+    }
+
     /// A primary holding `merged.rs` at [`MERGED_PRIMARY`], and an attached
     /// worktree that has embedded `worktree_path` at `worktree_content`, its
-    /// vector then marked [`WORKTREE_VECTOR`].
+    /// vector marked [`WORKTREE_VECTOR`] once both background fills stopped.
     async fn primary_with_worktree_vector(
         ollama: &wiremock::MockServer,
         worktree_path: &str,
@@ -17868,6 +17879,8 @@ mod tests {
             .unwrap();
         let worktree_ref = worktree_server.current_ref().await;
         cached_vector(&worktree_ref, worktree_path, worktree_content).await;
+        fill_settled(&server.current_ref().await).await;
+        fill_settled(&worktree_ref).await;
         worktree_ref.embedding_cache.write().await.insert(
             worktree_path.to_string(),
             CacheEntry {
