@@ -154,12 +154,18 @@ static NEXT_IDENTIFIER_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[derive(Clone)]
 pub(crate) struct IdentifierBuild {
     id: u64,
+    source: std::sync::Weak<ProjectCache>,
     /// The parsed documents, without vectors, once parsing is done.
     parsed: tokio::sync::watch::Receiver<Option<Arc<IdentifierIndex>>>,
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
 }
 
 impl IdentifierBuild {
+    /// Whether the build indexes the project cache `cache`.
+    fn built_from(&self, cache: &Arc<ProjectCache>) -> bool {
+        std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(cache))
+    }
+
     fn running(&self) -> bool {
         let finished = self.done.borrow().is_some();
         // A build whose task was aborted never finishes; its sender is gone.
@@ -3496,6 +3502,7 @@ impl ContextPlusServer {
         let (parsed, parsed_receiver) = tokio::sync::watch::channel(None);
         let build = IdentifierBuild {
             id: NEXT_IDENTIFIER_BUILD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            source: Arc::downgrade(cache),
             parsed: parsed_receiver,
             done: receiver,
         };
@@ -4760,7 +4767,8 @@ impl ContextPlusServer {
 
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
-        // keyword ranking needs only the parsed documents.
+        // keyword ranking needs only the parsed documents. A build of the
+        // tree before an edit answers only partially.
         let (idx, partial) = match self.identifier_index_or_build(&cache, true).await? {
             IdentifierLookup::Ready(index) => (index, None),
             IdentifierLookup::Building(build) => {
@@ -4771,7 +4779,11 @@ impl ContextPlusServer {
                     tokio::time::timeout(budget, build.clone().finished()).await
                 };
                 match waited {
-                    Ok(Ok(index)) => (index, None),
+                    Ok(Ok(index)) if build.built_from(&cache) => (index, None),
+                    Ok(Ok(index)) => (
+                        index,
+                        Some("identifiers reflect the tree before the latest edits".to_string()),
+                    ),
                     waited => {
                         let reason = match waited {
                             Ok(Err(error)) => format!("identifier embedding failed ({error})"),
@@ -8026,6 +8038,93 @@ mod tests {
             .map(|build| build.id);
         assert_eq!(running, Some(first.id), "the query started a second build");
         drop(held);
+    }
+
+    /// Waits until a request holds `cache` beyond its `holders`, as an
+    /// identifier query does from just before it joins a build.
+    async fn wait_until_held(cache: &Arc<ProjectCache>, holders: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while Arc::strong_count(cache) <= holders {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the query never resolved the project cache");
+    }
+
+    /// An identifier server whose cold build has parsed `src/ledger.rs` and
+    /// holds every embed permit, after an edit that adds `audit_account`.
+    async fn identifier_build_outdated_by_an_edit() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let (repo, ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn close_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        (repo, ollama, server, held)
+    }
+
+    /// Runs `args` as an identifier query that joins the running build, then
+    /// lets that build embed.
+    async fn identifier_query_joining_the_build(
+        server: &ContextPlusServer,
+        held: tokio::sync::OwnedSemaphorePermit,
+        args: serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        let edited = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&edited);
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move { server.dispatch("explore", args).await })
+        };
+        wait_until_held(&edited, holders).await;
+        drop(held);
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+        text_of(&answered)
+    }
+
+    #[tokio::test]
+    async fn an_identifier_answer_from_a_build_an_edit_outdated_is_partial() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+
+        let by_keyword = text_of(
+            &server
+                .dispatch("explore", identifier_args("audit_account", "keywords"))
+                .await,
+        );
+        let by_meaning = identifier_query_joining_the_build(
+            &server,
+            held,
+            identifier_args("audit_account", "meaning"),
+        )
+        .await;
+
+        for text in [&by_keyword, &by_meaning] {
+            assert!(
+                text.contains("audit_account - src/ledger.rs")
+                    || text.starts_with("Partial results"),
+                "keywords:\n{by_keyword}\n\nmeaning:\n{by_meaning}"
+            );
+        }
     }
 
     #[tokio::test]
