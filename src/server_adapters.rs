@@ -1612,6 +1612,7 @@ impl CachedWalkerIndexer {
             ForkRefusal::threshold(changed_count, deleted_count, base.index.document_count());
         let store_of_base = base.index.vector_store().cloned();
         let (lag, whole_root) = parent_lag(parent, &base);
+        let drift = self.fork_base_drift(ref_index, parent).await;
         let fork = tokio::task::spawn_blocking(move || {
             base.fork_delta(
                 &root,
@@ -1652,10 +1653,30 @@ impl CachedWalkerIndexer {
             deleted = deleted_count,
             parent_generation_lag = lag,
             parent_whole_root = whole_root,
+            drift_files = drift,
             elapsed_ms = started.elapsed().as_millis(),
             "cold-start phase"
         );
         installed
+    }
+
+    /// The files a worktree of the fork base differs in from the commit of
+    /// the fork base's index; `None` for a worktree of the primary.
+    async fn fork_base_drift(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+        parent: &crate::ref_index::RefIndex,
+    ) -> Option<usize> {
+        let base = crate::ref_index::RefId::for_canonical_path(&parent.canonical_root);
+        if self.state.fork_base_ref_id.get() != Some(&base) {
+            return None;
+        }
+        let indexed = self.state.fork_base_indexed_head.lock().unwrap().clone()?;
+        let root = ref_index.canonical_root.clone();
+        tokio::task::spawn_blocking(move || crate::git::fork_base::drift_files(&root, &indexed))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Builds the parent's index of its whole root when the parent holds none,
@@ -1669,6 +1690,12 @@ impl CachedWalkerIndexer {
         if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
             return;
         }
+        self.build_whole_root_index(parent).await;
+    }
+
+    /// Builds and installs the index of `parent`'s whole root unless it holds
+    /// one.
+    pub(crate) async fn build_whole_root_index(&self, parent: &Arc<crate::ref_index::RefIndex>) {
         let seen = {
             let current = parent.search_index_cache.read().await;
             if current
@@ -1761,6 +1788,7 @@ impl CachedWalkerIndexer {
         let started = std::time::Instant::now();
         let (generation, vector_generation) = (start.generation, start.vector_generation);
         let (lag, whole_root) = parent_lag(parent, &base);
+        let drift = self.fork_base_drift(ref_index, parent).await;
         let (docs, vectors, fork) = tokio::task::spawn_blocking(move || {
             let fork = base.fork(&root, &docs, &vectors, generation, vector_generation);
             (docs, vectors, fork)
@@ -1786,6 +1814,7 @@ impl CachedWalkerIndexer {
             installed,
             parent_generation_lag = lag,
             parent_whole_root = whole_root,
+            drift_files = drift,
             elapsed_ms = started.elapsed().as_millis(),
             "cold-start phase"
         );
@@ -2763,7 +2792,13 @@ pub(crate) async fn refresh_fork_parent(
     ref_index: &Arc<crate::ref_index::RefIndex>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use std::sync::atomic::Ordering;
-    if ref_index.parent_ref_id.is_some() || state.attached_children(ref_index).await.is_empty() {
+    let fork_base = state.fork_base_ref_id.get()
+        == Some(&crate::ref_index::RefId::for_canonical_path(
+            &ref_index.canonical_root,
+        ));
+    if ref_index.parent_ref_id.is_some()
+        || !fork_base && state.attached_children(ref_index).await.is_empty()
+    {
         return None;
     }
     let entry = ref_index.search_index_cache.read().await.clone()?;

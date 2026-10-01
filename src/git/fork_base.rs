@@ -137,11 +137,38 @@ pub fn nearer_to_base(
     let head = resolve(root, "HEAD").ok_or("no_head")?;
     let primary_head = resolve(primary_root, "HEAD").ok_or("no_head")?;
     let changed = |from: &str| {
-        git(root, &["diff", "--no-renames", "--name-only", from, &head])
-            .map(|names| names.lines().filter(|name| !name.is_empty()).count())
+        changed_paths(root, from, &head)
+            .map(|paths| paths.len())
             .ok_or("git_failed")
     };
     Ok(changed(indexed)? < changed(&primary_head)?)
+}
+
+/// Moves the fork base checkout at `dir` to `sha`, discarding any edits made
+/// in it; `Err` with the reason it could not.
+pub fn checkout(dir: &Path, sha: &str) -> std::result::Result<(), &'static str> {
+    git(dir, &["checkout", "--force", "--detach", "--quiet", sha])
+        .map(drop)
+        .ok_or("checkout_failed")
+}
+
+/// The paths that differ between commits `from` and `to`, renames as a
+/// deletion and an addition.
+pub fn changed_paths(dir: &Path, from: &str, to: &str) -> Option<Vec<String>> {
+    git(dir, &["diff", "--no-renames", "--name-only", from, to]).map(|names| {
+        names
+            .lines()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+/// How many files the worktree at `root` differs in from the fork base's
+/// `indexed` commit.
+pub fn drift_files(root: &Path, indexed: &str) -> Option<usize> {
+    let head = resolve(root, "HEAD")?;
+    changed_paths(root, indexed, &head).map(|paths| paths.len())
 }
 
 /// The commit `reference` names in the repository at `root`.

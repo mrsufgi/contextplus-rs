@@ -1077,7 +1077,10 @@ pub(crate) async fn start_fork_base(
 
 /// Attaches the fork base checkout as a parentless ref with its own CAS
 /// manifest, warmup and tracker; off when its root is already a worktree's.
-async fn register_fork_base(server: &ContextPlusServer, base: crate::git::fork_base::ForkBase) {
+pub(crate) async fn register_fork_base(
+    server: &ContextPlusServer,
+    base: crate::git::fork_base::ForkBase,
+) {
     let canonical = base.dir.canonicalize().unwrap_or_else(|_| base.dir.clone());
     let ref_id = RefId::for_canonical_path(&canonical);
     let ref_arc = server
@@ -1112,6 +1115,8 @@ async fn register_fork_base(server: &ContextPlusServer, base: crate::git::fork_b
     );
     *server.state.fork_base.lock().unwrap() = Some(base);
     let _ = server.state.fork_base_ref_id.set(ref_id);
+    // Indexes the checkout, and moves it first when its ref moved since.
+    let _advance = server.advance_fork_base();
 }
 
 /// Top-level entry called from `main`. Acquire lock → bind → write pid → run.
@@ -1300,6 +1305,7 @@ mod tests {
             .get()
             .expect("a fork base ref");
         let base = server.state.ref_index(base_id).await.expect("registered");
+        server.advance_fork_base().expect("an advance").await;
         assert!(
             base.canonical_root
                 .starts_with(bases.path().canonicalize().unwrap())

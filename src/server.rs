@@ -673,6 +673,12 @@ pub struct SharedState {
     pub fork_base_ref_id: std::sync::OnceLock<crate::ref_index::RefId>,
     /// The commit the fork base's installed index was built at.
     pub(crate) fork_base_indexed_head: std::sync::Mutex<Option<String>>,
+    /// The fork base's advance task while it runs.
+    fork_base_advance: std::sync::Mutex<Option<(tokio::task::AbortHandle, ForkBaseAdvance)>>,
+    /// Set while the fork base checkout moves and its index catches up.
+    pub(crate) fork_base_advancing: std::sync::atomic::AtomicBool,
+    /// When the fork base checkout last moved.
+    fork_base_advanced_at: std::sync::Mutex<Option<Instant>>,
     /// The fork base checkout, whose lock this daemon holds while it serves it.
     pub(crate) fork_base: std::sync::Mutex<Option<crate::git::fork_base::ForkBase>>,
     #[cfg(test)]
@@ -777,6 +783,12 @@ impl SharedState {
         let Some(base) = self.ref_index(base_id).await else {
             return refused("base_not_ready");
         };
+        if self
+            .fork_base_advancing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return refused("base_advancing");
+        }
         let forkable = base
             .search_index_cache
             .read()
@@ -1688,6 +1700,9 @@ async fn prune_identifier_vectors(
     expired
 }
 
+/// The fork base's advance task, which every caller awaits while it runs.
+pub(crate) type ForkBaseAdvance = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
 /// How long choosing a worktree's parent may run git on the registration path.
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2152,6 +2167,134 @@ impl ContextPlusServer {
     /// The `Arc<SharedState>` is shared — only the routing key changes.
     /// Callers should prefer this over mutating `session_ref_id` directly so
     /// the original server (held by the daemon accept loop) remains unchanged.
+    /// Starts the one task that moves the fork base checkout to the commit
+    /// its ref names and indexes it there, unless one runs; that task. `None`
+    /// without a registered fork base.
+    pub(crate) fn advance_fork_base(&self) -> Option<ForkBaseAdvance> {
+        use futures::FutureExt;
+        let base_id = *self.state.fork_base_ref_id.get()?;
+        let mut slot = self.state.fork_base_advance.lock().unwrap();
+        if let Some((task, advance)) = slot.as_ref()
+            && !task.is_finished()
+        {
+            return Some(advance.clone());
+        }
+        let base = self.with_session(base_id);
+        let task = tokio::spawn(async move { base.advance_fork_base_now().await });
+        let abort = task.abort_handle();
+        let advance = async move {
+            let _ = task.await;
+        }
+        .boxed()
+        .shared();
+        *slot = Some((abort, advance.clone()));
+        Some(advance)
+    }
+
+    /// Moves this session's ref, the fork base, to the commit its ref names
+    /// when the minimum interval has passed, until the ref stays put, and
+    /// records the head its index holds once current.
+    async fn advance_fork_base_now(&self) {
+        use std::sync::atomic::Ordering;
+        let state = &self.state;
+        let owner = self.current_ref().await;
+        let failed = |reason: &str| {
+            tracing::warn!(
+                phase = "fork_base_advance",
+                reason,
+                "fork base not advanced"
+            );
+            state.fork_base_advancing.store(false, Ordering::Release);
+        };
+        loop {
+            let base = state
+                .fork_base
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|base| (base.dir.clone(), base.reference.clone(), base.head.clone()));
+            let Some((dir, reference, head)) = base else {
+                return;
+            };
+            let root = state.root_dir.clone();
+            let target = tokio::task::spawn_blocking(move || {
+                crate::git::fork_base::resolve(&root, &reference)
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(target) = target else {
+                return failed("unresolved_ref");
+            };
+            let interval = std::time::Duration::from_secs(state.config.fork_base_min_advance_secs);
+            let due = state
+                .fork_base_advanced_at
+                .lock()
+                .unwrap()
+                .is_none_or(|at| at.elapsed() >= interval);
+            let moved = target != head && due;
+            if moved {
+                state.fork_base_advancing.store(true, Ordering::Release);
+                let (checkout_dir, sha, from) = (dir.clone(), target.clone(), head.clone());
+                let changed = tokio::task::spawn_blocking(move || {
+                    crate::git::fork_base::checkout(&checkout_dir, &sha)?;
+                    Ok(
+                        crate::git::fork_base::changed_paths(&checkout_dir, &from, &sha)
+                            .unwrap_or_default(),
+                    )
+                })
+                .await
+                .unwrap_or(Err("checkout_failed"));
+                let changed = match changed {
+                    Ok(changed) => changed,
+                    Err(reason) => return failed(reason),
+                };
+                if let Some(base) = state.fork_base.lock().unwrap().as_mut() {
+                    base.head = target.clone();
+                }
+                *state.fork_base_advanced_at.lock().unwrap() = Some(Instant::now());
+                let on_disk = changed.iter().map(|path| dir.join(path)).collect();
+                let (_, refresh) = self.refresh_tracked_files(changed, on_disk).await;
+                if let Some(task) = refresh {
+                    let _ = task.await;
+                }
+            }
+            let walker = CachedWalkerIndexer {
+                config: state.config.clone(),
+                ollama: state.ollama.clone(),
+                state: Arc::clone(state),
+            };
+            walker.build_whole_root_index(&owner).await;
+            if let Some(task) = crate::server_adapters::refresh_fork_parent(state, &owner).await {
+                let _ = task.await;
+            }
+            let head = if moved { target } else { head };
+            let indexed = owner
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|entry| {
+                    entry.forkable_at(&owner.canonical_root)
+                        && !entry.is_behind(owner.cache_generation.load(Ordering::Acquire))
+                });
+            if indexed {
+                *state.fork_base_indexed_head.lock().unwrap() = Some(head.clone());
+            }
+            state.fork_base_advancing.store(false, Ordering::Release);
+            tracing::info!(
+                phase = "fork_base_advance",
+                head = %head,
+                moved,
+                indexed,
+                "fork base checked"
+            );
+            if !moved {
+                return;
+            }
+        }
+    }
+
     pub fn with_session(&self, ref_id: crate::ref_index::RefId) -> Self {
         Self {
             state: Arc::clone(&self.state),
@@ -2459,6 +2602,9 @@ impl ContextPlusServer {
             budget_emergency: std::sync::atomic::AtomicBool::new(false),
             fork_base_ref_id: std::sync::OnceLock::new(),
             fork_base_indexed_head: std::sync::Mutex::new(None),
+            fork_base_advance: std::sync::Mutex::new(None),
+            fork_base_advancing: std::sync::atomic::AtomicBool::new(false),
+            fork_base_advanced_at: std::sync::Mutex::new(None),
             fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
@@ -2485,61 +2631,86 @@ impl ContextPlusServer {
             let root = root.clone();
             let changed_files: Vec<PathBuf> = files.iter().map(|f| root.join(f)).collect();
             tokio::spawn(async move {
-                let ref_index = srv.current_ref().await;
-                tracing::debug!(
-                    ref_id = %ref_index.cas_ref_id_hex,
-                    paths = ?files,
-                    "Embedding tracker refresh batch started"
-                );
-                let outcome = srv.incremental_reembed_detailed(&changed_files).await;
-                let updated = outcome.updated;
-                let skipped = outcome.skipped;
-                tracing::debug!(
-                    updated,
-                    skipped,
-                    "Incremental re-embedding for {} changed files",
-                    changed_files.len()
-                );
-                // Watchers can emit batches for metadata/read activity. Only
-                // invalidate when inspecting the source found a content change.
-                if outcome.content_changed {
-                    let new_gen = ref_index
-                        .cache_generation
-                        .fetch_add(1, std::sync::atomic::Ordering::Release)
-                        + 1;
-                    srv.refresh_search_paths(&files, new_gen).await;
-                    tracing::debug!(
-                        generation = new_gen,
-                        updated,
-                        skipped,
-                        paths = ?files,
-                        reason = "tracker batch contained changed content",
-                        "cache_generation bumped after tracker event"
-                    );
-                } else {
-                    tracing::debug!(
-                        generation = ref_index
-                            .cache_generation
-                            .load(std::sync::atomic::Ordering::Acquire),
-                        skipped,
-                        paths = ?files,
-                        reason = "all tracker paths were content-identical",
-                        "cache_generation unchanged after tracker event"
+                let (counts, _refresh) = srv.refresh_tracked_files(files, changed_files).await;
+                #[cfg(test)]
+                if let Some(task) = _refresh {
+                    crate::server_adapters::test_seams::parent_refreshed(
+                        &srv.current_ref().await.canonical_root,
+                        task,
                     );
                 }
-                (updated, skipped)
+                counts
             })
         })
     }
 
-    async fn refresh_search_paths(&self, paths: &[String], generation: u64) {
+    /// Re-embeds the tracked `files` of this session's ref, at
+    /// `changed_files` on disk, and refreshes its indexes when their content
+    /// changed. The re-embedded and skipped counts, and the task of a parent
+    /// rebuild the refresh started.
+    async fn refresh_tracked_files(
+        &self,
+        files: Vec<String>,
+        changed_files: Vec<PathBuf>,
+    ) -> ((usize, usize), Option<tokio::task::JoinHandle<()>>) {
+        let ref_index = self.current_ref().await;
+        tracing::debug!(
+            ref_id = %ref_index.cas_ref_id_hex,
+            paths = ?files,
+            "Embedding tracker refresh batch started"
+        );
+        let outcome = self.incremental_reembed_detailed(&changed_files).await;
+        let updated = outcome.updated;
+        let skipped = outcome.skipped;
+        tracing::debug!(
+            updated,
+            skipped,
+            "Incremental re-embedding for {} changed files",
+            changed_files.len()
+        );
+        // Watchers can emit batches for metadata/read activity. Only
+        // invalidate when inspecting the source found a content change.
+        let mut refresh = None;
+        if outcome.content_changed {
+            let new_gen = ref_index
+                .cache_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release)
+                + 1;
+            refresh = self.refresh_search_paths(&files, new_gen).await;
+            tracing::debug!(
+                generation = new_gen,
+                updated,
+                skipped,
+                paths = ?files,
+                reason = "tracker batch contained changed content",
+                "cache_generation bumped after tracker event"
+            );
+        } else {
+            tracing::debug!(
+                generation = ref_index
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                skipped,
+                paths = ?files,
+                reason = "all tracker paths were content-identical",
+                "cache_generation unchanged after tracker event"
+            );
+        }
+        ((updated, skipped), refresh)
+    }
+
+    async fn refresh_search_paths(
+        &self,
+        paths: &[String],
+        generation: u64,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         use crate::tools::semantic_search::{
             CachedSearchIndex, SearchDocument, SymbolSearchEntry, extract_plain_text_header,
             is_text_index_candidate, semantic_embedding_content,
         };
         let owner = self.current_ref().await;
         if owner.search_index_cache.read().await.is_none() {
-            return;
+            return None;
         }
         let mut docs = Vec::new();
         let mut vectors = Vec::new();
@@ -2616,11 +2787,7 @@ impl ContextPlusServer {
             );
         }
         drop(guard);
-        let _refresh = crate::server_adapters::refresh_fork_parent(&self.state, &owner).await;
-        #[cfg(test)]
-        if let Some(task) = _refresh {
-            crate::server_adapters::test_seams::parent_refreshed(&owner.canonical_root, task);
-        }
+        crate::server_adapters::refresh_fork_parent(&self.state, &owner).await
     }
 
     /// Start the embedding tracker for a specific ref if not already running
@@ -8574,6 +8741,145 @@ mod tests {
         assert_eq!(
             cold.state.choose_parent(&cut).await,
             Some(cold.state.default_ref_id)
+        );
+    }
+
+    /// A git primary of [`SEMANTIC_FORK_FILES`] files with `origin/main` at
+    /// its HEAD, and a server over it with that fork base registered.
+    async fn fork_base_server(
+        min_advance_secs: u64,
+    ) -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+    ) {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        lexdelta_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let bases = tempfile::tempdir().unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.fork_base = Some("origin/main".into());
+        config.fork_base_dir = Some(bases.path().to_path_buf());
+        config.fork_base_min_advance_secs = min_advance_secs;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
+        let root = primary.path().to_path_buf();
+        let base = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a fork base checkout");
+        crate::transport::daemon::register_fork_base(&server, base).await;
+        (ollama, primary, bases, server)
+    }
+
+    /// Commits an edit of five files tagged `tag` on a side branch and moves
+    /// `origin/main` to it; its sha.
+    fn fork_base_move_origin(primary: &std::path::Path, tag: &str) -> String {
+        lexdelta_git(primary, &["checkout", "-q", "-b", tag]);
+        for i in 0..5 {
+            std::fs::write(
+                primary.join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn {tag}_{i}() -> usize {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary, &["commit", "-qam", tag]);
+        let sha = choose_parent_rev(primary, "HEAD");
+        lexdelta_git(primary, &["checkout", "-q", "main"]);
+        lexdelta_git(primary, &["update-ref", "refs/remotes/origin/main", &sha]);
+        sha
+    }
+
+    /// The fork base's HEAD, the head of its installed index, and whether that
+    /// index holds the content `tag` wrote.
+    async fn fork_base_state(
+        server: &ContextPlusServer,
+        tag: &str,
+    ) -> (String, Option<String>, bool) {
+        let base = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        let head = choose_parent_rev(&base.canonical_root, "HEAD");
+        let indexed = server.state.fork_base_indexed_head.lock().unwrap().clone();
+        let holds = base
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|entry| {
+                entry
+                    .index
+                    .documents()
+                    .iter()
+                    .any(|doc| doc.content.contains(&format!("{tag}_1")))
+            });
+        (head, indexed, holds)
+    }
+
+    #[tokio::test]
+    async fn fork_base_advance_moves_the_checkout_and_its_index() {
+        let (_ollama, primary, _bases, server) = fork_base_server(0).await;
+        server.advance_fork_base().expect("an advance").await;
+        let start = choose_parent_rev(primary.path(), "origin/main");
+        let (head, indexed, _) = fork_base_state(&server, "advanced").await;
+        assert_eq!((head, indexed), (start.clone(), Some(start)));
+
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        server.advance_fork_base().unwrap().await;
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true)
+        );
+
+        let base = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        std::fs::write(base.canonical_root.join("src/area_1/file_1.rs"), "dirty\n").unwrap();
+        let again = fork_base_move_origin(primary.path(), "again");
+        server.advance_fork_base().unwrap().await;
+        assert_eq!(
+            fork_base_state(&server, "again").await,
+            (again.clone(), Some(again), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_base_advance_runs_one_task_at_a_time() {
+        let (_ollama, _primary, _bases, server) = fork_base_server(0).await;
+        let first = server.advance_fork_base().expect("an advance");
+        let second = server.advance_fork_base().expect("an advance");
+        assert!(first.ptr_eq(&second), "a second advance started");
+        first.await;
+        second.await;
+    }
+
+    #[tokio::test]
+    async fn fork_base_advance_waits_for_the_minimum_interval() {
+        let (_ollama, primary, _bases, server) = fork_base_server(3600).await;
+        server.advance_fork_base().expect("an advance").await;
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        server.advance_fork_base().unwrap().await;
+        fork_base_move_origin(primary.path(), "again");
+        server.advance_fork_base().unwrap().await;
+
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true),
+            "a second move inside the interval advanced the fork base"
         );
     }
 
