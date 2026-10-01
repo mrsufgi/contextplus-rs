@@ -212,6 +212,8 @@ pub struct RefIndex {
     /// Already `Arc<RwLock<…>>` so background rebuild tasks can hold a clone.
     pub(crate) semantic_vector_generation: AtomicU64,
     pub(crate) semantic_fill: tokio::sync::Mutex<crate::server_adapters::SemanticFill>,
+    /// The content hash of each changed file a re-embed is sending to Ollama.
+    pub(crate) reembedding: std::sync::Mutex<HashMap<String, String>>,
     /// The parent's vector store this worktree last forked, or was refused a fork of.
     pub(crate) fork_base: std::sync::Mutex<std::sync::Weak<crate::core::embeddings::VectorStore>>,
     /// The fork refusals logged since this worktree last forked.
@@ -302,6 +304,7 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            reembedding: std::sync::Mutex::new(HashMap::new()),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
@@ -362,6 +365,7 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            reembedding: std::sync::Mutex::new(HashMap::new()),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
@@ -424,6 +428,7 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            reembedding: std::sync::Mutex::new(HashMap::new()),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
             fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),

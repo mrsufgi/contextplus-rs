@@ -563,6 +563,36 @@ struct IncrementalReembedOutcome {
     content_changed: bool,
 }
 
+/// The changed files one re-embed sends to Ollama, released when it ends.
+struct ReembedClaims<'a> {
+    ref_index: &'a crate::ref_index::RefIndex,
+    claimed: Vec<(String, String)>,
+}
+
+impl ReembedClaims<'_> {
+    /// Claims `path` at `hash`; false when another re-embed already sends it.
+    fn claim(&mut self, path: &str, hash: &str) -> bool {
+        let mut reembedding = self.ref_index.reembedding.lock().unwrap();
+        if reembedding.get(path).is_some_and(|current| current == hash) {
+            return false;
+        }
+        reembedding.insert(path.to_string(), hash.to_string());
+        self.claimed.push((path.to_string(), hash.to_string()));
+        true
+    }
+}
+
+impl Drop for ReembedClaims<'_> {
+    fn drop(&mut self) {
+        let mut reembedding = self.ref_index.reembedding.lock().unwrap();
+        for (path, hash) in &self.claimed {
+            if reembedding.get(path) == Some(hash) {
+                reembedding.remove(path);
+            }
+        }
+    }
+}
+
 const IDENTIFIER_INDEX_TTL_SECS: u64 = 300;
 
 /// URL to fetch the instructions resource content from.
@@ -3717,6 +3747,10 @@ impl ContextPlusServer {
         let max_file_size = self.state.config.max_embed_file_size as u64;
         let ref_index = self.current_ref().await;
         let project_cache = ref_index.project_cache.read().await.as_ref().cloned();
+        let mut claims = ReembedClaims {
+            ref_index: &ref_index,
+            claimed: Vec::new(),
+        };
 
         // CAS setup for diff-only embedding via U6 content-addressed store.
         let mcp_data_dir = ref_index.root_dir.join(".mcp_data");
@@ -3777,6 +3811,10 @@ impl ContextPlusServer {
             if project_content_matches == Some(true)
                 || (project_content_matches.is_none() && embedding_cache_matches)
             {
+                skipped += 1;
+                continue;
+            }
+            if !oversized && !embedding_cache_matches && !claims.claim(&rel_path, &hash) {
                 skipped += 1;
                 continue;
             }
@@ -3891,6 +3929,8 @@ impl ContextPlusServer {
         if !texts_to_embed.is_empty() {
             let embed_texts: Vec<String> =
                 texts_to_embed.iter().map(|(_, _, t)| t.clone()).collect();
+            #[cfg(test)]
+            crate::server_adapters::test_seams::before_reembed(&ref_index.canonical_root).await;
             match self.state.ollama.embed_documents(&embed_texts).await {
                 Ok(vectors) => {
                     let mut cache = ref_index.embedding_cache.write().await;
@@ -9359,6 +9399,50 @@ mod tests {
                 .index
                 .shares_vector_store(&base_entry.index),
             "the worktree's index does not share the fork base's vector store"
+        );
+    }
+
+    /// A tracker batch of the files an advance is still embedding sends none
+    /// of them to Ollama again.
+    #[tokio::test]
+    async fn fork_base_advance_and_its_tracker_embed_each_changed_file_once() {
+        use crate::server_adapters::test_seams;
+
+        let (ollama, primary, _bases, server) = fork_base_server(0).await;
+        test_seams::settle_fork_base(&server.state).await;
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+        fork_base_move_origin(primary.path(), "advanced");
+        let pause = test_seams::pause_before_reembed(&base.canonical_root);
+
+        let advance = server.advance_fork_base().expect("an advance");
+        pause.wait_until_entered().await;
+        let files: Vec<String> = (0..5)
+            .map(|i| format!("src/area_{}/file_{i}.rs", i % 4))
+            .collect();
+        let on_disk = files.iter().map(|path| base.root_dir.join(path)).collect();
+        let (_, refresh) = server
+            .with_session(base_id)
+            .refresh_tracked_files(files, on_disk)
+            .await;
+        pause.resume();
+        advance.await;
+        if let Some(task) = refresh {
+            task.await.unwrap();
+        }
+        test_seams::settle_fork_base(&server.state).await;
+
+        let embedded = ollama
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(embed_request_inputs)
+            .filter(|input| input.contains("pub fn advanced_"))
+            .count();
+        assert_eq!(
+            embedded, 5,
+            "5 changed files were embedded {embedded} times"
         );
     }
 
