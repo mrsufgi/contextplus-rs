@@ -677,6 +677,9 @@ pub struct SharedState {
     fork_base_advance: std::sync::Mutex<Option<(tokio::task::AbortHandle, ForkBaseAdvance)>>,
     /// Set while the fork base checkout moves and its index catches up.
     pub(crate) fork_base_advancing: std::sync::atomic::AtomicBool,
+    /// Whether the running advance task checks its ref once more before it
+    /// exits, or exits: one of the `ADVANCE_` states.
+    fork_base_advance_state: std::sync::atomic::AtomicU8,
     /// When the fork base checkout last moved.
     fork_base_advanced_at: std::sync::Mutex<Option<Instant>>,
     /// The fork base checkout, whose lock this daemon holds while it serves it.
@@ -1713,6 +1716,13 @@ async fn prune_identifier_vectors(
 /// The fork base's advance task, which every caller awaits while it runs.
 pub(crate) type ForkBaseAdvance = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
 
+/// The fork base's advance task runs until a pass leaves its checkout put.
+const ADVANCE_RUNNING: u8 = 0;
+/// A trigger joined the running advance task, which checks its ref once more.
+const ADVANCE_RETRIGGERED: u8 = 1;
+/// The advance task exits, so the next trigger starts another.
+const ADVANCE_EXITING: u8 = 2;
+
 /// How long choosing a worktree's parent may run git on the registration path.
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2178,17 +2188,28 @@ impl ContextPlusServer {
     /// Callers should prefer this over mutating `session_ref_id` directly so
     /// the original server (held by the daemon accept loop) remains unchanged.
     /// Starts the one task that moves the fork base checkout to the commit
-    /// its ref names and indexes it there, unless one runs; that task. `None`
-    /// without a registered fork base.
+    /// its ref names and indexes it there, unless one runs, which then checks
+    /// its ref once more; that task. `None` without a registered fork base.
     pub(crate) fn advance_fork_base(&self) -> Option<ForkBaseAdvance> {
         use futures::FutureExt;
+        use std::sync::atomic::Ordering;
         let base_id = *self.state.fork_base_ref_id.get()?;
         let mut slot = self.state.fork_base_advance.lock().unwrap();
         if let Some((task, advance)) = slot.as_ref()
             && !task.is_finished()
+            && self
+                .state
+                .fork_base_advance_state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state != ADVANCE_EXITING).then_some(ADVANCE_RETRIGGERED)
+                })
+                .is_ok()
         {
             return Some(advance.clone());
         }
+        self.state
+            .fork_base_advance_state
+            .store(ADVANCE_RUNNING, Ordering::Release);
         let base = self.with_session(base_id);
         let task = tokio::spawn(async move { base.advance_fork_base_now().await });
         let abort = task.abort_handle();
@@ -2202,8 +2223,8 @@ impl ContextPlusServer {
     }
 
     /// Moves this session's ref, the fork base, to the commit its ref names
-    /// when the minimum interval has passed, until the ref stays put, and
-    /// records the head its index holds once current.
+    /// when the minimum interval has passed, until the ref stays put and no
+    /// trigger joined, and records the head its index holds once current.
     async fn advance_fork_base_now(&self) {
         use std::sync::atomic::Ordering;
         let state = &self.state;
@@ -2236,6 +2257,9 @@ impl ContextPlusServer {
             let Some(target) = target else {
                 return failed("unresolved_ref");
             };
+            #[cfg(test)]
+            crate::server_adapters::test_seams::after_fork_base_resolve(&owner.canonical_root)
+                .await;
             let interval = std::time::Duration::from_secs(state.config.fork_base_min_advance_secs);
             let due = state
                 .fork_base_advanced_at
@@ -2299,7 +2323,19 @@ impl ContextPlusServer {
                 indexed,
                 "fork base checked"
             );
-            if !moved {
+            let again = moved
+                || state.fork_base_advance_state.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |state| {
+                        Some(if state == ADVANCE_RETRIGGERED {
+                            ADVANCE_RUNNING
+                        } else {
+                            ADVANCE_EXITING
+                        })
+                    },
+                ) == Ok(ADVANCE_RETRIGGERED);
+            if !again {
                 return;
             }
         }
@@ -2614,6 +2650,7 @@ impl ContextPlusServer {
             fork_base_indexed_head: std::sync::Mutex::new(None),
             fork_base_advance: std::sync::Mutex::new(None),
             fork_base_advancing: std::sync::atomic::AtomicBool::new(false),
+            fork_base_advance_state: std::sync::atomic::AtomicU8::new(ADVANCE_RUNNING),
             fork_base_advanced_at: std::sync::Mutex::new(None),
             fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -8904,6 +8941,33 @@ mod tests {
         assert!(first.ptr_eq(&second), "a second advance started");
         first.await;
         second.await;
+    }
+
+    #[tokio::test]
+    async fn fork_base_advance_follows_a_ref_that_moves_while_it_runs() {
+        let (_ollama, primary, _bases, server) = fork_base_server(0).await;
+        server.advance_fork_base().expect("an advance").await;
+        let base = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        let pause =
+            crate::server_adapters::test_seams::pause_after_fork_base_resolve(&base.canonical_root);
+        let running = server.advance_fork_base().expect("an advance");
+        pause.wait_until_entered().await;
+
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        let joined = server.advance_fork_base().expect("an advance");
+        assert!(joined.ptr_eq(&running), "a second advance started");
+        pause.resume();
+        running.await;
+
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true),
+            "the running advance dropped a move of its ref"
+        );
     }
 
     #[tokio::test]
