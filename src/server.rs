@@ -256,7 +256,9 @@ impl IdentifierBuild {
                 let docs = Arc::clone(docs);
                 let edited = Arc::clone(cache);
                 tokio::task::spawn_blocking(move || {
-                    sender.send_replace(Some(Self::reparsed(&docs, &source, &edited)));
+                    let reparsed = Self::reparsed(&docs, &source, &edited);
+                    drop((docs, source, edited));
+                    sender.send_replace(Some(reparsed));
                 });
                 *slot = Some((Arc::downgrade(cache), current.clone()));
                 Some(current)
@@ -8778,6 +8780,51 @@ mod tests {
             build.running(),
             "the build ended before the requests answered"
         );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_published_reparse_no_longer_holds_the_edited_project_cache() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+
+        for _ in 0..200 {
+            *build.current.lock().unwrap() = None;
+            let observed = Arc::clone(&edited);
+            let holders = Arc::strong_count(&edited);
+            let current = build.reparse(&parsed, &edited).unwrap();
+            let held_after = tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while current.borrow().is_none() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the reparse never published"
+                    );
+                    std::hint::spin_loop();
+                }
+                Arc::strong_count(&observed)
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(
+                held_after, holders,
+                "the reparse published while it held the edited project cache"
+            );
+        }
         drop(held);
     }
 
