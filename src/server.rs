@@ -8349,7 +8349,10 @@ mod tests {
         let (_repo, ollama, server) = scripted_identifier_server(
             LEDGER_FILES,
             |inputs| embeddings_for(inputs).set_delay(std::time::Duration::from_millis(500)),
-            |config| config.embed_budget_ms = 600_000,
+            |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            },
         )
         .await;
 
@@ -8362,6 +8365,8 @@ mod tests {
             })
         };
         wait_for_embed_batch(&ollama, "src/ledger.rs").await;
+        let cache = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&cache);
         let second = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -8370,11 +8375,31 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while Arc::strong_count(&cache) <= holders && !second.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second caller never resolved the project cache");
         first.abort();
 
         let answered = second.await.unwrap();
-        assert_eq!(answered.is_error, Some(false), "{}", text_of(&answered));
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(
+            server
+                .state
+                .default_ref()
+                .unwrap()
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|index| index.dims > 0),
+            "the build was cancelled with the caller that gave up"
+        );
         assert_eq!(
             matching_embed_request_batches(&ollama, "src/ledger.rs")
                 .await
