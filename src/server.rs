@@ -15656,6 +15656,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn memory_budget_evicts_a_worktree_idle_past_the_residency() {
+        assert!(
+            residency_evicts(100, 120, RESIDENCY_BUDGET, RESIDENCY_BUDGET / 2 * 3).await,
+            "a worktree idle past its 100 s residency was kept over the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_evicts_a_worktree_idle_for_a_minute() {
+        assert!(
+            residency_evicts(100, 70, RESIDENCY_BUDGET, RESIDENCY_BUDGET * 3).await,
+            "an emergency kept a worktree idle for 70 s"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_trigger_saturates_on_a_huge_budget() {
+        assert!(
+            !residency_evicts(100, 70, usize::MAX / 2 + 1, usize::MAX).await,
+            "measured memory under a saturated twice-the-budget was taken as an emergency"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_resident_bytes_reads_this_process() {
