@@ -74,8 +74,14 @@ impl CachedLexicalIndex {
                 .is_none_or(|base| base.cached.document_paths.is_empty())
     }
 
-    /// Top `top_k` `(path, score)` hits, best first, equal scores by path.
-    pub(crate) fn search(&self, query: &str, top_k: usize) -> Vec<(&str, f64)> {
+    /// Top `top_k` `(path, score)` hits among the paths `keep` admits, best
+    /// first, equal scores by path.
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        keep: impl Fn(&str) -> bool,
+    ) -> Vec<(&str, f64)> {
         let path = |in_delta: bool, i: usize| {
             let paths = match &self.base {
                 Some(base) if !in_delta => &base.cached.document_paths,
@@ -97,6 +103,7 @@ impl CachedLexicalIndex {
                 .filter_map(|(i, score)| Some((path(true, i)?, score)))
                 .collect(),
         };
+        hits.retain(|(path, _)| keep(path));
         hits.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -4545,7 +4552,14 @@ impl ContextPlusServer {
             let top_k = Self::get_usize(&args, "top_k")
                 .filter(|&n| n > 0)
                 .unwrap_or(10);
-            let matches = self.lexical_search_text(options.query, top_k).await?;
+            let prefix = root
+                .strip_prefix(&self.current_ref().await.canonical_root)
+                .unwrap_or(std::path::Path::new(""))
+                .to_path_buf();
+            let keep = crate::tools::semantic_search::result_path_filter(&options, prefix);
+            let matches = self
+                .lexical_search_text(options.query, top_k, keep)
+                .await?;
             return Ok(Self::ok_text(format!(
                 "Partial results: {}, so these are keyword matches. Retry shortly for semantic ranking.\n\n{matches}",
                 self.query_embed_overdue()
@@ -5462,10 +5476,18 @@ impl ContextPlusServer {
             .filter(|&n| n > 0)
             .unwrap_or(10);
 
-        Ok(Self::ok_text(self.lexical_search_text(query, top_k).await?))
+        Ok(Self::ok_text(
+            self.lexical_search_text(query, top_k, |_| true).await?,
+        ))
     }
 
-    async fn lexical_search_text(&self, query: String, top_k: usize) -> Result<String> {
+    /// The top `top_k` keyword hits for `query` among the paths `keep` admits.
+    async fn lexical_search_text(
+        &self,
+        query: String,
+        top_k: usize,
+        keep: impl Fn(&str) -> bool + Send + 'static,
+    ) -> Result<String> {
         let cache = self.ensure_project_cache().await?;
         let cached = self.ensure_lexical_index(&cache).await?;
 
@@ -5474,7 +5496,7 @@ impl ContextPlusServer {
                 return "No files indexed. Ensure the project cache is populated.".to_string();
             }
 
-            let hits = cached.search(&query, top_k);
+            let hits = cached.search(&query, top_k, keep);
 
             if hits.is_empty() {
                 return format!("No lexical matches found for: {query}");
@@ -17605,6 +17627,65 @@ mod tests {
         assert_eq!(answered.is_error, Some(false), "{text}");
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_keyword_fallback_keeps_the_meaning_query_root_globs_and_scope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                embeddings_for(&embed_request_inputs(request))
+                    .set_delay(std::time::Duration::from_secs(3600))
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        for (file, source) in [
+            ("src/ledger.rs", "fn reconcile_ledger() {}\n"),
+            ("lib/ledger.rs", "fn reconcile_ledger() {}\n"),
+            ("docs/ledger.md", "# reconcile_ledger\n"),
+        ] {
+            let full_path = root.path().join(file);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.query_embed_budget_ms = 0;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        for (filters, expected) in [
+            (json!({ "path": "src" }), vec!["src/ledger.rs"]),
+            (json!({ "path": "src", "include_globs": ["*.rs"] }), vec!["src/ledger.rs"]),
+            (json!({ "include_globs": ["lib/**"] }), vec!["lib/ledger.rs"]),
+            (
+                json!({ "exclude_globs": ["src/**"] }),
+                vec!["lib/ledger.rs", "docs/ledger.md"],
+            ),
+            (json!({ "scope": "docs" }), vec!["docs/ledger.md"]),
+            (
+                json!({ "scope": "code" }),
+                vec!["src/ledger.rs", "lib/ledger.rs"],
+            ),
+        ] {
+            let mut args = filters.as_object().unwrap().clone();
+            args.insert("query".into(), json!("reconcile_ledger"));
+            let answered = server.dispatch("explore", args).await;
+
+            let text = text_of(&answered);
+            assert!(text.starts_with("Partial results"), "{filters}: {text}");
+            let mut found: Vec<&str> = ["src/ledger.rs", "lib/ledger.rs", "docs/ledger.md"]
+                .into_iter()
+                .filter(|file| text.contains(file))
+                .collect();
+            found.sort_unstable();
+            let mut expected = expected;
+            expected.sort_unstable();
+            assert_eq!(found, expected, "{filters}: {text}");
+        }
     }
 
     #[tokio::test]

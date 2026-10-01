@@ -595,13 +595,35 @@ pub fn glob_to_regex(glob: &str) -> String {
 }
 
 fn document_passes_filters(doc: &SearchDocument, opts: &ResolvedSearchOptions) -> bool {
-    let documentation = doc.path_prior.is_documentation;
-    if matches!(opts.scope, SearchScope::Code) && documentation
-        || matches!(opts.scope, SearchScope::Docs) && !documentation
-    {
-        return false;
+    scope_admits(opts.scope, doc.path_prior.is_documentation) && path_passes_filters(&doc.path, opts)
+}
+
+fn scope_admits(scope: SearchScope, documentation: bool) -> bool {
+    match scope {
+        SearchScope::All => true,
+        SearchScope::Code => !documentation,
+        SearchScope::Docs => documentation,
     }
-    path_passes_filters(&doc.path, opts)
+}
+
+/// The repository-relative paths a search of `options` can answer with,
+/// where `prefix` is its root's path in the repository: those under the
+/// root, in its scope and through its globs, which match the path from the
+/// root as they do for its documents.
+pub(crate) fn result_path_filter(
+    options: &SemanticSearchOptions,
+    prefix: PathBuf,
+) -> impl Fn(&str) -> bool + Send + 'static {
+    let options = resolve_search_options(options);
+    move |path| {
+        let Ok(relative) = Path::new(path).strip_prefix(&prefix) else {
+            return false;
+        };
+        scope_admits(
+            options.scope,
+            super::lexical_search::classify_path_prior(path).is_documentation,
+        ) && path_passes_filters(&relative.to_string_lossy(), &options)
+    }
 }
 
 fn path_passes_filters(path: &str, opts: &ResolvedSearchOptions) -> bool {
