@@ -706,10 +706,14 @@ fn score_identifier_candidates(
             if offset + vector_dims > vector_buffer.len() {
                 return None;
             }
-            let vec_slice = vector_buffer.slice(offset..offset + vector_dims);
-            let semantic_score =
+            // Without vectors, identifiers rank by keyword alone.
+            let semantic_score = if vector_dims == 0 {
+                0.0
+            } else {
+                let vec_slice = vector_buffer.slice(offset..offset + vector_dims);
                 crate::core::embeddings::cosine_similarity_simsimd(query_vec, vec_slice).max(0.0)
-                    as f64;
+                    as f64
+            };
 
             let name_score = keyword_coverage(query_terms, &doc.name_token_set);
             let signature_score = keyword_coverage(query_terms, &doc.signature_token_set);
@@ -866,12 +870,17 @@ pub async fn semantic_identifier_search(
     }
 
     // Get query embedding — embed takes &[String], so convert Cow<str> to String only once.
-    let query_string = query.as_ref().to_string();
-    let query_vecs = embed_fn.embed(std::slice::from_ref(&query_string)).await?;
-    let query_vec = query_vecs
-        .into_iter()
-        .next()
-        .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
+    // Without identifier vectors there is nothing to compare it with.
+    let query_vec = if vector_dims == 0 {
+        Vec::new()
+    } else {
+        let query_string = query.as_ref().to_string();
+        let query_vecs = embed_fn.embed(std::slice::from_ref(&query_string)).await?;
+        query_vecs
+            .into_iter()
+            .next()
+            .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?
+    };
     let query_terms = identifier_terms(query.as_ref());
 
     // Score identifiers

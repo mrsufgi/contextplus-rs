@@ -190,6 +190,35 @@ pub struct OllamaClient {
     /// the HTTP call acquires a permit (via `embed_single_query` →
     /// `embed_batch_adaptive` → `call_embed_api`).
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Caps document embeds, a request's or background, below the shared
+    /// semaphore's capacity, so a query finds a permit free instead of
+    /// queueing behind them.
+    document_permits: Option<Arc<tokio::sync::Semaphore>>,
+    /// Caps background batch embeds below the document cap, so a request's
+    /// documents find a permit free instead of queueing behind them.
+    batch_permits: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// Which callers an embed request competes with for permits.
+#[derive(Clone, Copy)]
+enum EmbedLane {
+    /// A single-text query, which a person is waiting on.
+    Query,
+    /// Documents a request is waiting on.
+    Interactive,
+    /// Document batches for background indexing.
+    Batch,
+}
+
+tokio::task_local! {
+    static INTERACTIVE: ();
+}
+
+/// Runs `request` with its document embeds in the interactive lane, so they
+/// never queue behind background batches while leaving queries a permit.
+/// Tasks it spawns are not covered.
+pub async fn interactive<F: std::future::Future>(request: F) -> F::Output {
+    INTERACTIVE.scope((), request).await
 }
 
 #[derive(Clone)]
@@ -302,7 +331,9 @@ impl OllamaClient {
             // TCP keepalive pings every 30 s so NAT/firewall state is preserved
             // even when the connection is otherwise silent.
             .tcp_keepalive(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(120))
+            // No client timeout: each request runs under its own deadline,
+            // `request_timeout` or `chat_timeout`, which a client timeout
+            // would cut short.
             .build()
             .expect("reqwest client build");
 
@@ -416,6 +447,8 @@ impl OllamaClient {
             flush_tx: flush_tx_arc,
             in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             semaphore: None,
+            document_permits: None,
+            batch_permits: None,
         }
     }
 
@@ -465,6 +498,21 @@ impl OllamaClient {
     /// retain the default `None` (no gating).
     pub fn with_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
         self.semaphore = Some(semaphore);
+        self
+    }
+
+    /// Let at most `limit` document embeds hold the shared semaphore's permits
+    /// at once. Below its capacity, queries always find one free.
+    pub fn with_document_limit(mut self, limit: usize) -> Self {
+        self.document_permits = Some(Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
+        self
+    }
+
+    /// Let at most `limit` background batch embeds hold document permits, or
+    /// shared permits without a document limit, at once. Below that limit, a
+    /// request's documents always find one free.
+    pub fn with_batch_limit(mut self, limit: usize) -> Self {
+        self.batch_permits = Some(Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
         self
     }
 
@@ -584,6 +632,13 @@ impl OllamaClient {
         self.embed(&inputs).await
     }
 
+    /// Whether the vector of user query `query` is cached, so embedding it
+    /// returns without a request.
+    pub fn query_cached(&self, query: &str) -> bool {
+        let input = format!("{}{}", self.query_prefix, query);
+        self.query_cache.lock().unwrap().get(&input).is_some()
+    }
+
     /// Embed one user query with the configured model-specific query prefix.
     pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         self.embed_queries(&[query.to_string()])
@@ -624,9 +679,14 @@ impl OllamaClient {
             .collect();
 
         // Embed all chunks in batches.
+        let lane = if INTERACTIVE.try_with(|_| ()).is_ok() {
+            EmbedLane::Interactive
+        } else {
+            EmbedLane::Batch
+        };
         let mut flat_embeddings = Vec::with_capacity(flattened.len());
         for batch in flattened.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(batch).await?;
+            let batch_result = self.embed_batch_adaptive(batch, lane).await?;
             flat_embeddings.extend(batch_result);
         }
 
@@ -654,7 +714,7 @@ impl OllamaClient {
 
         let mut flat_embeddings = Vec::with_capacity(flattened.len());
         for batch in flattened.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(batch).await?;
+            let batch_result = self.embed_batch_adaptive(batch, EmbedLane::Query).await?;
             flat_embeddings.extend(batch_result);
         }
 
@@ -877,9 +937,9 @@ impl OllamaClient {
         nonempty_chat_text(content, "Anthropic")
     }
 
-    fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String]) -> EmbedFuture<'a> {
+    fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String], lane: EmbedLane) -> EmbedFuture<'a> {
         Box::pin(async move {
-            match self.call_embed_api(batch).await {
+            match self.call_embed_api(batch, lane).await {
                 Ok(embeddings) => {
                     if embeddings.len() != batch.len() {
                         return Err(ContextPlusError::Ollama(format!(
@@ -892,13 +952,13 @@ impl OllamaClient {
                 }
                 Err(e) if is_context_length_error(&e) => {
                     if batch.len() == 1 {
-                        let vec = self.embed_single_adaptive(&batch[0]).await?;
+                        let vec = self.embed_single_adaptive(&batch[0], lane).await?;
                         Ok(vec![vec])
                     } else {
                         // Binary split
                         let mid = batch.len().div_ceil(2);
-                        let left = self.embed_batch_adaptive(&batch[..mid]).await?;
-                        let right = self.embed_batch_adaptive(&batch[mid..]).await?;
+                        let left = self.embed_batch_adaptive(&batch[..mid], lane).await?;
+                        let right = self.embed_batch_adaptive(&batch[mid..], lane).await?;
                         Ok([left, right].concat())
                     }
                 }
@@ -907,11 +967,11 @@ impl OllamaClient {
         })
     }
 
-    async fn embed_single_adaptive(&self, input: &str) -> Result<Vec<f32>> {
+    async fn embed_single_adaptive(&self, input: &str, lane: EmbedLane) -> Result<Vec<f32>> {
         let mut candidate = input.to_string();
 
         for _attempt in 0..=MAX_SINGLE_INPUT_RETRIES {
-            match self.call_embed_api(&[candidate.clone()]).await {
+            match self.call_embed_api(&[candidate.clone()], lane).await {
                 Ok(mut vecs) => {
                     return vecs.pop().ok_or_else(|| {
                         ContextPlusError::Ollama("empty embedding response".into())
@@ -932,7 +992,7 @@ impl OllamaClient {
         ))
     }
 
-    async fn call_embed_api(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn call_embed_api(&self, inputs: &[String], lane: EmbedLane) -> Result<Vec<Vec<f32>>> {
         // Check cancellation before starting the request
         if self.cancel_token.is_cancelled() {
             return Err(ContextPlusError::Cancelled);
@@ -947,6 +1007,20 @@ impl OllamaClient {
         let request = async {
             // Hold the permit until the body has been read, including error
             // paths. A closed semaphore retains the existing ungated behavior.
+            // A batch takes its own lane's permit first, so batches never hold
+            // every document permit a request's documents need, and documents
+            // take a document permit, so they never hold every shared permit a
+            // query needs.
+            let _batch_permit = match (lane, &self.batch_permits) {
+                (EmbedLane::Batch, Some(batch)) => Arc::clone(batch).acquire_owned().await.ok(),
+                _ => None,
+            };
+            let _document_permit = match (lane, &self.document_permits) {
+                (EmbedLane::Interactive | EmbedLane::Batch, Some(documents)) => {
+                    Arc::clone(documents).acquire_owned().await.ok()
+                }
+                _ => None,
+            };
             let _permit = if let Some(sem) = &self.semaphore {
                 Arc::clone(sem).acquire_owned().await.ok()
             } else {
@@ -3143,7 +3217,7 @@ mod tests {
         let config = config_with_host(&server.uri());
         let client = OllamaClient::new(&config);
         let input = "a".repeat(500);
-        let result = client.embed_single_adaptive(&input).await;
+        let result = client.embed_single_adaptive(&input, EmbedLane::Batch).await;
 
         assert!(result.is_ok(), "should succeed after adaptive shrinking");
         assert_eq!(result.unwrap(), vec![0.1, 0.2, 0.3]);
@@ -3184,7 +3258,7 @@ mod tests {
         let config = config_with_host(&server.uri());
         let client = OllamaClient::new(&config);
         let texts: Vec<String> = (0..4).map(|i| format!("text_{}", i)).collect();
-        let result = client.embed_batch_adaptive(&texts).await;
+        let result = client.embed_batch_adaptive(&texts, EmbedLane::Batch).await;
 
         assert!(result.is_ok(), "batch should succeed after splitting");
         let embeddings = result.unwrap();
@@ -3299,7 +3373,10 @@ mod tests {
 
         let client = OllamaClient::new(&openai_config(&server.uri()));
         let texts: Vec<String> = (0..4).map(|index| format!("text-{index}")).collect();
-        let result = client.embed_batch_adaptive(&texts).await.unwrap();
+        let result = client
+            .embed_batch_adaptive(&texts, EmbedLane::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 4);
     }
@@ -3477,6 +3554,34 @@ mod tests {
             }
             other => panic!("expected Ollama deadline error, got {:?}", other),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_embed_request_is_cut_off_only_at_its_deadline() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"embeddings": [[1.0, 2.0, 3.0]]}))
+                    .set_delay(std::time::Duration::from_secs(3600)),
+            )
+            .mount(&server)
+            .await;
+        let client = OllamaClient::new(&config_with_host(&server.uri()));
+
+        let started = tokio::time::Instant::now();
+        let result = client.embed_documents(&["hello".to_string()]).await;
+
+        assert!(
+            started.elapsed() >= EMBED_REQUEST_TIMEOUT,
+            "the request was cut off after {:?}, before its {:?} deadline: {result:?}",
+            started.elapsed(),
+            EMBED_REQUEST_TIMEOUT
+        );
     }
 
     #[tokio::test]

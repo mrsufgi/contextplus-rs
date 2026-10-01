@@ -564,13 +564,19 @@ impl WriteSchedule {
     }
 
     fn add_unwritten(&self, changed: usize) -> usize {
-        let previous = self
-            .unwritten
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |unwritten| {
-                Some(unwritten.saturating_add(changed))
-            })
-            .unwrap_or_default();
-        previous.saturating_add(changed)
+        let mut previous = self.unwritten.load(Ordering::Acquire);
+        loop {
+            let next = previous.saturating_add(changed);
+            match self.unwritten.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(current) => previous = current,
+            }
+        }
     }
 
     /// Drops every pending request.

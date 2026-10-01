@@ -74,8 +74,14 @@ impl CachedLexicalIndex {
                 .is_none_or(|base| base.cached.document_paths.is_empty())
     }
 
-    /// Top `top_k` `(path, score)` hits, best first, equal scores by path.
-    pub(crate) fn search(&self, query: &str, top_k: usize) -> Vec<(&str, f64)> {
+    /// Top `top_k` `(path, score)` hits among the paths `keep` admits, best
+    /// first, equal scores by path.
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        keep: impl Fn(&str) -> bool,
+    ) -> Vec<(&str, f64)> {
         let path = |in_delta: bool, i: usize| {
             let paths = match &self.base {
                 Some(base) if !in_delta => &base.cached.document_paths,
@@ -97,6 +103,7 @@ impl CachedLexicalIndex {
                 .filter_map(|(i, score)| Some((path(true, i)?, score)))
                 .collect(),
         };
+        hits.retain(|(path, _)| keep(path));
         hits.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -130,6 +137,76 @@ pub struct IdentifierIndex {
 /// Identifier embeddings keyed by identifier text. An identifier index holds
 /// the same allocations, so a vector is resident once however many indexes use it.
 pub(crate) type IdentifierVectors = HashMap<String, Arc<[f32]>>;
+
+/// A file's outline, `None` for a file no parser reads, with the digest of
+/// the content it was parsed from.
+pub(crate) type FileOutline = (
+    crate::cache::snapshot::Digest,
+    Option<Arc<crate::tools::context_tree::FileAnalysis>>,
+);
+
+type IdentifierBuildResult = Option<std::result::Result<Arc<IdentifierIndex>, String>>;
+
+static NEXT_IDENTIFIER_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An identifier index build running apart from the requests that wait on
+/// it: a request that gives up leaves it running, and the next one joins it.
+#[derive(Clone)]
+pub(crate) struct IdentifierBuild {
+    id: u64,
+    source: std::sync::Weak<ProjectCache>,
+    /// The parsed documents, without vectors, once parsing is done.
+    parsed: tokio::sync::watch::Receiver<Option<Arc<IdentifierIndex>>>,
+    done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
+}
+
+impl IdentifierBuild {
+    /// Whether the build indexes the project cache `cache`.
+    fn built_from(&self, cache: &Arc<ProjectCache>) -> bool {
+        std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(cache))
+    }
+
+    fn running(&self) -> bool {
+        let finished = self.done.borrow().is_some();
+        // A build whose task was aborted never finishes; its sender is gone.
+        !finished && self.done.has_changed().is_ok()
+    }
+
+    async fn finished(mut self) -> Result<Arc<IdentifierIndex>> {
+        let cancelled = || ContextPlusError::Other("identifier index build was cancelled".into());
+        let done = self
+            .done
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| cancelled())?;
+        match done.as_ref() {
+            Some(Ok(index)) => Ok(Arc::clone(index)),
+            Some(Err(error)) => Err(ContextPlusError::Other(error.clone())),
+            None => Err(cancelled()),
+        }
+    }
+
+    /// The parsed documents once parsing is done, or the index when the
+    /// build finishes without parsing.
+    async fn documents(mut self) -> Result<Arc<IdentifierIndex>> {
+        let parsed = self
+            .parsed
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|parsed| parsed.clone());
+        match parsed {
+            Some(parsed) => Ok(parsed),
+            None => self.finished().await,
+        }
+    }
+}
+
+/// An identifier index ready to search, or the build that will produce it.
+enum IdentifierLookup {
+    Ready(Arc<IdentifierIndex>),
+    Building(IdentifierBuild),
+}
 
 /// One embedding per identifier, grouped by file like the index documents and
 /// read as a flat buffer of `dims` floats per identifier.
@@ -412,6 +489,16 @@ impl SharedState {
         let _ = tokio::task::spawn_blocking(move || snapshots::flush(&config, &primary)).await;
     }
 
+    /// Writes the identifier vectors each ref embedded since its last save.
+    /// For a graceful shutdown.
+    pub async fn flush_identifier_vectors(&self) {
+        let id_cache_name = cache_name("identifier-embeddings", &self.config);
+        let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
+        for owner in refs {
+            flush_identifier_vectors(&owner, &id_cache_name).await;
+        }
+    }
+
     /// Look up a ref by id. Reserved for U4's session-scoped dispatch.
     pub async fn ref_index(
         &self,
@@ -597,7 +684,7 @@ impl SharedState {
             drop(guard);
             let mut guard = state.refs.write().await;
             // Double-check under write lock.
-            if let Some(r) = guard.get(&ref_id)
+            let flush = if let Some(r) = guard.get(&ref_id)
                 && r.session_count.load(std::sync::atomic::Ordering::Acquire) == 0
                 && r.eviction_generation
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -608,9 +695,22 @@ impl SharedState {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
-                guard.remove(&ref_id);
+                // A cancelled identifier build leaves vectors it had not saved.
+                let flush = guard.remove(&ref_id).map(|evicted| {
+                    flush_identifier_vectors(
+                        &evicted,
+                        &cache_name("identifier-embeddings", &state.config),
+                    )
+                });
                 state.ref_access.lock().unwrap().remove(&ref_id);
                 tracing::info!(ref_id = ref_id.0, "ref evicted after TTL expiry");
+                flush
+            } else {
+                None
+            };
+            drop(guard);
+            if let Some(flush) = flush {
+                flush.await;
             }
         });
     }
@@ -854,18 +954,33 @@ fn trim_retained_free_memory(measured: usize, threshold: usize) -> bool {
     if retained_free <= threshold {
         return false;
     }
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    trim_allocator();
     true
 }
 
 /// Returns memory the allocator holds free to the OS.
 async fn release_free_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+    let _ = tokio::task::spawn_blocking(trim_allocator).await;
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Allocator trims run on this thread.
+    static ALLOCATOR_TRIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns memory the allocator holds free to the OS. Walks every arena under
+/// its lock, so callers bound how often it runs.
+fn trim_allocator() {
+    #[cfg(test)]
+    ALLOCATOR_TRIMS.with(|trims| trims.set(trims.get() + 1));
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// A worktree used more recently than this is never evicted, so concurrently
 /// active worktrees cannot evict each other into repeated cold rebuilds.
 const MEMORY_BUDGET_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -913,6 +1028,11 @@ impl ResidentSnapshot {
             Arc::as_ptr(&owner.identifier_vector_overlay) as usize,
             identifier_vector_bytes(&*owner.identifier_vector_overlay.read().await),
             "identifier_overlay",
+        ));
+        components.push((
+            &owner.file_outlines as *const _ as usize,
+            file_outline_bytes(&owner.file_outlines.lock().unwrap()),
+            "outlines",
         ));
         // One statement per lock so no guard is held while the next is awaited.
         let identifier_index = owner.identifier_index.read().await.clone();
@@ -1160,6 +1280,163 @@ async fn prune_identifier_vectors(
     expired
 }
 
+/// How often an identifier build saves the vectors it has embedded so far; it
+/// saves the rest when it ends.
+const IDENTIFIER_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Saves the identifier vectors embedded since the last save into `target`'s
+/// cache file, debounced so a run of batches writes once.
+fn schedule_identifier_save(
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+    target: &Arc<RwLock<IdentifierVectors>>,
+    is_worktree: bool,
+    id_cache_name: String,
+) {
+    let ticket = ref_index
+        .identifier_persist_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        + 1;
+    let persist_generation = Arc::clone(&ref_index.identifier_persist_generation);
+    let save_lock = Arc::clone(&ref_index.identifier_save_lock);
+    let save = IdentifierSave::of(ref_index, Arc::downgrade(target), id_cache_name);
+    let pruner = (!is_worktree).then(|| (Arc::downgrade(state), Arc::downgrade(ref_index)));
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Serialized with the budget flush: both merge into the same file.
+        let _save = save_lock.lock().await;
+        if persist_generation.load(std::sync::atomic::Ordering::Acquire) != ticket {
+            return;
+        }
+        let pruned = match pruner
+            .as_ref()
+            .and_then(|(state, owner)| Some((state.upgrade()?, owner.upgrade()?)))
+        {
+            Some((state, owner)) => prune_identifier_vectors(&state, &owner).await,
+            None => Vec::new(),
+        };
+        save.write(pruned).await;
+    });
+}
+
+/// Writes the identifier vectors `owner` embedded since its last save, for
+/// a ref about to stop. The write holds none of the ref's other state.
+fn flush_identifier_vectors(
+    owner: &crate::ref_index::RefIndex,
+    id_cache_name: &str,
+) -> impl std::future::Future<Output = ()> + Send + use<> {
+    let resident_set = if owner.parent_ref_id.is_some() {
+        Arc::downgrade(&owner.identifier_vector_overlay)
+    } else {
+        owner
+            .identifier_vectors
+            .get()
+            .map_or_else(std::sync::Weak::new, Arc::downgrade)
+    };
+    let save_lock = Arc::clone(&owner.identifier_save_lock);
+    let save = IdentifierSave::of(owner, resident_set, id_cache_name.to_string());
+    async move {
+        let _save = save_lock.lock().await;
+        save.write(Vec::new()).await;
+    }
+}
+
+/// A ref's identifier cache file and the vectors it embedded since the file
+/// was last written.
+struct IdentifierSave {
+    root: PathBuf,
+    name: String,
+    unsaved: Arc<std::sync::Mutex<IdentifierVectors>>,
+    /// Every vector the file holds, to rebuild it when it is missing.
+    resident_set: std::sync::Weak<RwLock<IdentifierVectors>>,
+    #[cfg(test)]
+    saves: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl IdentifierSave {
+    fn of(
+        owner: &crate::ref_index::RefIndex,
+        resident_set: std::sync::Weak<RwLock<IdentifierVectors>>,
+        name: String,
+    ) -> Self {
+        Self {
+            root: owner.root_dir.clone(),
+            name,
+            unsaved: Arc::clone(&owner.identifier_unsaved),
+            resident_set,
+            #[cfg(test)]
+            saves: Arc::clone(&owner.identifier_saves),
+        }
+    }
+
+    /// Merges the unsaved vectors into the file without the `pruned` keys;
+    /// the vectors it fails to write stay unsaved.
+    async fn write(self, mut pruned: Vec<String>) {
+        // Only the vectors embedded since the last save: the save merges
+        // them into what is already on disk, or rebuilds a missing file
+        // from the whole resident set.
+        let pending = std::mem::take(&mut *self.unsaved.lock().unwrap());
+        // Embedded again since the prune: the save keeps it.
+        pruned.retain(|key| !pending.contains_key(key));
+        let data = match identifier_cache_data(&pending) {
+            Some(data) => data,
+            None if pruned.is_empty() => return,
+            None => rkyv_store::CacheData {
+                dims: 0,
+                keys: Vec::new(),
+                hashes: Vec::new(),
+                vectors: Vec::new(),
+            },
+        };
+        let (root, name, resident_set) = (self.root, self.name, self.resident_set);
+        let result = tokio::task::spawn_blocking(move || {
+            rkyv_store::save_cache_rebuilding(&root, &name, &data, &pruned, || {
+                let vectors = resident_set.upgrade()?;
+                identifier_cache_data(&vectors.blocking_read())
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                #[cfg(test)]
+                self.saves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result => {
+                if let Ok(Err(error)) = &result {
+                    tracing::warn!(%error, "Identifier cache persistence failed");
+                }
+                let mut unsaved = self.unsaved.lock().unwrap();
+                for (key, vector) in pending {
+                    unsaved.entry(key).or_insert(vector);
+                }
+            }
+        }
+    }
+}
+
+/// Estimate of the paths, headers and symbols of cached outlines.
+fn file_outline_bytes(outlines: &HashMap<String, FileOutline>) -> usize {
+    fn symbol_bytes(symbol: &crate::tools::context_tree::TreeSymbol) -> usize {
+        std::mem::size_of_val(symbol)
+            + symbol.name.len()
+            + symbol.kind.len()
+            + symbol.signature.len()
+            + symbol.children.iter().map(symbol_bytes).sum::<usize>()
+    }
+    outlines
+        .iter()
+        .map(|(path, (_, analysis))| {
+            64 + path.len()
+                + std::mem::size_of::<FileOutline>()
+                + analysis.as_ref().map_or(0, |analysis| {
+                    analysis.header.as_ref().map_or(0, String::len)
+                        + analysis.symbols.iter().map(symbol_bytes).sum::<usize>()
+                })
+        })
+        .sum()
+}
+
 /// O(1) estimate: vectors of one map share a width.
 fn identifier_vector_bytes(vectors: &IdentifierVectors) -> usize {
     vectors.values().next().map_or(0, |vector| {
@@ -1204,10 +1481,7 @@ fn build_lexical_index<'a>(
     });
     // Parsing on the pool threads left their allocator arenas holding the
     // freed parse state; hand it back rather than keep it resident.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    trim_allocator();
     built
 }
 
@@ -1380,8 +1654,10 @@ pub(crate) fn load_project_cache(
 }
 
 async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_name: &str) {
+    *owner.identifier_build.lock().unwrap() = None;
     // Background rebuilds and fills would refill what is cleared here.
     owner.cancel_background_tasks();
+    std::mem::take(&mut *owner.file_outlines.lock().unwrap());
     owner
         .cache_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1668,9 +1944,22 @@ impl ContextPlusServer {
         // `config.ollama_max_concurrent`, which Config::from_env clamps into
         // [1, 64]. We wire the same semaphore into the OllamaClient so that
         // every outbound embed (warmup, tracker, on-demand) shares one budget.
-        let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
+        // With three or more, document embeds hold at most all but one
+        // permit, so a query never waits behind them, and background batches
+        // hold all but one of those, so a request's documents never wait
+        // behind them. With two, background batches hold one and a request's
+        // documents share the other with queries.
+        let max_concurrent = config.ollama_max_concurrent.max(1);
+        let ollama_semaphore = Arc::new(Semaphore::new(max_concurrent));
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
             .with_semaphore(Arc::clone(&ollama_semaphore));
+        let ollama = if max_concurrent >= 3 {
+            ollama
+                .with_document_limit(max_concurrent - 1)
+                .with_batch_limit(max_concurrent - 2)
+        } else {
+            ollama.with_batch_limit(max_concurrent - 1)
+        };
 
         let embed_cache_name = cache_name("embeddings", &config);
 
@@ -3044,6 +3333,50 @@ impl ContextPlusServer {
         Box<dyn std::future::Future<Output = Result<Arc<IdentifierIndex>>> + Send + 'a>,
     > {
         Box::pin(async move {
+            let index = match self.identifier_index_or_build(cache, true).await? {
+                IdentifierLookup::Ready(index) => return Ok(index),
+                IdentifierLookup::Building(build) => build.finished().await?,
+            };
+            let installed = self
+                .current_ref()
+                .await
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &index));
+            if installed {
+                return Ok(index);
+            }
+            // The tree changed while the detached build ran, so it left the
+            // rebuild to the request.
+            let fresh_cache = self.ensure_project_cache().await?;
+            self.ensure_identifier_index(&fresh_cache).await
+        })
+    }
+
+    /// `ensure_identifier_index` from inside a build, which builds in place
+    /// rather than wait on a build of the same cache.
+    async fn ensure_identifier_index_in_build(
+        &self,
+        cache: &Arc<ProjectCache>,
+    ) -> Result<Arc<IdentifierIndex>> {
+        match self.identifier_index_or_build(cache, false).await? {
+            IdentifierLookup::Ready(index) => Ok(index),
+            IdentifierLookup::Building(build) => build.finished().await,
+        }
+    }
+
+    /// The identifier index of `cache` when it is current, or else the build
+    /// that produces it: detached and shared with concurrent callers when
+    /// `detach`, otherwise run in place.
+    fn identifier_index_or_build<'a>(
+        &'a self,
+        cache: &'a Arc<ProjectCache>,
+        detach: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<IdentifierLookup>> + Send + 'a>>
+    {
+        Box::pin(async move {
             let file_count = cache
                 .file_entries
                 .iter()
@@ -3077,7 +3410,7 @@ impl ContextPlusServer {
                         age_secs = idx.built_at.elapsed().as_secs(),
                         "IdentifierIndex hit"
                     );
-                    return Ok(Arc::clone(idx));
+                    return Ok(IdentifierLookup::Ready(Arc::clone(idx)));
                 }
 
                 let reason = match guard.as_ref() {
@@ -3146,27 +3479,97 @@ impl ContextPlusServer {
                         });
                         ref_index.track_background_task(&task);
                     }
-                    return Ok(previous);
+                    return Ok(IdentifierLookup::Ready(previous));
                 }
             }
-            self.build_identifier_index(cache, false).await
+            if detach {
+                return Ok(IdentifierLookup::Building(
+                    self.join_identifier_build(&ref_index, cache),
+                ));
+            }
+            self.build_identifier_index(cache, false)
+                .await
+                .map(IdentifierLookup::Ready)
         })
     }
 
-    /// The identifier index of a linked worktree's parent, built first when
-    /// missing, paired with the project cache it was built from.
+    /// The ref's running build, whichever project cache it started from, or
+    /// a new detached one of `cache`; a build installs its index only while
+    /// its cache is current. Concurrent callers share it, and one that stops
+    /// waiting does not cancel it.
+    fn join_identifier_build(
+        &self,
+        ref_index: &Arc<crate::ref_index::RefIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> IdentifierBuild {
+        let mut slot = ref_index.identifier_build.lock().unwrap();
+        if let Some(build) = slot.as_ref()
+            && build.running()
+        {
+            return build.clone();
+        }
+        let (done, receiver) = tokio::sync::watch::channel(None);
+        let (parsed, parsed_receiver) = tokio::sync::watch::channel(None);
+        let build = IdentifierBuild {
+            id: NEXT_IDENTIFIER_BUILD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            source: Arc::downgrade(cache),
+            parsed: parsed_receiver,
+            done: receiver,
+        };
+        let server = self.clone();
+        let owner = Arc::clone(ref_index);
+        let cache = Arc::clone(cache);
+        let id = build.id;
+        ref_index.spawn_background_task(async move {
+            let result = server
+                .build_identifier_index_seeded(&cache, true, true, Some(&parsed))
+                .await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    ref_id = %owner.cas_ref_id_hex,
+                    %error,
+                    "Identifier index build failed"
+                );
+            }
+            let mut slot = owner.identifier_build.lock().unwrap();
+            if slot.as_ref().is_some_and(|build| build.id == id) {
+                *slot = None;
+            }
+            drop(slot);
+            done.send_replace(Some(result.map_err(|error| error.to_string())));
+        });
+        *slot = Some(build.clone());
+        build
+    }
+
+    /// The embedded identifier index of a linked worktree's parent, paired
+    /// with the project cache it was built from; a missing one is never
+    /// built or waited for here.
     async fn parent_identifier_index(
         &self,
         ref_index: &crate::ref_index::RefIndex,
     ) -> Option<(Arc<IdentifierIndex>, Arc<ProjectCache>)> {
         let parent = self.identifier_parent(ref_index).await?;
-        let parent_server = self.with_session(ref_index.parent_ref_id?);
-        let parent_cache = parent_server.ensure_project_cache().await.ok()?;
-        parent_server
-            .ensure_identifier_index(&parent_cache)
-            .await
-            .ok()?;
         Self::built_identifier_index(&parent).await
+    }
+
+    /// The running identifier build of a linked worktree's parent, once it
+    /// has parsed or the embed budget has passed.
+    async fn parent_identifier_build(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<IdentifierBuild> {
+        let parent = self.identifier_parent(ref_index).await?;
+        let build = parent
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|build| build.running())
+            .cloned()?;
+        let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
+        let _ = tokio::time::timeout(budget, build.clone().documents()).await;
+        Some(build)
     }
 
     /// The primary checkout a linked worktree's identifier index seeds from.
@@ -3242,18 +3645,23 @@ impl ContextPlusServer {
         cache: &Arc<ProjectCache>,
         background: bool,
     ) -> Result<Arc<IdentifierIndex>> {
-        self.build_identifier_index_seeded(cache, background, true)
+        self.build_identifier_index_seeded(cache, background, true, None)
             .await
     }
 
     /// Builds the identifier index of the current ref. A first build of a
     /// linked worktree, when `seed_from_parent`, starts from its parent's
-    /// index and parses only the files whose content differs.
+    /// index and parses only the files whose content differs. While the
+    /// parent builds its first index, the worktree takes the parent's parsed
+    /// documents of identical files and embeds once the parent's build ends.
+    /// `parsed` receives the documents, without vectors, before they are
+    /// embedded.
     async fn build_identifier_index_seeded(
         &self,
         cache: &Arc<ProjectCache>,
         background: bool,
         seed_from_parent: bool,
+        parsed: Option<&tokio::sync::watch::Sender<Option<Arc<IdentifierIndex>>>>,
     ) -> Result<Arc<IdentifierIndex>> {
         let ref_index = self.current_ref().await;
         let update_guard = ref_index.identifier_update.lock().await;
@@ -3281,11 +3689,23 @@ impl ContextPlusServer {
         let previous = ref_index.identifier_index.read().await.as_ref().cloned();
         let mut incremental =
             previous.as_ref().is_some_and(|index| index.dims > 0) && source.is_some();
-        let parent_seed = if incremental || !seed_from_parent {
+        let mut parent_seed = if incremental || !seed_from_parent {
             None
         } else {
             self.parent_identifier_index(&ref_index).await
         };
+        let parent_build = if incremental || !seed_from_parent || parent_seed.is_some() {
+            None
+        } else {
+            self.parent_identifier_build(&ref_index).await
+        };
+        if parent_build.is_some() {
+            parent_seed = self.parent_identifier_index(&ref_index).await;
+        }
+        let parent_parsed = parent_build
+            .as_ref()
+            .filter(|_| parent_seed.is_none())
+            .and_then(|build| Some((build.parsed.borrow().clone()?, build.source.upgrade()?)));
         let from_parent = parent_seed.is_some();
         let (previous, source) = match parent_seed {
             Some((parent_index, parent_source)) => {
@@ -3307,7 +3727,9 @@ impl ContextPlusServer {
             cache.file_content.keys().cloned().collect()
         };
         let parse_paths = changed_paths.clone();
-        let use_snapshot = !incremental && snapshots::enabled(&self.state.config, &ref_index);
+        let use_snapshot = !incremental
+            && parent_parsed.is_none()
+            && snapshots::enabled(&self.state.config, &ref_index);
         let snapshot_root = ref_index.root_dir.clone();
         let snapshot_config = self.state.config.clone();
         let started = Instant::now();
@@ -3322,7 +3744,28 @@ impl ContextPlusServer {
                 })
                 .flatten();
             let from_snapshot = seeded.is_some();
-            let (mut docs, parse_paths) = seeded.unwrap_or((Vec::new(), parse_paths));
+            let (mut docs, parse_paths) = match (seeded, parent_parsed) {
+                (Some(seeded), _) => seeded,
+                (None, Some((parsed, source))) => {
+                    let mut docs = Vec::new();
+                    let mut differing = std::collections::HashSet::new();
+                    for path in parse_paths {
+                        match parsed.docs.files.get(&path) {
+                            Some(file_docs)
+                                if source.file_content.get(&path)
+                                    == cache_clone.file_content.get(&path) =>
+                            {
+                                docs.extend(file_docs.iter().cloned());
+                            }
+                            _ => {
+                                differing.insert(path);
+                            }
+                        }
+                    }
+                    (docs, differing)
+                }
+                (None, None) => (Vec::new(), parse_paths),
+            };
             let parsed_files = parse_paths.len();
             docs.par_extend(
                 cache_clone
@@ -3419,8 +3862,11 @@ impl ContextPlusServer {
                     "IdentifierIndex build discarded"
                 );
                 drop(update_guard);
+                if background {
+                    return Ok(idx);
+                }
                 let fresh_cache = self.ensure_project_cache().await?;
-                return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
+                return Box::pin(self.ensure_identifier_index_in_build(&fresh_cache)).await;
             }
             tracing::debug!(
                 ref_id = %ref_index.cas_ref_id_hex,
@@ -3465,104 +3911,131 @@ impl ContextPlusServer {
 
         drop(id_caches);
         drop(overlay);
-        // Embed only uncached identifiers, in chunks to survive MCP connection timeouts.
-        if !uncached_texts.is_empty() {
-            let chunk_size = self.state.ollama.batch_size();
-            for chunk_start in (0..uncached_indices.len()).step_by(chunk_size) {
-                let chunk_end = (chunk_start + chunk_size).min(uncached_indices.len());
-                let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
-                let chunk_vectors = self.state.ollama.embed_documents(chunk_texts).await?;
-                for (&idx, vector) in uncached_indices[chunk_start..chunk_end]
-                    .iter()
-                    .zip(chunk_vectors)
-                {
-                    result_vectors[idx] = Some(Arc::from(vector));
-                }
-            }
+        // Grouped before embedding, so a request that stops waiting can rank
+        // the parsed documents by keyword.
+        let mut positions_by_file: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        let mut docs_by_file: std::collections::BTreeMap<String, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for (i, doc) in identifier_docs.into_iter().enumerate() {
+            positions_by_file
+                .entry(doc.path.clone())
+                .or_default()
+                .push(i);
+            docs_by_file.entry(doc.path.clone()).or_default().push(doc);
+        }
+        let mut docs = if incremental {
+            previous.as_ref().unwrap().docs.files.clone()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        for path in &changed_paths {
+            docs.remove(path);
+        }
+        docs.extend(
+            docs_by_file
+                .into_iter()
+                .map(|(path, docs)| (path, Arc::new(docs))),
+        );
+        let docs = Segmented::from_files(docs);
+        if let Some(parsed) = parsed {
+            parsed.send_replace(Some(Arc::new(IdentifierIndex {
+                docs: docs.clone(),
+                vectors: IdentifierVectorIndex::empty(),
+                dims: 0,
+                file_count,
+                built_at: Instant::now(),
+            })));
         }
 
-        if !uncached_indices.is_empty() {
+        // Each batch's vectors are kept as it completes and saved at most every
+        // `IDENTIFIER_SAVE_INTERVAL`, so a build that fails or is cancelled
+        // leaves the next one only the rest.
+        if !uncached_texts.is_empty() {
+            if let Some(build) = parent_build.filter(IdentifierBuild::running) {
+                let _ = build.finished().await;
+            }
             let target = if is_worktree {
                 Arc::clone(&ref_index.identifier_vector_overlay)
             } else {
                 Arc::clone(resident)
             };
-            let mut target_guard = target.write().await;
-            let mut unsaved = ref_index.identifier_unsaved.lock().unwrap();
-            for &i in &uncached_indices {
-                if let Some(vector) = &result_vectors[i] {
-                    let key = identifier_docs[i].text.clone();
-                    target_guard.insert(key.clone(), Arc::clone(vector));
-                    unsaved.insert(key, Arc::clone(vector));
+            let chunk_size = self.state.ollama.batch_size().max(1);
+            let mut saved_at = Instant::now();
+            let mut failure = None;
+            for (indices, texts) in uncached_indices
+                .chunks(chunk_size)
+                .zip(uncached_texts.chunks(chunk_size))
+            {
+                let (indices, texts): (Vec<usize>, Vec<String>) = {
+                    let id_caches = resident.read().await;
+                    indices
+                        .iter()
+                        .zip(texts)
+                        .filter(|&(&i, text)| match id_caches.get(text) {
+                            Some(vector) => {
+                                result_vectors[i] = Some(Arc::clone(vector));
+                                false
+                            }
+                            None => true,
+                        })
+                        .map(|(&i, text)| (i, text.clone()))
+                        .unzip()
+                };
+                if texts.is_empty() {
+                    continue;
+                }
+                let embedded = match self.state.ollama.embed_documents(&texts).await {
+                    Err(ContextPlusError::Cancelled) => Err(ContextPlusError::Cancelled),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            identifiers = texts.len(),
+                            "Identifier embedding batch failed, retrying once"
+                        );
+                        self.state.ollama.embed_documents(&texts).await
+                    }
+                    embedded => embedded,
+                };
+                let vectors = match embedded {
+                    Ok(vectors) => vectors,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
+                {
+                    let mut target_guard = target.write().await;
+                    let mut unsaved = ref_index.identifier_unsaved.lock().unwrap();
+                    for ((&i, key), vector) in indices.iter().zip(&texts).zip(vectors) {
+                        let vector: Arc<[f32]> = Arc::from(vector);
+                        target_guard.insert(key.clone(), Arc::clone(&vector));
+                        unsaved.insert(key.clone(), Arc::clone(&vector));
+                        result_vectors[i] = Some(vector);
+                    }
+                }
+                if saved_at.elapsed() >= IDENTIFIER_SAVE_INTERVAL {
+                    schedule_identifier_save(
+                        &self.state,
+                        &ref_index,
+                        &target,
+                        is_worktree,
+                        id_cache_name.clone(),
+                    );
+                    saved_at = Instant::now();
                 }
             }
-            drop(unsaved);
-            drop(target_guard);
-            let ticket = ref_index
-                .identifier_persist_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                + 1;
-            let persist_generation = Arc::clone(&ref_index.identifier_persist_generation);
-            let persist_root = ref_index.root_dir.clone();
-            let save_lock = Arc::clone(&ref_index.identifier_save_lock);
-            let unsaved = Arc::clone(&ref_index.identifier_unsaved);
-            let resident_set = Arc::downgrade(&target);
-            let pruner =
-                (!is_worktree).then(|| (Arc::downgrade(&self.state), Arc::downgrade(&ref_index)));
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                // Serialized with the budget flush: both merge into the same file.
-                let _save = save_lock.lock().await;
-                if persist_generation.load(std::sync::atomic::Ordering::Acquire) != ticket {
-                    return;
-                }
-                let mut pruned = match pruner
-                    .as_ref()
-                    .and_then(|(state, owner)| Some((state.upgrade()?, owner.upgrade()?)))
-                {
-                    Some((state, owner)) => prune_identifier_vectors(&state, &owner).await,
-                    None => Vec::new(),
-                };
-                // Only the vectors embedded since the last save: the save merges
-                // them into what is already on disk, or rebuilds a missing file
-                // from the whole resident set.
-                let pending = std::mem::take(&mut *unsaved.lock().unwrap());
-                // Embedded again since the prune: the save keeps it.
-                pruned.retain(|key| !pending.contains_key(key));
-                let data = match identifier_cache_data(&pending) {
-                    Some(data) => data,
-                    None if pruned.is_empty() => return,
-                    None => rkyv_store::CacheData {
-                        dims: 0,
-                        keys: Vec::new(),
-                        hashes: Vec::new(),
-                        vectors: Vec::new(),
-                    },
-                };
-                let result = tokio::task::spawn_blocking(move || {
-                    rkyv_store::save_cache_rebuilding(
-                        &persist_root,
-                        &id_cache_name,
-                        &data,
-                        &pruned,
-                        || {
-                            let vectors = resident_set.upgrade()?;
-                            identifier_cache_data(&vectors.blocking_read())
-                        },
-                    )
-                })
-                .await;
-                if !matches!(result, Ok(Ok(()))) {
-                    if let Ok(Err(error)) = &result {
-                        tracing::warn!(%error, "Identifier cache persistence failed");
-                    }
-                    let mut unsaved = unsaved.lock().unwrap();
-                    for (key, vector) in pending {
-                        unsaved.entry(key).or_insert(vector);
-                    }
-                }
-            });
+            schedule_identifier_save(
+                &self.state,
+                &ref_index,
+                &target,
+                is_worktree,
+                id_cache_name.clone(),
+            );
+            if let Some(error) = failure {
+                return Err(error);
+            }
         }
 
         let embed_ms = started.elapsed().as_millis() - lookup_done;
@@ -3572,41 +4045,29 @@ impl ContextPlusServer {
             .map_or(0, |v| v.len());
         let zero: Arc<[f32]> = Arc::from(vec![0.0; dims]);
 
-        let mut docs_by_file: std::collections::BTreeMap<String, Vec<_>> =
-            std::collections::BTreeMap::new();
-        let mut vectors_by_file: std::collections::BTreeMap<String, Vec<Arc<[f32]>>> =
-            std::collections::BTreeMap::new();
-        for (doc, vector) in identifier_docs.into_iter().zip(result_vectors) {
-            let file_vectors = vectors_by_file.entry(doc.path.clone()).or_default();
-            if dims != 0 {
-                file_vectors.push(vector.unwrap_or_else(|| Arc::clone(&zero)));
-            }
-            docs_by_file.entry(doc.path.clone()).or_default().push(doc);
-        }
-        let mut docs = if incremental {
-            previous.as_ref().unwrap().docs.files.clone()
-        } else {
-            std::collections::BTreeMap::new()
-        };
         let mut vectors = if incremental {
             previous.as_ref().unwrap().vectors.file_segments().clone()
         } else {
             std::collections::BTreeMap::new()
         };
         for path in &changed_paths {
-            docs.remove(path);
             vectors.remove(path);
         }
-        docs.extend(
-            docs_by_file
-                .into_iter()
-                .map(|(path, docs)| (path, Arc::new(docs))),
-        );
-        vectors.extend(
-            vectors_by_file
-                .into_iter()
-                .map(|(path, vectors)| (path, Arc::new(vectors))),
-        );
+        vectors.extend(positions_by_file.into_iter().map(|(path, positions)| {
+            let file_vectors = if dims == 0 {
+                Vec::new()
+            } else {
+                positions
+                    .iter()
+                    .map(|&i| {
+                        result_vectors[i]
+                            .clone()
+                            .unwrap_or_else(|| Arc::clone(&zero))
+                    })
+                    .collect()
+            };
+            (path, Arc::new(file_vectors))
+        }));
         let previous_dims = previous.as_ref().map_or(0, |index| index.dims);
         if incremental && dims != 0 && dims != previous_dims {
             *ref_index.identifier_source.write().await = None;
@@ -3615,12 +4076,13 @@ impl ContextPlusServer {
                 cache,
                 background,
                 seed_from_parent && !from_parent,
+                parsed,
             ))
             .await;
         }
         let dims = if incremental { previous_dims } else { dims };
         let idx = Arc::new(IdentifierIndex {
-            docs: Segmented::from_files(docs),
+            docs,
             vectors: IdentifierVectorIndex::new(vectors, dims),
             dims,
             file_count,
@@ -3657,7 +4119,7 @@ impl ContextPlusServer {
                 return Ok(idx);
             }
             let fresh_cache = self.ensure_project_cache().await?;
-            return Box::pin(self.ensure_identifier_index(&fresh_cache)).await;
+            return Box::pin(self.ensure_identifier_index_in_build(&fresh_cache)).await;
         }
         tracing::debug!(
             ref_id = %ref_index.cas_ref_id_hex,
@@ -4093,6 +4555,10 @@ impl ContextPlusServer {
 
         let root = self.resolve_root(&args).await;
         let cache = self.ensure_project_cache().await?;
+        let ref_index = self.current_ref().await;
+        let target_path = Self::get_str(&args, "target_path");
+        // The tree shows only the files under the target, so only they are outlined.
+        let prefix = target_path.as_deref().map(ct::target_prefix);
 
         // Build entries and analyses in spawn_blocking (tree-sitter parsing is CPU-bound)
         let (ct_entries, ct_analyses) = tokio::task::spawn_blocking(move || {
@@ -4106,32 +4572,18 @@ impl ContextPlusServer {
                 })
                 .collect();
 
-            let mut ct_analyses = BTreeMap::new();
-            for entry in &cache.file_entries {
-                if entry.is_directory {
-                    continue;
-                }
-                if let Some(content) = cache.file_content.get(&entry.relative_path) {
-                    let content = Arc::clone(content);
-                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                        let header = crate::core::parser::extract_header(&content);
-                        let tree_symbols: Vec<ct::TreeSymbol> =
-                            symbols.iter().map(code_sym_to_tree_sym).collect();
-                        ct_analyses.insert(
-                            entry.relative_path.clone(),
-                            ct::FileAnalysis {
-                                header: if header.is_empty() {
-                                    None
-                                } else {
-                                    Some(header)
-                                },
-                                symbols: tree_symbols,
-                            },
-                        );
-                    }
-                }
-            }
+            let paths: Vec<&str> = cache
+                .file_entries
+                .iter()
+                .filter(|entry| {
+                    !entry.is_directory
+                        && prefix
+                            .as_deref()
+                            .is_none_or(|prefix| entry.relative_path.starts_with(prefix))
+                })
+                .map(|entry| entry.relative_path.as_str())
+                .collect();
+            let ct_analyses = outline_files(&ref_index, &paths, &cache.file_content);
             (ct_entries, ct_analyses)
         })
         .await
@@ -4139,7 +4591,7 @@ impl ContextPlusServer {
 
         let options = ct::ContextTreeOptions {
             root_dir: root,
-            target_path: Self::get_str(&args, "target_path"),
+            target_path,
             depth_limit: Self::get_usize(&args, "depth_limit"),
             include_symbols: Self::get_bool(&args, "include_symbols"),
             max_tokens: Self::get_usize(&args, "max_tokens"),
@@ -4339,6 +4791,22 @@ impl ContextPlusServer {
             },
         };
 
+        if !self.query_embedded_within_budget(&options.query).await? {
+            let top_k = Self::get_usize(&args, "top_k")
+                .filter(|&n| n > 0)
+                .unwrap_or(10);
+            let prefix = root
+                .strip_prefix(&self.current_ref().await.canonical_root)
+                .unwrap_or(std::path::Path::new(""))
+                .to_path_buf();
+            let keep = crate::tools::semantic_search::result_path_filter(&options, prefix);
+            let matches = self.lexical_search_text(options.query, top_k, keep).await?;
+            return Ok(Self::ok_text(format!(
+                "Partial results: {}, so these are keyword matches. Retry shortly for semantic ranking.\n\n{matches}",
+                self.query_embed_overdue()
+            )));
+        }
+
         let embedder = OllamaEmbedder(self.state.ollama.clone());
         let walker = crate::server_adapters::RefWalkerIndexer {
             ref_index: self.current_ref().await,
@@ -4360,12 +4828,14 @@ impl ContextPlusServer {
         } else {
             None
         };
-        let result = crate::tools::semantic_search::semantic_code_search_owned(
-            options,
-            &embedder,
-            Arc::new(walker),
-            Some(Arc::clone(&ref_index.search_index_cache)),
-            cache_gen.cloned(),
+        let result = crate::core::embeddings::interactive(
+            crate::tools::semantic_search::semantic_code_search_owned(
+                options,
+                &embedder,
+                Arc::new(walker),
+                Some(Arc::clone(&ref_index.search_index_cache)),
+                cache_gen.cloned(),
+            ),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -4376,16 +4846,108 @@ impl ContextPlusServer {
         args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         self.ensure_tracker_started().await;
-        use crate::tools::semantic_identifiers::*;
 
         let query = Self::get_str(&args, "query")
             .ok_or_else(|| ContextPlusError::Other("query is required".into()))?;
         let root = self.resolve_root(&args).await;
 
-        let cache = self.ensure_project_cache().await?;
+        let mut cache = self.ensure_project_cache().await?;
 
-        // Use cached identifier index (TTL=300s, rebuilds if file count changes)
-        let idx = self.ensure_identifier_index(&cache).await?;
+        // A build waits at most the embed budget; past it, the parsed
+        // documents answer by keyword while the build keeps embedding. A
+        // keyword ranking needs only the parsed documents. A build of the
+        // tree before an edit answers only partially, and once it ends, a
+        // build of the current tree takes the rest of the budget; until that
+        // build parses, the ended build's index answers.
+        const OUTDATED: &str = "identifiers reflect the tree before the latest edits";
+        let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
+        let started = tokio::time::Instant::now();
+        let mut lookup = self.identifier_index_or_build(&cache, true).await?;
+        let mut outdated = None;
+        let (idx, partial) = loop {
+            let build = match lookup {
+                IdentifierLookup::Ready(index) => break (index, None),
+                IdentifierLookup::Building(build) => build,
+            };
+            let remaining = budget.saturating_sub(started.elapsed());
+            let waited = if Self::ranks_identifiers_by_keyword(&args) {
+                tokio::time::timeout(remaining, build.clone().documents()).await
+            } else {
+                tokio::time::timeout(remaining, build.clone().finished()).await
+            };
+            match waited {
+                Ok(Ok(index)) if build.built_from(&cache) => break (index, None),
+                Ok(Ok(index)) if !build.running() => {
+                    outdated = Some(index);
+                    cache = self.ensure_project_cache().await?;
+                    lookup = self.identifier_index_or_build(&cache, true).await?;
+                }
+                Ok(Ok(index)) => break (index, Some(OUTDATED.to_string())),
+                waited => {
+                    let reason = match waited {
+                        Ok(Err(error)) => format!("identifier embedding failed ({error})"),
+                        _ => {
+                            "identifier embeddings are still building in the background".to_string()
+                        }
+                    };
+                    let parsed = match outdated {
+                        Some(index) if build.parsed.borrow().is_none() => {
+                            break (index, Some(OUTDATED.to_string()));
+                        }
+                        _ => self.parsed_identifier_docs(&build).await,
+                    };
+                    let Some(index) = parsed else {
+                        return Ok(Self::ok_text(format!(
+                            "Partial results: {reason}, and no identifiers are parsed yet. Retry shortly."
+                        )));
+                    };
+                    break (index, Some(reason));
+                }
+            }
+        };
+        self.search_identifiers(args, root, query, &cache, &idx, partial)
+            .await
+    }
+
+    /// The documents of a build that has not finished: its own once parsed,
+    /// else the index this ref already holds, unless that answers for the
+    /// parent's tree.
+    async fn parsed_identifier_docs(
+        &self,
+        build: &IdentifierBuild,
+    ) -> Option<Arc<IdentifierIndex>> {
+        let parsed = build.parsed.borrow().clone();
+        if parsed.is_some() {
+            return parsed;
+        }
+        let ref_index = self.current_ref().await;
+        if ref_index
+            .identifier_inherited
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        ref_index.identifier_index.read().await.as_ref().cloned()
+    }
+
+    /// Whether identifier search `args` rank by keyword alone.
+    fn ranks_identifiers_by_keyword(args: &serde_json::Map<String, Value>) -> bool {
+        Self::get_f64(args, "semantic_weight") == Some(0.0)
+            && Self::get_f64(args, "keyword_weight") != Some(0.0)
+    }
+
+    /// Searches `idx`; with a `partial` reason, by keyword only and without
+    /// the vectors, noting why.
+    async fn search_identifiers(
+        &self,
+        args: serde_json::Map<String, Value>,
+        root: PathBuf,
+        query: String,
+        cache: &Arc<ProjectCache>,
+        idx: &Arc<IdentifierIndex>,
+        partial: Option<String>,
+    ) -> Result<CallToolResult> {
+        use crate::tools::semantic_identifiers::*;
 
         if idx.docs.is_empty() {
             return Ok(Self::ok_text(
@@ -4393,13 +4955,32 @@ impl ContextPlusServer {
             ));
         }
 
+        let by_keyword = Self::ranks_identifiers_by_keyword(&args);
+        let partial = match partial {
+            None if !by_keyword
+                && idx.dims > 0
+                && !self.query_embedded_within_budget(&query).await? =>
+            {
+                Some(self.query_embed_overdue())
+            }
+            partial => partial,
+        };
+        let keyword_only = by_keyword || partial.is_some();
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
             query,
             top_k: Self::get_usize(&args, "top_k"),
             top_calls_per_identifier: Self::get_usize(&args, "top_calls_per_identifier"),
-            semantic_weight: Self::get_f64(&args, "semantic_weight"),
-            keyword_weight: Self::get_f64(&args, "keyword_weight"),
+            semantic_weight: if keyword_only {
+                Some(0.0)
+            } else {
+                Self::get_f64(&args, "semantic_weight")
+            },
+            keyword_weight: if keyword_only {
+                Some(1.0)
+            } else {
+                Self::get_f64(&args, "keyword_weight")
+            },
             include_kinds: Self::get_string_array(&args, "include_kinds"),
         };
 
@@ -4423,17 +5004,28 @@ impl ContextPlusServer {
                 .collect::<Vec<_>>()
         });
 
+        let no_vectors = IdentifierVectorIndex::empty();
+        let (vectors, dims) = if keyword_only {
+            (&no_vectors, 0)
+        } else {
+            (&idx.vectors, idx.dims)
+        };
         let result = semantic_identifier_search(
             options,
             &OllamaEmbedder(self.state.ollama.clone()),
             &idx.docs,
-            &idx.vectors,
-            idx.dims,
+            vectors,
+            dims,
             &cache.file_content,
             candidates.as_deref(),
         )
         .await?;
-        Ok(Self::ok_text(result))
+        Ok(Self::ok_text(match partial {
+            Some(reason) => format!(
+                "Partial results: {reason}, so identifiers are ranked by keyword only. Retry shortly for semantic ranking.\n\n{result}"
+            ),
+            None => result,
+        }))
     }
 
     async fn handle_semantic_navigate(
@@ -4462,13 +5054,15 @@ impl ContextPlusServer {
                 state: self.state.clone(),
             },
         };
-        let result = crate::tools::semantic_navigate::semantic_navigate(
-            options,
-            &self.state.ollama,
-            &self.state.config,
-            &ref_index.embedding_cache,
-            &ref_index.root_dir,
-            Some(&indexer),
+        let result = crate::core::embeddings::interactive(
+            crate::tools::semantic_navigate::semantic_navigate(
+                options,
+                &self.state.ollama,
+                &self.state.config,
+                &ref_index.embedding_cache,
+                &ref_index.root_dir,
+                Some(&indexer),
+            ),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -5166,15 +5760,27 @@ impl ContextPlusServer {
             .filter(|&n| n > 0)
             .unwrap_or(10);
 
+        Ok(Self::ok_text(
+            self.lexical_search_text(query, top_k, |_| true).await?,
+        ))
+    }
+
+    /// The top `top_k` keyword hits for `query` among the paths `keep` admits.
+    async fn lexical_search_text(
+        &self,
+        query: String,
+        top_k: usize,
+        keep: impl Fn(&str) -> bool + Send + 'static,
+    ) -> Result<String> {
         let cache = self.ensure_project_cache().await?;
         let cached = self.ensure_lexical_index(&cache).await?;
 
-        let formatted = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             if cached.is_empty() {
                 return "No files indexed. Ensure the project cache is populated.".to_string();
             }
 
-            let hits = cached.search(&query, top_k);
+            let hits = cached.search(&query, top_k, keep);
 
             if hits.is_empty() {
                 return format!("No lexical matches found for: {query}");
@@ -5191,11 +5797,34 @@ impl ContextPlusServer {
             lines.join("\n")
         })
         .await
-        .map_err(|e| {
-            ContextPlusError::Other(format!("lexical_search spawn_blocking failed: {e}"))
-        })?;
+        .map_err(|e| ContextPlusError::Other(format!("lexical_search spawn_blocking failed: {e}")))
+    }
 
-        Ok(Self::ok_text(formatted))
+    /// Embeds the search query `query` as the searches do, waiting at most
+    /// the query embed budget. Past it, `false`: the embed keeps running and
+    /// caches the vector for a later search.
+    async fn query_embedded_within_budget(&self, query: &str) -> Result<bool> {
+        let text = crate::tools::semantic_search::sanitize_query(query).into_owned();
+        if text.is_empty() || self.state.ollama.query_cached(&text) {
+            return Ok(true);
+        }
+        let ollama = self.state.ollama.clone();
+        let embed = tokio::spawn(async move { ollama.embed_queries(&[text]).await });
+        let budget = std::time::Duration::from_millis(self.state.config.query_embed_budget_ms);
+        match tokio::time::timeout(budget, embed).await {
+            Ok(Ok(embedded)) => embedded.map(|_| true),
+            Ok(Err(error)) => Err(ContextPlusError::Other(format!(
+                "query embedding task failed: {error}"
+            ))),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn query_embed_overdue(&self) -> String {
+        format!(
+            "the query embedding did not finish within {} ms",
+            self.state.config.query_embed_budget_ms
+        )
     }
 }
 
@@ -5401,6 +6030,80 @@ impl ContextPlusServer {
 }
 
 // --- Type conversion helpers ---
+
+/// Files a directory outline parses per structural pool job, so other
+/// structural work waits behind at most one batch of a cold outline.
+const OUTLINE_BATCH: usize = 64;
+
+/// The outline of each of `paths` a parser reads. A file outlined before with
+/// the same content keeps its outline; the others are parsed in parallel on
+/// the structural pool, a batch at a time.
+fn outline_files(
+    ref_index: &crate::ref_index::RefIndex,
+    paths: &[&str],
+    files: &crate::core::walker::FileContents,
+) -> BTreeMap<String, crate::tools::context_tree::FileAnalysis> {
+    use rayon::prelude::*;
+
+    let known: Vec<Option<FileOutline>> = {
+        let outlines = ref_index.file_outlines.lock().unwrap();
+        paths
+            .iter()
+            .map(|path| outlines.get(*path).cloned())
+            .collect()
+    };
+    let mut outlined: Vec<Option<(FileOutline, bool)>> = Vec::with_capacity(paths.len());
+    for (paths, known) in paths.chunks(OUTLINE_BATCH).zip(known.chunks(OUTLINE_BATCH)) {
+        STRUCTURAL_POOL.install(|| {
+            outlined.par_extend(paths.par_iter().zip(known).map(|(path, known)| {
+                let content = files.get(path)?;
+                let digest = crate::cache::snapshot::digest(content.as_bytes());
+                if let Some(known) = known.as_ref().filter(|(known, _)| *known == digest) {
+                    return Some((known.clone(), false));
+                }
+                #[cfg(test)]
+                {
+                    ref_index
+                        .outline_parses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::server_adapters::test_seams::outline_parse(&ref_index.root_dir);
+                }
+                Some(((digest, file_outline(path, content).map(Arc::new)), true))
+            }));
+        });
+    }
+    let mut outlines = ref_index.file_outlines.lock().unwrap();
+    outlines.retain(|path, _| files.get(path).is_some());
+    let mut analyses = BTreeMap::new();
+    for (path, outline) in paths.iter().zip(outlined) {
+        let Some((outline, parsed)) = outline else {
+            continue;
+        };
+        if let Some(analysis) = &outline.1 {
+            analyses.insert(path.to_string(), analysis.as_ref().clone());
+        }
+        if parsed {
+            outlines.insert(path.to_string(), outline);
+        }
+    }
+    drop(outlines);
+    analyses
+}
+
+/// The outline of the file at `path`, when a parser reads it.
+fn file_outline(path: &str, content: &str) -> Option<crate::tools::context_tree::FileAnalysis> {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let symbols = parse_with_tree_sitter(content, ext).ok()?;
+    let header = crate::core::parser::extract_header(content);
+    Some(crate::tools::context_tree::FileAnalysis {
+        header: if header.is_empty() {
+            None
+        } else {
+            Some(header)
+        },
+        symbols: symbols.iter().map(code_sym_to_tree_sym).collect(),
+    })
+}
 
 fn code_sym_to_tree_sym(
     sym: &crate::core::parser::CodeSymbol,
@@ -6433,6 +7136,7 @@ mod tests {
         text_of(&result)
     }
 
+    /// Explores identifiers by keyword once the index is built.
     async fn explore_identifier(
         server: &ContextPlusServer,
         query: &str,
@@ -6447,6 +7151,8 @@ mod tests {
         if let Some(path) = path {
             args.insert("path".into(), json!(path));
         }
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
         let result = server.dispatch("explore", args).await;
         assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
         text_of(&result)
@@ -6803,7 +7509,7 @@ mod tests {
         name: &str,
         at_least: usize,
     ) -> usize {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if let Ok(Some(data)) = rkyv_store::load_cache(root, name)
                     && data.keys.len() >= at_least
@@ -6853,6 +7559,34 @@ mod tests {
             "the save after a corrupt cache file wrote {rebuilt} entries, not the {} in memory",
             saved + 1
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_writes_unsaved_identifiers() {
+        let (repo, _ollama, server, name, saved) = identifier_server_with_saved_cache().await;
+        assert!(saved >= 3, "the first identifier save never landed");
+        let primary = server.state.default_ref().unwrap();
+        let embedded: Arc<[f32]> = Arc::from(vec![0.0, 1.0]);
+        primary
+            .identifier_vectors
+            .get()
+            .unwrap()
+            .write()
+            .await
+            .insert("reopen_ledger".into(), Arc::clone(&embedded));
+        primary
+            .identifier_unsaved
+            .lock()
+            .unwrap()
+            .insert("reopen_ledger".into(), embedded);
+
+        server.state.flush_identifier_vectors().await;
+
+        let keys = rkyv_store::load_cache(repo.path(), &name)
+            .unwrap()
+            .map(|data| data.keys)
+            .unwrap_or_default();
+        assert!(keys.iter().any(|key| key == "reopen_ledger"), "{keys:?}");
     }
 
     #[tokio::test]
@@ -7192,6 +7926,804 @@ mod tests {
         drop(building);
 
         assert!(pruned.is_empty(), "{pruned:?}");
+    }
+
+    /// An identifier server whose embedder answers each request through
+    /// `respond`, given the request's inputs.
+    async fn scripted_identifier_server(
+        files: &[(&str, &str)],
+        respond: impl Fn(&[String]) -> wiremock::ResponseTemplate + Send + Sync + 'static,
+        configure: impl FnOnce(&mut Config),
+    ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(move |request: &Request| respond(&embed_request_inputs(request)))
+            .mount(&ollama)
+            .await;
+
+        let repo = tempfile::tempdir().unwrap();
+        for &(path, source) in files {
+            let full_path = repo.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = ollama.uri();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        configure(&mut config);
+        let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
+        (repo, ollama, server)
+    }
+
+    fn embeddings_for(inputs: &[String]) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "embeddings": vec![vec![1.0, 0.0]; inputs.len()]
+        }))
+    }
+
+    fn identifier_args(query: &str, matching: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!(query));
+        args.insert("kind".into(), json!("identifiers"));
+        args.insert("match".into(), json!(matching));
+        args
+    }
+
+    async fn wait_for_embed_batch(ollama: &wiremock::MockServer, marker: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(ollama, marker)
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the identifier build never reached embedding");
+    }
+
+    const LEDGER_FILES: &[(&str, &str)] = &[(
+        "src/ledger.rs",
+        "pub fn open_account() {}\npub fn close_account() {}\n",
+    )];
+
+    #[tokio::test]
+    async fn identifier_query_answers_by_keyword_within_the_budget_while_the_build_embeds() {
+        let (_repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "meaning")),
+        )
+        .await
+        .expect("the identifier query waited past its budget for the build");
+
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(60), build.finished())
+            .await
+            .expect("the build stopped when the request stopped waiting for it")
+            .unwrap();
+        let primary = server.state.default_ref().unwrap();
+        assert!(
+            primary
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|index| index.dims > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_identifier_answer_never_serves_an_inherited_index() {
+        let (_primary, _ollama, server) = identifier_server_configured(
+            &[("src/primary.rs", "pub fn primary_only_name() {}\n")],
+            |config| config.embed_budget_ms = 0,
+        )
+        .await;
+        let primary_cache = server.ensure_project_cache().await.unwrap();
+        server
+            .ensure_identifier_index(&primary_cache)
+            .await
+            .unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join("src")).unwrap();
+        std::fs::write(
+            worktree.path().join("src/ledger.rs"),
+            "pub fn worktree_name() {}\n",
+        )
+        .unwrap();
+        let canonical = worktree.path().canonicalize().unwrap();
+        let mut attach = serde_json::Map::new();
+        attach.insert("path".into(), json!(canonical.to_string_lossy()));
+        server.handle_attach_worktree(attach).await.unwrap();
+        let session = server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical));
+        let worktree_ref = session.current_ref().await;
+        assert!(
+            worktree_ref
+                .identifier_inherited
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let building = worktree_ref.identifier_update.lock().await;
+
+        let answered = session
+            .dispatch("explore", identifier_args("primary_only_name", "keywords"))
+            .await;
+
+        drop(building);
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(!text.contains("primary_only_name -"), "{text}");
+    }
+
+    /// Holds every embed permit, so builds parse but embed nothing until it
+    /// is dropped.
+    async fn hold_embeds(server: &ContextPlusServer) -> tokio::sync::OwnedSemaphorePermit {
+        let permits = server.state.config.ollama_max_concurrent.max(1) as u32;
+        server
+            .state
+            .ollama_semaphore()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap()
+    }
+
+    async fn started_identifier_build(server: &ContextPlusServer) -> IdentifierBuild {
+        let cache = server.ensure_project_cache().await.unwrap();
+        match server
+            .identifier_index_or_build(&cache, true)
+            .await
+            .unwrap()
+        {
+            IdentifierLookup::Building(build) => build,
+            IdentifierLookup::Ready(_) => panic!("the identifier index was already built"),
+        }
+    }
+
+    async fn wait_until_parsed(build: &IdentifierBuild) {
+        let mut parsed = build.parsed.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            parsed.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the identifier build never parsed")
+        .expect("the identifier build ended before parsing");
+    }
+
+    #[tokio::test]
+    async fn an_identifier_query_after_an_edit_joins_the_running_build() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let first = started_identifier_build(&server).await;
+        wait_until_parsed(&first).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn close_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        let running = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+        assert_eq!(running, Some(first.id), "the query started a second build");
+        drop(held);
+    }
+
+    /// Waits until a request holds `cache` beyond its `holders`, as an
+    /// identifier query does from just before it joins a build.
+    async fn wait_until_held(cache: &Arc<ProjectCache>, holders: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while Arc::strong_count(cache) <= holders {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the query never resolved the project cache");
+    }
+
+    /// An identifier server whose cold build has parsed `src/ledger.rs` and
+    /// holds every embed permit, after an edit that adds `audit_account`.
+    async fn identifier_build_outdated_by_an_edit() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let (repo, ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn close_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        (repo, ollama, server, held)
+    }
+
+    /// Runs `args` as an identifier query that joins the running build, then
+    /// lets that build embed.
+    async fn identifier_query_joining_the_build(
+        server: &ContextPlusServer,
+        held: tokio::sync::OwnedSemaphorePermit,
+        args: serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        let edited = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&edited);
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move { server.dispatch("explore", args).await })
+        };
+        wait_until_held(&edited, holders).await;
+        drop(held);
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+        text_of(&answered)
+    }
+
+    #[tokio::test]
+    async fn an_identifier_answer_from_a_build_an_edit_outdated_is_partial() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+
+        let by_keyword = text_of(
+            &server
+                .dispatch("explore", identifier_args("audit_account", "keywords"))
+                .await,
+        );
+        let by_meaning = identifier_query_joining_the_build(
+            &server,
+            held,
+            identifier_args("audit_account", "meaning"),
+        )
+        .await;
+
+        for text in [&by_keyword, &by_meaning] {
+            assert!(
+                text.contains("audit_account - src/ledger.rs")
+                    || text.starts_with("Partial results"),
+                "keywords:\n{by_keyword}\n\nmeaning:\n{by_meaning}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_builds_the_edited_tree_when_its_joined_build_ends() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+
+        let text = identifier_query_joining_the_build(
+            &server,
+            held,
+            identifier_args("audit_account", "meaning"),
+        )
+        .await;
+
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_builds_the_current_tree_after_a_second_edit() {
+        let (repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&edited);
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("reconcile_account", "meaning"))
+                    .await
+            })
+        };
+        wait_until_held(&edited, holders).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn reconcile_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("second test edit")
+            .await;
+        drop(held);
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("reconcile_account - src/ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_keeps_the_outdated_index_until_the_rebuild_parses() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let primary = server.state.default_ref().unwrap();
+        let outdated = primary
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+        let mut next_build = std::pin::pin!(primary.identifier_update.lock());
+        assert!(futures::poll!(&mut next_build).is_pending());
+        let edited = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&edited);
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("open_account", "meaning"))
+                    .await
+            })
+        };
+        wait_until_held(&edited, holders).await;
+        drop(held);
+        let blocked = next_build.await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !primary
+                .identifier_build
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|build| Some(build.id) != outdated)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the query never started a build of the edited tree");
+        primary.cancel_background_tasks();
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+        drop(blocked);
+
+        let text = text_of(&answered);
+        assert!(
+            text.starts_with(
+                "Partial results: identifiers reflect the tree before the latest edits"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_detached_identifier_build_outdated_by_an_edit_does_not_walk_the_tree_again() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        crate::server_adapters::test_seams::record_reads(repo.path());
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(60), build.finished())
+            .await
+            .expect("the identifier build never finished")
+            .unwrap();
+
+        assert_eq!(
+            crate::server_adapters::test_seams::reads(repo.path()),
+            Vec::<String>::new(),
+            "the detached build walked the tree again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_needs_neither_vectors_nor_a_query_embed() {
+        let (_repo, ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let mut keyword_args = serde_json::Map::new();
+        keyword_args.insert("semantic_weight".into(), json!(0.0));
+        keyword_args.insert("keyword_weight".into(), json!(1.0));
+        let ranked_by_keyword = server
+            .search_identifiers(
+                keyword_args,
+                server.resolve_root(&serde_json::Map::new()).await,
+                "open_account".into(),
+                &server.ensure_project_cache().await.unwrap(),
+                &server.parsed_identifier_docs(&build).await.unwrap(),
+                Some("held".into()),
+            )
+            .await
+            .unwrap();
+        let expected = text_of(&ranked_by_keyword)
+            .split_once("\n\n")
+            .unwrap()
+            .1
+            .to_string();
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        assert_eq!(text_of(&answered), expected);
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(60), build.finished())
+            .await
+            .expect("the identifier build never finished")
+            .unwrap();
+        let requests = ollama.received_requests().await.unwrap().len();
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "keywords"))
+            .await;
+        assert_eq!(text_of(&answered), expected);
+        assert_eq!(
+            ollama.received_requests().await.unwrap().len(),
+            requests,
+            "the keyword query embedded its query"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_gives_up_leaves_the_identifier_build_to_the_next_caller() {
+        let (_repo, ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            |inputs| embeddings_for(inputs).set_delay(std::time::Duration::from_millis(500)),
+            |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            },
+        )
+        .await;
+
+        let first = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("open_account", "meaning"))
+                    .await
+            })
+        };
+        wait_for_embed_batch(&ollama, "src/ledger.rs").await;
+        let cache = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&cache);
+        let second = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("open_account", "meaning"))
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while Arc::strong_count(&cache) <= holders && !second.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second caller never resolved the project cache");
+        first.abort();
+
+        let answered = second.await.unwrap();
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(
+            server
+                .state
+                .default_ref()
+                .unwrap()
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|index| index.dims > 0),
+            "the build was cancelled with the caller that gave up"
+        );
+        assert_eq!(
+            matching_embed_request_batches(&ollama, "src/ledger.rs")
+                .await
+                .len(),
+            1,
+            "the second caller embedded the identifiers again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_identifier_build_logs_its_error() {
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            |_| wiremock::ResponseTemplate::new(500),
+            |config| config.embed_budget_ms = 600_000,
+        )
+        .await;
+
+        server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let logs = crate::test_logs::logs_as_string(&logs);
+        let failure = logs
+            .lines()
+            .find(|line| line.contains("Identifier index build failed"))
+            .unwrap_or_else(|| panic!("the build failure was not logged:\n{logs}"));
+        assert!(
+            failure.contains("WARN") && failure.contains("HTTP 500"),
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identifier_batch_that_fails_once_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            {
+                let failures = Arc::clone(&failures);
+                move |inputs| {
+                    if inputs.iter().any(|input| input.contains("src/ledger.rs"))
+                        && failures.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        return wiremock::ResponseTemplate::new(500);
+                    }
+                    embeddings_for(inputs)
+                }
+            },
+            |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            },
+        )
+        .await;
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+    }
+
+    /// An embedder that fails, attempt and retry alike, the identifier batch
+    /// that arrives once `after` batches have embedded, until `recover`.
+    /// Batches follow the walk order, which the file system decides, so the
+    /// failing batch is chosen by arrival and then matched by content.
+    struct FailingIdentifierBatch {
+        after: usize,
+        recovered: std::sync::atomic::AtomicBool,
+        state: std::sync::Mutex<FailingIdentifierBatchState>,
+    }
+
+    #[derive(Default)]
+    struct FailingIdentifierBatchState {
+        embedded_batches: usize,
+        embedded: Vec<String>,
+        failed: Option<Vec<String>>,
+    }
+
+    impl FailingIdentifierBatch {
+        fn after(after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                after,
+                recovered: std::sync::atomic::AtomicBool::new(false),
+                state: Default::default(),
+            })
+        }
+
+        fn respond(&self, inputs: &[String]) -> wiremock::ResponseTemplate {
+            let names: Vec<String> = inputs
+                .iter()
+                .filter(|input| input.contains("src/"))
+                .map(|input| input.split(' ').next().unwrap().to_string())
+                .collect();
+            if names.is_empty() {
+                return embeddings_for(inputs);
+            }
+            let mut state = self.state.lock().unwrap();
+            if !self.recovered.load(std::sync::atomic::Ordering::SeqCst) {
+                let fails = match &state.failed {
+                    Some(failed) => *failed == names,
+                    None => state.embedded_batches == self.after,
+                };
+                if fails {
+                    state.failed = Some(names);
+                    return wiremock::ResponseTemplate::new(500);
+                }
+            }
+            state.embedded_batches += 1;
+            state.embedded.extend(names);
+            embeddings_for(inputs)
+        }
+
+        fn recover(&self) {
+            self.recovered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn failed(&self) -> Option<Vec<String>> {
+            self.state.lock().unwrap().failed.clone()
+        }
+
+        fn take_embedded(&self) -> Vec<String> {
+            let mut embedded = std::mem::take(&mut self.state.lock().unwrap().embedded);
+            embedded.sort();
+            embedded
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_identifier_batch_keeps_earlier_batches_for_the_next_build() {
+        let embedder = FailingIdentifierBatch::after(2);
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            &[
+                ("src/a.rs", "pub fn alpha_one() {}\npub fn alpha_two() {}\n"),
+                ("src/b.rs", "pub fn beta_one() {}\npub fn beta_two() {}\n"),
+                ("src/z.rs", "pub fn zeta_one() {}\npub fn zeta_two() {}\n"),
+            ],
+            {
+                let embedder = Arc::clone(&embedder);
+                move |inputs| embedder.respond(inputs)
+            },
+            |config| {
+                config.embed_batch_size = 2;
+                config.embed_budget_ms = 600_000;
+            },
+        )
+        .await;
+
+        server
+            .dispatch("explore", identifier_args("alpha_one", "meaning"))
+            .await;
+        let before_failure = embedder.take_embedded();
+        let mut failed = embedder.failed().expect("no identifier batch failed");
+        failed.sort();
+        assert_eq!(before_failure.len(), 4, "{before_failure:?}");
+        embedder.recover();
+        let answered = server
+            .dispatch("explore", identifier_args("alpha_one", "meaning"))
+            .await;
+
+        assert_eq!(answered.is_error, Some(false), "{}", text_of(&answered));
+        assert_eq!(
+            embedder.take_embedded(),
+            failed,
+            "the next build embedded again what {before_failure:?} had embedded"
+        );
+    }
+
+    /// The identifier cache writes so far, once no save is in flight and
+    /// every embedded vector is saved.
+    async fn settled_identifier_saves(server: &ContextPlusServer) -> usize {
+        let owner = server.current_ref().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                {
+                    let _save = owner.identifier_save_lock.lock().await;
+                    if owner
+                        .identifier_saves
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                        && owner.identifier_unsaved.lock().unwrap().is_empty()
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the embedded identifiers were never saved");
+        owner
+            .identifier_saves
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn an_identifier_build_writes_the_cache_once_when_it_ends() {
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            |inputs| embeddings_for(inputs).set_delay(std::time::Duration::from_millis(400)),
+            |config| config.embed_batch_size = 1,
+        )
+        .await;
+        let cache = server.ensure_project_cache().await.unwrap();
+
+        server.ensure_identifier_index(&cache).await.unwrap();
+
+        assert_eq!(
+            settled_identifier_saves(&server).await,
+            1,
+            "each embedded batch rewrote the identifier cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_identifier_build_saves_the_batches_it_embedded() {
+        let embedder = FailingIdentifierBatch::after(1);
+        let (repo, _ollama, server) = scripted_identifier_server(
+            &[
+                ("src/a.rs", "pub fn alpha_one() {}\npub fn alpha_two() {}\n"),
+                ("src/z.rs", "pub fn zeta_one() {}\npub fn zeta_two() {}\n"),
+            ],
+            {
+                let embedder = Arc::clone(&embedder);
+                move |inputs| embedder.respond(inputs)
+            },
+            |config| config.embed_batch_size = 2,
+        )
+        .await;
+        let cache = server.ensure_project_cache().await.unwrap();
+
+        assert!(server.ensure_identifier_index(&cache).await.is_err());
+
+        settled_identifier_saves(&server).await;
+        let name = cache_name("identifier-embeddings", &server.state.config);
+        let saved = rkyv_store::load_cache(repo.path(), &name)
+            .unwrap()
+            .map(|data| data.keys);
+        assert_eq!(saved.map(|keys| keys.len()), Some(2));
     }
 
     #[test]
@@ -7658,6 +9190,270 @@ mod tests {
         let dir = server.dispatch("outline", args).await;
         assert_eq!(dir.is_error, Some(false), "{}", text_of(&dir));
         assert!(text_of(&dir).contains("auth.rs"), "{}", text_of(&dir));
+    }
+
+    const OUTLINE_FILES: &[(&str, &str)] = &[
+        (
+            "src/a/ledger.rs",
+            "//! Ledger entries.\npub struct Ledger;\nimpl Ledger {\n    pub fn open(&self) {}\n    pub fn close(&self) {}\n}\n",
+        ),
+        (
+            "src/a/account.ts",
+            "// Accounts.\nexport class Account {\n  balance(): number { return 0; }\n}\nexport function openAccount() {}\n",
+        ),
+        ("src/b/report.rs", "pub fn monthly_report() {}\n"),
+        ("lib/util.rs", "pub fn helper() {}\n"),
+        ("README.md", "# Outline fixture\n"),
+    ];
+
+    fn outline_server() -> (tempfile::TempDir, ContextPlusServer) {
+        let repo = tempfile::tempdir().unwrap();
+        for &(path, source) in OUTLINE_FILES {
+            let full_path = repo.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
+        (repo, server)
+    }
+
+    async fn context_tree(server: &ContextPlusServer, args: &serde_json::Value) -> String {
+        let result = server
+            .dispatch("get_context_tree", args.as_object().unwrap().clone())
+            .await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        text_of(&result)
+    }
+
+    async fn outline_parses(server: &ContextPlusServer) -> usize {
+        server
+            .current_ref()
+            .await
+            .outline_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn directory_outline_parses_only_the_files_under_its_target() {
+        let (_repo, server) = outline_server();
+
+        context_tree(&server, &json!({ "target_path": "src/a" })).await;
+
+        assert_eq!(
+            outline_parses(&server).await,
+            2,
+            "the outline of src/a parsed files outside it"
+        );
+    }
+
+    /// The tree as built before outlines were scoped and cached: every file
+    /// parsed in turn, then the tree narrowed to the target.
+    async fn serially_parsed_context_tree(
+        server: &ContextPlusServer,
+        args: &serde_json::Value,
+    ) -> String {
+        use crate::tools::context_tree as ct;
+
+        let cache = server.ensure_project_cache().await.unwrap();
+        let entries: Vec<ct::FileEntry> = cache
+            .file_entries
+            .iter()
+            .map(|e| ct::FileEntry {
+                relative_path: e.relative_path.clone(),
+                is_directory: e.is_directory,
+                depth: e.depth,
+            })
+            .collect();
+        let mut analyses = BTreeMap::new();
+        for entry in &cache.file_entries {
+            if entry.is_directory {
+                continue;
+            }
+            if let Some(content) = cache.file_content.get(&entry.relative_path) {
+                let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                if let Ok(symbols) = parse_with_tree_sitter(content, ext) {
+                    let header = crate::core::parser::extract_header(content);
+                    analyses.insert(
+                        entry.relative_path.clone(),
+                        ct::FileAnalysis {
+                            header: (!header.is_empty()).then_some(header),
+                            symbols: symbols.iter().map(code_sym_to_tree_sym).collect(),
+                        },
+                    );
+                }
+            }
+        }
+        let options = ct::ContextTreeOptions {
+            root_dir: server.current_ref().await.root_dir.clone(),
+            target_path: args["target_path"].as_str().map(str::to_string),
+            depth_limit: args["depth_limit"].as_u64().map(|depth| depth as usize),
+            include_symbols: args["include_symbols"].as_bool(),
+            max_tokens: args["max_tokens"].as_u64().map(|tokens| tokens as usize),
+        };
+        ct::get_context_tree(options, &entries, &analyses)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn directory_outline_matches_the_serially_parsed_tree() {
+        let (_repo, server) = outline_server();
+
+        for args in [
+            json!({}),
+            json!({ "target_path": "src" }),
+            json!({ "target_path": "src/a/" }),
+            json!({ "target_path": "src/a", "include_symbols": false }),
+            json!({ "target_path": "src", "depth_limit": 1 }),
+            json!({ "max_tokens": 20 }),
+            json!({ "target_path": "missing" }),
+        ] {
+            let expected = serially_parsed_context_tree(&server, &args).await;
+            assert_eq!(context_tree(&server, &args).await, expected, "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_directory_outline_reuses_the_parsed_files() {
+        let (_repo, server) = outline_server();
+        let args = json!({ "target_path": "src" });
+        let first = context_tree(&server, &args).await;
+        let parsed = outline_parses(&server).await;
+
+        let second = context_tree(&server, &args).await;
+
+        assert_eq!(second, first);
+        assert_eq!(
+            outline_parses(&server).await,
+            parsed,
+            "the second outline parsed the files again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_outline_parses_a_changed_file_again() {
+        let (repo, server) = outline_server();
+        let args = json!({ "target_path": "src" });
+        context_tree(&server, &args).await;
+        std::fs::write(
+            repo.path().join("src/b/report.rs"),
+            "pub fn yearly_report() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let parsed = outline_parses(&server).await;
+
+        let outline = context_tree(&server, &args).await;
+
+        assert!(outline.contains("yearly_report"), "{outline}");
+        assert!(!outline.contains("monthly_report"), "{outline}");
+        assert_eq!(outline_parses(&server).await, parsed + 1);
+    }
+
+    #[tokio::test]
+    async fn cached_directory_outlines_count_toward_the_resident_estimate() {
+        let (_repo, server) = outline_server();
+        context_tree(&server, &json!({})).await;
+
+        let owner = server.current_ref().await;
+        let components = ResidentSnapshot::capture(&owner).await.measure();
+
+        assert!(
+            components
+                .iter()
+                .any(|(_, bytes, name)| *name == "outlines" && *bytes > 0),
+            "{components:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structural_work_waits_for_at_most_one_batch_of_a_cold_outline() {
+        const FILES: usize = 512;
+        if STRUCTURAL_POOL.current_num_threads() < 2 {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        for i in 0..FILES {
+            std::fs::write(
+                repo.path().join(format!("src/file_{i}.rs")),
+                format!("pub fn function_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
+        let cache = server.ensure_project_cache().await.unwrap();
+        let ref_index = server.current_ref().await;
+        let pause = crate::server_adapters::test_seams::pause_outline_parse(&ref_index.root_dir);
+        let outline = {
+            let ref_index = Arc::clone(&ref_index);
+            tokio::task::spawn_blocking(move || {
+                let paths: Vec<&str> = cache
+                    .file_entries
+                    .iter()
+                    .filter(|entry| !entry.is_directory)
+                    .map(|entry| entry.relative_path.as_str())
+                    .collect();
+                outline_files(&ref_index, &paths, &cache.file_content).len()
+            })
+        };
+        let entered = Arc::clone(&pause);
+        tokio::task::spawn_blocking(move || entered.wait_until_entered())
+            .await
+            .unwrap();
+
+        let probe = Arc::clone(&ref_index);
+        let parsed_before_probe = tokio::task::spawn_blocking(move || {
+            STRUCTURAL_POOL.install(|| {
+                probe
+                    .outline_parses
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+        })
+        .await
+        .unwrap();
+        tokio::task::spawn_blocking(move || pause.resume())
+            .await
+            .unwrap();
+
+        assert_eq!(outline.await.unwrap(), FILES);
+        assert!(
+            parsed_before_probe < FILES / 2,
+            "pool work waited until the outline had parsed {parsed_before_probe} of {FILES} files"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_outline_leaves_returning_freed_memory_to_the_budget_check() {
+        let (_repo, server) = outline_server();
+        let cache = server.ensure_project_cache().await.unwrap();
+        let paths: Vec<&str> = cache
+            .file_entries
+            .iter()
+            .filter(|entry| !entry.is_directory)
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        let ref_index = server.current_ref().await;
+        let trims = ALLOCATOR_TRIMS.with(std::cell::Cell::get);
+
+        outline_files(&ref_index, &paths, &cache.file_content);
+
+        assert!(outline_parses(&server).await > 0);
+        assert_eq!(
+            ALLOCATOR_TRIMS.with(std::cell::Cell::get),
+            trims,
+            "the outline walked the allocator's arenas itself"
+        );
     }
 
     #[tokio::test]
@@ -8258,7 +10054,7 @@ mod tests {
             .unwrap_or("");
         assert!(first.contains("verify_token"), "{text}");
         assert!(
-            text.contains("Score: 100% | Semantic: 100% | Keyword: 100%"),
+            text.contains("Score: 100% | Semantic: 0% | Keyword: 100%"),
             "keyword-only weighting must make the score equal the keyword coverage:\n{text}"
         );
     }
@@ -12702,9 +14498,14 @@ mod tests {
         server.with_session(crate::ref_index::RefId::for_canonical_path(&canonical))
     }
 
-    /// After a restart a worktree may query before the primary has built its
-    /// identifier index; its build then shares the primary's documents of
-    /// every identical file and parses only the files that differ.
+    async fn build_primary_identifier_index(server: &ContextPlusServer) {
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
+    }
+
+    /// A worktree's first build over a primary with an embedded identifier
+    /// index shares the primary's documents of every identical file and
+    /// parses only the files that differ.
     #[tokio::test]
     async fn worktree_identifier_build_reuses_primary_documents_of_identical_files() {
         let ollama = wiremock::MockServer::start().await;
@@ -12717,6 +14518,7 @@ mod tests {
         std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
         std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
         let server = identifier_test_server(&ollama, primary.path()).await;
+        build_primary_identifier_index(&server).await;
         let worktree_server = attached_worktree(&server, worktree.path()).await;
 
         let cache = worktree_server.ensure_project_cache().await.unwrap();
@@ -12752,6 +14554,93 @@ mod tests {
             &primary_index.docs.files["differs.rs"]
         ));
         assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
+    }
+
+    /// A worktree whose primary has no embedded identifier index parses all
+    /// of its own files rather than wait for the primary to build one.
+    #[tokio::test]
+    async fn worktree_identifier_build_never_builds_the_primary_index() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            std::fs::write(dir.join("same.rs"), "fn same() {}\n").unwrap();
+        }
+        std::fs::write(
+            primary.path().join("primary_only.rs"),
+            "fn primary_only() {}\n",
+        )
+        .unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+
+        let cache = worktree_server.ensure_project_cache().await.unwrap();
+        let index = worktree_server
+            .ensure_identifier_index(&cache)
+            .await
+            .unwrap();
+
+        assert_eq!(index.docs.files["same.rs"][0].name, "same");
+        assert!(
+            server
+                .state
+                .default_ref()
+                .unwrap()
+                .identifier_index
+                .read()
+                .await
+                .is_none(),
+            "the worktree build built the primary's identifier index"
+        );
+        assert!(
+            matching_embed_request_batches(&ollama, "primary_only")
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A worktree whose primary is building its first identifier index takes
+    /// the primary's parsed documents of identical files and leaves their
+    /// embedding to the primary.
+    #[tokio::test]
+    async fn worktree_identifier_build_joins_the_primary_build_for_identical_files() {
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            std::fs::write(dir.join("same_a.rs"), "fn same_a() {}\n").unwrap();
+            std::fs::write(dir.join("same_b.rs"), "fn same_b() {}\n").unwrap();
+        }
+        std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+        let held = hold_embeds(&server).await;
+        let primary_build = started_identifier_build(&server).await;
+        wait_until_parsed(&primary_build).await;
+
+        let worktree_build = started_identifier_build(&worktree_server).await;
+        wait_until_parsed(&worktree_build).await;
+        drop(held);
+        let index = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            worktree_build.finished(),
+        )
+        .await
+        .expect("the worktree identifier build never finished")
+        .unwrap();
+
+        assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
+        assert_eq!(index.docs.files["same_a.rs"][0].name, "same_a");
+        assert_eq!(matching_embed_input_count(&ollama, "same_a").await, 1);
+        assert_eq!(matching_embed_input_count(&ollama, "same_b").await, 1);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("cold-start phase") && line.contains("parsed_files=1")),
+            "the worktree parsed its identical files again:\n{logs}"
+        );
     }
 
     /// Every field of an identifier index's documents, in index order.
@@ -12825,6 +14714,7 @@ mod tests {
             std::fs::write(dir.join("added.rs"), "fn added() {}\n").unwrap();
         }
         let server = identifier_test_server(&ollama, primary.path()).await;
+        build_primary_identifier_index(&server).await;
         let worktree_server = attached_worktree(&server, worktree.path()).await;
         let cache = worktree_server.ensure_project_cache().await.unwrap();
         let seeded = worktree_server
@@ -12839,6 +14729,20 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(Arc::ptr_eq(
+            &seeded.docs.files["same.rs"],
+            &server
+                .state
+                .default_ref()
+                .unwrap()
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .docs
+                .files["same.rs"]
+        ));
         assert!(!seeded.docs.files.contains_key("deleted.rs"));
         assert_eq!(identifier_documents(&seeded), identifier_documents(&full));
         assert_eq!(vectors(&seeded), vectors(&full));
@@ -13883,6 +15787,133 @@ mod tests {
         // Verify RefWarmupMode is accessible from the config stored in state.
         let _ = server.state.config.ref_warmup_mode;
         assert_eq!(server.state.config.ref_warmup_mode, RefWarmupMode::Shallow);
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_slow_batch_embeds_hold_every_batch_permit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = embeddings_for(&inputs);
+                if inputs.iter().any(|input| input.contains("BATCH")) {
+                    response.set_delay(std::time::Duration::from_secs(3600))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.ollama_max_concurrent = 2;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let batches: Vec<_> = (0..3)
+            .map(|i| {
+                let ollama = server.state.ollama.clone();
+                tokio::spawn(async move {
+                    ollama
+                        .embed_documents(&[format!("BATCH {i} a"), format!("BATCH {i} b")])
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "BATCH")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no batch embed reached the embedder");
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind the batch embeds");
+        assert!(query.is_ok(), "{query:?}");
+        for batch in batches {
+            batch.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_slow_request_and_batch_documents_hold_permits() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = embeddings_for(&inputs);
+                if inputs.iter().any(|input| input.contains("SLOW")) {
+                    response.set_delay(std::time::Duration::from_secs(3600))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.ollama_max_concurrent = 4;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let embeds: Vec<_> = (0..4)
+            .flat_map(|i| {
+                let batch = server.state.ollama.clone();
+                let request = server.state.ollama.clone();
+                [
+                    tokio::spawn(async move {
+                        batch
+                            .embed_documents(&[
+                                format!("SLOW batch {i} a"),
+                                format!("SLOW batch {i} b"),
+                            ])
+                            .await
+                    }),
+                    tokio::spawn(async move {
+                        crate::core::embeddings::interactive(request.embed_documents(&[
+                            format!("SLOW request {i} a"),
+                            format!("SLOW request {i} b"),
+                        ]))
+                        .await
+                    }),
+                ]
+            })
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "SLOW request")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no request document embed reached the embedder");
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind the document embeds");
+        assert!(query.is_ok(), "{query:?}");
+        for embed in embeds {
+            embed.abort();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -16582,7 +18613,9 @@ mod tests {
         // The fresh query's embed never returns, so a long budget keeps it in
         // flight for as long as the wait below takes.
         let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
+        // The fill's batch holds one permit; the fresh query's embed needs the other.
         config.ollama_max_concurrent = 2;
+        config.query_embed_budget_ms = 600_000;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 
         let mut first_config = server.state.config.clone();
@@ -16608,7 +18641,14 @@ mod tests {
                 .await
         });
 
-        ollama.slow_query_started.acquire().await.unwrap().forget();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            ollama.slow_query_started.acquire(),
+        )
+        .await
+        .expect("the fresh query's embed queued behind the fill's batch")
+        .unwrap()
+        .forget();
         ollama.release_fill.add_permits(1);
 
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -16634,6 +18674,160 @@ mod tests {
         );
 
         slow_query.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_query_vector_is_served_with_no_query_embed_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = semantic_fill_config("http://127.0.0.1:1", 20, 60_000);
+        config.query_embed_budget_ms = 0;
+        rkyv_store::save_query_cache(
+            root.path(),
+            &config.query_cache_identity(),
+            &[("reconcile_ledger".to_string(), vec![1.0, 0.0])],
+        )
+        .unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        assert!(
+            server
+                .query_embedded_within_budget("reconcile_ledger")
+                .await
+                .unwrap(),
+            "a cached query vector waited on the query embed budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_meaning_query_answers_by_keyword_when_its_embed_outlasts_the_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                embeddings_for(&embed_request_inputs(request))
+                    .set_delay(std::time::Duration::from_secs(3600))
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ledger.rs"), "fn reconcile_ledger() {}\n").unwrap();
+        std::fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.query_embed_budget_ms = 200;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("reconcile_ledger"));
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", args),
+        )
+        .await
+        .expect("the meaning query waited on a hung embedder");
+
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_keyword_fallback_keeps_the_meaning_query_root_globs_and_scope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                embeddings_for(&embed_request_inputs(request))
+                    .set_delay(std::time::Duration::from_secs(3600))
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        for (file, source) in [
+            ("src/ledger.rs", "fn reconcile_ledger() {}\n"),
+            ("lib/ledger.rs", "fn reconcile_ledger() {}\n"),
+            ("docs/ledger.md", "# reconcile_ledger\n"),
+        ] {
+            let full_path = root.path().join(file);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.query_embed_budget_ms = 0;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        for (filters, expected) in [
+            (json!({ "path": "src" }), vec!["src/ledger.rs"]),
+            (
+                json!({ "path": "src", "include_globs": ["*.rs"] }),
+                vec!["src/ledger.rs"],
+            ),
+            (
+                json!({ "include_globs": ["lib/**"] }),
+                vec!["lib/ledger.rs"],
+            ),
+            (
+                json!({ "exclude_globs": ["src/**"] }),
+                vec!["lib/ledger.rs", "docs/ledger.md"],
+            ),
+            (json!({ "scope": "docs" }), vec!["docs/ledger.md"]),
+            (
+                json!({ "scope": "code" }),
+                vec!["src/ledger.rs", "lib/ledger.rs"],
+            ),
+        ] {
+            let mut args = filters.as_object().unwrap().clone();
+            args.insert("query".into(), json!("reconcile_ledger"));
+            let answered = server.dispatch("explore", args).await;
+
+            let text = text_of(&answered);
+            assert!(text.starts_with("Partial results"), "{filters}: {text}");
+            let mut found: Vec<&str> = ["src/ledger.rs", "lib/ledger.rs", "docs/ledger.md"]
+                .into_iter()
+                .filter(|file| text.contains(file))
+                .collect();
+            found.sort_unstable();
+            let mut expected = expected;
+            expected.sort_unstable();
+            assert_eq!(found, expected, "{filters}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identifier_query_answers_by_keyword_when_its_embed_outlasts_the_budget() {
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            |inputs| {
+                let response = embeddings_for(inputs);
+                if inputs.iter().all(|input| input.contains("src/")) {
+                    response
+                } else {
+                    response.set_delay(std::time::Duration::from_secs(3600))
+                }
+            },
+            |config| config.query_embed_budget_ms = 200,
+        )
+        .await;
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "meaning")),
+        )
+        .await
+        .expect("the identifier query waited on a hung embedder");
+
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
     }
 
     #[tokio::test]
@@ -17681,7 +19875,7 @@ mod tests {
                 .await
         });
         let wait_pause = Arc::clone(&pause);
-        tokio::task::spawn_blocking(move || wait_pause.wait_until_enumerated())
+        tokio::task::spawn_blocking(move || wait_pause.wait_until_entered())
             .await
             .unwrap();
         std::fs::remove_file(&ephemeral).unwrap();

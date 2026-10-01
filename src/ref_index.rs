@@ -61,7 +61,10 @@ use tokio::sync::RwLock;
 
 use crate::core::embedding_tracker::EmbeddingTrackerHandle;
 use crate::core::embeddings::CacheEntry;
-use crate::server::{CachedLexicalIndex, IdentifierIndex, IdentifierVectors, ProjectCache};
+use crate::server::{
+    CachedLexicalIndex, FileOutline, IdentifierBuild, IdentifierIndex, IdentifierVectors,
+    ProjectCache,
+};
 use crate::tools::semantic_search::CachedSearchIndex;
 
 /// Stable identifier for a ref (worktree + HEAD).
@@ -192,7 +195,13 @@ pub struct RefIndex {
     background_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     #[cfg(test)]
     pub(crate) semantic_walks: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) outline_parses: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) identifier_saves: Arc<AtomicUsize>,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
+    /// The detached identifier build requests join, while it runs.
+    pub(crate) identifier_build: std::sync::Mutex<Option<IdentifierBuild>>,
     pub(crate) identifier_rebuilding: Arc<std::sync::atomic::AtomicBool>,
     /// When each resident identifier vector no index uses was first seen unused.
     pub(crate) identifier_unused_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
@@ -238,6 +247,9 @@ pub struct RefIndex {
 
     /// Snapshot writes and the snapshot's file documents for this ref.
     pub(crate) snapshots: SnapshotState,
+
+    /// The outline of each file a directory outline has parsed, by path.
+    pub(crate) file_outlines: std::sync::Mutex<HashMap<String, FileOutline>>,
 }
 
 impl RefIndex {
@@ -272,7 +284,12 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            outline_parses: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_saves: Arc::new(AtomicUsize::new(0)),
             identifier_update: tokio::sync::Mutex::new(()),
+            identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -286,6 +303,7 @@ impl RefIndex {
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
             snapshots: SnapshotState::default(),
+            file_outlines: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -324,7 +342,12 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            outline_parses: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_saves: Arc::new(AtomicUsize::new(0)),
             identifier_update: tokio::sync::Mutex::new(()),
+            identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -338,6 +361,7 @@ impl RefIndex {
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
             snapshots: SnapshotState::default(),
+            file_outlines: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -378,7 +402,12 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            outline_parses: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_saves: Arc::new(AtomicUsize::new(0)),
             identifier_update: tokio::sync::Mutex::new(()),
+            identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -392,6 +421,7 @@ impl RefIndex {
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
             snapshots: SnapshotState::default(),
+            file_outlines: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -399,6 +429,20 @@ impl RefIndex {
         let mut tasks = self.background_tasks.lock().unwrap();
         tasks.retain(|task| !task.is_finished());
         tasks.push(task.abort_handle());
+    }
+
+    /// Spawns `task` already tracked, so a cancel either aborts it or ran
+    /// before it was spawned.
+    pub(crate) fn spawn_background_task<F>(&self, task: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let mut tasks = self.background_tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        let task = tokio::spawn(task);
+        tasks.push(task.abort_handle());
+        task
     }
 
     pub(crate) fn cancel_background_tasks(&self) {

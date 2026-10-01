@@ -156,6 +156,8 @@ pub struct Config {
     pub embed_doc_shape: EmbedDocShape,
     pub embed_batch_size: usize,
     pub embed_budget_ms: u64,
+    /// How long a search waits for its query embedding before it answers by keyword.
+    pub query_embed_budget_ms: u64,
     pub embed_fill_batch_timeout_ms: u64,
     pub embed_tracker_mode: TrackerMode,
     pub embed_tracker_debounce_ms: u64,
@@ -197,7 +199,10 @@ pub struct Config {
     pub ref_warmup_mode: RefWarmupMode,
     /// Capacity of the global Ollama embed semaphore. All Ollama embed calls
     /// (on-demand, tracker, and warmup) share this permit pool so N parallel
-    /// warmups cannot saturate a CPU-only Ollama instance.
+    /// warmups cannot saturate a CPU-only Ollama instance. From three, one
+    /// permit is kept for queries and one more for a request's documents;
+    /// with two, a request's documents and queries share the one permit
+    /// background batches leave.
     /// Controlled by `CONTEXTPLUS_OLLAMA_MAX_CONCURRENT` (default: 4, clamped to [1, 64]).
     pub ollama_max_concurrent: usize,
 }
@@ -588,6 +593,7 @@ impl Config {
             ),
             embed_batch_size: batch_size,
             embed_budget_ms: env_parse(env, "CONTEXTPLUS_EMBED_BUDGET_MS", 20_000),
+            query_embed_budget_ms: env_parse(env, "CONTEXTPLUS_QUERY_EMBED_BUDGET_MS", 5_000),
             embed_fill_batch_timeout_ms: env_parse(
                 env,
                 "CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS",
@@ -1311,22 +1317,26 @@ mod tests {
         with_cleared_env(
             &[
                 "CONTEXTPLUS_EMBED_BUDGET_MS",
+                "CONTEXTPLUS_QUERY_EMBED_BUDGET_MS",
                 "CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS",
             ],
             || {
                 let c = Config::from_env();
                 assert_eq!(c.embed_budget_ms, 20_000);
+                assert_eq!(c.query_embed_budget_ms, 5_000);
                 assert_eq!(c.embed_fill_batch_timeout_ms, 120_000);
             },
         );
         with_env(
             &[
                 ("CONTEXTPLUS_EMBED_BUDGET_MS", "37"),
+                ("CONTEXTPLUS_QUERY_EMBED_BUDGET_MS", "53"),
                 ("CONTEXTPLUS_EMBED_FILL_BATCH_TIMEOUT_MS", "91"),
             ],
             || {
                 let c = Config::from_env();
                 assert_eq!(c.embed_budget_ms, 37);
+                assert_eq!(c.query_embed_budget_ms, 53);
                 assert_eq!(c.embed_fill_batch_timeout_ms, 91);
             },
         );

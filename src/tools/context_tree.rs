@@ -331,6 +331,15 @@ pub fn build_context_tree(
     }
 }
 
+/// The path prefix of the entries a tree scoped to `target` shows.
+pub fn target_prefix(target: &str) -> String {
+    if target.ends_with('/') {
+        target.to_string()
+    } else {
+        format!("{}/", target)
+    }
+}
+
 /// Async entry point that uses provider traits for file walking and analysis.
 pub async fn get_context_tree(
     options: ContextTreeOptions,
@@ -346,11 +355,7 @@ pub async fn get_context_tree(
     let filtered_entries: Vec<FileEntry>;
     let filtered_analyses: BTreeMap<String, FileAnalysis>;
     let (effective_entries, effective_analyses) = if let Some(ref target) = options.target_path {
-        let prefix = if target.ends_with('/') {
-            target.clone()
-        } else {
-            format!("{}/", target)
-        };
+        let prefix = target_prefix(target);
         filtered_entries = entries
             .iter()
             .filter(|e| e.relative_path.starts_with(&prefix))
