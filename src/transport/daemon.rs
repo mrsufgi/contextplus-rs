@@ -1397,7 +1397,13 @@ mod tests {
         if let Some(task) = start_fork_base(&server).await {
             task.await.unwrap();
         }
-        server.advance_fork_base().expect("an advance").await;
+        let checked = server.advance_fork_base().expect("an advance");
+        checked.clone().await;
+        // Only the session's registration may see the moved ref.
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+        let tracker = base.tracker_handle.lock().unwrap().take();
+        tracker.expect("the fork base's tracker").stop().await;
         std::fs::write(primary.path().join("lib.rs"), "pub fn moved() {}\n").unwrap();
         fork_base_git(primary.path(), &["commit", "-qam", "moved"]);
         let moved = fork_base_git(primary.path(), &["rev-parse", "HEAD"]);
@@ -1427,11 +1433,15 @@ mod tests {
                 .expect("daemon did not register the session")
                 .unwrap();
         assert!(matches!(ready, SessionReady::Ready { .. }));
-        inspection
+        let advance = inspection
             .state
             .fork_base_advance_task()
-            .expect("an advance")
-            .await;
+            .expect("an advance");
+        assert!(
+            !advance.ptr_eq(&checked),
+            "registering a session started no advance"
+        );
+        advance.await;
         let base = inspection
             .state
             .fork_base
