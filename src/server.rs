@@ -22205,8 +22205,8 @@ mod tests {
 
         assert_eq!(report.hits + report.misses.len(), FILES);
         let loads = crate::cache::cas::test_seams::manifest_loads(&mcp_data);
-        assert!(
-            loads <= 2,
+        assert_eq!(
+            loads, 2,
             "the warmup loaded {loads} manifests for {FILES} lookups, not one per level"
         );
     }
