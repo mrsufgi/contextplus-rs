@@ -190,18 +190,28 @@ pub struct OllamaClient {
     /// the HTTP call acquires a permit (via `embed_single_query` →
     /// `embed_batch_adaptive` → `call_embed_api`).
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
-    /// Caps batch embeds below the shared semaphore's capacity, so a
-    /// single-text query finds a permit free instead of queueing behind them.
+    /// Caps background batch embeds below the shared semaphore's capacity, so
+    /// an interactive embed finds a permit free instead of queueing behind them.
     batch_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Which callers an embed request competes with for permits.
 #[derive(Clone, Copy)]
 enum EmbedLane {
-    /// A single-text query, which a person is waiting on.
-    Query,
-    /// Document batches for indexing.
+    /// A query, or documents a request is waiting on.
+    Interactive,
+    /// Document batches for background indexing.
     Batch,
+}
+
+tokio::task_local! {
+    static INTERACTIVE: ();
+}
+
+/// Runs `request` with its document embeds in the interactive lane, so they
+/// never queue behind background batches. Tasks it spawns are not covered.
+pub async fn interactive<F: std::future::Future>(request: F) -> F::Output {
+    INTERACTIVE.scope((), request).await
 }
 
 #[derive(Clone)]
@@ -481,8 +491,8 @@ impl OllamaClient {
         self
     }
 
-    /// Let at most `limit` batch embeds hold the shared semaphore's permits at
-    /// once. Below its capacity, single-text queries always find one free.
+    /// Let at most `limit` background batch embeds hold the shared semaphore's
+    /// permits at once. Below its capacity, interactive embeds always find one free.
     pub fn with_batch_limit(mut self, limit: usize) -> Self {
         self.batch_permits = Some(Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
         self
@@ -644,9 +654,14 @@ impl OllamaClient {
             .collect();
 
         // Embed all chunks in batches.
+        let lane = if INTERACTIVE.try_with(|_| ()).is_ok() {
+            EmbedLane::Interactive
+        } else {
+            EmbedLane::Batch
+        };
         let mut flat_embeddings = Vec::with_capacity(flattened.len());
         for batch in flattened.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(batch, EmbedLane::Batch).await?;
+            let batch_result = self.embed_batch_adaptive(batch, lane).await?;
             flat_embeddings.extend(batch_result);
         }
 
@@ -674,7 +689,9 @@ impl OllamaClient {
 
         let mut flat_embeddings = Vec::with_capacity(flattened.len());
         for batch in flattened.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(batch, EmbedLane::Query).await?;
+            let batch_result = self
+                .embed_batch_adaptive(batch, EmbedLane::Interactive)
+                .await?;
             flat_embeddings.extend(batch_result);
         }
 
@@ -968,7 +985,7 @@ impl OllamaClient {
             // Hold the permit until the body has been read, including error
             // paths. A closed semaphore retains the existing ungated behavior.
             // A batch takes its own lane's permit first, so batches never hold
-            // every shared permit a query needs.
+            // every shared permit an interactive embed needs.
             let _batch_permit = match (lane, &self.batch_permits) {
                 (EmbedLane::Batch, Some(batch)) => Arc::clone(batch).acquire_owned().await.ok(),
                 _ => None,

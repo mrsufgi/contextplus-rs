@@ -1911,8 +1911,8 @@ impl ContextPlusServer {
         // `config.ollama_max_concurrent`, which Config::from_env clamps into
         // [1, 64]. We wire the same semaphore into the OllamaClient so that
         // every outbound embed (warmup, tracker, on-demand) shares one budget.
-        // Batches hold at most all but one permit, so a query never waits
-        // behind them while the budget has two or more.
+        // Background batches hold at most all but one permit, so a request's
+        // embeds never wait behind them while the budget has two or more.
         let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
             .with_semaphore(Arc::clone(&ollama_semaphore))
@@ -4692,12 +4692,14 @@ impl ContextPlusServer {
         } else {
             None
         };
-        let result = crate::tools::semantic_search::semantic_code_search_owned(
-            options,
-            &embedder,
-            Arc::new(walker),
-            Some(Arc::clone(&ref_index.search_index_cache)),
-            cache_gen.cloned(),
+        let result = crate::core::embeddings::interactive(
+            crate::tools::semantic_search::semantic_code_search_owned(
+                options,
+                &embedder,
+                Arc::new(walker),
+                Some(Arc::clone(&ref_index.search_index_cache)),
+                cache_gen.cloned(),
+            ),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -4877,13 +4879,15 @@ impl ContextPlusServer {
                 state: self.state.clone(),
             },
         };
-        let result = crate::tools::semantic_navigate::semantic_navigate(
-            options,
-            &self.state.ollama,
-            &self.state.config,
-            &ref_index.embedding_cache,
-            &ref_index.root_dir,
-            Some(&indexer),
+        let result = crate::core::embeddings::interactive(
+            crate::tools::semantic_navigate::semantic_navigate(
+                options,
+                &self.state.ollama,
+                &self.state.config,
+                &ref_index.embedding_cache,
+                &ref_index.root_dir,
+                Some(&indexer),
+            ),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -17876,9 +17880,8 @@ mod tests {
         // The fresh query's embed never returns, so a long budget keeps it in
         // flight for as long as the wait below takes.
         let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
-        // Two batch embeds at once, the fill's and the fresh query's, plus
-        // the permit kept free for queries.
-        config.ollama_max_concurrent = 3;
+        // The fill's batch holds one permit; the fresh query's embed needs the other.
+        config.ollama_max_concurrent = 2;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 
         let mut first_config = server.state.config.clone();
@@ -17904,7 +17907,14 @@ mod tests {
                 .await
         });
 
-        ollama.slow_query_started.acquire().await.unwrap().forget();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            ollama.slow_query_started.acquire(),
+        )
+        .await
+        .expect("the fresh query's embed queued behind the fill's batch")
+        .unwrap()
+        .forget();
         ollama.release_fill.add_permits(1);
 
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
