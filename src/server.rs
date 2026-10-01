@@ -22876,6 +22876,45 @@ mod tests {
         );
     }
 
+    /// The `semantic_fork_refused` lines `logs` holds for `root`.
+    fn semantic_fork_refusals(logs: &str, root: &std::path::Path) -> Vec<String> {
+        let root = format!("root={} ", root.display());
+        logs.lines()
+            .filter(|line| line.contains("phase=\"semantic_fork_refused\"") && line.contains(&root))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_refusal_over_the_threshold_is_logged_once() {
+        use crate::tools::semantic_search::WalkAndIndexFn;
+
+        let (_ollama, _primary, _holder, worktree, server) =
+            semantic_fork_git_servers(semantic_fork_rewrite_a_third).await;
+        semantic_fork_query(&server).await;
+        let session = attached_worktree(&server, &worktree).await;
+        let root = worktree.canonicalize().unwrap();
+
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        semantic_fork_query(&session).await;
+        let first = semantic_fork_refusals(&crate::test_logs::logs_as_string(&logs), &root);
+        semantic_fork_walker(&session, session.current_ref().await)
+            .walk_or_install(&worktree)
+            .await
+            .unwrap();
+        drop(capture);
+        let all = semantic_fork_refusals(&crate::test_logs::logs_as_string(&logs), &root);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|line| line.contains("reason=\"over_threshold\""))
+                .count(),
+            1,
+            "{first:?}"
+        );
+        assert_eq!(all, first, "a second walk logged the same refusals again");
+    }
+
     /// Replaces the primary's vector store with a fresh build, as after an eviction.
     async fn semantic_fork_rebuild_primary(
         server: &ContextPlusServer,

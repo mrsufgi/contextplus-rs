@@ -681,9 +681,24 @@ impl CachedWalkerIndexer {
                 .and_then(|entry| entry.pending_vector_dimensions());
             let base =
                 base.filter(|base| replacement_dims.is_none_or(|dims| dims == base.index.dims()));
+            if let (Some(parent), None) = (&fork_parent, &base) {
+                let entry = parent.search_index_cache.read().await.clone();
+                let clause = match &entry {
+                    Some(entry) => entry
+                        .unforkable_clause(&parent.canonical_root)
+                        .unwrap_or("dimensions"),
+                    None => "no_index",
+                };
+                log_fork_refusal(
+                    &ref_index,
+                    parent,
+                    entry.as_ref().and_then(|entry| entry.index.vector_store()),
+                    ForkRefusal::not_forkable(clause),
+                );
+            }
             let mut walked = None;
             if let (Some(parent), Some(base)) = (&fork_parent, &base) {
-                match self.fork_documents(&root, parent, base).await {
+                match self.fork_documents(&root, &ref_index, parent, base).await {
                     Ok(forked) => {
                         return self
                             .fork_walk(
@@ -711,15 +726,20 @@ impl CachedWalkerIndexer {
             if docs.is_empty() {
                 return Ok(WalkOutcome::Documents(docs, Vec::new()));
             }
-            if let (Some(parent), Some(base)) = (&fork_parent, &base)
-                && let Some(shared) = Shared::of(&base.index, &docs)
-            {
-                let forked = shared.forked(docs, content_hashes, embedding_texts);
-                return self
-                    .fork_walk(
-                        &root, &ref_index, parent, base, forked, walk_start, documents,
-                    )
-                    .await;
+            if let (Some(parent), Some(base)) = (&fork_parent, &base) {
+                match Shared::of(&base.index, &docs) {
+                    Ok(shared) => {
+                        let forked = shared.forked(docs, content_hashes, embedding_texts);
+                        return self
+                            .fork_walk(
+                                &root, &ref_index, parent, base, forked, walk_start, documents,
+                            )
+                            .await;
+                    }
+                    Err(refusal) => {
+                        log_fork_refusal(&ref_index, parent, base.index.vector_store(), refusal)
+                    }
+                }
             }
             let vectors = self
                 .walk_vectors(&root, &ref_index, &content_hashes, &embedding_texts, true)
@@ -1385,18 +1405,25 @@ impl CachedWalkerIndexer {
     async fn fork_documents(
         &self,
         root: &Path,
+        ref_index: &crate::ref_index::RefIndex,
         parent: &Arc<crate::ref_index::RefIndex>,
         base: &Arc<CachedSearchIndex>,
     ) -> std::result::Result<Forked, Option<WalkedFiles>> {
+        let refused = |refusal| {
+            log_fork_refusal(ref_index, parent, base.index.vector_store(), refusal);
+        };
         // The flat file cache the primary holds, however old: its clean blobs
         // and contents were recorded together. A walk never builds one.
-        let files = parent
+        let Some(files) = parent
             .project_cache
             .read()
             .await
             .clone()
             .filter(|cache| cache.file_content.base().is_none())
-            .ok_or(None)?;
+        else {
+            refused(ForkRefusal::reason("no_parent_cache"));
+            return Err(None);
+        };
         let started = std::time::Instant::now();
         let config = self.config.clone();
         let walk_root = root.to_path_buf();
@@ -1409,6 +1436,7 @@ impl CachedWalkerIndexer {
         );
         let max_size = self.config.max_embed_file_size;
         if files.file_content.base().is_none() {
+            refused(ForkRefusal::reason("flat_cache"));
             return Err(Some(
                 files
                     .file_entries
@@ -1470,20 +1498,24 @@ impl CachedWalkerIndexer {
         })
         .await
         .map_err(|_| None)?;
-        let Some(forked) = forked else {
-            // Refused: the standalone walk takes the contents at hand.
-            return Err(walked
-                .into_iter()
-                .map(|(path, walked)| match walked {
-                    Walked::Shared(_) => {
-                        let content = files.file_content.get(&path).cloned();
-                        Some((path, content))
-                    }
-                    Walked::Read(Some(content)) => Some((path, Some(content))),
-                    Walked::Skipped => Some((path, None)),
-                    Walked::Read(None) => None,
-                })
-                .collect());
+        let forked = match forked {
+            Ok(forked) => forked,
+            Err(refusal) => {
+                refused(refusal);
+                // Refused: the standalone walk takes the contents at hand.
+                return Err(walked
+                    .into_iter()
+                    .map(|(path, walked)| match walked {
+                        Walked::Shared(_) => {
+                            let content = files.file_content.get(&path).cloned();
+                            Some((path, content))
+                        }
+                        Walked::Read(Some(content)) => Some((path, Some(content))),
+                        Walked::Skipped => Some((path, None)),
+                        Walked::Read(None) => None,
+                    })
+                    .collect());
+            }
         };
         tracing::info!(
             phase = "semantic_walk",
@@ -1540,6 +1572,9 @@ impl CachedWalkerIndexer {
         let root = ref_index.canonical_root.clone();
         let (generation, vector_generation) = (start.generation, start.vector_generation);
         let (changed_count, deleted_count) = (changed.len(), deleted.len());
+        let threshold =
+            ForkRefusal::threshold(changed_count, deleted_count, base.index.document_count());
+        let store_of_base = base.index.vector_store().cloned();
         let fork = tokio::task::spawn_blocking(move || {
             base.fork_delta(
                 &root,
@@ -1555,6 +1590,9 @@ impl CachedWalkerIndexer {
         .ok()
         .flatten();
         let Some(fork) = fork else {
+            if let Err(refusal) = threshold {
+                log_fork_refusal(ref_index, parent, store_of_base.as_ref(), refusal);
+            }
             record();
             return None;
         };
@@ -1566,6 +1604,7 @@ impl CachedWalkerIndexer {
         };
         if installed.is_some() {
             record();
+            ref_index.fork_refused.lock().unwrap().clear();
         }
         tracing::info!(
             phase = "semantic_fork",
@@ -1690,6 +1729,7 @@ impl CachedWalkerIndexer {
         );
         if installed {
             record();
+            ref_index.fork_refused.lock().unwrap().clear();
         }
         tracing::info!(
             phase = "semantic_fork",
@@ -1852,7 +1892,7 @@ impl CachedWalkerIndexer {
                 })
                 .collect();
             let Forked { documents, deleted } =
-                Forked::of(&walked, &classify_base.index, doc_shape)?;
+                Forked::of(&walked, &classify_base.index, doc_shape).ok()?;
             let fingerprint =
                 IndexFingerprint::of(documents.iter().map(|document| match document {
                     ForkDocument::Shared(at) => &classify_base.index.documents()[*at],
@@ -2452,13 +2492,13 @@ struct Forked {
 }
 
 impl Forked {
-    /// The documents of the classified files `walked` over `base`; `None`
+    /// The documents of the classified files `walked` over `base`, refused
     /// when the worktree's own changes pass the promotion threshold.
     fn of(
         walked: &[(String, Walked)],
         base: &SearchIndex,
         doc_shape: crate::config::EmbedDocShape,
-    ) -> Option<Self> {
+    ) -> std::result::Result<Self, ForkRefusal> {
         use rayon::prelude::*;
         let held = positions_by_path(base);
         let parent_documents: HashMap<&str, &SearchDocument> = base
@@ -2503,10 +2543,8 @@ impl Forked {
             .iter()
             .filter(|document| matches!(document, ForkDocument::Own(_)))
             .count();
-        ((changed + deleted.len()) as f64
-            <= base.documents().len() as f64
-                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION)
-            .then_some(Self { documents, deleted })
+        ForkRefusal::threshold(changed, deleted.len(), base.documents().len())?;
+        Ok(Self { documents, deleted })
     }
 }
 
@@ -2520,8 +2558,8 @@ struct Shared {
 }
 
 impl Shared {
-    /// `None` when the walk's own changes pass the promotion threshold.
-    fn of(base: &SearchIndex, docs: &[SearchDocument]) -> Option<Self> {
+    /// Refused when the walk's own changes pass the promotion threshold.
+    fn of(base: &SearchIndex, docs: &[SearchDocument]) -> std::result::Result<Self, ForkRefusal> {
         let held: HashMap<&str, usize> = base
             .documents()
             .iter()
@@ -2549,10 +2587,8 @@ impl Shared {
             .map(|doc| doc.path.clone())
             .collect();
         let changed = positions.iter().filter(|at| at.is_none()).count();
-        ((changed + deleted.len()) as f64
-            <= base.documents().len() as f64
-                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION)
-            .then_some(Self { positions, deleted })
+        ForkRefusal::threshold(changed, deleted.len(), base.documents().len())?;
+        Ok(Self { positions, deleted })
     }
 
     /// The walked `docs`, with their content hashes and embedding texts, over
@@ -2578,6 +2614,88 @@ impl Shared {
             deleted: self.deleted,
         }
     }
+}
+
+/// Why a worktree's walk did not fork its parent's index.
+#[derive(Clone, Copy, Debug)]
+struct ForkRefusal {
+    reason: &'static str,
+    /// The clause of [`CachedSearchIndex::forkable_at`] the parent failed.
+    clause: Option<&'static str>,
+    changed: usize,
+    deleted: usize,
+    limit: usize,
+}
+
+/// The parent's vector store, reason and clause of a logged fork refusal.
+pub(crate) type ForkRefusalKey = (usize, &'static str, Option<&'static str>);
+
+impl ForkRefusal {
+    fn reason(reason: &'static str) -> Self {
+        Self {
+            reason,
+            clause: None,
+            changed: 0,
+            deleted: 0,
+            limit: 0,
+        }
+    }
+
+    fn not_forkable(clause: &'static str) -> Self {
+        Self {
+            clause: Some(clause),
+            ..Self::reason("not_forkable")
+        }
+    }
+
+    /// Refused when `changed` and `deleted` documents pass the promotion
+    /// threshold of a parent index of `documents`.
+    fn threshold(
+        changed: usize,
+        deleted: usize,
+        documents: usize,
+    ) -> std::result::Result<(), Self> {
+        let limit = documents as f64 * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION;
+        if (changed + deleted) as f64 <= limit {
+            return Ok(());
+        }
+        Err(Self {
+            changed,
+            deleted,
+            limit: limit as usize,
+            ..Self::reason("over_threshold")
+        })
+    }
+}
+
+/// Logs why `ref_index` did not fork `parent`'s index over `store`, once per
+/// store and refusal.
+fn log_fork_refusal(
+    ref_index: &crate::ref_index::RefIndex,
+    parent: &crate::ref_index::RefIndex,
+    store: Option<&Arc<crate::core::embeddings::VectorStore>>,
+    refusal: ForkRefusal,
+) {
+    let key = (
+        store.map_or(0, |store| Arc::as_ptr(store) as usize),
+        refusal.reason,
+        refusal.clause,
+    );
+    if !ref_index.fork_refused.lock().unwrap().insert(key) {
+        return;
+    }
+    tracing::info!(
+        phase = "semantic_fork_refused",
+        ref_id = %ref_index.cas_ref_id_hex,
+        root = %ref_index.canonical_root.display(),
+        parent_ref_id = %parent.cas_ref_id_hex,
+        reason = refusal.reason,
+        clause = refusal.clause.unwrap_or("none"),
+        changed = refusal.changed,
+        deleted = refusal.deleted,
+        limit = refusal.limit,
+        "cold-start phase"
+    );
 }
 
 /// The parent's semantic index when a worktree can fork it.

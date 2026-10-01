@@ -1246,12 +1246,25 @@ impl CachedSearchIndex {
     /// A parent entry a worktree can fork: walked from its whole `root`, over
     /// a vector store worth sharing, with no queued batches or rebuild.
     pub(crate) fn forkable_at(&self, root: &Path) -> bool {
-        self.search_root == root
-            && self.index.ann_store.is_some()
-            && self.pending.lock().unwrap().batches.is_empty()
-            && !self
-                .rebuild_in_progress
-                .load(std::sync::atomic::Ordering::Acquire)
+        self.unforkable_clause(root).is_none()
+    }
+
+    /// The first clause of [`Self::forkable_at`] this entry fails at `root`.
+    pub(crate) fn unforkable_clause(&self, root: &Path) -> Option<&'static str> {
+        if self.search_root != root {
+            Some("scoped")
+        } else if self.index.ann_store.is_none() {
+            Some("no_ann_store")
+        } else if !self.pending.lock().unwrap().batches.is_empty() {
+            Some("batches_queued")
+        } else if self
+            .rebuild_in_progress
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Some("rebuild_in_progress")
+        } else {
+            None
+        }
     }
 
     #[cfg(test)]
