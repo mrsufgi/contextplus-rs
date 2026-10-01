@@ -595,7 +595,8 @@ pub fn glob_to_regex(glob: &str) -> String {
 }
 
 fn document_passes_filters(doc: &SearchDocument, opts: &ResolvedSearchOptions) -> bool {
-    scope_admits(opts.scope, doc.path_prior.is_documentation) && path_passes_filters(&doc.path, opts)
+    scope_admits(opts.scope, doc.path_prior.is_documentation)
+        && path_passes_filters(&doc.path, opts)
 }
 
 fn scope_admits(scope: SearchScope, documentation: bool) -> bool {

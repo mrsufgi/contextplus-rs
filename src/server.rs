@@ -4705,9 +4705,7 @@ impl ContextPlusServer {
                 .unwrap_or(std::path::Path::new(""))
                 .to_path_buf();
             let keep = crate::tools::semantic_search::result_path_filter(&options, prefix);
-            let matches = self
-                .lexical_search_text(options.query, top_k, keep)
-                .await?;
+            let matches = self.lexical_search_text(options.query, top_k, keep).await?;
             return Ok(Self::ok_text(format!(
                 "Partial results: {}, so these are keyword matches. Retry shortly for semantic ranking.\n\n{matches}",
                 self.query_embed_overdue()
@@ -7971,7 +7969,11 @@ mod tests {
 
     async fn started_identifier_build(server: &ContextPlusServer) -> IdentifierBuild {
         let cache = server.ensure_project_cache().await.unwrap();
-        match server.identifier_index_or_build(&cache, true).await.unwrap() {
+        match server
+            .identifier_index_or_build(&cache, true)
+            .await
+            .unwrap()
+        {
             IdentifierLookup::Building(build) => build,
             IdentifierLookup::Ready(_) => panic!("the identifier index was already built"),
         }
@@ -18266,8 +18268,14 @@ mod tests {
 
         for (filters, expected) in [
             (json!({ "path": "src" }), vec!["src/ledger.rs"]),
-            (json!({ "path": "src", "include_globs": ["*.rs"] }), vec!["src/ledger.rs"]),
-            (json!({ "include_globs": ["lib/**"] }), vec!["lib/ledger.rs"]),
+            (
+                json!({ "path": "src", "include_globs": ["*.rs"] }),
+                vec!["src/ledger.rs"],
+            ),
+            (
+                json!({ "include_globs": ["lib/**"] }),
+                vec!["lib/ledger.rs"],
+            ),
             (
                 json!({ "exclude_globs": ["src/**"] }),
                 vec!["lib/ledger.rs", "docs/ledger.md"],
