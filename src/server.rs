@@ -468,6 +468,16 @@ impl SharedState {
         let _ = tokio::task::spawn_blocking(move || snapshots::flush(&config, &primary)).await;
     }
 
+    /// Writes the identifier vectors each ref embedded since its last save.
+    /// For a graceful shutdown.
+    pub async fn flush_identifier_vectors(&self) {
+        let id_cache_name = cache_name("identifier-embeddings", &self.config);
+        let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
+        for owner in refs {
+            flush_identifier_vectors(&owner, &id_cache_name).await;
+        }
+    }
+
     /// Look up a ref by id. Reserved for U4's session-scoped dispatch.
     pub async fn ref_index(
         &self,
@@ -653,7 +663,7 @@ impl SharedState {
             drop(guard);
             let mut guard = state.refs.write().await;
             // Double-check under write lock.
-            if let Some(r) = guard.get(&ref_id)
+            let flush = if let Some(r) = guard.get(&ref_id)
                 && r.session_count.load(std::sync::atomic::Ordering::Acquire) == 0
                 && r.eviction_generation
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -664,9 +674,22 @@ impl SharedState {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
-                guard.remove(&ref_id);
+                // A cancelled identifier build leaves vectors it had not saved.
+                let flush = guard.remove(&ref_id).map(|evicted| {
+                    flush_identifier_vectors(
+                        &evicted,
+                        &cache_name("identifier-embeddings", &state.config),
+                    )
+                });
                 state.ref_access.lock().unwrap().remove(&ref_id);
                 tracing::info!(ref_id = ref_id.0, "ref evicted after TTL expiry");
+                flush
+            } else {
+                None
+            };
+            drop(guard);
+            if let Some(flush) = flush {
+                flush.await;
             }
         });
     }
@@ -1221,6 +1244,10 @@ async fn prune_identifier_vectors(
     expired
 }
 
+/// How often an identifier build saves the vectors it has embedded so far; it
+/// saves the rest when it ends.
+const IDENTIFIER_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Saves the identifier vectors embedded since the last save into `target`'s
 /// cache file, debounced so a run of batches writes once.
 fn schedule_identifier_save(
@@ -1235,10 +1262,8 @@ fn schedule_identifier_save(
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
         + 1;
     let persist_generation = Arc::clone(&ref_index.identifier_persist_generation);
-    let persist_root = ref_index.root_dir.clone();
     let save_lock = Arc::clone(&ref_index.identifier_save_lock);
-    let unsaved = Arc::clone(&ref_index.identifier_unsaved);
-    let resident_set = Arc::downgrade(target);
+    let save = IdentifierSave::of(ref_index, Arc::downgrade(target), id_cache_name);
     let pruner = (!is_worktree).then(|| (Arc::downgrade(state), Arc::downgrade(ref_index)));
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1247,17 +1272,74 @@ fn schedule_identifier_save(
         if persist_generation.load(std::sync::atomic::Ordering::Acquire) != ticket {
             return;
         }
-        let mut pruned = match pruner
+        let pruned = match pruner
             .as_ref()
             .and_then(|(state, owner)| Some((state.upgrade()?, owner.upgrade()?)))
         {
             Some((state, owner)) => prune_identifier_vectors(&state, &owner).await,
             None => Vec::new(),
         };
+        save.write(pruned).await;
+    });
+}
+
+/// Writes the identifier vectors `owner` embedded since its last save, for
+/// a ref about to stop. The write holds none of the ref's other state.
+fn flush_identifier_vectors(
+    owner: &crate::ref_index::RefIndex,
+    id_cache_name: &str,
+) -> impl std::future::Future<Output = ()> + Send + use<> {
+    let resident_set = if owner.parent_ref_id.is_some() {
+        Arc::downgrade(&owner.identifier_vector_overlay)
+    } else {
+        owner
+            .identifier_vectors
+            .get()
+            .map_or_else(std::sync::Weak::new, Arc::downgrade)
+    };
+    let save_lock = Arc::clone(&owner.identifier_save_lock);
+    let save = IdentifierSave::of(owner, resident_set, id_cache_name.to_string());
+    async move {
+        let _save = save_lock.lock().await;
+        save.write(Vec::new()).await;
+    }
+}
+
+/// A ref's identifier cache file and the vectors it embedded since the file
+/// was last written.
+struct IdentifierSave {
+    root: PathBuf,
+    name: String,
+    unsaved: Arc<std::sync::Mutex<IdentifierVectors>>,
+    /// Every vector the file holds, to rebuild it when it is missing.
+    resident_set: std::sync::Weak<RwLock<IdentifierVectors>>,
+    #[cfg(test)]
+    saves: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl IdentifierSave {
+    fn of(
+        owner: &crate::ref_index::RefIndex,
+        resident_set: std::sync::Weak<RwLock<IdentifierVectors>>,
+        name: String,
+    ) -> Self {
+        Self {
+            root: owner.root_dir.clone(),
+            name,
+            unsaved: Arc::clone(&owner.identifier_unsaved),
+            resident_set,
+            #[cfg(test)]
+            saves: Arc::clone(&owner.identifier_saves),
+        }
+    }
+
+    /// Merges the unsaved vectors into the file without the `pruned` keys;
+    /// the vectors it fails to write stay unsaved.
+    async fn write(self, mut pruned: Vec<String>) {
         // Only the vectors embedded since the last save: the save merges
         // them into what is already on disk, or rebuilds a missing file
         // from the whole resident set.
-        let pending = std::mem::take(&mut *unsaved.lock().unwrap());
+        let pending = std::mem::take(&mut *self.unsaved.lock().unwrap());
         // Embedded again since the prune: the save keeps it.
         pruned.retain(|key| !pending.contains_key(key));
         let data = match identifier_cache_data(&pending) {
@@ -1270,23 +1352,31 @@ fn schedule_identifier_save(
                 vectors: Vec::new(),
             },
         };
+        let (root, name, resident_set) = (self.root, self.name, self.resident_set);
         let result = tokio::task::spawn_blocking(move || {
-            rkyv_store::save_cache_rebuilding(&persist_root, &id_cache_name, &data, &pruned, || {
+            rkyv_store::save_cache_rebuilding(&root, &name, &data, &pruned, || {
                 let vectors = resident_set.upgrade()?;
                 identifier_cache_data(&vectors.blocking_read())
             })
         })
         .await;
-        if !matches!(result, Ok(Ok(()))) {
-            if let Ok(Err(error)) = &result {
-                tracing::warn!(%error, "Identifier cache persistence failed");
+        match result {
+            Ok(Ok(())) => {
+                #[cfg(test)]
+                self.saves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let mut unsaved = unsaved.lock().unwrap();
-            for (key, vector) in pending {
-                unsaved.entry(key).or_insert(vector);
+            result => {
+                if let Ok(Err(error)) = &result {
+                    tracing::warn!(%error, "Identifier cache persistence failed");
+                }
+                let mut unsaved = self.unsaved.lock().unwrap();
+                for (key, vector) in pending {
+                    unsaved.entry(key).or_insert(vector);
+                }
             }
         }
-    });
+    }
 }
 
 /// Estimate of the paths, headers and symbols of cached outlines.
@@ -3742,8 +3832,9 @@ impl ContextPlusServer {
             }));
         }
 
-        // Each batch's vectors are kept and saved as it completes, so a build
-        // that fails or is cancelled leaves the next one only the rest.
+        // Each batch's vectors are kept as it completes and saved at most every
+        // `IDENTIFIER_SAVE_INTERVAL`, so a build that fails or is cancelled
+        // leaves the next one only the rest.
         if !uncached_texts.is_empty() {
             let target = if is_worktree {
                 Arc::clone(&ref_index.identifier_vector_overlay)
@@ -3751,20 +3842,29 @@ impl ContextPlusServer {
                 Arc::clone(resident)
             };
             let chunk_size = self.state.ollama.batch_size().max(1);
+            let mut saved_at = Instant::now();
+            let mut failure = None;
             for (indices, texts) in uncached_indices
                 .chunks(chunk_size)
                 .zip(uncached_texts.chunks(chunk_size))
             {
-                let vectors = match self.state.ollama.embed_documents(texts).await {
-                    Ok(vectors) => vectors,
-                    Err(ContextPlusError::Cancelled) => return Err(ContextPlusError::Cancelled),
+                let embedded = match self.state.ollama.embed_documents(texts).await {
+                    Err(ContextPlusError::Cancelled) => Err(ContextPlusError::Cancelled),
                     Err(error) => {
                         tracing::warn!(
                             %error,
                             identifiers = texts.len(),
                             "Identifier embedding batch failed, retrying once"
                         );
-                        self.state.ollama.embed_documents(texts).await?
+                        self.state.ollama.embed_documents(texts).await
+                    }
+                    embedded => embedded,
+                };
+                let vectors = match embedded {
+                    Ok(vectors) => vectors,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
                     }
                 };
                 {
@@ -3777,13 +3877,26 @@ impl ContextPlusServer {
                         result_vectors[i] = Some(vector);
                     }
                 }
-                schedule_identifier_save(
-                    &self.state,
-                    &ref_index,
-                    &target,
-                    is_worktree,
-                    id_cache_name.clone(),
-                );
+                if saved_at.elapsed() >= IDENTIFIER_SAVE_INTERVAL {
+                    schedule_identifier_save(
+                        &self.state,
+                        &ref_index,
+                        &target,
+                        is_worktree,
+                        id_cache_name.clone(),
+                    );
+                    saved_at = Instant::now();
+                }
+            }
+            schedule_identifier_save(
+                &self.state,
+                &ref_index,
+                &target,
+                is_worktree,
+                id_cache_name.clone(),
+            );
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
 
@@ -7270,6 +7383,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_flush_writes_unsaved_identifiers() {
+        let (repo, _ollama, server, name, saved) = identifier_server_with_saved_cache().await;
+        assert!(saved >= 3, "the first identifier save never landed");
+        let primary = server.state.default_ref().unwrap();
+        let embedded: Arc<[f32]> = Arc::from(vec![0.0, 1.0]);
+        primary
+            .identifier_vectors
+            .get()
+            .unwrap()
+            .write()
+            .await
+            .insert("reopen_ledger".into(), Arc::clone(&embedded));
+        primary
+            .identifier_unsaved
+            .lock()
+            .unwrap()
+            .insert("reopen_ledger".into(), embedded);
+
+        server.state.flush_identifier_vectors().await;
+
+        let keys = rkyv_store::load_cache(repo.path(), &name)
+            .unwrap()
+            .map(|data| data.keys)
+            .unwrap_or_default();
+        assert!(keys.iter().any(|key| key == "reopen_ledger"), "{keys:?}");
+    }
+
+    #[tokio::test]
     async fn eviction_flush_writes_unsaved_identifiers_and_rebuilds_a_missing_cache_file() {
         let (repo, _ollama, server, name, saved) = identifier_server_with_saved_cache().await;
         assert!(saved >= 3, "the first identifier save never landed");
@@ -7970,6 +8111,80 @@ mod tests {
             ["zeta_one", "zeta_two"],
             "the next build embedded again what {before_failure:?} had embedded"
         );
+    }
+
+    /// The identifier cache writes so far, once no save is in flight and
+    /// every embedded vector is saved.
+    async fn settled_identifier_saves(server: &ContextPlusServer) -> usize {
+        let owner = server.current_ref().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                {
+                    let _save = owner.identifier_save_lock.lock().await;
+                    if owner
+                        .identifier_saves
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                        && owner.identifier_unsaved.lock().unwrap().is_empty()
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the embedded identifiers were never saved");
+        owner
+            .identifier_saves
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn an_identifier_build_writes_the_cache_once_when_it_ends() {
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            |inputs| embeddings_for(inputs).set_delay(std::time::Duration::from_millis(400)),
+            |config| config.embed_batch_size = 1,
+        )
+        .await;
+        let cache = server.ensure_project_cache().await.unwrap();
+
+        server.ensure_identifier_index(&cache).await.unwrap();
+
+        assert_eq!(
+            settled_identifier_saves(&server).await,
+            1,
+            "each embedded batch rewrote the identifier cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_identifier_build_saves_the_batches_it_embedded() {
+        let (repo, _ollama, server) = scripted_identifier_server(
+            &[
+                ("src/a.rs", "pub fn alpha_one() {}\npub fn alpha_two() {}\n"),
+                ("src/z.rs", "pub fn zeta_one() {}\npub fn zeta_two() {}\n"),
+            ],
+            |inputs| {
+                if inputs.iter().any(|input| input.contains("zeta")) {
+                    return wiremock::ResponseTemplate::new(500);
+                }
+                embeddings_for(inputs)
+            },
+            |config| config.embed_batch_size = 2,
+        )
+        .await;
+        let cache = server.ensure_project_cache().await.unwrap();
+
+        assert!(server.ensure_identifier_index(&cache).await.is_err());
+
+        settled_identifier_saves(&server).await;
+        let name = cache_name("identifier-embeddings", &server.state.config);
+        let saved = rkyv_store::load_cache(repo.path(), &name)
+            .unwrap()
+            .map(|data| data.keys);
+        assert_eq!(saved.map(|keys| keys.len()), Some(2));
     }
 
     #[test]

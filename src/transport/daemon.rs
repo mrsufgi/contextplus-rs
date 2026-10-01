@@ -618,8 +618,10 @@ pub async fn run(
     }
     let _ = std::fs::remove_file(&pid_path);
 
-    // Final flush: persist query embeddings and unwritten snapshots before exit.
+    // Final flush: persist query embeddings, identifier vectors and unwritten
+    // snapshots before exit.
     server.state.ollama.flush_query_cache();
+    server.state.flush_identifier_vectors().await;
     server.state.flush_snapshots().await;
 
     Ok(())

@@ -255,6 +255,7 @@ pub async fn run_mcp_server(root_dir: PathBuf, config: Config) -> Result<()> {
     }
 
     state_for_shutdown.ollama.flush_query_cache();
+    state_for_shutdown.flush_identifier_vectors().await;
     state_for_shutdown.flush_snapshots().await;
 
     idle_monitor.stop();

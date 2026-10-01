@@ -197,6 +197,8 @@ pub struct RefIndex {
     pub(crate) semantic_walks: AtomicUsize,
     #[cfg(test)]
     pub(crate) outline_parses: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) identifier_saves: Arc<AtomicUsize>,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
     /// The detached identifier build requests join, while it runs.
     pub(crate) identifier_build: std::sync::Mutex<Option<IdentifierBuild>>,
@@ -284,6 +286,8 @@ impl RefIndex {
             semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
             outline_parses: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_saves: Arc::new(AtomicUsize::new(0)),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -340,6 +344,8 @@ impl RefIndex {
             semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
             outline_parses: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_saves: Arc::new(AtomicUsize::new(0)),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -398,6 +404,8 @@ impl RefIndex {
             semantic_walks: AtomicUsize::new(0),
             #[cfg(test)]
             outline_parses: AtomicUsize::new(0),
+            #[cfg(test)]
+            identifier_saves: Arc::new(AtomicUsize::new(0)),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
