@@ -61,7 +61,9 @@ use tokio::sync::RwLock;
 
 use crate::core::embedding_tracker::EmbeddingTrackerHandle;
 use crate::core::embeddings::CacheEntry;
-use crate::server::{CachedLexicalIndex, IdentifierIndex, IdentifierVectors, ProjectCache};
+use crate::server::{
+    CachedLexicalIndex, IdentifierBuild, IdentifierIndex, IdentifierVectors, ProjectCache,
+};
 use crate::tools::semantic_search::CachedSearchIndex;
 
 /// Stable identifier for a ref (worktree + HEAD).
@@ -193,6 +195,8 @@ pub struct RefIndex {
     #[cfg(test)]
     pub(crate) semantic_walks: AtomicUsize,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
+    /// The detached identifier build requests join, while it runs.
+    pub(crate) identifier_build: std::sync::Mutex<Option<IdentifierBuild>>,
     pub(crate) identifier_rebuilding: Arc<std::sync::atomic::AtomicBool>,
     /// When each resident identifier vector no index uses was first seen unused.
     pub(crate) identifier_unused_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
@@ -273,6 +277,7 @@ impl RefIndex {
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
+            identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -325,6 +330,7 @@ impl RefIndex {
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
+            identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
@@ -379,6 +385,7 @@ impl RefIndex {
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
+            identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identifier_unused_since: std::sync::Mutex::new(HashMap::new()),
             lexical_update: tokio::sync::Mutex::new(()),
