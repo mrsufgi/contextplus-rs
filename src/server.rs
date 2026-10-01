@@ -22702,10 +22702,10 @@ mod tests {
         assert_eq!(result, semantic_fork_standalone(&server, &sub_root).await);
     }
 
-    /// A worktree's walk leaves the primary's scoped index in place and builds
-    /// its own.
+    /// A worktree's walk replaces the primary's scoped index with one of its
+    /// whole root and forks it.
     #[tokio::test]
-    async fn semantic_fork_leaves_a_scoped_primary_index_and_builds_standalone() {
+    async fn semantic_fork_replaces_a_scoped_primary_index_and_forks_it() {
         let (_ollama, primary_root, worktree, server, session) =
             semantic_fork_servers(lexdelta_edit_worktree).await;
         let mut args = semantic_args("shared symbol");
@@ -22722,18 +22722,53 @@ mod tests {
                 .unwrap()
         );
 
-        let result = semantic_fork_query(&session).await;
+        semantic_fork_query(&session).await;
+        let primary = semantic_fork_index(&server).await;
+        assert_eq!(
+            primary.search_root(),
+            primary_root.path().canonicalize().unwrap(),
+            "the worktree's walk left the primary's scoped index"
+        );
+        let fork = semantic_fork_index(&session).await;
+        assert!(fork.index.shares_vector_store(&primary.index));
+        assert_eq!(
+            semantic_fork_hits(&fork),
+            semantic_fork_standalone_hits(&server, worktree.path()).await
+        );
+    }
+
+    /// A worktree's warmup over a primary holding a scoped index builds the
+    /// primary's index of its whole root from its cache and forks it.
+    #[tokio::test]
+    async fn semantic_fork_warmup_replaces_a_scoped_primary_index() {
+        let (_ollama, primary_root, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        server.ensure_project_cache().await.unwrap();
+        let primary = server.state.default_ref().unwrap();
+        *primary.search_index_cache.write().await = None;
+        let mut args = semantic_args("shared symbol");
+        args.insert("scope".into(), json!("code"));
+        args.insert("rootDir".into(), json!("src/area_1"));
+        server.handle_semantic_code_search(args).await.unwrap();
+        assert_ne!(
+            semantic_fork_index(&server).await.search_root(),
+            primary.canonical_root
+        );
+
+        semantic_fork_warmup(&session).await;
+        let whole = semantic_fork_index(&server).await;
+        assert_eq!(
+            whole.search_root(),
+            primary_root.path().canonicalize().unwrap(),
+            "the warmup left the primary's scoped index"
+        );
         assert!(
-            Arc::ptr_eq(&scoped, &semantic_fork_index(&server).await),
-            "the worktree's walk replaced the primary's scoped index"
-        );
-        assert_eq!(
-            semantic_fork_index(&session).await.search_root(),
-            worktree.path().canonicalize().unwrap()
-        );
-        assert_eq!(
-            result,
-            semantic_fork_standalone(&server, worktree.path()).await
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&whole.index),
+            "the warmup did not fork the primary's whole-root index"
         );
     }
 

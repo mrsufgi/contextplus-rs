@@ -1633,7 +1633,8 @@ impl CachedWalkerIndexer {
     }
 
     /// Builds the parent's index of its whole root when the parent holds none,
-    /// as after a restart, and installs it so a worktree can fork it.
+    /// as after a restart, or a scoped one, and installs it so a worktree can
+    /// fork it.
     async fn build_parent_index(
         &self,
         parent: &Arc<crate::ref_index::RefIndex>,
@@ -1642,9 +1643,16 @@ impl CachedWalkerIndexer {
         if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
             return;
         }
-        if parent.search_index_cache.read().await.is_some() {
-            return;
-        }
+        let seen = {
+            let current = parent.search_index_cache.read().await;
+            if current
+                .as_ref()
+                .is_some_and(|entry| entry.search_root() == parent.canonical_root)
+            {
+                return;
+            }
+            current.as_ref().map(Arc::downgrade)
+        };
         let generation = parent
             .cache_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1683,7 +1691,7 @@ impl CachedWalkerIndexer {
         else {
             return;
         };
-        let installed = entry.install(&mut *parent.search_index_cache.write().await, None);
+        let installed = entry.install(&mut *parent.search_index_cache.write().await, seen.as_ref());
         tracing::info!(
             phase = "semantic_parent_index",
             ref_id = %parent.cas_ref_id_hex,
@@ -1832,8 +1840,9 @@ impl CachedWalkerIndexer {
             .then(Default::default)
     }
 
-    /// The parent a worktree's warmup forks, its index built first from its
-    /// cached vectors when it holds none: the warmup makes no Ollama call.
+    /// The parent a worktree's warmup forks, its index of its whole root built
+    /// first from its cached vectors when it holds none: the warmup makes no
+    /// Ollama call.
     async fn warmup_parent(
         &self,
         ref_index: &crate::ref_index::RefIndex,
@@ -1841,7 +1850,12 @@ impl CachedWalkerIndexer {
         let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
         if parent.parent_ref_id.is_none()
             && parent.canonical_root != ref_index.canonical_root
-            && parent.search_index_cache.read().await.is_none()
+            && parent
+                .search_index_cache
+                .read()
+                .await
+                .as_ref()
+                .is_none_or(|entry| entry.search_root() != parent.canonical_root)
             && let Some(files) = parent.project_cache.read().await.clone()
         {
             self.primary_warmup(&parent, &files).await;
