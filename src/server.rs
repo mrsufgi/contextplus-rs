@@ -158,7 +158,14 @@ pub(crate) struct IdentifierBuild {
     /// The parsed documents, without vectors, once parsing is done.
     parsed: tokio::sync::watch::Receiver<Option<Arc<IdentifierIndex>>>,
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
+    /// The documents as of the latest project cache a request asked for.
+    current: Arc<std::sync::Mutex<Option<CurrentIdentifierDocs>>>,
 }
+
+type CurrentIdentifierDocs = (
+    std::sync::Weak<ProjectCache>,
+    tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>,
+);
 
 impl IdentifierBuild {
     /// Whether the build indexes the project cache `cache`.
@@ -203,8 +210,9 @@ impl IdentifierBuild {
 
     /// `docs`, documents of this build, as of the project cache `cache`: each
     /// file whose content differs from the build's project cache is parsed
-    /// again. `None` once the build's project cache is gone, or when more
-    /// than `FULL_REBUILD_CHANGE_FRACTION` of its files differ.
+    /// again, once per project cache for every request of it. `None` once the
+    /// build's project cache is gone, or when more than
+    /// `FULL_REBUILD_CHANGE_FRACTION` of its files differ.
     async fn documents_for(
         &self,
         docs: &Arc<IdentifierIndex>,
@@ -213,48 +221,70 @@ impl IdentifierBuild {
         if self.built_from(cache) {
             return Some(Arc::clone(docs));
         }
-        let source = self.source.upgrade()?;
-        let docs = Arc::clone(docs);
-        let cache = Arc::clone(cache);
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            let differing: std::collections::BTreeSet<&String> = cache
-                .file_content
-                .keys()
-                .chain(source.file_content.keys())
-                .filter(|path| cache.file_content.get(path) != source.file_content.get(path))
-                .collect();
-            if differing.len() as f64
-                > source.file_content.len() as f64
-                    * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
-            {
-                return None;
+        let mut current = {
+            let mut slot = self.current.lock().unwrap();
+            match slot.as_ref() {
+                Some((of, current)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)) => {
+                    current.clone()
+                }
+                _ => {
+                    let source = self.source.upgrade()?;
+                    let (sender, current) = tokio::sync::watch::channel(None);
+                    let docs = Arc::clone(docs);
+                    let edited = Arc::clone(cache);
+                    tokio::task::spawn_blocking(move || {
+                        sender.send_replace(Some(Self::reparsed(&docs, &source, &edited)));
+                    });
+                    *slot = Some((Arc::downgrade(cache), current.clone()));
+                    current
+                }
             }
-            let mut files = docs.docs.files.clone();
-            for path in &differing {
-                files.remove(*path);
-            }
-            files.par_extend(differing.into_par_iter().filter_map(|path| {
-                let content = cache.file_content.get(path)?;
-                let file_docs =
-                    crate::tools::semantic_identifiers::identifier_docs_for_file(path, content)?;
-                Some((path.clone(), Arc::new(file_docs)))
-            }));
-            Some(Arc::new(IdentifierIndex {
-                docs: Segmented::from_files(files),
-                vectors: IdentifierVectorIndex::empty(),
-                dims: 0,
-                file_count: cache
-                    .file_entries
-                    .iter()
-                    .filter(|entry| !entry.is_directory)
-                    .count(),
-                built_at: Instant::now(),
-            }))
-        })
-        .await
-        .ok()
-        .flatten()
+        };
+        let reparsed = current.wait_for(Option::is_some).await.ok()?.clone();
+        reparsed.flatten()
+    }
+
+    /// `docs`, parsed from `source`, with each file whose content differs in
+    /// `cache` parsed again.
+    fn reparsed(
+        docs: &IdentifierIndex,
+        source: &ProjectCache,
+        cache: &ProjectCache,
+    ) -> Option<Arc<IdentifierIndex>> {
+        use rayon::prelude::*;
+        let differing: std::collections::BTreeSet<&String> = cache
+            .file_content
+            .keys()
+            .chain(source.file_content.keys())
+            .filter(|path| cache.file_content.get(path) != source.file_content.get(path))
+            .collect();
+        if differing.len() as f64
+            > source.file_content.len() as f64
+                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
+        {
+            return None;
+        }
+        let mut files = docs.docs.files.clone();
+        for path in &differing {
+            files.remove(*path);
+        }
+        files.par_extend(differing.into_par_iter().filter_map(|path| {
+            let content = cache.file_content.get(path)?;
+            let file_docs =
+                crate::tools::semantic_identifiers::identifier_docs_for_file(path, content)?;
+            Some((path.clone(), Arc::new(file_docs)))
+        }));
+        Some(Arc::new(IdentifierIndex {
+            docs: Segmented::from_files(files),
+            vectors: IdentifierVectorIndex::empty(),
+            dims: 0,
+            file_count: cache
+                .file_entries
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .count(),
+            built_at: Instant::now(),
+        }))
     }
 }
 
@@ -3663,6 +3693,7 @@ impl ContextPlusServer {
             source: Arc::downgrade(cache),
             parsed: parsed_receiver,
             done: receiver,
+            current: Arc::default(),
         };
         let server = self.clone();
         let owner = Arc::clone(ref_index);
@@ -8520,6 +8551,54 @@ mod tests {
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("before the latest edits"), "{text}");
         assert!(build.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn requests_against_one_build_after_an_edit_share_one_reparse() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let edit = |name: &str| {
+            std::fs::write(
+                repo.path().join("src/ledger.rs"),
+                format!("pub fn open_account() {{}}\npub fn {name}() {{}}\n"),
+            )
+            .unwrap();
+        };
+        edit("audit_account");
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+
+        let (first, concurrent) = tokio::join!(
+            build.documents_for(&parsed, &edited),
+            build.documents_for(&parsed, &edited)
+        );
+        let repeated = build.documents_for(&parsed, &edited).await;
+        edit("freeze_account");
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited_again = server.ensure_project_cache().await.unwrap();
+        let newer = build.documents_for(&parsed, &edited_again).await.unwrap();
+
+        let first = first.unwrap();
+        assert!(Arc::ptr_eq(&first, &concurrent.unwrap()));
+        assert!(Arc::ptr_eq(&first, &repeated.unwrap()));
+        let names = |index: &IdentifierIndex| -> Vec<String> {
+            index.docs.iter().map(|doc| doc.name.clone()).collect()
+        };
+        assert!(names(&first).contains(&"audit_account".to_string()));
+        assert!(names(&newer).contains(&"freeze_account".to_string()));
+        assert!(
+            build.running(),
+            "the build ended before the requests answered"
+        );
         drop(held);
     }
 
