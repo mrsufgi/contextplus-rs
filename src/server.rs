@@ -9143,6 +9143,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fork_base_build_takes_the_primary_vectors_of_identical_files() {
+        let ollama = wiremock::MockServer::start().await;
+        let (primary, _holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        lexdelta_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let bases = tempfile::tempdir().unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.fork_base = Some("origin/main".into());
+        config.fork_base_dir = Some(bases.path().to_path_buf());
+        config.fork_base_min_advance_secs = 0;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
+        semantic_fork_query(&server).await;
+        let embedded = ollama.received_requests().await.unwrap().len();
+
+        let root = primary.path().to_path_buf();
+        let base = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a fork base checkout");
+        crate::transport::daemon::register_fork_base(&server, base).await;
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+
+        let (_, indexed, _) = fork_base_state(&server, "none").await;
+        assert!(indexed.is_some(), "the fork base was not indexed");
+        assert_eq!(
+            ollama.received_requests().await.unwrap().len(),
+            embedded,
+            "the fork base embedded files the primary holds vectors of"
+        );
+    }
+
     /// A checkout of `files` at a new directory registered as the fork base.
     async fn attach_identifier_fork_base(
         server: &ContextPlusServer,

@@ -1083,13 +1083,22 @@ impl CachedWalkerIndexer {
             ancestor_id = ancestor.parent_ref_id;
         }
         // A fork's entry holds the vectors it took from a parent that has since
-        // moved off their content; they become this ref's own.
-        let unfound: Vec<usize> = uncached_indices
-            .iter()
-            .copied()
-            .filter(|&idx| vectors[idx].is_none())
-            .collect();
-        if !unfound.is_empty() {
+        // moved off their content; they become this ref's own. The fork base,
+        // no worktree of the primary, takes the primary's of identical files.
+        let fork_base = self.state.fork_base_ref_id.get()
+            == Some(&crate::ref_index::RefId::for_canonical_path(
+                &ref_index.canonical_root,
+            ));
+        let primary = fork_base.then(|| self.state.default_ref()).flatten();
+        for holder in std::iter::once(ref_index.as_ref()).chain(primary.as_deref()) {
+            let unfound: Vec<usize> = uncached_indices
+                .iter()
+                .copied()
+                .filter(|&idx| vectors[idx].is_none())
+                .collect();
+            if unfound.is_empty() {
+                break;
+            }
             let wanted: Vec<(&str, &str)> = unfound
                 .iter()
                 .map(|&idx| {
@@ -1097,7 +1106,7 @@ impl CachedWalkerIndexer {
                     (path.as_str(), hash.as_str())
                 })
                 .collect();
-            for (idx, vector) in unfound.iter().zip(held_vectors(ref_index, &wanted).await) {
+            for (idx, vector) in unfound.iter().zip(held_vectors(holder, &wanted).await) {
                 if let Some((_, vector)) = vector {
                     vectors[*idx] = Some(vector.clone());
                     let hash = content_hashes[*idx].1.clone();
