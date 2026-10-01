@@ -154,20 +154,16 @@ static NEXT_IDENTIFIER_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[derive(Clone)]
 pub(crate) struct IdentifierBuild {
     id: u64,
-    source: std::sync::Weak<ProjectCache>,
     /// The parsed documents, without vectors, once parsing is done.
     parsed: Arc<std::sync::OnceLock<Arc<IdentifierIndex>>>,
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
 }
 
 impl IdentifierBuild {
-    /// Still running, for the project cache `cache`.
-    fn running_for(&self, cache: &Arc<ProjectCache>) -> bool {
+    fn running(&self) -> bool {
         let finished = self.done.borrow().is_some();
         // A build whose task was aborted never finishes; its sender is gone.
-        std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(cache))
-            && !finished
-            && self.done.has_changed().is_ok()
+        !finished && self.done.has_changed().is_ok()
     }
 
     async fn finished(mut self) -> Result<Arc<IdentifierIndex>> {
@@ -3349,8 +3345,10 @@ impl ContextPlusServer {
         })
     }
 
-    /// The running build of `cache`, or a new detached one. Concurrent
-    /// callers share it, and one that stops waiting does not cancel it.
+    /// The ref's running build, whichever project cache it started from, or
+    /// a new detached one of `cache`; a build installs its index only while
+    /// its cache is current. Concurrent callers share it, and one that stops
+    /// waiting does not cancel it.
     fn join_identifier_build(
         &self,
         ref_index: &Arc<crate::ref_index::RefIndex>,
@@ -3358,14 +3356,13 @@ impl ContextPlusServer {
     ) -> IdentifierBuild {
         let mut slot = ref_index.identifier_build.lock().unwrap();
         if let Some(build) = slot.as_ref()
-            && build.running_for(cache)
+            && build.running()
         {
             return build.clone();
         }
         let (done, receiver) = tokio::sync::watch::channel(None);
         let build = IdentifierBuild {
             id: NEXT_IDENTIFIER_BUILD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            source: Arc::downgrade(cache),
             parsed: Arc::default(),
             done: receiver,
         };
@@ -7756,6 +7753,74 @@ mod tests {
         let text = text_of(&answered);
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(!text.contains("primary_only_name -"), "{text}");
+    }
+
+    /// Holds every embed permit, so builds parse but embed nothing until it
+    /// is dropped.
+    async fn hold_embeds(server: &ContextPlusServer) -> tokio::sync::OwnedSemaphorePermit {
+        let permits = server.state.config.ollama_max_concurrent.max(1) as u32;
+        server
+            .state
+            .ollama_semaphore()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap()
+    }
+
+    async fn started_identifier_build(server: &ContextPlusServer) -> IdentifierBuild {
+        let cache = server.ensure_project_cache().await.unwrap();
+        match server.identifier_index_or_build(&cache, true).await.unwrap() {
+            IdentifierLookup::Building(build) => build,
+            IdentifierLookup::Ready(_) => panic!("the identifier index was already built"),
+        }
+    }
+
+    async fn wait_until_parsed(build: &IdentifierBuild) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while build.parsed.get().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the identifier build never parsed");
+    }
+
+    #[tokio::test]
+    async fn an_identifier_query_after_an_edit_joins_the_running_build() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let first = started_identifier_build(&server).await;
+        wait_until_parsed(&first).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn close_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        let running = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+        assert_eq!(running, Some(first.id), "the query started a second build");
+        drop(held);
     }
 
     #[tokio::test]
