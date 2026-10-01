@@ -275,6 +275,30 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn fork_base_checkout_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next advance pass of the fork base rooted at `root` after
+    /// it moved the checkout, before its index catches up.
+    pub(crate) fn pause_after_fork_base_checkout(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fork_base_checkout_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_fork_base_checkout(root: &Path) {
+        let pause = fork_base_checkout_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn stale_install_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))

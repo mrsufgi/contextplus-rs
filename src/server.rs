@@ -676,8 +676,6 @@ pub struct SharedState {
     pub(crate) fork_base_indexed_head: std::sync::Mutex<Option<String>>,
     /// The fork base's advance task while it runs.
     fork_base_advance: std::sync::Mutex<Option<(tokio::task::AbortHandle, ForkBaseAdvance)>>,
-    /// Set while the fork base checkout moves and its index catches up.
-    pub(crate) fork_base_advancing: std::sync::atomic::AtomicBool,
     /// Whether the running advance task checks its ref once more before it
     /// exits, or exits: one of the `ADVANCE_` states.
     fork_base_advance_state: std::sync::atomic::AtomicU8,
@@ -797,12 +795,6 @@ impl SharedState {
         let Some(base) = self.ref_index(base_id).await else {
             return refused("base_not_ready");
         };
-        if self
-            .fork_base_advancing
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return refused("base_advancing");
-        }
         let entry = base
             .search_index_cache
             .read()
@@ -2250,7 +2242,6 @@ impl ContextPlusServer {
                 reason,
                 "fork base not advanced"
             );
-            state.fork_base_advancing.store(false, Ordering::Release);
         };
         loop {
             let base = state
@@ -2283,7 +2274,6 @@ impl ContextPlusServer {
                 .is_none_or(|at| at.elapsed() >= interval);
             let moved = target != head && due;
             if moved {
-                state.fork_base_advancing.store(true, Ordering::Release);
                 let (checkout_dir, sha, from) = (dir.clone(), target.clone(), head.clone());
                 let changed = tokio::task::spawn_blocking(move || {
                     crate::git::fork_base::checkout(&checkout_dir, &sha)?;
@@ -2302,6 +2292,9 @@ impl ContextPlusServer {
                     base.head = target.clone();
                 }
                 *state.fork_base_advanced_at.lock().unwrap() = Some(Instant::now());
+                #[cfg(test)]
+                crate::server_adapters::test_seams::after_fork_base_checkout(&owner.canonical_root)
+                    .await;
                 let on_disk = changed.iter().map(|path| dir.join(path)).collect();
                 let (_, refresh) = self.refresh_tracked_files(changed, on_disk).await;
                 if let Some(task) = refresh {
@@ -2331,7 +2324,6 @@ impl ContextPlusServer {
             if indexed {
                 *state.fork_base_indexed_head.lock().unwrap() = Some(head.clone());
             }
-            state.fork_base_advancing.store(false, Ordering::Release);
             tracing::info!(
                 phase = "fork_base_advance",
                 head = %head,
@@ -2665,7 +2657,6 @@ impl ContextPlusServer {
             fork_base_ref_id: std::sync::OnceLock::new(),
             fork_base_indexed_head: std::sync::Mutex::new(None),
             fork_base_advance: std::sync::Mutex::new(None),
-            fork_base_advancing: std::sync::atomic::AtomicBool::new(false),
             fork_base_advance_state: std::sync::atomic::AtomicU8::new(ADVANCE_RUNNING),
             fork_base_advanced_at: std::sync::Mutex::new(None),
             fork_base: std::sync::Mutex::new(None),
@@ -9060,6 +9051,44 @@ mod tests {
         );
     }
 
+    /// A worktree registered while the fork base moves to the commit it was
+    /// cut from is parented on the fork base, at the commit its index holds.
+    #[tokio::test]
+    async fn choose_parent_takes_the_fork_base_while_it_advances() {
+        let (_ollama, primary, _bases, server) = fork_base_server(0).await;
+        server.advance_fork_base().expect("an advance").await;
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        for i in 10..20 {
+            std::fs::write(
+                primary
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn primary_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary.path(), &["commit", "-qam", "primary"]);
+        let holder = tempfile::tempdir().unwrap();
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &advanced);
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+
+        let pause = crate::server_adapters::test_seams::pause_after_fork_base_checkout(
+            &base.canonical_root,
+        );
+        let advance = server.advance_fork_base().expect("an advance");
+        pause.wait_until_entered().await;
+        let parent = server.state.choose_parent(&cut).await;
+        pause.resume();
+        advance.await;
+
+        assert_eq!(
+            parent,
+            Some(base_id),
+            "a worktree registered during an advance was parented on the primary"
+        );
+    }
+
     #[tokio::test]
     async fn fork_base_advance_waits_for_the_minimum_interval() {
         let (_ollama, primary, _bases, server) = fork_base_server(3600).await;
@@ -9104,10 +9133,7 @@ mod tests {
         let server = choose_parent_server(primary.path());
         let base = choose_parent_base(&server, holder.path(), &b, false).await;
         let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
-        server
-            .state
-            .fork_base_advancing
-            .store(true, std::sync::atomic::Ordering::Release);
+        *server.state.fork_base_indexed_head.lock().unwrap() = None;
         let pause = crate::server_adapters::test_seams::pause_after_choose_parent(&cut);
 
         let attach = {
