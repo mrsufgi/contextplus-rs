@@ -748,6 +748,14 @@ impl SharedState {
             .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
         let budget = self.config.resident_memory_budget_bytes;
         let measured = self.measured_resident_bytes(estimated);
+        let emergency = measured > budget.saturating_mul(2);
+        if !emergency
+            && self
+                .budget_emergency
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            tracing::info!("Resident memory is under twice CONTEXTPLUS_MEMORY_BUDGET_MB again");
+        }
         if measured <= budget {
             self.budget_warned
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -771,7 +779,6 @@ impl SharedState {
             return;
         }
         let low_watermark = budget / 5 * 4;
-        let emergency = measured > budget.saturating_mul(2);
         let configured_idle =
             std::time::Duration::from_secs(self.config.memory_budget_min_idle_secs);
         let min_idle = if emergency {
@@ -15720,6 +15727,31 @@ mod tests {
             )
             .count(),
             1,
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_logs_the_end_of_each_emergency_once() {
+        let logs = budget_passes_logs(&[
+            RESIDENCY_BUDGET * 3,
+            RESIDENCY_BUDGET / 2 * 3,
+            RESIDENCY_BUDGET / 2 * 3,
+            RESIDENCY_BUDGET * 3,
+            RESIDENCY_BUDGET / 2,
+        ])
+        .await;
+
+        assert_eq!(
+            logs.matches("Resident memory is under twice CONTEXTPLUS_MEMORY_BUDGET_MB again")
+                .count(),
+            2,
+            "{logs}"
+        );
+        assert_eq!(
+            logs.matches("Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB")
+                .count(),
+            2,
             "{logs}"
         );
     }
