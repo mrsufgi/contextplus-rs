@@ -208,6 +208,23 @@ impl IdentifierBuild {
         }
     }
 
+    /// `finished`, parsing the documents again as of `cache` once the build
+    /// has parsed them, so a request that stops waiting finds them parsed.
+    async fn finished_reparsing(self, cache: &Arc<ProjectCache>) -> Result<Arc<IdentifierIndex>> {
+        let reparse = async {
+            if let Ok(docs) = self.clone().documents().await
+                && !self.built_from(cache)
+            {
+                self.reparse(&docs, cache);
+            }
+            std::future::pending().await
+        };
+        tokio::select! {
+            finished = self.clone().finished() => finished,
+            never = reparse => never,
+        }
+    }
+
     /// `docs`, documents of this build, as of the project cache `cache`: each
     /// file whose content differs from the build's project cache is parsed
     /// again, once per project cache for every request of it. `None` once the
@@ -5066,8 +5083,9 @@ impl ContextPlusServer {
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
         // keyword ranking needs only the parsed documents, with the files an
-        // edit changed since the build started parsed again within the budget.
-        // A build of the tree before an edit answers only partially, and once
+        // edit changed since the build started parsed again within the budget;
+        // a ranking by meaning parses them while it waits on the build. A
+        // build of the tree before an edit answers only partially, and once
         // it ends, a build of the current tree takes the rest of the budget;
         // until that build parses, the ended build's index answers.
         const OUTDATED: &str = "identifiers reflect the tree before the latest edits";
@@ -5084,7 +5102,7 @@ impl ContextPlusServer {
             let waited = if Self::ranks_identifiers_by_keyword(&args) {
                 tokio::time::timeout(remaining, build.clone().documents()).await
             } else {
-                tokio::time::timeout(remaining, build.clone().finished()).await
+                tokio::time::timeout(remaining, build.clone().finished_reparsing(&cache)).await
             };
             match waited {
                 Ok(Ok(index)) if build.built_from(&cache) => break (index, None),
@@ -8440,6 +8458,62 @@ mod tests {
         assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
         assert!(!text.contains("close_account"), "{text}");
         assert!(first.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_after_an_edit_parses_the_edited_files_while_it_waits() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("audit_account", "meaning"))
+                    .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut reparse = loop {
+                let current = build.current.lock().unwrap().clone();
+                match current {
+                    Some((of, reparse)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(&edited)) => {
+                        break reparse;
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            };
+            reparse.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the query left the edited files unparsed while it waited on the build");
+        assert!(!query.is_finished(), "the query answered before its budget");
+        server.current_ref().await.cancel_background_tasks();
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+        assert!(!text.contains("close_account"), "{text}");
         drop(held);
     }
 
