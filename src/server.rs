@@ -4779,10 +4779,13 @@ impl ContextPlusServer {
         // documents answer by keyword while the build keeps embedding. A
         // keyword ranking needs only the parsed documents. A build of the
         // tree before an edit answers only partially, and once it ends, a
-        // build of the current tree takes the rest of the budget.
+        // build of the current tree takes the rest of the budget; until that
+        // build parses, the ended build's index answers.
+        const OUTDATED: &str = "identifiers reflect the tree before the latest edits";
         let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
         let started = tokio::time::Instant::now();
         let mut lookup = self.identifier_index_or_build(&cache, true).await?;
+        let mut outdated = None;
         let (idx, partial) = loop {
             let build = match lookup {
                 IdentifierLookup::Ready(index) => break (index, None),
@@ -4796,16 +4799,12 @@ impl ContextPlusServer {
             };
             match waited {
                 Ok(Ok(index)) if build.built_from(&cache) => break (index, None),
-                Ok(Ok(_)) if !build.running() => {
+                Ok(Ok(index)) if !build.running() => {
+                    outdated = Some(index);
                     cache = self.ensure_project_cache().await?;
                     lookup = self.identifier_index_or_build(&cache, true).await?;
                 }
-                Ok(Ok(index)) => {
-                    break (
-                        index,
-                        Some("identifiers reflect the tree before the latest edits".to_string()),
-                    );
-                }
+                Ok(Ok(index)) => break (index, Some(OUTDATED.to_string())),
                 waited => {
                     let reason = match waited {
                         Ok(Err(error)) => format!("identifier embedding failed ({error})"),
@@ -4813,7 +4812,13 @@ impl ContextPlusServer {
                             "identifier embeddings are still building in the background".to_string()
                         }
                     };
-                    let Some(index) = self.parsed_identifier_docs(&build).await else {
+                    let parsed = match outdated {
+                        Some(index) if build.parsed.borrow().is_none() => {
+                            break (index, Some(OUTDATED.to_string()));
+                        }
+                        _ => self.parsed_identifier_docs(&build).await,
+                    };
+                    let Some(index) = parsed else {
                         return Ok(Self::ok_text(format!(
                             "Partial results: {reason}, and no identifiers are parsed yet. Retry shortly."
                         )));
@@ -8196,6 +8201,62 @@ mod tests {
         let text = text_of(&answered);
         assert!(!text.starts_with("Partial results"), "{text}");
         assert!(text.contains("reconcile_account - src/ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_keeps_the_outdated_index_until_the_rebuild_parses() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let primary = server.state.default_ref().unwrap();
+        let outdated = primary
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+        let mut next_build = std::pin::pin!(primary.identifier_update.lock());
+        assert!(futures::poll!(&mut next_build).is_pending());
+        let edited = server.ensure_project_cache().await.unwrap();
+        let holders = Arc::strong_count(&edited);
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("open_account", "meaning"))
+                    .await
+            })
+        };
+        wait_until_held(&edited, holders).await;
+        drop(held);
+        let blocked = next_build.await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !primary
+                .identifier_build
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|build| Some(build.id) != outdated)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the query never started a build of the edited tree");
+        primary.cancel_background_tasks();
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+        drop(blocked);
+
+        let text = text_of(&answered);
+        assert!(
+            text.starts_with(
+                "Partial results: identifiers reflect the tree before the latest edits"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
     }
 
     #[tokio::test]
