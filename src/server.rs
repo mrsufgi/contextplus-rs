@@ -2495,6 +2495,12 @@ impl ContextPlusServer {
                 generation,
             );
         }
+        drop(guard);
+        let _refresh = crate::server_adapters::refresh_fork_parent(&self.state, &owner).await;
+        #[cfg(test)]
+        if let Some(task) = _refresh {
+            crate::server_adapters::test_seams::parent_refreshed(&owner.canonical_root, task);
+        }
     }
 
     /// Start the embedding tracker for a specific ref if not already running
@@ -23035,19 +23041,31 @@ mod tests {
         }
     }
 
-    /// A git primary with its whole-root index, moved by a commit that edits
-    /// `edits` files and deletes `deletions` through the tracker with no
-    /// primary query after it, then a worktree at the moved HEAD forked by
-    /// its first query; after a subdirectory search first when `scoped`. The
-    /// worktree's fork and refusal lines.
+    /// A git primary with its whole-root index and an attached worktree,
+    /// moved by a commit that edits `edits` files and deletes `deletions`
+    /// through the tracker with no primary query after it, then a worktree at
+    /// the moved HEAD forked by its first query; after a subdirectory search
+    /// first when `scoped`. The new worktree's fork and refusal lines.
     async fn semantic_fork_after_a_primary_move(
         scoped: bool,
         edits: usize,
         deletions: usize,
     ) -> Vec<String> {
         let ollama = wiremock::MockServer::start().await;
-        let (primary, _holder, worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        let (primary, holder, worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
+        let attached = holder.path().join("attached");
+        lexdelta_git(
+            primary.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                attached.to_str().unwrap(),
+            ],
+        );
         let server = identifier_test_server(&ollama, primary.path()).await;
+        attached_worktree(&server, &attached).await;
         server.ensure_project_cache().await.unwrap();
         semantic_fork_query(&server).await;
         if scoped {
@@ -23078,6 +23096,10 @@ mod tests {
         server.build_tracker_callback().await(primary.path().to_path_buf(), moved)
             .await
             .unwrap();
+        let canonical = primary.path().canonicalize().unwrap();
+        for task in crate::server_adapters::test_seams::take_parent_refreshes(&canonical) {
+            task.await.unwrap();
+        }
         lexdelta_add_worktree(primary.path(), &worktree, "pulled");
 
         let session = attached_worktree(&server, &worktree).await;
@@ -23145,9 +23167,98 @@ mod tests {
         assert!(whole.forkable_at(&primary.canonical_root));
     }
 
+    /// Queues on the primary's entry a batch restating one of its documents,
+    /// one tracker generation ahead of it, as a tracker refresh during a
+    /// rebuild queues one.
+    async fn semantic_fork_queue_primary_batch(server: &ContextPlusServer) {
+        use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument};
+
+        let primary = server.state.default_ref().unwrap();
+        let mut entry = semantic_fork_index(server).await;
+        let at = entry
+            .index
+            .documents()
+            .iter()
+            .position(|doc| doc.path == "src/area_1/file_5.rs")
+            .unwrap();
+        let doc = SearchDocument::clone(&entry.index.documents()[at]);
+        let vector = entry.index.vector_at(at).map(<[f32]>::to_vec);
+        let generation = primary
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        entry
+            .rebuild_in_progress
+            .store(true, std::sync::atomic::Ordering::Release);
+        CachedSearchIndex::refresh_paths(
+            &mut entry,
+            &primary.canonical_root,
+            vec![doc],
+            vec![vector],
+            &[],
+            generation,
+        );
+        entry
+            .rebuild_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!entry.forkable_at(&primary.canonical_root));
+    }
+
+    /// A parent of an attached worktree whose entry is behind its tracker is
+    /// rebuilt from cached vectors without a query, and becomes forkable.
+    #[tokio::test]
+    async fn semantic_fork_parent_behind_with_a_child_rebuilds_without_a_query() {
+        let (ollama, _primary, _worktree, server, _session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_queue_primary_batch(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let before = semantic_fork_index(&server).await;
+        let embedded = ollama.received_requests().await.unwrap().len();
+
+        crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent")
+            .await
+            .unwrap();
+        let after = semantic_fork_index(&server).await;
+        assert!(!Arc::ptr_eq(&before, &after), "the parent was not rebuilt");
+        assert!(after.pending_paths().is_empty());
+        assert!(after.forkable_at(&primary.canonical_root));
+        assert_eq!(
+            ollama.received_requests().await.unwrap().len(),
+            embedded,
+            "the parent's rebuild called Ollama"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_parent_behind_without_a_child_is_left_alone() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), SEMANTIC_FORK_FILES);
+        let server = identifier_test_server(&ollama, primary_root.path()).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_queue_primary_batch(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let before = semantic_fork_index(&server).await;
+
+        assert!(
+            crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+                .await
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&before, &semantic_fork_index(&server).await));
+    }
+
     #[tokio::test]
     async fn semantic_fork_after_a_small_primary_move_has_no_delta() {
         semantic_fork_assert_no_delta(&semantic_fork_after_a_primary_move(false, 150, 50).await);
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_after_a_large_primary_move_has_no_delta() {
+        semantic_fork_assert_no_delta(&semantic_fork_after_a_primary_move(false, 400, 50).await);
     }
 
     #[tokio::test]

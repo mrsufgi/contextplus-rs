@@ -1243,6 +1243,13 @@ impl CachedSearchIndex {
             && self.pending.lock().unwrap().batches.is_empty()
     }
 
+    /// Whether this entry was built before the tracker's `generation` or has
+    /// batches queued.
+    pub(crate) fn is_behind(&self, generation: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Acquire) < generation
+            || !self.pending.lock().unwrap().batches.is_empty()
+    }
+
     /// A parent entry a worktree can fork: walked from its whole `root`, over
     /// a vector store worth sharing, with no queued batches or rebuild.
     pub(crate) fn forkable_at(&self, root: &Path) -> bool {

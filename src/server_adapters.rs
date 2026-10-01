@@ -96,6 +96,32 @@ pub(crate) mod test_seams {
         pause
     }
 
+    fn parent_refresh_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>
+    {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the task of a parent rebuild a refresh of the ref at `root` started.
+    pub(crate) fn parent_refreshed(root: &Path, task: tokio::task::JoinHandle<()>) {
+        parent_refresh_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(task);
+    }
+
+    /// The parent rebuilds refreshes of the ref at `root` started.
+    pub(crate) fn take_parent_refreshes(root: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+        parent_refresh_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn after_budget_clear(root: &Path) {
         let pause = budget_clear_slots().lock().unwrap().remove(root);
         if let Some(pause) = pause {
@@ -2728,6 +2754,43 @@ fn log_fork_refusal(
     );
 }
 
+/// Rebuilds the index of `ref_index`, a parent of attached worktrees, in the
+/// background from cached vectors when it is behind its tracker, so they
+/// fork it without waiting for its next query. The rebuild's task, when this
+/// call started it.
+pub(crate) async fn refresh_fork_parent(
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+    if ref_index.parent_ref_id.is_some() || state.attached_children(ref_index).await.is_empty() {
+        return None;
+    }
+    let entry = ref_index.search_index_cache.read().await.clone()?;
+    let generation = ref_index.cache_generation.load(Ordering::Acquire);
+    if entry.search_root() != ref_index.canonical_root || !entry.is_behind(generation) {
+        return None;
+    }
+    // Vectors the cache lacks are left to the fill, not embedded by the walk.
+    let mut config = state.config.clone();
+    config.embed_budget_ms = 0;
+    let walker: Arc<dyn WalkAndIndexFn> = Arc::new(RefWalkerIndexer {
+        walker: CachedWalkerIndexer {
+            config,
+            ollama: state.ollama.clone(),
+            state: Arc::clone(state),
+        },
+        ref_index: Arc::clone(ref_index),
+    });
+    crate::tools::semantic_search::spawn_stale_rebuild(
+        &entry,
+        &ref_index.search_index_cache,
+        generation,
+        &walker,
+        &ref_index.canonical_root,
+    )
+}
+
 /// The tracker generations `parent` moved since its entry `base` was built,
 /// and whether `base` indexes its whole root.
 fn parent_lag(parent: &crate::ref_index::RefIndex, base: &CachedSearchIndex) -> (u64, bool) {
@@ -3087,6 +3150,7 @@ async fn run_fill(
             }
             let mut fill = ref_index.semantic_fill.lock().await;
             let mut ready = Vec::new();
+            let mut refreshed = false;
             match outcome {
                 Ok(Ok(vectors))
                     if vectors.len() == batch.len() && vectors.iter().all(|v| !v.is_empty()) =>
@@ -3134,6 +3198,7 @@ async fn run_fill(
                             vector_generation,
                         );
                     }
+                    refreshed = true;
                 }
                 result => {
                     for doc in &batch {
@@ -3159,6 +3224,13 @@ async fn run_fill(
                 }
             }
             drop(fill);
+            if refreshed {
+                let _refresh = refresh_fork_parent(&state, &ref_index).await;
+                #[cfg(test)]
+                if let Some(task) = _refresh {
+                    test_seams::parent_refreshed(&ref_index.canonical_root, task);
+                }
+            }
             if completed >= 64 {
                 persist_fill(&state, &ref_index, &config, parent_vectors.as_deref()).await;
                 completed = 0;
