@@ -3553,6 +3553,25 @@ impl ContextPlusServer {
         Self::built_identifier_index(&parent).await
     }
 
+    /// The running identifier build of a linked worktree's parent, once it
+    /// has parsed or the embed budget has passed.
+    async fn parent_identifier_build(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+    ) -> Option<IdentifierBuild> {
+        let parent = self.identifier_parent(ref_index).await?;
+        let build = parent
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|build| build.running())
+            .cloned()?;
+        let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
+        let _ = tokio::time::timeout(budget, build.clone().documents()).await;
+        Some(build)
+    }
+
     /// The primary checkout a linked worktree's identifier index seeds from.
     async fn identifier_parent(
         &self,
@@ -3632,8 +3651,11 @@ impl ContextPlusServer {
 
     /// Builds the identifier index of the current ref. A first build of a
     /// linked worktree, when `seed_from_parent`, starts from its parent's
-    /// index and parses only the files whose content differs. `parsed`
-    /// receives the documents, without vectors, before they are embedded.
+    /// index and parses only the files whose content differs. While the
+    /// parent builds its first index, the worktree takes the parent's parsed
+    /// documents of identical files and embeds once the parent's build ends.
+    /// `parsed` receives the documents, without vectors, before they are
+    /// embedded.
     async fn build_identifier_index_seeded(
         &self,
         cache: &Arc<ProjectCache>,
@@ -3667,11 +3689,23 @@ impl ContextPlusServer {
         let previous = ref_index.identifier_index.read().await.as_ref().cloned();
         let mut incremental =
             previous.as_ref().is_some_and(|index| index.dims > 0) && source.is_some();
-        let parent_seed = if incremental || !seed_from_parent {
+        let mut parent_seed = if incremental || !seed_from_parent {
             None
         } else {
             self.parent_identifier_index(&ref_index).await
         };
+        let parent_build = if incremental || !seed_from_parent || parent_seed.is_some() {
+            None
+        } else {
+            self.parent_identifier_build(&ref_index).await
+        };
+        if parent_build.is_some() {
+            parent_seed = self.parent_identifier_index(&ref_index).await;
+        }
+        let parent_parsed = parent_build
+            .as_ref()
+            .filter(|_| parent_seed.is_none())
+            .and_then(|build| Some((build.parsed.borrow().clone()?, build.source.upgrade()?)));
         let from_parent = parent_seed.is_some();
         let (previous, source) = match parent_seed {
             Some((parent_index, parent_source)) => {
@@ -3693,7 +3727,9 @@ impl ContextPlusServer {
             cache.file_content.keys().cloned().collect()
         };
         let parse_paths = changed_paths.clone();
-        let use_snapshot = !incremental && snapshots::enabled(&self.state.config, &ref_index);
+        let use_snapshot = !incremental
+            && parent_parsed.is_none()
+            && snapshots::enabled(&self.state.config, &ref_index);
         let snapshot_root = ref_index.root_dir.clone();
         let snapshot_config = self.state.config.clone();
         let started = Instant::now();
@@ -3708,7 +3744,28 @@ impl ContextPlusServer {
                 })
                 .flatten();
             let from_snapshot = seeded.is_some();
-            let (mut docs, parse_paths) = seeded.unwrap_or((Vec::new(), parse_paths));
+            let (mut docs, parse_paths) = match (seeded, parent_parsed) {
+                (Some(seeded), _) => seeded,
+                (None, Some((parsed, source))) => {
+                    let mut docs = Vec::new();
+                    let mut differing = std::collections::HashSet::new();
+                    for path in parse_paths {
+                        match parsed.docs.files.get(&path) {
+                            Some(file_docs)
+                                if source.file_content.get(&path)
+                                    == cache_clone.file_content.get(&path) =>
+                            {
+                                docs.extend(file_docs.iter().cloned());
+                            }
+                            _ => {
+                                differing.insert(path);
+                            }
+                        }
+                    }
+                    (docs, differing)
+                }
+                (None, None) => (Vec::new(), parse_paths),
+            };
             let parsed_files = parse_paths.len();
             docs.par_extend(
                 cache_clone
@@ -3896,6 +3953,9 @@ impl ContextPlusServer {
         // `IDENTIFIER_SAVE_INTERVAL`, so a build that fails or is cancelled
         // leaves the next one only the rest.
         if !uncached_texts.is_empty() {
+            if let Some(build) = parent_build.filter(IdentifierBuild::running) {
+                let _ = build.finished().await;
+            }
             let target = if is_worktree {
                 Arc::clone(&ref_index.identifier_vector_overlay)
             } else {
@@ -3908,7 +3968,25 @@ impl ContextPlusServer {
                 .chunks(chunk_size)
                 .zip(uncached_texts.chunks(chunk_size))
             {
-                let embedded = match self.state.ollama.embed_documents(texts).await {
+                let (indices, texts): (Vec<usize>, Vec<String>) = {
+                    let id_caches = resident.read().await;
+                    indices
+                        .iter()
+                        .zip(texts)
+                        .filter(|&(&i, text)| match id_caches.get(text) {
+                            Some(vector) => {
+                                result_vectors[i] = Some(Arc::clone(vector));
+                                false
+                            }
+                            None => true,
+                        })
+                        .map(|(&i, text)| (i, text.clone()))
+                        .unzip()
+                };
+                if texts.is_empty() {
+                    continue;
+                }
+                let embedded = match self.state.ollama.embed_documents(&texts).await {
                     Err(ContextPlusError::Cancelled) => Err(ContextPlusError::Cancelled),
                     Err(error) => {
                         tracing::warn!(
@@ -3916,7 +3994,7 @@ impl ContextPlusServer {
                             identifiers = texts.len(),
                             "Identifier embedding batch failed, retrying once"
                         );
-                        self.state.ollama.embed_documents(texts).await
+                        self.state.ollama.embed_documents(&texts).await
                     }
                     embedded => embedded,
                 };
@@ -3930,7 +4008,7 @@ impl ContextPlusServer {
                 {
                     let mut target_guard = target.write().await;
                     let mut unsaved = ref_index.identifier_unsaved.lock().unwrap();
-                    for ((&i, key), vector) in indices.iter().zip(texts).zip(vectors) {
+                    for ((&i, key), vector) in indices.iter().zip(&texts).zip(vectors) {
                         let vector: Arc<[f32]> = Arc::from(vector);
                         target_guard.insert(key.clone(), Arc::clone(&vector));
                         unsaved.insert(key.clone(), Arc::clone(&vector));
@@ -14470,6 +14548,50 @@ mod tests {
             matching_embed_request_batches(&ollama, "primary_only")
                 .await
                 .is_empty()
+        );
+    }
+
+    /// A worktree whose primary is building its first identifier index takes
+    /// the primary's parsed documents of identical files and leaves their
+    /// embedding to the primary.
+    #[tokio::test]
+    async fn worktree_identifier_build_joins_the_primary_build_for_identical_files() {
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            std::fs::write(dir.join("same_a.rs"), "fn same_a() {}\n").unwrap();
+            std::fs::write(dir.join("same_b.rs"), "fn same_b() {}\n").unwrap();
+        }
+        std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+        let held = hold_embeds(&server).await;
+        let primary_build = started_identifier_build(&server).await;
+        wait_until_parsed(&primary_build).await;
+
+        let worktree_build = started_identifier_build(&worktree_server).await;
+        wait_until_parsed(&worktree_build).await;
+        drop(held);
+        let index = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            worktree_build.finished(),
+        )
+        .await
+        .expect("the worktree identifier build never finished")
+        .unwrap();
+
+        assert_eq!(index.docs.files["differs.rs"][0].name, "new_name");
+        assert_eq!(index.docs.files["same_a.rs"][0].name, "same_a");
+        assert_eq!(matching_embed_input_count(&ollama, "same_a").await, 1);
+        assert_eq!(matching_embed_input_count(&ollama, "same_b").await, 1);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("cold-start phase") && line.contains("parsed_files=1")),
+            "the worktree parsed its identical files again:\n{logs}"
         );
     }
 
