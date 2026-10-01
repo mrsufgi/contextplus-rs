@@ -6322,6 +6322,8 @@ async fn import_baseline_for_ref(
                 tokio::task::spawn_blocking(move || {
                     let mut hits: Vec<HitEntry> = Vec::new();
                     let mut misses: Vec<MissedChunk> = Vec::new();
+                    // The chain's manifests, read once on the first wanted file.
+                    let mut chain = None;
 
                     for (rel_path, content) in &project_cache.file_content {
                         // Skip files that exceed the max embed size, and those not wanted.
@@ -6334,11 +6336,12 @@ async fn import_baseline_for_ref(
 
                         let chunk_hash = ChunkHash::of(&embed_text);
                         let key = ChunkKey::new(rel_path.clone(), 0);
+                        let chain = chain.get_or_insert_with(|| cas.chain_map(&ref_id_hex));
 
-                        match cas.lookup_chunk(&ref_id_hex, &key) {
-                            Ok(Some(h)) if h == chunk_hash => {
+                        match chain.get(&key) {
+                            Some(h) if *h == chunk_hash => {
                                 // Chunk hash matches manifest entry — try to load the blob.
-                                match cas.read_blob(&h) {
+                                match cas.read_blob(h) {
                                     Ok(Some(vec)) => {
                                         hits.push((rel_path.clone(), content_hash, vec));
                                     }
@@ -22180,6 +22183,31 @@ mod tests {
         assert_eq!(
             semantic_fork_query(&session).await,
             semantic_fork_standalone(&server, worktree.path()).await
+        );
+    }
+
+    /// A worktree whose parent has no index to fork looks up every file, and
+    /// reads each manifest of its CAS chain once, not once per file.
+    #[tokio::test]
+    async fn baseline_import_reads_each_manifest_once_per_pass() {
+        const FILES: usize = 50;
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), FILES);
+        lexdelta_corpus(worktree.path(), FILES);
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let mcp_data = server.state.root_dir.join(".mcp_data");
+        crate::cache::cas::test_seams::record_manifest_loads(&mcp_data);
+
+        let report = semantic_fork_warmup(&session).await;
+
+        assert_eq!(report.hits + report.misses.len(), FILES);
+        let loads = crate::cache::cas::test_seams::manifest_loads(&mcp_data);
+        assert!(
+            loads <= 2,
+            "the warmup loaded {loads} manifests for {FILES} lookups, not one per level"
         );
     }
 

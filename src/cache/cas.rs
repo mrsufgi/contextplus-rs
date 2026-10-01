@@ -396,6 +396,8 @@ impl CasStore {
                 );
                 return Ok(None);
             }
+            #[cfg(test)]
+            test_seams::manifest_loaded(&self.mcp_data);
             let manifest = self.load_manifest(&current)?;
             if let Some(hash) = manifest
                 .keys
@@ -442,6 +444,8 @@ impl CasStore {
                 );
                 break;
             }
+            #[cfg(test)]
+            test_seams::manifest_loaded(&self.mcp_data);
             let manifest = match self.load_manifest(&current) {
                 Ok(manifest) => manifest,
                 Err(e) => {
@@ -678,6 +682,41 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn manifest_load_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Counts the manifests chunk lookups load from the CAS at `mcp_data`
+    /// from now on.
+    pub(crate) fn record_manifest_loads(mcp_data: &Path) {
+        manifest_load_slots()
+            .lock()
+            .unwrap()
+            .insert(mcp_data.to_path_buf(), 0);
+    }
+
+    pub(crate) fn manifest_loaded(mcp_data: &Path) {
+        if let Some(loads) = manifest_load_slots().lock().unwrap().get_mut(mcp_data) {
+            *loads += 1;
+        }
+    }
+
+    pub(crate) fn manifest_loads(mcp_data: &Path) -> usize {
+        manifest_load_slots()
+            .lock()
+            .unwrap()
+            .remove(mcp_data)
+            .unwrap_or_default()
+    }
+}
 
 #[cfg(test)]
 mod tests {
