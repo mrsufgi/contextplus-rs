@@ -24184,6 +24184,13 @@ mod tests {
             !Arc::ptr_eq(&forked, &entry) && forked.forkable_at(&primary.canonical_root),
             "the worktree forked a primary index with queued batches"
         );
+        assert!(
+            semantic_fork_index(&session)
+                .await
+                .index
+                .shares_vector_store(&forked.index),
+            "the worktree did not fork the caught-up primary"
+        );
         assert_eq!(
             result,
             semantic_fork_standalone(&server, worktree.path()).await
