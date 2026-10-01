@@ -122,6 +122,34 @@ pub(crate) mod test_seams {
             .unwrap_or_default()
     }
 
+    fn stale_rebuild_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>
+    {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the task of a whole-root rebuild a subdirectory search of the
+    /// ref at `root` started.
+    pub(crate) fn stale_rebuild_started(root: &Path, task: tokio::task::JoinHandle<()>) {
+        stale_rebuild_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(task);
+    }
+
+    /// The whole-root rebuilds subdirectory searches of the ref at `root`
+    /// started.
+    pub(crate) fn take_stale_rebuilds(root: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+        stale_rebuild_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn after_budget_clear(root: &Path) {
         let pause = budget_clear_slots().lock().unwrap().remove(root);
         if let Some(pause) = pause {
@@ -630,6 +658,24 @@ impl RefWalkerIndexer {
             metadata.is_some() && *entry.metadata.read().unwrap() == metadata
         };
         current.then_some((entry, prefix))
+    }
+
+    /// The ref's semantic entry of its whole root, current or not, when
+    /// `root` lies inside it, with `root`'s path inside it.
+    pub(crate) async fn whole_root_index(
+        &self,
+        root: &Path,
+    ) -> Option<(Arc<CachedSearchIndex>, std::path::PathBuf)> {
+        let entry = self.ref_index.search_index_cache.read().await.clone()?;
+        if entry.search_root() != self.ref_index.canonical_root {
+            return None;
+        }
+        let canonical = tokio::fs::canonicalize(root).await.ok()?;
+        let prefix = canonical
+            .strip_prefix(entry.search_root())
+            .ok()?
+            .to_path_buf();
+        Some((entry, prefix))
     }
 
     /// Expires a worktree's semantic entry when its parent holds a forkable

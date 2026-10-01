@@ -5513,6 +5513,35 @@ impl ContextPlusServer {
         } else {
             None
         };
+        // A subdirectory of a ref whose whole-root entry is behind its tracker
+        // is answered from that entry while it rebuilds, as the root is.
+        if let Some(generation) = cache_gen
+            && let Some((stale, prefix)) = walker.whole_root_index(&root).await
+            && !prefix.as_os_str().is_empty()
+        {
+            let walker: Arc<dyn crate::tools::semantic_search::WalkAndIndexFn> = Arc::new(walker);
+            let _rebuild = crate::tools::semantic_search::spawn_stale_rebuild(
+                &stale,
+                &ref_index.search_index_cache,
+                generation.load(std::sync::atomic::Ordering::Acquire),
+                &walker,
+                &ref_index.canonical_root,
+            );
+            #[cfg(test)]
+            if let Some(task) = _rebuild {
+                crate::server_adapters::test_seams::stale_rebuild_started(
+                    &ref_index.canonical_root,
+                    task,
+                );
+            }
+            let result = crate::core::embeddings::interactive(
+                crate::tools::semantic_search::search_entry_under(
+                    stale, prefix, options, &embedder,
+                ),
+            )
+            .await?;
+            return Ok(Self::ok_text(result));
+        }
         let result = crate::core::embeddings::interactive(
             crate::tools::semantic_search::semantic_code_search_owned(
                 options,
@@ -24212,6 +24241,67 @@ mod tests {
             "a subdirectory search replaced the whole-root entry"
         );
         assert!(whole.forkable_at(&primary.canonical_root));
+    }
+
+    /// Subdirectory searches on a ref whose whole-root entry is behind its
+    /// tracker answer from that entry and rebuild it once, not walk each.
+    #[tokio::test]
+    async fn semantic_scoped_searches_on_a_stale_whole_root_entry_walk_once() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary_root = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary_root.path(), SEMANTIC_FORK_FILES);
+        let mut config = identifier_test_server(&ollama, primary_root.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.embed_tracker_mode = TrackerMode::Lazy;
+        let server = ContextPlusServer::new(primary_root.path().to_path_buf(), config);
+        semantic_fork_query(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        primary
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let scoped_query = || {
+            let mut args = semantic_args("shared symbol");
+            args.insert("scope".into(), json!("code"));
+            args.insert("rootDir".into(), json!("src/area_1"));
+            server.handle_semantic_code_search(args)
+        };
+        let walks = primary
+            .semantic_walks
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let first = text_of(&scoped_query().await.unwrap());
+        let second = text_of(&scoped_query().await.unwrap());
+        for task in crate::server_adapters::test_seams::take_stale_rebuilds(&primary.canonical_root)
+        {
+            task.await.unwrap();
+        }
+        let tracker = primary.tracker_handle.lock().unwrap().take();
+        if let Some(tracker) = tracker {
+            tracker.stop().await;
+        }
+
+        for result in [&first, &second] {
+            assert!(
+                result.contains("1. file_") && !result.contains(". src/"),
+                "{result}"
+            );
+        }
+        let walked = primary
+            .semantic_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - walks;
+        assert!(
+            walked <= 1,
+            "two subdirectory searches walked {walked} times"
+        );
+        assert!(
+            semantic_fork_index(&server)
+                .await
+                .forkable_at(&primary.canonical_root)
+        );
     }
 
     /// Queues on the primary's entry a batch restating one of its documents,
