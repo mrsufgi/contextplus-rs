@@ -221,27 +221,47 @@ impl IdentifierBuild {
         if self.built_from(cache) {
             return Some(Arc::clone(docs));
         }
-        let mut current = {
-            let mut slot = self.current.lock().unwrap();
-            match slot.as_ref() {
-                Some((of, current)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)) => {
-                    current.clone()
-                }
-                _ => {
-                    let source = self.source.upgrade()?;
-                    let (sender, current) = tokio::sync::watch::channel(None);
-                    let docs = Arc::clone(docs);
-                    let edited = Arc::clone(cache);
-                    tokio::task::spawn_blocking(move || {
-                        sender.send_replace(Some(Self::reparsed(&docs, &source, &edited)));
-                    });
-                    *slot = Some((Arc::downgrade(cache), current.clone()));
-                    current
-                }
-            }
-        };
+        let mut current = self.reparse(docs, cache)?;
         let reparsed = current.wait_for(Option::is_some).await.ok()?.clone();
         reparsed.flatten()
+    }
+
+    /// `documents_for` without waiting: `None` too while the files that
+    /// differ are still being parsed again.
+    fn documents_for_now(
+        &self,
+        docs: &Arc<IdentifierIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        if self.built_from(cache) {
+            return Some(Arc::clone(docs));
+        }
+        self.reparse(docs, cache)?.borrow().clone().flatten()
+    }
+
+    /// The reparse of `docs` as of `cache`, started unless one is already.
+    fn reparse(
+        &self,
+        docs: &Arc<IdentifierIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> Option<tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>> {
+        let mut slot = self.current.lock().unwrap();
+        match slot.as_ref() {
+            Some((of, current)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)) => {
+                Some(current.clone())
+            }
+            _ => {
+                let source = self.source.upgrade()?;
+                let (sender, current) = tokio::sync::watch::channel(None);
+                let docs = Arc::clone(docs);
+                let edited = Arc::clone(cache);
+                tokio::task::spawn_blocking(move || {
+                    sender.send_replace(Some(Self::reparsed(&docs, &source, &edited)));
+                });
+                *slot = Some((Arc::downgrade(cache), current.clone()));
+                Some(current)
+            }
+        }
     }
 
     /// `docs`, parsed from `source`, with each file whose content differs in
@@ -5098,8 +5118,9 @@ impl ContextPlusServer {
     }
 
     /// The documents of a build that has not finished: its own once parsed,
-    /// with the files that differ in `cache` parsed again, else the index
-    /// this ref already holds, unless that answers for the parent's tree.
+    /// with the files that differ in `cache` parsed again once a request has
+    /// parsed them, else the index this ref already holds, unless that
+    /// answers for the parent's tree.
     async fn parsed_identifier_docs(
         &self,
         build: &IdentifierBuild,
@@ -5107,7 +5128,7 @@ impl ContextPlusServer {
     ) -> Option<Arc<IdentifierIndex>> {
         let parsed = build.parsed.borrow().clone();
         if let Some(parsed) = parsed {
-            return Some(build.documents_for(&parsed, cache).await.unwrap_or(parsed));
+            return Some(build.documents_for_now(&parsed, cache).unwrap_or(parsed));
         }
         let ref_index = self.current_ref().await;
         if ref_index
@@ -8371,7 +8392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_partial_identifier_answer_after_an_edit_parses_the_edited_files_again() {
+    async fn a_partial_identifier_answer_after_an_edit_reads_the_edited_files_once_parsed() {
         let (repo, _ollama, server) =
             scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
                 config.embed_budget_ms = 0
@@ -8388,6 +8409,17 @@ mod tests {
         server
             .invalidate_project_cache_with_reason("test edit")
             .await;
+        server
+            .dispatch("explore", identifier_args("audit_account", "meaning"))
+            .await;
+        let mut reparse = first.current.lock().unwrap().as_ref().unwrap().1.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            reparse.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the edited files were never parsed again")
+        .unwrap();
 
         let answered = server
             .dispatch("explore", identifier_args("audit_account", "meaning"))
@@ -8605,6 +8637,25 @@ mod tests {
         let text = text_of(&answered);
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("before the latest edits"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_partial_identifier_answer_does_not_wait_for_its_reparse() {
+        let (_repo, _ollama, server, held, stalled) =
+            identifier_build_with_a_stalled_reparse().await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "meaning")),
+        )
+        .await
+        .expect("the partial answer waited for the reparse");
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("open_account - src/ledger.rs"), "{text}");
         drop(stalled);
         drop(held);
