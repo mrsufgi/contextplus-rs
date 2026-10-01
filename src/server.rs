@@ -672,8 +672,10 @@ pub struct SharedState {
     /// The `RefId` of the fork base checkout, once registered.
     pub fork_base_ref_id: std::sync::OnceLock<crate::ref_index::RefId>,
     /// The commit the fork base's installed index, its vectors filled, was
-    /// built at.
+    /// built at; after a restart, restored before the index is built again.
     pub(crate) fork_base_indexed_head: std::sync::Mutex<Option<String>>,
+    /// Set while the fork base checkout registers in the background.
+    pub(crate) fork_base_registering: tokio::sync::watch::Sender<bool>,
     /// The fork base's advance task while it runs.
     fork_base_advance: std::sync::Mutex<Option<(tokio::task::AbortHandle, ForkBaseAdvance)>>,
     /// Whether the running advance task checks its ref once more before it
@@ -808,28 +810,35 @@ impl SharedState {
             );
             Some(primary)
         };
+        let deadline = tokio::time::Instant::now() + CHOOSE_PARENT_TIMEOUT;
+        let mut registering = self.fork_base_registering.subscribe();
+        let _ = tokio::time::timeout_at(deadline, registering.wait_for(|busy| !busy)).await;
         let Some(base_id) = self.fork_base_ref_id.get().copied() else {
             return refused("base_not_ready");
         };
         let Some(base) = self.ref_index(base_id).await else {
             return refused("base_not_ready");
         };
-        let entry = base
-            .search_index_cache
-            .read()
-            .await
-            .clone()
-            .filter(|entry| entry.forkable_at(&base.canonical_root));
+        let entry = base.search_index_cache.read().await.clone();
         let indexed = self.fork_base_indexed_head.lock().unwrap().clone();
-        let (Some(entry), Some(indexed)) = (entry, indexed) else {
+        let Some(indexed) = indexed else {
             return refused("base_cold");
         };
-        if !crate::server_adapters::vectors_filled(&base, &entry).await {
-            return refused("base_filling");
+        // A head restored after a restart comes before the index, which the
+        // worktree's first walk builds from the vectors on disk.
+        match entry {
+            None => {}
+            Some(entry) if !entry.forkable_at(&base.canonical_root) => {
+                return refused("base_cold");
+            }
+            Some(entry) if !crate::server_adapters::vectors_filled(&base, &entry).await => {
+                return refused("base_filling");
+            }
+            Some(_) => {}
         }
         let (root, primary_root) = (canonical_root.to_path_buf(), self.canonical_root.clone());
-        let nearer = tokio::time::timeout(
-            CHOOSE_PARENT_TIMEOUT,
+        let nearer = tokio::time::timeout_at(
+            deadline,
             tokio::task::spawn_blocking(move || {
                 crate::git::fork_base::nearer_to_base(&root, &primary_root, &indexed)
             }),
@@ -2342,6 +2351,14 @@ impl ContextPlusServer {
             };
             if indexed {
                 *state.fork_base_indexed_head.lock().unwrap() = Some(head.clone());
+                let (dir, name, head) = (dir, cache_name("fork-base", &state.config), head.clone());
+                let saved = tokio::task::spawn_blocking(move || {
+                    crate::git::fork_base::save_indexed_head(&dir, &name, &head)
+                })
+                .await;
+                if let Ok(Err(error)) = saved {
+                    tracing::warn!(phase = "fork_base_advance", %error, "fork base head not saved");
+                }
             }
             tracing::info!(
                 phase = "fork_base_advance",
@@ -2678,6 +2695,7 @@ impl ContextPlusServer {
             fork_base_advance: std::sync::Mutex::new(None),
             fork_base_advance_state: std::sync::atomic::AtomicU8::new(ADVANCE_RUNNING),
             fork_base_advanced_at: std::sync::Mutex::new(None),
+            fork_base_registering: tokio::sync::watch::channel(false).0,
             fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
@@ -8803,7 +8821,9 @@ mod tests {
         }
         let id = crate::ref_index::RefId::for_canonical_path(&root);
         server.state.fork_base_ref_id.set(id).unwrap();
-        *server.state.fork_base_indexed_head.lock().unwrap() = Some(indexed.to_string());
+        if !cold {
+            *server.state.fork_base_indexed_head.lock().unwrap() = Some(indexed.to_string());
+        }
         id
     }
 
@@ -9177,6 +9197,70 @@ mod tests {
             server.state.choose_parent(&cut).await,
             Some(*server.state.fork_base_ref_id.get().unwrap()),
             "a worktree was parented on the primary after the fork base filled"
+        );
+    }
+
+    /// After a restart, a worktree registered while the fork base registers
+    /// again is parented on it, at the head its index held before.
+    #[tokio::test]
+    async fn choose_parent_takes_the_fork_base_after_a_restart() {
+        let (_ollama, primary, _bases, server) =
+            fork_base_server_tracked(0, TrackerMode::Lazy).await;
+        server
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        let origin = choose_parent_rev(primary.path(), "origin/main");
+        assert_eq!(
+            fork_base_state(&server, "none").await.1,
+            Some(origin.clone())
+        );
+        let base = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        let tracker = base.tracker_handle.lock().unwrap().take();
+        tracker.expect("the fork base's tracker").stop().await;
+        drop(server.state.fork_base.lock().unwrap().take());
+        for i in 10..20 {
+            std::fs::write(
+                primary
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn primary_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary.path(), &["commit", "-qam", "primary"]);
+        let holder = tempfile::tempdir().unwrap();
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &origin);
+
+        let restarted =
+            ContextPlusServer::new(primary.path().to_path_buf(), server.state.config.clone());
+        let registration = crate::transport::daemon::start_fork_base(&restarted)
+            .await
+            .expect("a background registration");
+        let parent = restarted.state.choose_parent(&cut).await;
+        registration.await.unwrap();
+        restarted
+            .state
+            .fork_base_advance_task()
+            .expect("an advance")
+            .await;
+        let base = restarted
+            .state
+            .ref_index(*restarted.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        let tracker = base.tracker_handle.lock().unwrap().take();
+        tracker.expect("the fork base's tracker").stop().await;
+
+        assert_eq!(
+            parent,
+            restarted.state.fork_base_ref_id.get().copied(),
+            "a worktree registered after a restart was parented on the primary"
         );
     }
 

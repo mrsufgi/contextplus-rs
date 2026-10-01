@@ -171,6 +171,26 @@ pub fn drift_files(root: &Path, indexed: &str) -> Option<usize> {
     changed_paths(root, indexed, &head).map(|paths| paths.len())
 }
 
+/// The commit the checkout at `dir` was last indexed at, its vectors filled,
+/// as [`save_indexed_head`] recorded it for the caches named `name`.
+pub fn load_indexed_head(dir: &Path, name: &str) -> Option<String> {
+    let head = std::fs::read_to_string(indexed_head_path(dir, name)).ok()?;
+    Some(head.trim().to_owned()).filter(|head| !head.is_empty())
+}
+
+/// Records `head` as the commit the checkout at `dir` was indexed at, so a
+/// restarted daemon can parent worktrees on it before it indexes it again.
+pub fn save_indexed_head(dir: &Path, name: &str, head: &str) -> std::io::Result<()> {
+    let path = indexed_head_path(dir, name);
+    std::fs::create_dir_all(path.parent().unwrap_or(dir))?;
+    std::fs::write(path, head)
+}
+
+fn indexed_head_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(crate::transport::paths::MCP_DATA_DIR)
+        .join(format!("{name}.head"))
+}
+
 /// The commit `reference` names in the repository at `root`.
 pub(crate) fn resolve(root: &Path, reference: &str) -> Option<String> {
     git(

@@ -1043,6 +1043,7 @@ pub(crate) async fn start_fork_base(
         return None;
     }
     crate::git::fork_base::fork_base_dir(config, &server.state.root_dir)?;
+    server.state.fork_base_registering.send_replace(true);
     let register = {
         let server = server.clone();
         async move {
@@ -1067,6 +1068,7 @@ pub(crate) async fn start_fork_base(
                     "fork base off"
                 ),
             }
+            server.state.fork_base_registering.send_replace(false);
         }
     };
     Some(tokio::spawn(register))
@@ -1108,8 +1110,21 @@ pub(crate) async fn register_fork_base(
         head = %base.head,
         "fork base registered"
     );
+    let name = crate::server::cache_name("fork-base", &server.state.config);
+    let (dir, head) = (base.dir.clone(), base.head.clone());
+    let restored =
+        tokio::task::spawn_blocking(move || crate::git::fork_base::load_indexed_head(&dir, &name))
+            .await
+            .ok()
+            .flatten()
+            .filter(|indexed| *indexed == head);
+    if restored.is_some() {
+        *server.state.fork_base_indexed_head.lock().unwrap() = restored;
+    }
     *server.state.fork_base.lock().unwrap() = Some(base);
     let _ = server.state.fork_base_ref_id.set(ref_id);
+    // Registrations waiting on the fork base choose their parent from here.
+    server.state.fork_base_registering.send_replace(false);
     prepare_ref(server, ref_id, &ref_arc).await;
     server.ensure_tracker_started_for(ref_id).await;
     // Indexes the checkout, and moves it first when its ref moved since.
