@@ -5036,10 +5036,10 @@ impl ContextPlusServer {
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
         // keyword ranking needs only the parsed documents, with the files an
-        // edit changed since the build started parsed again. A build of the
-        // tree before an edit answers only partially, and once it ends, a
-        // build of the current tree takes the rest of the budget; until that
-        // build parses, the ended build's index answers.
+        // edit changed since the build started parsed again within the budget.
+        // A build of the tree before an edit answers only partially, and once
+        // it ends, a build of the current tree takes the rest of the budget;
+        // until that build parses, the ended build's index answers.
         const OUTDATED: &str = "identifiers reflect the tree before the latest edits";
         let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
         let started = tokio::time::Instant::now();
@@ -5063,10 +5063,14 @@ impl ContextPlusServer {
                     cache = self.ensure_project_cache().await?;
                     lookup = self.identifier_index_or_build(&cache, true).await?;
                 }
-                Ok(Ok(index)) => match build.documents_for(&index, &cache).await {
-                    Some(current) => break (current, None),
-                    None => break (index, Some(OUTDATED.to_string())),
-                },
+                Ok(Ok(index)) => {
+                    let remaining = budget.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(remaining, build.documents_for(&index, &cache)).await
+                    {
+                        Ok(Some(current)) => break (current, None),
+                        _ => break (index, Some(OUTDATED.to_string())),
+                    }
+                }
                 waited => {
                     let reason = match waited {
                         Ok(Err(error)) => format!("identifier embedding failed ({error})"),
@@ -8551,6 +8555,58 @@ mod tests {
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("before the latest edits"), "{text}");
         assert!(build.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    /// An identifier server whose cold build has parsed `src/ledger.rs` and
+    /// holds every embed permit, after an edit that adds `audit_account`
+    /// whose reparse runs until the returned sender is dropped.
+    async fn identifier_build_with_a_stalled_reparse() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::watch::Sender<Option<Option<Arc<IdentifierIndex>>>>,
+    ) {
+        let (repo, ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let (stalled, reparse) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = Some((Arc::downgrade(&edited), reparse));
+        (repo, ollama, server, held, stalled)
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_answers_within_the_budget_while_its_reparse_runs() {
+        let (_repo, _ollama, server, held, stalled) =
+            identifier_build_with_a_stalled_reparse().await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the reparse");
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        drop(stalled);
         drop(held);
     }
 
