@@ -1944,15 +1944,22 @@ impl ContextPlusServer {
         // `config.ollama_max_concurrent`, which Config::from_env clamps into
         // [1, 64]. We wire the same semaphore into the OllamaClient so that
         // every outbound embed (warmup, tracker, on-demand) shares one budget.
-        // Document embeds hold at most all but one permit, so a query never
-        // waits behind them while the budget has two or more. Background
-        // batches hold all but one of those, so a request's documents never
-        // wait behind them while the budget has three or more.
-        let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
+        // With three or more, document embeds hold at most all but one
+        // permit, so a query never waits behind them, and background batches
+        // hold all but one of those, so a request's documents never wait
+        // behind them. With two, background batches hold one and a request's
+        // documents share the other with queries.
+        let max_concurrent = config.ollama_max_concurrent.max(1);
+        let ollama_semaphore = Arc::new(Semaphore::new(max_concurrent));
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
-            .with_semaphore(Arc::clone(&ollama_semaphore))
-            .with_document_limit(config.ollama_max_concurrent.saturating_sub(1))
-            .with_batch_limit(config.ollama_max_concurrent.saturating_sub(2));
+            .with_semaphore(Arc::clone(&ollama_semaphore));
+        let ollama = if max_concurrent >= 3 {
+            ollama
+                .with_document_limit(max_concurrent - 1)
+                .with_batch_limit(max_concurrent - 2)
+        } else {
+            ollama.with_batch_limit(max_concurrent - 1)
+        };
 
         let embed_cache_name = cache_name("embeddings", &config);
 
@@ -18315,9 +18322,8 @@ mod tests {
         // The fresh query's embed never returns, so a long budget keeps it in
         // flight for as long as the wait below takes.
         let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
-        // The fill's batch holds one permit and the fresh query's embed another;
-        // the third is kept for queries.
-        config.ollama_max_concurrent = 3;
+        // The fill's batch holds one permit; the fresh query's embed needs the other.
+        config.ollama_max_concurrent = 2;
         config.query_embed_budget_ms = 600_000;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 

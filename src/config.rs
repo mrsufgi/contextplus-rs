@@ -199,7 +199,10 @@ pub struct Config {
     pub ref_warmup_mode: RefWarmupMode,
     /// Capacity of the global Ollama embed semaphore. All Ollama embed calls
     /// (on-demand, tracker, and warmup) share this permit pool so N parallel
-    /// warmups cannot saturate a CPU-only Ollama instance.
+    /// warmups cannot saturate a CPU-only Ollama instance. From three, one
+    /// permit is kept for queries and one more for a request's documents;
+    /// with two, a request's documents and queries share the one permit
+    /// background batches leave.
     /// Controlled by `CONTEXTPLUS_OLLAMA_MAX_CONCURRENT` (default: 4, clamped to [1, 64]).
     pub ollama_max_concurrent: usize,
 }

@@ -508,8 +508,9 @@ impl OllamaClient {
         self
     }
 
-    /// Let at most `limit` background batch embeds hold document permits at
-    /// once. Below the document limit, a request's documents always find one free.
+    /// Let at most `limit` background batch embeds hold document permits, or
+    /// shared permits without a document limit, at once. Below that limit, a
+    /// request's documents always find one free.
     pub fn with_batch_limit(mut self, limit: usize) -> Self {
         self.batch_permits = Some(Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
         self
