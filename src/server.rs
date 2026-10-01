@@ -4541,6 +4541,7 @@ impl ContextPlusServer {
             Ok(result) => result,
             Err(e) => Self::err_text(format!("Error: {}", e)),
         };
+        self.state.touch_ref(ref_id);
         drop(serving);
         self.state.schedule_memory_budget_enforcement();
         result
@@ -15412,6 +15413,62 @@ mod tests {
             !logs.contains("ref caches evicted for memory budget")
                 && !logs.contains("memory budget pass evicted worktrees"),
             "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_spares_a_worktree_whose_request_outlasted_the_idle_window() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("served.rs"),
+            "fn served_request() {}\n",
+        )
+        .unwrap();
+        let mut config = identifier_test_server(&ollama, primary.path())
+            .await
+            .state
+            .config
+            .clone();
+        config.resident_memory_budget_bytes = 1024;
+        let server = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        let session = attached_worktree(&server, worktree.path()).await;
+        let id = session.session_ref_id.unwrap();
+        let owner = session.current_ref().await;
+        owner.embedding_cache.write().await.insert(
+            "resident.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "resident-hash".to_string(),
+                vector: vec![0.5; 4096],
+            },
+        );
+        let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(&owner.root_dir);
+        let request = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .dispatch("semantic_code_search", semantic_args("served request"))
+                    .await
+            }
+        });
+        pause.wait_until_entered().await;
+        mark_ref_idle(&server.state, id);
+        pause.resume();
+        request.await.unwrap();
+        let generation = owner
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            !owner.embedding_cache.read().await.is_empty()
+                && owner
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == generation,
+            "the budget evicted a worktree whose request had just ended"
         );
     }
 
