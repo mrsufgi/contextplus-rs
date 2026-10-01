@@ -16995,14 +16995,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_query_embed_proceeds_while_navigate_embeds_its_corpus_beside_a_batch() {
-        let (_root, ollama, server) = slow_marker_server(
-            &[(
-                "src/navigate.rs",
-                "pub fn navigate_corpus() { /* SLOW */ }\n",
-            )],
-            2,
-        )
-        .await;
+        let corpus: Vec<(String, String)> = (0..32)
+            .map(|i| {
+                (
+                    format!("src/routes/route_{i}.rs"),
+                    format!("pub fn route_{i}() {{}}\n"),
+                )
+            })
+            .chain([(
+                "src/navigate.rs".to_string(),
+                "pub fn navigate_corpus() { /* SLOW */ }\n".to_string(),
+            )])
+            .collect();
+        let corpus: Vec<(&str, &str)> = corpus
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let (_root, ollama, server) = slow_marker_server(&corpus, 2).await;
         let navigate = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -17060,6 +17069,61 @@ mod tests {
         })
         .await
         .expect("navigate's fresh files queued behind a background batch");
+
+        navigate.abort();
+        server.current_ref().await.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn navigate_embeds_a_file_edited_since_its_cache_beside_a_background_batch() {
+        let (root, ollama, server) = slow_marker_server(
+            &[
+                ("src/edited.rs", "pub fn before_edit() {}\n"),
+                ("src/steady.rs", "pub fn steady_file() {}\n"),
+            ],
+            2,
+        )
+        .await;
+        let warmed = server
+            .dispatch("semantic_navigate", serde_json::Map::new())
+            .await;
+        assert!(
+            !matching_embed_request_batches(&ollama, "steady_file")
+                .await
+                .is_empty(),
+            "{}",
+            text_of(&warmed)
+        );
+        std::fs::write(
+            root.path().join("src/edited.rs"),
+            "pub fn edited_needle() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+        let navigate = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("semantic_navigate", serde_json::Map::new())
+                    .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "edited_needle")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate's edited file queued behind a background batch");
 
         navigate.abort();
         server.current_ref().await.cancel_background_tasks();
