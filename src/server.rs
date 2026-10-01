@@ -713,7 +713,8 @@ impl SharedState {
         let id_cache_name = cache_name("identifier-embeddings", &self.config);
         let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
         for owner in refs {
-            flush_identifier_vectors(&owner, &id_cache_name).await;
+            let shares = self.identifier_owner_id(&owner).is_some();
+            flush_identifier_vectors(&owner, shares, &id_cache_name).await;
         }
     }
 
@@ -745,6 +746,22 @@ impl SharedState {
                     .is_some_and(|dir| dir == canonical_root)
         };
         (!self.pinned(ref_id) && !fork_base()).then_some(self.default_ref_id)
+    }
+
+    /// The ref whose identifier vectors `owner` shares, keeping its own misses
+    /// in an overlay; `None` when it owns them. The fork base and its
+    /// worktrees share the primary's.
+    pub(crate) fn identifier_owner_id(
+        &self,
+        owner: &crate::ref_index::RefIndex,
+    ) -> Option<crate::ref_index::RefId> {
+        let id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
+        match self.fork_base_ref_id.get() {
+            Some(base) if id == *base || owner.parent_ref_id == Some(*base) => {
+                Some(self.default_ref_id)
+            }
+            _ => owner.parent_ref_id,
+        }
     }
 
     /// Refs attached as worktrees of `parent`.
@@ -797,12 +814,15 @@ impl SharedState {
         }
 
         let created = make_ref();
+        if let Some(owner_id) = self.identifier_owner_id(&created) {
+            let owner = self.refs.read().await.get(&owner_id).cloned();
+            if let Some(owner_vectors) = owner.as_ref().and_then(|o| o.identifier_vectors.get()) {
+                let _ = created.identifier_vectors.set(Arc::clone(owner_vectors));
+            }
+        }
         if let Some(parent_id) = created.parent_ref_id {
             let parent = self.refs.read().await.get(&parent_id).cloned();
             if let Some(parent) = parent {
-                if let Some(parent_vectors) = parent.identifier_vectors.get() {
-                    let _ = created.identifier_vectors.set(Arc::clone(parent_vectors));
-                }
                 // Installs write the index and its source under the index write
                 // lock, so reading both under one read guard cannot tear.
                 let (identifier_index, identifier_source) = {
@@ -940,6 +960,7 @@ impl SharedState {
                 let flush = guard.remove(&ref_id).map(|evicted| {
                     flush_identifier_vectors(
                         &evicted,
+                        state.identifier_owner_id(&evicted).is_some(),
                         &cache_name("identifier-embeddings", &state.config),
                     )
                 });
@@ -1523,7 +1544,7 @@ async fn prune_identifier_vectors(
         |refs: &HashMap<crate::ref_index::RefId, Arc<crate::ref_index::RefIndex>>| {
             refs.values()
                 .filter(|other| {
-                    other.parent_ref_id == Some(owner_id)
+                    state.identifier_owner_id(other) == Some(owner_id)
                         || other
                             .identifier_vectors
                             .get()
@@ -1643,12 +1664,14 @@ fn schedule_identifier_save(
 }
 
 /// Writes the identifier vectors `owner` embedded since its last save, for
-/// a ref about to stop. The write holds none of the ref's other state.
+/// a ref about to stop; only its overlay when it `shares` another ref's
+/// vectors. The write holds none of the ref's other state.
 fn flush_identifier_vectors(
     owner: &crate::ref_index::RefIndex,
+    shares: bool,
     id_cache_name: &str,
 ) -> impl std::future::Future<Output = ()> + Send + use<> {
-    let resident_set = if owner.parent_ref_id.is_some() {
+    let resident_set = if shares {
         Arc::downgrade(&owner.identifier_vector_overlay)
     } else {
         owner
@@ -4138,8 +4161,9 @@ impl ContextPlusServer {
         // worktree shares the primary's resident vectors and keeps only its own
         // misses in a per-ref overlay persisted under its root.
         let id_cache_name = cache_name("identifier-embeddings", &self.state.config);
-        let is_worktree = ref_index.parent_ref_id.is_some();
-        let base_owner = match ref_index.parent_ref_id {
+        let owner_id = self.state.identifier_owner_id(&ref_index);
+        let is_worktree = owner_id.is_some();
+        let base_owner = match owner_id {
             Some(parent_id) => self
                 .state
                 .ref_index(parent_id)
@@ -8313,6 +8337,137 @@ mod tests {
         let pruned = prune_with_unused_vectors(&server, 10).await;
 
         assert!(pruned.is_empty(), "{pruned:?}");
+    }
+
+    /// A checkout of `files` at a new directory registered as the fork base.
+    async fn attach_identifier_fork_base(
+        server: &ContextPlusServer,
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, Arc<crate::ref_index::RefIndex>) {
+        let root = identifier_checkout(files);
+        let base = attach_identifier_ref(server, root.path(), None).await;
+        server
+            .state
+            .fork_base_ref_id
+            .set(crate::ref_index::RefId::for_canonical_path(
+                &base.canonical_root,
+            ))
+            .unwrap();
+        (root, base)
+    }
+
+    fn identifier_checkout(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for &(path, source) in files {
+            let full_path = root.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        root
+    }
+
+    async fn attach_identifier_ref(
+        server: &ContextPlusServer,
+        root: &std::path::Path,
+        parent: Option<crate::ref_index::RefId>,
+    ) -> Arc<crate::ref_index::RefIndex> {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let canonical = root.canonicalize().unwrap();
+        server
+            .state
+            .attach_ref(RefId::for_canonical_path(&canonical), || {
+                Arc::new(RefIndex::new(canonical.clone(), canonical.clone(), parent))
+            })
+            .await
+    }
+
+    async fn build_ref_identifier_index(
+        server: &ContextPlusServer,
+        owner: &crate::ref_index::RefIndex,
+    ) {
+        let session = server.with_session(crate::ref_index::RefId::for_canonical_path(
+            &owner.canonical_root,
+        ));
+        let cache = session.ensure_project_cache().await.unwrap();
+        session.ensure_identifier_index(&cache).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_base_and_its_worktrees_share_the_primary_identifier_vectors() {
+        let files = [("src/lib.rs", "pub fn shared_name() {}\n")];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        explore_identifier(&server, "shared_name", None).await;
+        let (_base_root, base) = attach_identifier_fork_base(&server, &files).await;
+        let child_root = identifier_checkout(&files);
+        let base_id = crate::ref_index::RefId::for_canonical_path(&base.canonical_root);
+        let child = attach_identifier_ref(&server, child_root.path(), Some(base_id)).await;
+
+        for owner in [&base, &child] {
+            build_ref_identifier_index(&server, owner).await;
+        }
+        let primary = server.state.default_ref().unwrap();
+        let resident = primary.identifier_vectors.get().unwrap();
+        for owner in [&base, &child] {
+            assert!(
+                Arc::ptr_eq(resident, owner.identifier_vectors.get().unwrap()),
+                "{} does not share the primary's identifier vectors",
+                owner.canonical_root.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_base_flush_writes_only_its_own_identifier_vectors() {
+        let files = [("src/lib.rs", "pub fn shared_name() {}\n")];
+        let (_repo, _ollama, server) = identifier_server(&files).await;
+        explore_identifier(&server, "shared_name", None).await;
+        let (base_root, base) = attach_identifier_fork_base(
+            &server,
+            &[
+                files[0],
+                ("src/base_only.rs", "pub fn base_only_name() {}\n"),
+            ],
+        )
+        .await;
+        build_ref_identifier_index(&server, &base).await;
+
+        let name = cache_name("identifier-embeddings", &server.state.config);
+        server.state.flush_identifier_vectors().await;
+        let keys = rkyv_store::load_cache(base_root.path(), &name)
+            .unwrap()
+            .map(|data| data.keys)
+            .unwrap_or_default();
+        assert_eq!(count_named(&keys, "base_only_name"), 1, "{keys:?}");
+        assert_eq!(count_named(&keys, "shared_name"), 0, "{keys:?}");
+    }
+
+    #[tokio::test]
+    async fn identifier_prune_keeps_vectors_a_fork_base_worktree_uses() {
+        let (repo, _ollama, server, name) = primary_with_saved_names(5, 5, 0).await;
+        let files = [
+            (
+                "src/retired.rs",
+                std::fs::read_to_string(repo.path().join("src/retired.rs")).unwrap(),
+            ),
+            (
+                "src/kept.rs",
+                std::fs::read_to_string(repo.path().join("src/kept.rs")).unwrap(),
+            ),
+        ];
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        let (_base_root, base) = attach_identifier_fork_base(&server, &files).await;
+        let child_root = identifier_checkout(&files);
+        let base_id = crate::ref_index::RefId::for_canonical_path(&base.canonical_root);
+        let child = attach_identifier_ref(&server, child_root.path(), Some(base_id)).await;
+        build_ref_identifier_index(&server, &child).await;
+
+        let on_disk = rename_retired_names(repo.path(), &server, &name, 5).await;
+
+        let resident = resident_identifier_keys(&server).await;
+        for keys in [&on_disk, &resident] {
+            assert_eq!(count_named(keys, "retired_name"), 5, "{keys:?}");
+        }
     }
 
     #[tokio::test]
