@@ -669,6 +669,10 @@ pub struct SharedState {
     budget_warned: std::sync::atomic::AtomicBool,
     /// Set while measured memory is over twice the budget.
     budget_emergency: std::sync::atomic::AtomicBool,
+    /// The `RefId` of the fork base checkout, once registered.
+    pub fork_base_ref_id: std::sync::OnceLock<crate::ref_index::RefId>,
+    /// The fork base checkout, whose lock this daemon holds while it serves it.
+    pub(crate) fork_base: std::sync::Mutex<Option<crate::git::fork_base::ForkBase>>,
     #[cfg(test)]
     pub(crate) measured_resident_override: std::sync::Mutex<Option<usize>>,
     #[cfg(test)]
@@ -2340,6 +2344,8 @@ impl ContextPlusServer {
             last_free_memory_check: std::sync::Mutex::new(None),
             budget_warned: std::sync::atomic::AtomicBool::new(false),
             budget_emergency: std::sync::atomic::AtomicBool::new(false),
+            fork_base_ref_id: std::sync::OnceLock::new(),
+            fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
             #[cfg(test)]
