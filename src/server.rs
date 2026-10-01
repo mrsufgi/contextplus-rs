@@ -455,6 +455,8 @@ pub struct SharedState {
     last_free_memory_check: std::sync::Mutex<Option<Instant>>,
     /// Set once the over-budget warning is logged, until memory is back under budget.
     budget_warned: std::sync::atomic::AtomicBool,
+    /// Set while measured memory is over twice the budget.
+    budget_emergency: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) measured_resident_override: std::sync::Mutex<Option<usize>>,
     #[cfg(test)]
@@ -777,6 +779,17 @@ impl SharedState {
         } else {
             configured_idle
         };
+        if emergency
+            && !self
+                .budget_emergency
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            tracing::warn!(
+                "Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB; worktrees idle for \
+                 {} s are evicted",
+                min_idle.as_secs()
+            );
+        }
         let in_use_before = if self.trim_due() {
             sample_allocator_in_use().await
         } else {
@@ -2099,6 +2112,7 @@ impl ContextPlusServer {
             last_budget_trim: std::sync::Mutex::new(None),
             last_free_memory_check: std::sync::Mutex::new(None),
             budget_warned: std::sync::atomic::AtomicBool::new(false),
+            budget_emergency: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -15677,6 +15691,36 @@ mod tests {
         assert!(
             !residency_evicts(100, 70, usize::MAX / 2 + 1, usize::MAX).await,
             "measured memory under a saturated twice-the-budget was taken as an emergency"
+        );
+    }
+
+    /// Runs one budget pass at each measured size and returns its logs.
+    async fn budget_passes_logs(measured: &[usize]) -> String {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 100;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        for &measured in measured {
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+            server.state.enforce_memory_budget().await;
+        }
+        crate::test_logs::logs_as_string(&logs)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_logs_an_emergency_once_when_it_begins() {
+        let logs = budget_passes_logs(&[RESIDENCY_BUDGET * 3, RESIDENCY_BUDGET * 3]).await;
+
+        assert_eq!(
+            logs.matches(
+                "Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB; worktrees idle for \
+                 60 s are evicted"
+            )
+            .count(),
+            1,
+            "{logs}"
         );
     }
 
