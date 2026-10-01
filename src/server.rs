@@ -8861,44 +8861,45 @@ mod tests {
 
     #[tokio::test]
     async fn a_reparse_of_a_few_edited_files_never_waits_on_the_rayon_pool() {
-        let tree: Vec<(String, String)> = (0..20)
-            .map(|i| {
-                (
-                    format!("src/depot_{i}.rs"),
-                    format!("pub fn stock_{i}() {{}}\n"),
-                )
+        const CHILD: &str = "CONTEXTPLUS_REPARSE_RAYON_SATURATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate saturation from other tests that legitimately use the global pool.
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "server::tests::a_reparse_of_a_few_edited_files_never_waits_on_the_rayon_pool",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RAYON_NUM_THREADS", "2")
+                    .output()
+                    .unwrap()
             })
-            .collect();
-        let tree: Vec<(&str, &str)> = tree
-            .iter()
-            .map(|(path, source)| (path.as_str(), source.as_str()))
-            .collect();
-        let (repo, _ollama, server) =
-            scripted_identifier_server(&tree, embeddings_for, |_| {}).await;
-        let held = hold_embeds(&server).await;
-        let source = server.ensure_project_cache().await.unwrap();
-        let build = started_identifier_build(&server).await;
-        wait_until_parsed(&build).await;
-        let parsed = build.parsed.borrow().clone().unwrap();
-        for i in 0..2 {
-            std::fs::write(
-                repo.path().join(format!("src/depot_{i}.rs")),
-                format!("pub fn audit_{i}() {{}}\n"),
-            )
+            .await
             .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
         }
-        server
-            .invalidate_project_cache_with_reason("test edit")
-            .await;
-        let edited = server.ensure_project_cache().await.unwrap();
+
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let source = build.source.upgrade().unwrap();
+        let parsed = build.parsed.borrow().clone().unwrap();
+        edit_depot(&repo, &server, 0).await;
+        let edited = edit_depot(&repo, &server, 1).await;
         let gate = Arc::new(std::sync::RwLock::new(()));
         let closed = gate.write().unwrap();
         let (entered_tx, entered) = std::sync::mpsc::channel();
         {
             let gate = Arc::clone(&gate);
             rayon::spawn_broadcast(move |_| {
-                entered_tx.send(()).unwrap();
-                drop(gate.read().unwrap());
+                let _ = entered_tx.send(());
+                drop(gate.read());
             });
         }
         for _ in 0..rayon::current_num_threads() {
