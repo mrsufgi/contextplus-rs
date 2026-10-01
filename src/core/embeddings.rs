@@ -190,6 +190,18 @@ pub struct OllamaClient {
     /// the HTTP call acquires a permit (via `embed_single_query` →
     /// `embed_batch_adaptive` → `call_embed_api`).
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Caps batch embeds below the shared semaphore's capacity, so a
+    /// single-text query finds a permit free instead of queueing behind them.
+    batch_permits: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// Which callers an embed request competes with for permits.
+#[derive(Clone, Copy)]
+enum EmbedLane {
+    /// A single-text query, which a person is waiting on.
+    Query,
+    /// Document batches for indexing.
+    Batch,
 }
 
 #[derive(Clone)]
@@ -416,6 +428,7 @@ impl OllamaClient {
             flush_tx: flush_tx_arc,
             in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             semaphore: None,
+            batch_permits: None,
         }
     }
 
@@ -465,6 +478,13 @@ impl OllamaClient {
     /// retain the default `None` (no gating).
     pub fn with_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
         self.semaphore = Some(semaphore);
+        self
+    }
+
+    /// Let at most `limit` batch embeds hold the shared semaphore's permits at
+    /// once. Below its capacity, single-text queries always find one free.
+    pub fn with_batch_limit(mut self, limit: usize) -> Self {
+        self.batch_permits = Some(Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
         self
     }
 
@@ -626,7 +646,7 @@ impl OllamaClient {
         // Embed all chunks in batches.
         let mut flat_embeddings = Vec::with_capacity(flattened.len());
         for batch in flattened.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(batch).await?;
+            let batch_result = self.embed_batch_adaptive(batch, EmbedLane::Batch).await?;
             flat_embeddings.extend(batch_result);
         }
 
@@ -654,7 +674,7 @@ impl OllamaClient {
 
         let mut flat_embeddings = Vec::with_capacity(flattened.len());
         for batch in flattened.chunks(self.batch_size) {
-            let batch_result = self.embed_batch_adaptive(batch).await?;
+            let batch_result = self.embed_batch_adaptive(batch, EmbedLane::Query).await?;
             flat_embeddings.extend(batch_result);
         }
 
@@ -877,9 +897,9 @@ impl OllamaClient {
         nonempty_chat_text(content, "Anthropic")
     }
 
-    fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String]) -> EmbedFuture<'a> {
+    fn embed_batch_adaptive<'a>(&'a self, batch: &'a [String], lane: EmbedLane) -> EmbedFuture<'a> {
         Box::pin(async move {
-            match self.call_embed_api(batch).await {
+            match self.call_embed_api(batch, lane).await {
                 Ok(embeddings) => {
                     if embeddings.len() != batch.len() {
                         return Err(ContextPlusError::Ollama(format!(
@@ -892,13 +912,13 @@ impl OllamaClient {
                 }
                 Err(e) if is_context_length_error(&e) => {
                     if batch.len() == 1 {
-                        let vec = self.embed_single_adaptive(&batch[0]).await?;
+                        let vec = self.embed_single_adaptive(&batch[0], lane).await?;
                         Ok(vec![vec])
                     } else {
                         // Binary split
                         let mid = batch.len().div_ceil(2);
-                        let left = self.embed_batch_adaptive(&batch[..mid]).await?;
-                        let right = self.embed_batch_adaptive(&batch[mid..]).await?;
+                        let left = self.embed_batch_adaptive(&batch[..mid], lane).await?;
+                        let right = self.embed_batch_adaptive(&batch[mid..], lane).await?;
                         Ok([left, right].concat())
                     }
                 }
@@ -907,11 +927,11 @@ impl OllamaClient {
         })
     }
 
-    async fn embed_single_adaptive(&self, input: &str) -> Result<Vec<f32>> {
+    async fn embed_single_adaptive(&self, input: &str, lane: EmbedLane) -> Result<Vec<f32>> {
         let mut candidate = input.to_string();
 
         for _attempt in 0..=MAX_SINGLE_INPUT_RETRIES {
-            match self.call_embed_api(&[candidate.clone()]).await {
+            match self.call_embed_api(&[candidate.clone()], lane).await {
                 Ok(mut vecs) => {
                     return vecs.pop().ok_or_else(|| {
                         ContextPlusError::Ollama("empty embedding response".into())
@@ -932,7 +952,7 @@ impl OllamaClient {
         ))
     }
 
-    async fn call_embed_api(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn call_embed_api(&self, inputs: &[String], lane: EmbedLane) -> Result<Vec<Vec<f32>>> {
         // Check cancellation before starting the request
         if self.cancel_token.is_cancelled() {
             return Err(ContextPlusError::Cancelled);
@@ -947,6 +967,12 @@ impl OllamaClient {
         let request = async {
             // Hold the permit until the body has been read, including error
             // paths. A closed semaphore retains the existing ungated behavior.
+            // A batch takes its own lane's permit first, so batches never hold
+            // every shared permit a query needs.
+            let _batch_permit = match (lane, &self.batch_permits) {
+                (EmbedLane::Batch, Some(batch)) => Arc::clone(batch).acquire_owned().await.ok(),
+                _ => None,
+            };
             let _permit = if let Some(sem) = &self.semaphore {
                 Arc::clone(sem).acquire_owned().await.ok()
             } else {
@@ -3143,7 +3169,7 @@ mod tests {
         let config = config_with_host(&server.uri());
         let client = OllamaClient::new(&config);
         let input = "a".repeat(500);
-        let result = client.embed_single_adaptive(&input).await;
+        let result = client.embed_single_adaptive(&input, EmbedLane::Batch).await;
 
         assert!(result.is_ok(), "should succeed after adaptive shrinking");
         assert_eq!(result.unwrap(), vec![0.1, 0.2, 0.3]);
@@ -3184,7 +3210,7 @@ mod tests {
         let config = config_with_host(&server.uri());
         let client = OllamaClient::new(&config);
         let texts: Vec<String> = (0..4).map(|i| format!("text_{}", i)).collect();
-        let result = client.embed_batch_adaptive(&texts).await;
+        let result = client.embed_batch_adaptive(&texts, EmbedLane::Batch).await;
 
         assert!(result.is_ok(), "batch should succeed after splitting");
         let embeddings = result.unwrap();
@@ -3299,7 +3325,10 @@ mod tests {
 
         let client = OllamaClient::new(&openai_config(&server.uri()));
         let texts: Vec<String> = (0..4).map(|index| format!("text-{index}")).collect();
-        let result = client.embed_batch_adaptive(&texts).await.unwrap();
+        let result = client
+            .embed_batch_adaptive(&texts, EmbedLane::Batch)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 4);
     }

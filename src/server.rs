@@ -1783,9 +1783,12 @@ impl ContextPlusServer {
         // `config.ollama_max_concurrent`, which Config::from_env clamps into
         // [1, 64]. We wire the same semaphore into the OllamaClient so that
         // every outbound embed (warmup, tracker, on-demand) shares one budget.
+        // Batches hold at most all but one permit, so a query never waits
+        // behind them while the budget has two or more.
         let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
-            .with_semaphore(Arc::clone(&ollama_semaphore));
+            .with_semaphore(Arc::clone(&ollama_semaphore))
+            .with_batch_limit(config.ollama_max_concurrent.saturating_sub(1));
 
         let embed_cache_name = cache_name("embeddings", &config);
 
@@ -4513,6 +4516,17 @@ impl ContextPlusServer {
             },
         };
 
+        if !self.query_embedded_within_budget(&options.query).await? {
+            let top_k = Self::get_usize(&args, "top_k")
+                .filter(|&n| n > 0)
+                .unwrap_or(10);
+            let matches = self.lexical_search_text(options.query, top_k).await?;
+            return Ok(Self::ok_text(format!(
+                "Partial results: {}, so these are keyword matches. Retry shortly for semantic ranking.\n\n{matches}",
+                self.query_embed_overdue()
+            )));
+        }
+
         let embedder = OllamaEmbedder(self.state.ollama.clone());
         let walker = crate::server_adapters::RefWalkerIndexer {
             ref_index: self.current_ref().await,
@@ -4624,6 +4638,12 @@ impl ContextPlusServer {
             ));
         }
 
+        let partial = match partial {
+            None if idx.dims > 0 && !self.query_embedded_within_budget(&query).await? => {
+                Some(self.query_embed_overdue())
+            }
+            partial => partial,
+        };
         let keyword_only = partial.is_some();
         let options = SemanticIdentifierSearchOptions {
             root_dir: root.clone(),
@@ -5417,10 +5437,14 @@ impl ContextPlusServer {
             .filter(|&n| n > 0)
             .unwrap_or(10);
 
+        Ok(Self::ok_text(self.lexical_search_text(query, top_k).await?))
+    }
+
+    async fn lexical_search_text(&self, query: String, top_k: usize) -> Result<String> {
         let cache = self.ensure_project_cache().await?;
         let cached = self.ensure_lexical_index(&cache).await?;
 
-        let formatted = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             if cached.is_empty() {
                 return "No files indexed. Ensure the project cache is populated.".to_string();
             }
@@ -5442,11 +5466,34 @@ impl ContextPlusServer {
             lines.join("\n")
         })
         .await
-        .map_err(|e| {
-            ContextPlusError::Other(format!("lexical_search spawn_blocking failed: {e}"))
-        })?;
+        .map_err(|e| ContextPlusError::Other(format!("lexical_search spawn_blocking failed: {e}")))
+    }
 
-        Ok(Self::ok_text(formatted))
+    /// Embeds the search query `query` as the searches do, waiting at most
+    /// the query embed budget. Past it, `false`: the embed keeps running and
+    /// caches the vector for a later search.
+    async fn query_embedded_within_budget(&self, query: &str) -> Result<bool> {
+        let text = crate::tools::semantic_search::sanitize_query(query).into_owned();
+        if text.is_empty() {
+            return Ok(true);
+        }
+        let ollama = self.state.ollama.clone();
+        let embed = tokio::spawn(async move { ollama.embed_queries(&[text]).await });
+        let budget = std::time::Duration::from_millis(self.state.config.query_embed_budget_ms);
+        match tokio::time::timeout(budget, embed).await {
+            Ok(Ok(embedded)) => embedded.map(|_| true),
+            Ok(Err(error)) => Err(ContextPlusError::Other(format!(
+                "query embedding task failed: {error}"
+            ))),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn query_embed_overdue(&self) -> String {
+        format!(
+            "the query embedding did not finish within {} ms",
+            self.state.config.query_embed_budget_ms
+        )
     }
 }
 
@@ -14432,6 +14479,63 @@ mod tests {
         assert_eq!(server.state.config.ref_warmup_mode, RefWarmupMode::Shallow);
     }
 
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_slow_batch_embeds_hold_every_batch_permit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = embeddings_for(&inputs);
+                if inputs.iter().any(|input| input.contains("BATCH")) {
+                    response.set_delay(std::time::Duration::from_secs(30))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.ollama_max_concurrent = 2;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let batches: Vec<_> = (0..3)
+            .map(|i| {
+                let ollama = server.state.ollama.clone();
+                tokio::spawn(async move {
+                    ollama
+                        .embed_documents(&[format!("BATCH {i} a"), format!("BATCH {i} b")])
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while matching_embed_request_batches(&ollama, "BATCH")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no batch embed reached the embedder");
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind the batch embeds");
+        assert!(query.is_ok(), "{query:?}");
+        for batch in batches {
+            batch.abort();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // U18: per-ref warmup tests
     // -----------------------------------------------------------------------
@@ -17129,7 +17233,9 @@ mod tests {
         // The fresh query's embed never returns, so a long budget keeps it in
         // flight for as long as the wait below takes.
         let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
-        config.ollama_max_concurrent = 2;
+        // Two batch embeds at once, the fill's and the fresh query's, plus
+        // the permit kept free for queries.
+        config.ollama_max_concurrent = 3;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 
         let mut first_config = server.state.config.clone();
@@ -17181,6 +17287,73 @@ mod tests {
         );
 
         slow_query.abort();
+    }
+
+    #[tokio::test]
+    async fn a_meaning_query_answers_by_keyword_when_its_embed_outlasts_the_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                embeddings_for(&embed_request_inputs(request))
+                    .set_delay(std::time::Duration::from_secs(30))
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ledger.rs"), "fn reconcile_ledger() {}\n").unwrap();
+        std::fs::write(root.path().join("other.rs"), "fn unrelated() {}\n").unwrap();
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.query_embed_budget_ms = 200;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".into(), json!("reconcile_ledger"));
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server.dispatch("explore", args),
+        )
+        .await
+        .expect("the meaning query waited on a hung embedder");
+
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("ledger.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_identifier_query_answers_by_keyword_when_its_embed_outlasts_the_budget() {
+        let (_repo, _ollama, server) = scripted_identifier_server(
+            LEDGER_FILES,
+            |inputs| {
+                let response = embeddings_for(inputs);
+                if inputs.iter().all(|input| input.contains("src/")) {
+                    response
+                } else {
+                    response.set_delay(std::time::Duration::from_secs(30))
+                }
+            },
+            |config| config.query_embed_budget_ms = 200,
+        )
+        .await;
+        let cache = server.ensure_project_cache().await.unwrap();
+        server.ensure_identifier_index(&cache).await.unwrap();
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server.dispatch("explore", identifier_args("open_account", "meaning")),
+        )
+        .await
+        .expect("the identifier query waited on a hung embedder");
+
+        let text = text_of(&answered);
+        assert_eq!(answered.is_error, Some(false), "{text}");
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
     }
 
     #[tokio::test]
