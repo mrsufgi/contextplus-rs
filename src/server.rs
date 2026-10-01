@@ -5200,15 +5200,13 @@ impl ContextPlusServer {
                 state: self.state.clone(),
             },
         };
-        let result = crate::core::embeddings::interactive(
-            crate::tools::semantic_navigate::semantic_navigate(
-                options,
-                &self.state.ollama,
-                &self.state.config,
-                &ref_index.embedding_cache,
-                &ref_index.root_dir,
-                Some(&indexer),
-            ),
+        let result = crate::tools::semantic_navigate::semantic_navigate(
+            options,
+            &self.state.ollama,
+            &self.state.config,
+            &ref_index.embedding_cache,
+            &ref_index.root_dir,
+            Some(&indexer),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -16637,6 +16635,84 @@ mod tests {
         for embed in embeds {
             embed.abort();
         }
+    }
+
+    /// A server whose embedder answers at once, except requests with a
+    /// `SLOW` input, which it never answers within a test.
+    async fn slow_marker_server(
+        files: &[(&str, &str)],
+        max_concurrent: usize,
+    ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = embeddings_for(&inputs);
+                if inputs.iter().any(|input| input.contains("SLOW")) {
+                    response.set_delay(std::time::Duration::from_secs(3600))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        for &(path, source) in files {
+            let full_path = root.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = semantic_fill_config(&ollama.uri(), 600_000, 60_000);
+        config.ollama_max_concurrent = max_concurrent;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        (root, ollama, server)
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_navigate_embeds_its_corpus_beside_a_batch() {
+        let (_root, ollama, server) = slow_marker_server(
+            &[(
+                "src/navigate.rs",
+                "pub fn navigate_corpus() { /* SLOW */ }\n",
+            )],
+            2,
+        )
+        .await;
+        let navigate = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("semantic_navigate", serde_json::Map::new())
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "navigate_corpus")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate never embedded its corpus");
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind navigate's corpus and a background batch");
+
+        assert!(query.is_ok(), "{query:?}");
+        navigate.abort();
     }
 
     // -----------------------------------------------------------------------
