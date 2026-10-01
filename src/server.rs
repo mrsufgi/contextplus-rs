@@ -5690,7 +5690,7 @@ impl ContextPlusServer {
     /// caches the vector for a later search.
     async fn query_embedded_within_budget(&self, query: &str) -> Result<bool> {
         let text = crate::tools::semantic_search::sanitize_query(query).into_owned();
-        if text.is_empty() {
+        if text.is_empty() || self.state.ollama.query_cached(&text) {
             return Ok(true);
         }
         let ollama = self.state.ollama.clone();
@@ -18109,6 +18109,28 @@ mod tests {
         );
 
         slow_query.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_query_vector_is_served_with_no_query_embed_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = semantic_fill_config("http://127.0.0.1:1", 20, 60_000);
+        config.query_embed_budget_ms = 0;
+        rkyv_store::save_query_cache(
+            root.path(),
+            &config.query_cache_identity(),
+            &[("reconcile_ledger".to_string(), vec![1.0, 0.0])],
+        )
+        .unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        assert!(
+            server
+                .query_embedded_within_budget("reconcile_ledger")
+                .await
+                .unwrap(),
+            "a cached query vector waited on the query embed budget"
+        );
     }
 
     #[tokio::test]

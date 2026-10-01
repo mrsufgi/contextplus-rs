@@ -614,6 +614,13 @@ impl OllamaClient {
         self.embed(&inputs).await
     }
 
+    /// Whether the vector of user query `query` is cached, so embedding it
+    /// returns without a request.
+    pub fn query_cached(&self, query: &str) -> bool {
+        let input = format!("{}{}", self.query_prefix, query);
+        self.query_cache.lock().unwrap().get(&input).is_some()
+    }
+
     /// Embed one user query with the configured model-specific query prefix.
     pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         self.embed_queries(&[query.to_string()])
