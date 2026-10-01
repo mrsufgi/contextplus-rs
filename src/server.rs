@@ -1648,9 +1648,9 @@ pub(crate) fn load_project_cache(
 }
 
 async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_name: &str) {
+    *owner.identifier_build.lock().unwrap() = None;
     // Background rebuilds and fills would refill what is cleared here.
     owner.cancel_background_tasks();
-    *owner.identifier_build.lock().unwrap() = None;
     std::mem::take(&mut *owner.file_outlines.lock().unwrap());
     owner
         .cache_generation
@@ -3317,10 +3317,25 @@ impl ContextPlusServer {
         Box<dyn std::future::Future<Output = Result<Arc<IdentifierIndex>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            match self.identifier_index_or_build(cache, true).await? {
-                IdentifierLookup::Ready(index) => Ok(index),
-                IdentifierLookup::Building(build) => build.finished().await,
+            let index = match self.identifier_index_or_build(cache, true).await? {
+                IdentifierLookup::Ready(index) => return Ok(index),
+                IdentifierLookup::Building(build) => build.finished().await?,
+            };
+            let installed = self
+                .current_ref()
+                .await
+                .identifier_index
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &index));
+            if installed {
+                return Ok(index);
             }
+            // The tree changed while the detached build ran, so it left the
+            // rebuild to the request.
+            let fresh_cache = self.ensure_project_cache().await?;
+            self.ensure_identifier_index(&fresh_cache).await
         })
     }
 
@@ -3484,15 +3499,13 @@ impl ContextPlusServer {
             parsed: parsed_receiver,
             done: receiver,
         };
-        *slot = Some(build.clone());
-        drop(slot);
         let server = self.clone();
         let owner = Arc::clone(ref_index);
         let cache = Arc::clone(cache);
         let id = build.id;
-        let task = tokio::spawn(async move {
+        ref_index.spawn_background_task(async move {
             let result = server
-                .build_identifier_index_seeded(&cache, false, true, Some(&parsed))
+                .build_identifier_index_seeded(&cache, true, true, Some(&parsed))
                 .await;
             if let Err(error) = &result {
                 tracing::warn!(
@@ -3508,7 +3521,7 @@ impl ContextPlusServer {
             drop(slot);
             done.send_replace(Some(result.map_err(|error| error.to_string())));
         });
-        ref_index.track_background_task(&task);
+        *slot = Some(build.clone());
         build
     }
 
@@ -3775,6 +3788,9 @@ impl ContextPlusServer {
                     "IdentifierIndex build discarded"
                 );
                 drop(update_guard);
+                if background {
+                    return Ok(idx);
+                }
                 let fresh_cache = self.ensure_project_cache().await?;
                 return Box::pin(self.ensure_identifier_index_in_build(&fresh_cache)).await;
             }
@@ -8001,6 +8017,36 @@ mod tests {
             .map(|build| build.id);
         assert_eq!(running, Some(first.id), "the query started a second build");
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_detached_identifier_build_outdated_by_an_edit_does_not_walk_the_tree_again() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_FILES, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        crate::server_adapters::test_seams::record_reads(repo.path());
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(60), build.finished())
+            .await
+            .expect("the identifier build never finished")
+            .unwrap();
+
+        assert_eq!(
+            crate::server_adapters::test_seams::reads(repo.path()),
+            Vec::<String>::new(),
+            "the detached build walked the tree again"
+        );
     }
 
     #[tokio::test]

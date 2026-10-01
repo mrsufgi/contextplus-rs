@@ -431,6 +431,20 @@ impl RefIndex {
         tasks.push(task.abort_handle());
     }
 
+    /// Spawns `task` already tracked, so a cancel either aborts it or ran
+    /// before it was spawned.
+    pub(crate) fn spawn_background_task<F>(&self, task: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let mut tasks = self.background_tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        let task = tokio::spawn(task);
+        tasks.push(task.abort_handle());
+        task
+    }
+
     pub(crate) fn cancel_background_tasks(&self) {
         for task in self.background_tasks.lock().unwrap().drain(..) {
             task.abort();
