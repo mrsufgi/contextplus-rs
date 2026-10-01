@@ -62,7 +62,8 @@ use tokio::sync::RwLock;
 use crate::core::embedding_tracker::EmbeddingTrackerHandle;
 use crate::core::embeddings::CacheEntry;
 use crate::server::{
-    CachedLexicalIndex, IdentifierBuild, IdentifierIndex, IdentifierVectors, ProjectCache,
+    CachedLexicalIndex, FileOutline, IdentifierBuild, IdentifierIndex, IdentifierVectors,
+    ProjectCache,
 };
 use crate::tools::semantic_search::CachedSearchIndex;
 
@@ -194,6 +195,8 @@ pub struct RefIndex {
     background_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     #[cfg(test)]
     pub(crate) semantic_walks: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) outline_parses: AtomicUsize,
     pub(crate) identifier_update: tokio::sync::Mutex<()>,
     /// The detached identifier build requests join, while it runs.
     pub(crate) identifier_build: std::sync::Mutex<Option<IdentifierBuild>>,
@@ -242,6 +245,9 @@ pub struct RefIndex {
 
     /// Snapshot writes and the snapshot's file documents for this ref.
     pub(crate) snapshots: SnapshotState,
+
+    /// The outline of each file a directory outline has parsed, by path.
+    pub(crate) file_outlines: std::sync::Mutex<HashMap<String, FileOutline>>,
 }
 
 impl RefIndex {
@@ -276,6 +282,8 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            outline_parses: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -291,6 +299,7 @@ impl RefIndex {
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
             snapshots: SnapshotState::default(),
+            file_outlines: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -329,6 +338,8 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            outline_parses: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -344,6 +355,7 @@ impl RefIndex {
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
             snapshots: SnapshotState::default(),
+            file_outlines: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -384,6 +396,8 @@ impl RefIndex {
             background_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             semantic_walks: AtomicUsize::new(0),
+            #[cfg(test)]
+            outline_parses: AtomicUsize::new(0),
             identifier_update: tokio::sync::Mutex::new(()),
             identifier_build: std::sync::Mutex::new(None),
             identifier_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -399,6 +413,7 @@ impl RefIndex {
             project_cache: Arc::new(RwLock::new(None)),
             lexical_search_cache: Arc::new(RwLock::new(None)),
             snapshots: SnapshotState::default(),
+            file_outlines: std::sync::Mutex::new(HashMap::new()),
         }
     }
 

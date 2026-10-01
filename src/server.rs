@@ -131,6 +131,13 @@ pub struct IdentifierIndex {
 /// the same allocations, so a vector is resident once however many indexes use it.
 pub(crate) type IdentifierVectors = HashMap<String, Arc<[f32]>>;
 
+/// A file's outline, `None` for a file no parser reads, with the digest of
+/// the content it was parsed from.
+pub(crate) type FileOutline = (
+    crate::cache::snapshot::Digest,
+    Option<Arc<crate::tools::context_tree::FileAnalysis>>,
+);
+
 type IdentifierBuildResult = Option<std::result::Result<Arc<IdentifierIndex>, String>>;
 
 static NEXT_IDENTIFIER_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -960,6 +967,11 @@ impl ResidentSnapshot {
             identifier_vector_bytes(&*owner.identifier_vector_overlay.read().await),
             "identifier_overlay",
         ));
+        components.push((
+            &owner.file_outlines as *const _ as usize,
+            file_outline_bytes(&owner.file_outlines.lock().unwrap()),
+            "outlines",
+        ));
         // One statement per lock so no guard is held while the next is awaited.
         let identifier_index = owner.identifier_index.read().await.clone();
         let search_index = owner.search_index_cache.read().await.clone();
@@ -1274,6 +1286,28 @@ fn schedule_identifier_save(
     });
 }
 
+/// Estimate of the paths, headers and symbols of cached outlines.
+fn file_outline_bytes(outlines: &HashMap<String, FileOutline>) -> usize {
+    fn symbol_bytes(symbol: &crate::tools::context_tree::TreeSymbol) -> usize {
+        std::mem::size_of_val(symbol)
+            + symbol.name.len()
+            + symbol.kind.len()
+            + symbol.signature.len()
+            + symbol.children.iter().map(symbol_bytes).sum::<usize>()
+    }
+    outlines
+        .iter()
+        .map(|(path, (_, analysis))| {
+            64 + path.len()
+                + std::mem::size_of::<FileOutline>()
+                + analysis.as_ref().map_or(0, |analysis| {
+                    analysis.header.as_ref().map_or(0, String::len)
+                        + analysis.symbols.iter().map(symbol_bytes).sum::<usize>()
+                })
+        })
+        .sum()
+}
+
 /// O(1) estimate: vectors of one map share a width.
 fn identifier_vector_bytes(vectors: &IdentifierVectors) -> usize {
     vectors.values().next().map_or(0, |vector| {
@@ -1497,6 +1531,7 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
     // Background rebuilds and fills would refill what is cleared here.
     owner.cancel_background_tasks();
     *owner.identifier_build.lock().unwrap() = None;
+    std::mem::take(&mut *owner.file_outlines.lock().unwrap());
     owner
         .cache_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -4270,6 +4305,10 @@ impl ContextPlusServer {
 
         let root = self.resolve_root(&args).await;
         let cache = self.ensure_project_cache().await?;
+        let ref_index = self.current_ref().await;
+        let target_path = Self::get_str(&args, "target_path");
+        // The tree shows only the files under the target, so only they are outlined.
+        let prefix = target_path.as_deref().map(ct::target_prefix);
 
         // Build entries and analyses in spawn_blocking (tree-sitter parsing is CPU-bound)
         let (ct_entries, ct_analyses) = tokio::task::spawn_blocking(move || {
@@ -4283,32 +4322,18 @@ impl ContextPlusServer {
                 })
                 .collect();
 
-            let mut ct_analyses = BTreeMap::new();
-            for entry in &cache.file_entries {
-                if entry.is_directory {
-                    continue;
-                }
-                if let Some(content) = cache.file_content.get(&entry.relative_path) {
-                    let content = Arc::clone(content);
-                    let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
-                    if let Ok(symbols) = parse_with_tree_sitter(&content, ext) {
-                        let header = crate::core::parser::extract_header(&content);
-                        let tree_symbols: Vec<ct::TreeSymbol> =
-                            symbols.iter().map(code_sym_to_tree_sym).collect();
-                        ct_analyses.insert(
-                            entry.relative_path.clone(),
-                            ct::FileAnalysis {
-                                header: if header.is_empty() {
-                                    None
-                                } else {
-                                    Some(header)
-                                },
-                                symbols: tree_symbols,
-                            },
-                        );
-                    }
-                }
-            }
+            let paths: Vec<&str> = cache
+                .file_entries
+                .iter()
+                .filter(|entry| {
+                    !entry.is_directory
+                        && prefix
+                            .as_deref()
+                            .is_none_or(|prefix| entry.relative_path.starts_with(prefix))
+                })
+                .map(|entry| entry.relative_path.as_str())
+                .collect();
+            let ct_analyses = outline_files(&ref_index, &paths, &cache.file_content);
             (ct_entries, ct_analyses)
         })
         .await
@@ -4316,7 +4341,7 @@ impl ContextPlusServer {
 
         let options = ct::ContextTreeOptions {
             root_dir: root,
-            target_path: Self::get_str(&args, "target_path"),
+            target_path,
             depth_limit: Self::get_usize(&args, "depth_limit"),
             include_symbols: Self::get_bool(&args, "include_symbols"),
             max_tokens: Self::get_usize(&args, "max_tokens"),
@@ -5699,6 +5724,83 @@ impl ContextPlusServer {
 }
 
 // --- Type conversion helpers ---
+
+/// The outline of each of `paths` a parser reads. A file outlined before with
+/// the same content keeps its outline; the others are parsed in parallel on
+/// the structural pool.
+fn outline_files(
+    ref_index: &crate::ref_index::RefIndex,
+    paths: &[&str],
+    files: &crate::core::walker::FileContents,
+) -> BTreeMap<String, crate::tools::context_tree::FileAnalysis> {
+    use rayon::prelude::*;
+
+    let known: Vec<Option<FileOutline>> = {
+        let outlines = ref_index.file_outlines.lock().unwrap();
+        paths
+            .iter()
+            .map(|path| outlines.get(*path).cloned())
+            .collect()
+    };
+    let outlined: Vec<Option<(FileOutline, bool)>> = STRUCTURAL_POOL.install(|| {
+        paths
+            .par_iter()
+            .zip(known)
+            .map(|(path, known)| {
+                let content = files.get(path)?;
+                let digest = crate::cache::snapshot::digest(content.as_bytes());
+                if let Some(known) = known.filter(|(known, _)| *known == digest) {
+                    return Some((known, false));
+                }
+                #[cfg(test)]
+                ref_index
+                    .outline_parses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(((digest, file_outline(path, content).map(Arc::new)), true))
+            })
+            .collect()
+    });
+    let parsed = outlined.iter().flatten().any(|(_, parsed)| *parsed);
+    let mut outlines = ref_index.file_outlines.lock().unwrap();
+    outlines.retain(|path, _| files.get(path).is_some());
+    let mut analyses = BTreeMap::new();
+    for (path, outline) in paths.iter().zip(outlined) {
+        let Some((outline, parsed)) = outline else {
+            continue;
+        };
+        if let Some(analysis) = &outline.1 {
+            analyses.insert(path.to_string(), analysis.as_ref().clone());
+        }
+        if parsed {
+            outlines.insert(path.to_string(), outline);
+        }
+    }
+    drop(outlines);
+    // Parsing on the pool threads left their allocator arenas holding the
+    // freed parse state; hand it back rather than keep it resident.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if parsed {
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+    analyses
+}
+
+/// The outline of the file at `path`, when a parser reads it.
+fn file_outline(path: &str, content: &str) -> Option<crate::tools::context_tree::FileAnalysis> {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let symbols = parse_with_tree_sitter(content, ext).ok()?;
+    let header = crate::core::parser::extract_header(content);
+    Some(crate::tools::context_tree::FileAnalysis {
+        header: if header.is_empty() {
+            None
+        } else {
+            Some(header)
+        },
+        symbols: symbols.iter().map(code_sym_to_tree_sym).collect(),
+    })
+}
 
 fn code_sym_to_tree_sym(
     sym: &crate::core::parser::CodeSymbol,
@@ -8252,6 +8354,186 @@ mod tests {
         let dir = server.dispatch("outline", args).await;
         assert_eq!(dir.is_error, Some(false), "{}", text_of(&dir));
         assert!(text_of(&dir).contains("auth.rs"), "{}", text_of(&dir));
+    }
+
+    const OUTLINE_FILES: &[(&str, &str)] = &[
+        (
+            "src/a/ledger.rs",
+            "//! Ledger entries.\npub struct Ledger;\nimpl Ledger {\n    pub fn open(&self) {}\n    pub fn close(&self) {}\n}\n",
+        ),
+        (
+            "src/a/account.ts",
+            "// Accounts.\nexport class Account {\n  balance(): number { return 0; }\n}\nexport function openAccount() {}\n",
+        ),
+        ("src/b/report.rs", "pub fn monthly_report() {}\n"),
+        ("lib/util.rs", "pub fn helper() {}\n"),
+        ("README.md", "# Outline fixture\n"),
+    ];
+
+    fn outline_server() -> (tempfile::TempDir, ContextPlusServer) {
+        let repo = tempfile::tempdir().unwrap();
+        for &(path, source) in OUTLINE_FILES {
+            let full_path = repo.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = Config::from_env();
+        config.ollama_host = "http://127.0.0.1:1".to_string();
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        let server = ContextPlusServer::new(repo.path().to_path_buf(), config);
+        (repo, server)
+    }
+
+    async fn context_tree(server: &ContextPlusServer, args: &serde_json::Value) -> String {
+        let result = server
+            .dispatch("get_context_tree", args.as_object().unwrap().clone())
+            .await;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+        text_of(&result)
+    }
+
+    async fn outline_parses(server: &ContextPlusServer) -> usize {
+        server
+            .current_ref()
+            .await
+            .outline_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn directory_outline_parses_only_the_files_under_its_target() {
+        let (_repo, server) = outline_server();
+
+        context_tree(&server, &json!({ "target_path": "src/a" })).await;
+
+        assert_eq!(
+            outline_parses(&server).await,
+            2,
+            "the outline of src/a parsed files outside it"
+        );
+    }
+
+    /// The tree as built before outlines were scoped and cached: every file
+    /// parsed in turn, then the tree narrowed to the target.
+    async fn serially_parsed_context_tree(
+        server: &ContextPlusServer,
+        args: &serde_json::Value,
+    ) -> String {
+        use crate::tools::context_tree as ct;
+
+        let cache = server.ensure_project_cache().await.unwrap();
+        let entries: Vec<ct::FileEntry> = cache
+            .file_entries
+            .iter()
+            .map(|e| ct::FileEntry {
+                relative_path: e.relative_path.clone(),
+                is_directory: e.is_directory,
+                depth: e.depth,
+            })
+            .collect();
+        let mut analyses = BTreeMap::new();
+        for entry in &cache.file_entries {
+            if entry.is_directory {
+                continue;
+            }
+            if let Some(content) = cache.file_content.get(&entry.relative_path) {
+                let ext = entry.relative_path.rsplit('.').next().unwrap_or("");
+                if let Ok(symbols) = parse_with_tree_sitter(content, ext) {
+                    let header = crate::core::parser::extract_header(content);
+                    analyses.insert(
+                        entry.relative_path.clone(),
+                        ct::FileAnalysis {
+                            header: (!header.is_empty()).then_some(header),
+                            symbols: symbols.iter().map(code_sym_to_tree_sym).collect(),
+                        },
+                    );
+                }
+            }
+        }
+        let options = ct::ContextTreeOptions {
+            root_dir: server.current_ref().await.root_dir.clone(),
+            target_path: args["target_path"].as_str().map(str::to_string),
+            depth_limit: args["depth_limit"].as_u64().map(|depth| depth as usize),
+            include_symbols: args["include_symbols"].as_bool(),
+            max_tokens: args["max_tokens"].as_u64().map(|tokens| tokens as usize),
+        };
+        ct::get_context_tree(options, &entries, &analyses)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn directory_outline_matches_the_serially_parsed_tree() {
+        let (_repo, server) = outline_server();
+
+        for args in [
+            json!({}),
+            json!({ "target_path": "src" }),
+            json!({ "target_path": "src/a/" }),
+            json!({ "target_path": "src/a", "include_symbols": false }),
+            json!({ "target_path": "src", "depth_limit": 1 }),
+            json!({ "max_tokens": 20 }),
+            json!({ "target_path": "missing" }),
+        ] {
+            let expected = serially_parsed_context_tree(&server, &args).await;
+            assert_eq!(context_tree(&server, &args).await, expected, "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_directory_outline_reuses_the_parsed_files() {
+        let (_repo, server) = outline_server();
+        let args = json!({ "target_path": "src" });
+        let first = context_tree(&server, &args).await;
+        let parsed = outline_parses(&server).await;
+
+        let second = context_tree(&server, &args).await;
+
+        assert_eq!(second, first);
+        assert_eq!(
+            outline_parses(&server).await,
+            parsed,
+            "the second outline parsed the files again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_outline_parses_a_changed_file_again() {
+        let (repo, server) = outline_server();
+        let args = json!({ "target_path": "src" });
+        context_tree(&server, &args).await;
+        std::fs::write(
+            repo.path().join("src/b/report.rs"),
+            "pub fn yearly_report() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let parsed = outline_parses(&server).await;
+
+        let outline = context_tree(&server, &args).await;
+
+        assert!(outline.contains("yearly_report"), "{outline}");
+        assert!(!outline.contains("monthly_report"), "{outline}");
+        assert_eq!(outline_parses(&server).await, parsed + 1);
+    }
+
+    #[tokio::test]
+    async fn cached_directory_outlines_count_toward_the_resident_estimate() {
+        let (_repo, server) = outline_server();
+        context_tree(&server, &json!({})).await;
+
+        let owner = server.current_ref().await;
+        let components = ResidentSnapshot::capture(&owner).await.measure();
+
+        assert!(
+            components
+                .iter()
+                .any(|(_, bytes, name)| *name == "outlines" && *bytes > 0),
+            "{components:?}"
+        );
     }
 
     #[tokio::test]
