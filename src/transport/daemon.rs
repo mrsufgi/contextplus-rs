@@ -871,14 +871,7 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         .unwrap_or_else(|_| reg.client_root.clone());
     let ref_id = RefId::for_canonical_path(&canonical_root);
 
-    // Determine parent ref: find merge-base between client HEAD and primary.
-    // For now: if the client root differs from the primary root, the primary
-    // ref is the parent (CoW-fork). U6 will wire in proper merge-base lookup.
-    let parent_ref_id = if ref_id != server.state.default_ref_id {
-        Some(server.state.default_ref_id)
-    } else {
-        None
-    };
+    let parent_ref_id = server.state.registration_parent(&canonical_root);
 
     let head_sha = reg.head_sha.clone();
     let client_root = reg.client_root.clone();
@@ -1320,6 +1313,52 @@ mod tests {
                 .exists(),
             "the fork base has no CAS manifest"
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_and_attaches_on_the_fork_base_dir_get_no_parent() {
+        let (primary, _bases, server) = fork_base_daemon();
+        let dir =
+            crate::git::fork_base::fork_base_dir(&server.state.config, primary.path()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let ref_id = RefId::for_canonical_path(&dir);
+
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), dir.to_string_lossy().into_owned().into());
+        server.dispatch("attach_worktree", args).await;
+        let attached = server.state.ref_index(ref_id).await.expect("attached");
+        assert_eq!(attached.parent_ref_id, None);
+
+        let server = daemon_server(primary.path(), server.state.config.clone());
+        let inspection = server.clone();
+        let (mut bridge_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let connection = tokio::spawn(serve_connection(server, daemon_stream));
+        write_frame(
+            &mut bridge_stream,
+            &RegisterSession {
+                client_root: dir.clone(),
+                head_sha: "base-head".into(),
+                client_pid: 42,
+                search_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: SessionReady =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut bridge_stream))
+                .await
+                .expect("daemon did not register the session")
+                .unwrap();
+        assert!(matches!(ready, SessionReady::Ready { .. }));
+        let registered = inspection
+            .state
+            .ref_index(ref_id)
+            .await
+            .expect("registered");
+        assert_eq!(registered.parent_ref_id, None);
+        drop(bridge_stream);
+        connection.abort();
     }
 
     #[test]

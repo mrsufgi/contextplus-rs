@@ -725,6 +725,28 @@ impl SharedState {
         self.refs.read().await.get(&id).cloned()
     }
 
+    /// Whether the daemon owns `ref_id` for its lifetime and never evicts or
+    /// detaches it: the primary or the fork base.
+    pub(crate) fn pinned(&self, ref_id: crate::ref_index::RefId) -> bool {
+        ref_id == self.default_ref_id || self.fork_base_ref_id.get() == Some(&ref_id)
+    }
+
+    /// The parent of a ref registered at `canonical_root`: none for the
+    /// primary and the fork base checkout, else the primary.
+    pub(crate) fn registration_parent(
+        &self,
+        canonical_root: &std::path::Path,
+    ) -> Option<crate::ref_index::RefId> {
+        let ref_id = crate::ref_index::RefId::for_canonical_path(canonical_root);
+        let fork_base = || {
+            self.config.fork_base.is_some()
+                && crate::git::fork_base::fork_base_dir(&self.config, &self.root_dir)
+                    .and_then(|dir| dir.canonicalize().ok())
+                    .is_some_and(|dir| dir == canonical_root)
+        };
+        (!self.pinned(ref_id) && !fork_base()).then_some(self.default_ref_id)
+    }
+
     /// Refs attached as worktrees of `parent`.
     pub(crate) async fn attached_children(
         &self,
@@ -862,8 +884,9 @@ impl SharedState {
         if count != 1 {
             return;
         }
-        // Primary ref is never evicted — the daemon owns it for its lifetime.
-        if ref_id == self.default_ref_id {
+        // The primary and the fork base are never evicted — the daemon owns
+        // them for its lifetime.
+        if self.pinned(ref_id) {
             return;
         }
         let epoch = {
@@ -1021,10 +1044,10 @@ impl SharedState {
         let access = self.ref_access.lock().unwrap().clone();
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
-                if Arc::ptr_eq(&refs[i], &self.default_ref) {
+                let id = crate::ref_index::RefId::for_canonical_path(&refs[i].canonical_root);
+                if Arc::ptr_eq(&refs[i], &self.default_ref) || self.pinned(id) {
                     return None;
                 }
-                let id = crate::ref_index::RefId::for_canonical_path(&refs[i].canonical_root);
                 let Some(&(tick, last_used)) = access.get(&id) else {
                     return Some((0, i));
                 };
@@ -5500,11 +5523,7 @@ impl ContextPlusServer {
             }
         }
 
-        let parent_ref_id = if ref_id != self.state.default_ref_id {
-            Some(self.state.default_ref_id)
-        } else {
-            None
-        };
+        let parent_ref_id = self.state.registration_parent(&canonical);
 
         // Optional: read HEAD from the worktree's git index. Tolerates non-git
         // dirs (returns None → stored as None on the ref).
@@ -5607,6 +5626,11 @@ impl ContextPlusServer {
                 "Cannot detach the primary ref; the daemon owns its lifetime.".into(),
             ));
         }
+        if self.state.pinned(ref_id) {
+            return Ok(Self::err_text(
+                "Cannot detach the fork base; the daemon owns its lifetime.".into(),
+            ));
+        }
         {
             let guard = self.state.refs.read().await;
             if !guard.contains_key(&ref_id) {
@@ -5637,7 +5661,7 @@ impl ContextPlusServer {
         _args: serde_json::Map<String, Value>,
     ) -> Result<CallToolResult> {
         let guard = self.state.refs.read().await;
-        let mut rows: Vec<(u64, PathBuf, bool, usize, Option<String>)> = guard
+        let mut rows: Vec<(u64, PathBuf, bool, usize, Option<String>, bool)> = guard
             .iter()
             .map(|(id, r)| {
                 (
@@ -5646,6 +5670,7 @@ impl ContextPlusServer {
                     *id == self.state.default_ref_id,
                     r.session_count.load(std::sync::atomic::Ordering::Acquire),
                     r.head_sha.clone(),
+                    self.state.fork_base_ref_id.get() == Some(id),
                 )
             })
             .collect();
@@ -5668,8 +5693,14 @@ impl ContextPlusServer {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "process environment".into())
         );
-        for (id, path, is_primary, sessions, head) in rows {
-            let tag = if is_primary { " [primary]" } else { "" };
+        for (id, path, is_primary, sessions, head, is_fork_base) in rows {
+            let tag = if is_primary {
+                " [primary]"
+            } else if is_fork_base {
+                " [fork_base]"
+            } else {
+                ""
+            };
             let head_str = head
                 .as_deref()
                 .filter(|s| !s.is_empty())
@@ -16709,6 +16740,86 @@ mod tests {
     }
 
     const RESIDENCY_BUDGET: usize = 1024 * 1024;
+
+    /// A server whose fork base is a parentless ref holding embeddings, idle
+    /// past the residency.
+    async fn fork_base_budget_server(
+        root: &std::path::Path,
+        base_root: &std::path::Path,
+    ) -> (ContextPlusServer, Arc<crate::ref_index::RefIndex>) {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 100;
+        let server = ContextPlusServer::new(root.to_path_buf(), config);
+        let canonical = base_root.canonicalize().unwrap();
+        let id = RefId::for_canonical_path(&canonical);
+        let base = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(canonical.clone(), canonical.clone(), None))
+            })
+            .await;
+        base.embedding_cache.write().await.insert(
+            "base.rs".into(),
+            crate::core::embeddings::CacheEntry {
+                hash: "base-hash".into(),
+                vector: vec![0.5; 4096],
+            },
+        );
+        server.state.fork_base_ref_id.set(id).unwrap();
+        mark_ref_idle_for(&server.state, id, std::time::Duration::from_secs(120));
+        (server, base)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_never_evicts_the_fork_base() {
+        for measured in [RESIDENCY_BUDGET / 2 * 3, RESIDENCY_BUDGET * 3] {
+            let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+
+            server.state.enforce_memory_budget().await;
+            assert!(
+                !base.embedding_cache.read().await.is_empty(),
+                "a pass at {measured} bytes evicted the fork base"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detach_worktree_refuses_the_fork_base() {
+        let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".into(),
+            json!(base_root.path().to_string_lossy().into_owned()),
+        );
+
+        let result = server.handle_detach_worktree(args).await.unwrap();
+        assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+        let listed = text_of(
+            &server
+                .handle_list_worktrees(serde_json::Map::new())
+                .await
+                .unwrap(),
+        );
+        assert!(listed.contains(" [fork_base] "), "{listed}");
+        assert_eq!(
+            base.session_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(
+            server
+                .state
+                .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+                .await
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn memory_budget_keeps_a_worktree_used_within_the_residency() {
