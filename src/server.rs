@@ -1944,12 +1944,15 @@ impl ContextPlusServer {
         // `config.ollama_max_concurrent`, which Config::from_env clamps into
         // [1, 64]. We wire the same semaphore into the OllamaClient so that
         // every outbound embed (warmup, tracker, on-demand) shares one budget.
-        // Background batches hold at most all but one permit, so a request's
-        // embeds never wait behind them while the budget has two or more.
+        // Document embeds hold at most all but one permit, so a query never
+        // waits behind them while the budget has two or more. Background
+        // batches hold all but one of those, so a request's documents never
+        // wait behind them while the budget has three or more.
         let ollama_semaphore = Arc::new(Semaphore::new(config.ollama_max_concurrent.max(1)));
         let ollama = OllamaClient::new_with_root(&config, Some(root_dir.clone()))
             .with_semaphore(Arc::clone(&ollama_semaphore))
-            .with_batch_limit(config.ollama_max_concurrent.saturating_sub(1));
+            .with_document_limit(config.ollama_max_concurrent.saturating_sub(1))
+            .with_batch_limit(config.ollama_max_concurrent.saturating_sub(2));
 
         let embed_cache_name = cache_name("embeddings", &config);
 
@@ -15545,6 +15548,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_slow_request_and_batch_documents_hold_permits() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = embeddings_for(&inputs);
+                if inputs.iter().any(|input| input.contains("SLOW")) {
+                    response.set_delay(std::time::Duration::from_secs(3600))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = semantic_fill_config(&ollama.uri(), 20, 60_000);
+        config.ollama_max_concurrent = 4;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        let embeds: Vec<_> = (0..4)
+            .flat_map(|i| {
+                let batch = server.state.ollama.clone();
+                let request = server.state.ollama.clone();
+                [
+                    tokio::spawn(async move {
+                        batch
+                            .embed_documents(&[
+                                format!("SLOW batch {i} a"),
+                                format!("SLOW batch {i} b"),
+                            ])
+                            .await
+                    }),
+                    tokio::spawn(async move {
+                        crate::core::embeddings::interactive(request.embed_documents(&[
+                            format!("SLOW request {i} a"),
+                            format!("SLOW request {i} b"),
+                        ]))
+                        .await
+                    }),
+                ]
+            })
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "SLOW request")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no request document embed reached the embedder");
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind the document embeds");
+        assert!(query.is_ok(), "{query:?}");
+        for embed in embeds {
+            embed.abort();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // U18: per-ref warmup tests
     // -----------------------------------------------------------------------
@@ -18242,8 +18315,9 @@ mod tests {
         // The fresh query's embed never returns, so a long budget keeps it in
         // flight for as long as the wait below takes.
         let mut config = semantic_fill_config(&ollama.uri, 120_000, 60_000);
-        // The fill's batch holds one permit; the fresh query's embed needs the other.
-        config.ollama_max_concurrent = 2;
+        // The fill's batch holds one permit and the fresh query's embed another;
+        // the third is kept for queries.
+        config.ollama_max_concurrent = 3;
         config.query_embed_budget_ms = 600_000;
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
 
