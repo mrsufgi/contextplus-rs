@@ -8546,12 +8546,76 @@ mod tests {
         assert!(text.contains("open_account - src/ledger.rs"), "{text}");
     }
 
+    /// An embedder that fails, attempt and retry alike, the identifier batch
+    /// that arrives once `after` batches have embedded, until `recover`.
+    /// Batches follow the walk order, which the file system decides, so the
+    /// failing batch is chosen by arrival and then matched by content.
+    struct FailingIdentifierBatch {
+        after: usize,
+        recovered: std::sync::atomic::AtomicBool,
+        state: std::sync::Mutex<FailingIdentifierBatchState>,
+    }
+
+    #[derive(Default)]
+    struct FailingIdentifierBatchState {
+        embedded_batches: usize,
+        embedded: Vec<String>,
+        failed: Option<Vec<String>>,
+    }
+
+    impl FailingIdentifierBatch {
+        fn after(after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                after,
+                recovered: std::sync::atomic::AtomicBool::new(false),
+                state: Default::default(),
+            })
+        }
+
+        fn respond(&self, inputs: &[String]) -> wiremock::ResponseTemplate {
+            let names: Vec<String> = inputs
+                .iter()
+                .filter(|input| input.contains("src/"))
+                .map(|input| input.split(' ').next().unwrap().to_string())
+                .collect();
+            if names.is_empty() {
+                return embeddings_for(inputs);
+            }
+            let mut state = self.state.lock().unwrap();
+            if !self.recovered.load(std::sync::atomic::Ordering::SeqCst) {
+                let fails = match &state.failed {
+                    Some(failed) => *failed == names,
+                    None => state.embedded_batches == self.after,
+                };
+                if fails {
+                    state.failed = Some(names);
+                    return wiremock::ResponseTemplate::new(500);
+                }
+            }
+            state.embedded_batches += 1;
+            state.embedded.extend(names);
+            embeddings_for(inputs)
+        }
+
+        fn recover(&self) {
+            self.recovered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn failed(&self) -> Option<Vec<String>> {
+            self.state.lock().unwrap().failed.clone()
+        }
+
+        fn take_embedded(&self) -> Vec<String> {
+            let mut embedded = std::mem::take(&mut self.state.lock().unwrap().embedded);
+            embedded.sort();
+            embedded
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_identifier_batch_keeps_earlier_batches_for_the_next_build() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let failing = Arc::new(AtomicBool::new(true));
-        let embedded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let embedder = FailingIdentifierBatch::after(2);
         let (_repo, _ollama, server) = scripted_identifier_server(
             &[
                 ("src/a.rs", "pub fn alpha_one() {}\npub fn alpha_two() {}\n"),
@@ -8559,20 +8623,8 @@ mod tests {
                 ("src/z.rs", "pub fn zeta_one() {}\npub fn zeta_two() {}\n"),
             ],
             {
-                let failing = Arc::clone(&failing);
-                let embedded = Arc::clone(&embedded);
-                move |inputs| {
-                    if failing.load(Ordering::SeqCst) && inputs.iter().any(|i| i.contains("zeta")) {
-                        return wiremock::ResponseTemplate::new(500);
-                    }
-                    embedded.lock().unwrap().extend(
-                        inputs
-                            .iter()
-                            .filter(|input| input.contains("src/"))
-                            .map(|input| input.split(' ').next().unwrap().to_string()),
-                    );
-                    embeddings_for(inputs)
-                }
+                let embedder = Arc::clone(&embedder);
+                move |inputs| embedder.respond(inputs)
             },
             |config| {
                 config.embed_batch_size = 2;
@@ -8584,22 +8636,19 @@ mod tests {
         server
             .dispatch("explore", identifier_args("alpha_one", "meaning"))
             .await;
-        let before_failure = std::mem::take(&mut *embedded.lock().unwrap());
-        assert!(
-            !before_failure.is_empty(),
-            "the failing batch came first, so no batch completed before it"
-        );
-        failing.store(false, Ordering::SeqCst);
+        let before_failure = embedder.take_embedded();
+        let mut failed = embedder.failed().expect("no identifier batch failed");
+        failed.sort();
+        assert_eq!(before_failure.len(), 4, "{before_failure:?}");
+        embedder.recover();
         let answered = server
             .dispatch("explore", identifier_args("alpha_one", "meaning"))
             .await;
 
         assert_eq!(answered.is_error, Some(false), "{}", text_of(&answered));
-        let mut after_failure = std::mem::take(&mut *embedded.lock().unwrap());
-        after_failure.sort();
         assert_eq!(
-            after_failure,
-            ["zeta_one", "zeta_two"],
+            embedder.take_embedded(),
+            failed,
             "the next build embedded again what {before_failure:?} had embedded"
         );
     }
@@ -8652,16 +8701,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_identifier_build_saves_the_batches_it_embedded() {
+        let embedder = FailingIdentifierBatch::after(1);
         let (repo, _ollama, server) = scripted_identifier_server(
             &[
                 ("src/a.rs", "pub fn alpha_one() {}\npub fn alpha_two() {}\n"),
                 ("src/z.rs", "pub fn zeta_one() {}\npub fn zeta_two() {}\n"),
             ],
-            |inputs| {
-                if inputs.iter().any(|input| input.contains("zeta")) {
-                    return wiremock::ResponseTemplate::new(500);
-                }
-                embeddings_for(inputs)
+            {
+                let embedder = Arc::clone(&embedder);
+                move |inputs| embedder.respond(inputs)
             },
             |config| config.embed_batch_size = 2,
         )
