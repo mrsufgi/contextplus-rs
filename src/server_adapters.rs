@@ -1972,7 +1972,7 @@ impl CachedWalkerIndexer {
 
     /// Builds the parent's index of its whole root when the parent holds none,
     /// as after a restart, or a scoped one, and installs it so a worktree can
-    /// fork it.
+    /// fork it, catching up one its queued batches leave unforkable.
     async fn build_parent_index(
         &self,
         parent: &Arc<crate::ref_index::RefIndex>,
@@ -1982,6 +1982,27 @@ impl CachedWalkerIndexer {
             return;
         }
         self.build_whole_root_index(parent).await;
+        self.catch_up_parent(parent).await;
+    }
+
+    /// Rebuilds the parent's index of its whole root from cached vectors when
+    /// only its queued batches keep a worktree from forking it, as when they
+    /// queued with no worktree attached, and waits for the rebuild.
+    async fn catch_up_parent(&self, parent: &Arc<crate::ref_index::RefIndex>) {
+        let queued = parent
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|entry| {
+                entry.unforkable_clause(&parent.canonical_root) == Some("batches_queued")
+            });
+        if !queued {
+            return;
+        }
+        if let Some(rebuild) = refresh_fork_parent(&self.state, parent).await {
+            let _ = rebuild.await;
+        }
     }
 
     /// Builds and installs the index of `parent`'s whole root unless it holds
@@ -2187,25 +2208,27 @@ impl CachedWalkerIndexer {
     }
 
     /// The parent a worktree's warmup forks, its index of its whole root built
-    /// first from its cached vectors when it holds none: the warmup makes no
-    /// Ollama call.
+    /// or caught up first from its cached vectors: the warmup makes no Ollama
+    /// call.
     async fn warmup_parent(
         &self,
         ref_index: &crate::ref_index::RefIndex,
     ) -> Option<Arc<crate::ref_index::RefIndex>> {
         let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
-        if parent.parent_ref_id.is_none()
-            && parent.canonical_root != ref_index.canonical_root
-            && parent
-                .search_index_cache
-                .read()
-                .await
-                .as_ref()
-                .is_none_or(|entry| entry.search_root() != parent.canonical_root)
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return Some(parent);
+        }
+        if parent
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_none_or(|entry| entry.search_root() != parent.canonical_root)
             && let Some(files) = parent.project_cache.read().await.clone()
         {
             self.primary_warmup(&parent, &files).await;
         }
+        self.catch_up_parent(&parent).await;
         Some(parent)
     }
 

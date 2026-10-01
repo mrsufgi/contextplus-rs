@@ -24145,7 +24145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_fork_skips_a_primary_with_queued_batches() {
+    async fn semantic_fork_catches_up_a_primary_with_queued_batches_before_forking() {
         use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument};
 
         let (_ollama, primary_root, worktree, server, session) =
@@ -24179,11 +24179,9 @@ mod tests {
         ));
 
         let result = semantic_fork_query(&session).await;
+        let forked = semantic_fork_index(&server).await;
         assert!(
-            !semantic_fork_index(&session)
-                .await
-                .index
-                .shares_vector_store(&entry.index),
+            !Arc::ptr_eq(&forked, &entry) && forked.forkable_at(&primary.canonical_root),
             "the worktree forked a primary index with queued batches"
         );
         assert_eq!(
@@ -24968,6 +24966,68 @@ mod tests {
             "the parent was left {:?}",
             after.unforkable_clause(&primary.canonical_root)
         );
+    }
+
+    /// A primary whose index of its whole root fell behind its tracker while
+    /// no worktree was attached, and a worktree of it, not yet attached.
+    async fn semantic_fork_parent_left_behind() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+    ) {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        lexdelta_corpus(primary.path(), SEMANTIC_FORK_FILES);
+        lexdelta_corpus(worktree.path(), SEMANTIC_FORK_FILES);
+        lexdelta_edit_worktree(worktree.path());
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_queue_primary_batch(&server).await;
+        (ollama, primary, worktree, server)
+    }
+
+    async fn semantic_fork_assert_parent_caught_up(
+        server: &ContextPlusServer,
+        session: &ContextPlusServer,
+    ) {
+        let primary = server.state.default_ref().unwrap();
+        let parent = semantic_fork_index(server).await;
+        assert!(
+            parent.forkable_at(&primary.canonical_root),
+            "the parent was left {:?}",
+            parent.unforkable_clause(&primary.canonical_root)
+        );
+        assert!(
+            semantic_fork_index(session)
+                .await
+                .index
+                .shares_vector_store(&parent.index),
+            "the worktree did not fork its parent"
+        );
+    }
+
+    /// A worktree's walk over a parent left behind while it had no worktree
+    /// catches the parent up from its cached vectors and forks it.
+    #[tokio::test]
+    async fn semantic_fork_walk_catches_up_a_parent_left_behind() {
+        let (_ollama, _primary, worktree, server) = semantic_fork_parent_left_behind().await;
+        let session = attached_worktree(&server, worktree.path()).await;
+
+        semantic_fork_query(&session).await;
+        semantic_fork_assert_parent_caught_up(&server, &session).await;
+    }
+
+    /// A worktree's warmup over a parent left behind while it had no worktree
+    /// catches the parent up from its cached vectors and forks it.
+    #[tokio::test]
+    async fn semantic_fork_warmup_catches_up_a_parent_left_behind() {
+        let (_ollama, _primary, worktree, server) = semantic_fork_parent_left_behind().await;
+        let session = attached_worktree(&server, worktree.path()).await;
+
+        semantic_fork_warmup(&session).await;
+        semantic_fork_assert_parent_caught_up(&server, &session).await;
     }
 
     #[tokio::test]
