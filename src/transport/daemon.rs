@@ -1030,9 +1030,8 @@ async fn prepare_ref(server: &ContextPlusServer, ref_id: RefId, ref_arc: &RefInd
     }
 }
 
-/// Registers the fork base checkout as a parentless ref, at once when it
-/// exists and otherwise in the background once created. The background task,
-/// when one started.
+/// Registers the fork base checkout as a parentless ref in the background,
+/// once created when missing. The background task, when one started.
 pub(crate) async fn start_fork_base(
     server: &ContextPlusServer,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -1043,7 +1042,7 @@ pub(crate) async fn start_fork_base(
         tracing::info!(phase = "fork_base", reason = "tracker_off", "fork base off");
         return None;
     }
-    let dir = crate::git::fork_base::fork_base_dir(config, &server.state.root_dir)?;
+    crate::git::fork_base::fork_base_dir(config, &server.state.root_dir)?;
     let register = {
         let server = server.clone();
         async move {
@@ -1070,10 +1069,6 @@ pub(crate) async fn start_fork_base(
             }
         }
     };
-    if dir.exists() {
-        register.await;
-        return None;
-    }
     Some(tokio::spawn(register))
 }
 
@@ -1152,7 +1147,7 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     if config.warmup_on_start {
         server.spawn_warmup_task(true);
     }
-    let _creating_fork_base = start_fork_base(&server).await;
+    let _registering_fork_base = start_fork_base(&server).await;
 
     run(server, listener, socket_path, pid_path, idle_secs, lock).await?;
     Ok(true)
@@ -1295,7 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_registers_a_parentless_fork_base_before_any_session() {
+    async fn daemon_registers_a_parentless_fork_base() {
         let (_primary, bases, server) = fork_base_daemon();
 
         if let Some(task) = start_fork_base(&server).await {
@@ -1324,6 +1319,30 @@ mod tests {
                 .exists(),
             "the fork base has no CAS manifest"
         );
+    }
+
+    #[tokio::test]
+    async fn start_fork_base_registers_an_existing_checkout_in_the_background() {
+        let (_primary, _bases, server) = fork_base_daemon();
+        let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
+        let existing = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        drop(existing.expect("a fork base checkout"));
+
+        let registration = start_fork_base(&server)
+            .await
+            .expect("a background registration");
+        assert!(
+            server.state.fork_base_ref_id.get().is_none(),
+            "the fork base registered before the daemon took sessions"
+        );
+        registration.await.unwrap();
+        assert!(server.state.fork_base_ref_id.get().is_some());
+        server.advance_fork_base().expect("an advance").await;
     }
 
     #[tokio::test]
