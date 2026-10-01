@@ -671,6 +671,8 @@ pub struct SharedState {
     budget_emergency: std::sync::atomic::AtomicBool,
     /// The `RefId` of the fork base checkout, once registered.
     pub fork_base_ref_id: std::sync::OnceLock<crate::ref_index::RefId>,
+    /// The commit the fork base's installed index was built at.
+    pub(crate) fork_base_indexed_head: std::sync::Mutex<Option<String>>,
     /// The fork base checkout, whose lock this daemon holds while it serves it.
     pub(crate) fork_base: std::sync::Mutex<Option<crate::git::fork_base::ForkBase>>,
     #[cfg(test)]
@@ -746,6 +748,68 @@ impl SharedState {
                     .is_some_and(|dir| dir == canonical_root)
         };
         (!self.pinned(ref_id) && !fork_base()).then_some(self.default_ref_id)
+    }
+
+    /// The parent of a ref registered at `canonical_root`: none for the primary
+    /// and the fork base, else whichever of the fork base and the primary its
+    /// HEAD differs from in fewer files, the primary on a tie or whenever the
+    /// fork base cannot serve.
+    pub(crate) async fn choose_parent(
+        self: &Arc<Self>,
+        canonical_root: &std::path::Path,
+    ) -> Option<crate::ref_index::RefId> {
+        let primary = self.registration_parent(canonical_root)?;
+        if self.config.fork_base.is_none() {
+            return Some(primary);
+        }
+        let refused = |reason: &str| {
+            tracing::info!(
+                phase = "fork_parent",
+                root = %canonical_root.display(),
+                reason,
+                "worktree parented on the primary"
+            );
+            Some(primary)
+        };
+        let Some(base_id) = self.fork_base_ref_id.get().copied() else {
+            return refused("base_not_ready");
+        };
+        let Some(base) = self.ref_index(base_id).await else {
+            return refused("base_not_ready");
+        };
+        let forkable = base
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|entry| entry.forkable_at(&base.canonical_root));
+        let indexed = self.fork_base_indexed_head.lock().unwrap().clone();
+        let Some(indexed) = indexed.filter(|_| forkable) else {
+            return refused("base_cold");
+        };
+        let (root, primary_root) = (canonical_root.to_path_buf(), self.canonical_root.clone());
+        let nearer = tokio::time::timeout(
+            CHOOSE_PARENT_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                crate::git::fork_base::nearer_to_base(&root, &primary_root, &indexed)
+            }),
+        )
+        .await;
+        match nearer {
+            Ok(Ok(Ok(true))) => {
+                tracing::info!(
+                    phase = "fork_parent",
+                    root = %canonical_root.display(),
+                    parent_ref_id = %base.cas_ref_id_hex,
+                    "worktree parented on the fork base"
+                );
+                Some(base_id)
+            }
+            Ok(Ok(Ok(false))) => Some(primary),
+            Ok(Ok(Err(reason))) => refused(reason),
+            Ok(Err(_)) => refused("git_failed"),
+            Err(_) => refused("timeout"),
+        }
     }
 
     /// The ref whose identifier vectors `owner` shares, keeping its own misses
@@ -1624,6 +1688,9 @@ async fn prune_identifier_vectors(
     expired
 }
 
+/// How long choosing a worktree's parent may run git on the registration path.
+const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How often an identifier build saves the vectors it has embedded so far; it
 /// saves the rest when it ends.
 const IDENTIFIER_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2391,6 +2458,7 @@ impl ContextPlusServer {
             budget_warned: std::sync::atomic::AtomicBool::new(false),
             budget_emergency: std::sync::atomic::AtomicBool::new(false),
             fork_base_ref_id: std::sync::OnceLock::new(),
+            fork_base_indexed_head: std::sync::Mutex::new(None),
             fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
@@ -5547,7 +5615,7 @@ impl ContextPlusServer {
             }
         }
 
-        let parent_ref_id = self.state.registration_parent(&canonical);
+        let parent_ref_id = self.state.choose_parent(&canonical).await;
 
         // Optional: read HEAD from the worktree's git index. Tolerates non-git
         // dirs (returns None → stored as None on the ref).
@@ -8337,6 +8405,176 @@ mod tests {
         let pruned = prune_with_unused_vectors(&server, 10).await;
 
         assert!(pruned.is_empty(), "{pruned:?}");
+    }
+
+    /// A primary at commit A of ten files, `origin/main` at commit B editing
+    /// five, and a server over it with the fork base on.
+    fn choose_parent_repository() -> (tempfile::TempDir, tempfile::TempDir, String, String) {
+        let primary = tempfile::tempdir().unwrap();
+        lexdelta_git(primary.path(), &["init", "-q", "-b", "main"]);
+        lexdelta_corpus(primary.path(), 10);
+        lexdelta_git(primary.path(), &["add", "-A"]);
+        lexdelta_git(primary.path(), &["commit", "-qm", "a"]);
+        let a = choose_parent_rev(primary.path(), "HEAD");
+        lexdelta_git(primary.path(), &["checkout", "-q", "-b", "upstream"]);
+        for i in 0..5 {
+            std::fs::write(
+                primary
+                    .path()
+                    .join(format!("src/area_{}/file_{i}.rs", i % 4)),
+                format!("pub fn upstream_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        lexdelta_git(primary.path(), &["commit", "-qam", "b"]);
+        let b = choose_parent_rev(primary.path(), "HEAD");
+        lexdelta_git(primary.path(), &["checkout", "-q", "main"]);
+        lexdelta_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", &b],
+        );
+        (primary, tempfile::tempdir().unwrap(), a, b)
+    }
+
+    fn choose_parent_rev(root: &std::path::Path, rev: &str) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A linked worktree of `primary` detached at `rev` under `holder`.
+    fn choose_parent_worktree(
+        primary: &std::path::Path,
+        holder: &std::path::Path,
+        name: &str,
+        rev: &str,
+    ) -> PathBuf {
+        let path = holder.join(name);
+        lexdelta_git(
+            primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                path.to_str().unwrap(),
+                rev,
+            ],
+        );
+        path.canonicalize().unwrap()
+    }
+
+    /// Registers a parentless fork base indexed at `indexed`, its index
+    /// forkable unless `cold`.
+    async fn choose_parent_base(
+        server: &ContextPlusServer,
+        holder: &std::path::Path,
+        indexed: &str,
+        cold: bool,
+    ) -> crate::ref_index::RefId {
+        use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument};
+
+        let root = holder.join("base");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let base = attach_identifier_ref(server, &root, None).await;
+        if !cold {
+            let docs = (0..SEMANTIC_FORK_FILES)
+                .map(|i| {
+                    SearchDocument::new(
+                        format!("f{i}.rs"),
+                        String::new(),
+                        vec![],
+                        vec![],
+                        "x".into(),
+                    )
+                })
+                .collect();
+            let vectors = vec![Some(vec![1.0, 0.0, 0.0]); SEMANTIC_FORK_FILES];
+            let entry = CachedSearchIndex::build(&root, docs, vectors, 0, 0, None);
+            assert!(entry.install(&mut *base.search_index_cache.write().await, None));
+            assert!(
+                base.search_index_cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .forkable_at(&root)
+            );
+        }
+        let id = crate::ref_index::RefId::for_canonical_path(&root);
+        server.state.fork_base_ref_id.set(id).unwrap();
+        *server.state.fork_base_indexed_head.lock().unwrap() = Some(indexed.to_string());
+        id
+    }
+
+    fn choose_parent_server(primary: &std::path::Path) -> ContextPlusServer {
+        let mut config = Config::from_env_map(&HashMap::from([(
+            "CONTEXTPLUS_FORK_BASE".to_string(),
+            "origin/main".to_string(),
+        )]));
+        config.embed_tracker_mode = TrackerMode::Off;
+        config.ref_warmup_mode = RefWarmupMode::Off;
+        ContextPlusServer::new(primary.to_path_buf(), config)
+    }
+
+    #[tokio::test]
+    async fn choose_parent_takes_the_nearer_of_the_fork_base_and_the_primary() {
+        let (primary, holder, a, b) = choose_parent_repository();
+        let server = choose_parent_server(primary.path());
+        let base = choose_parent_base(&server, holder.path(), &b, false).await;
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
+        let old = choose_parent_worktree(primary.path(), holder.path(), "old", &a);
+        std::fs::write(old.join("src/area_0/file_8.rs"), "pub fn old() {}\n").unwrap();
+        lexdelta_git(&old, &["commit", "-qam", "old"]);
+        let default = server.state.default_ref_id;
+
+        assert_eq!(server.state.choose_parent(&cut).await, Some(base));
+        assert_eq!(server.state.choose_parent(&old).await, Some(default));
+        let primary_root = server.state.canonical_root.clone();
+        assert_eq!(server.state.choose_parent(&primary_root).await, None);
+        let base_root = server
+            .state
+            .ref_index(base)
+            .await
+            .unwrap()
+            .canonical_root
+            .clone();
+        assert_eq!(server.state.choose_parent(&base_root).await, None);
+
+        let (other, _, _, other_b) = choose_parent_repository();
+        let foreign = choose_parent_worktree(other.path(), holder.path(), "foreign", &other_b);
+        assert_eq!(server.state.choose_parent(&foreign).await, Some(default));
+    }
+
+    #[tokio::test]
+    async fn choose_parent_takes_the_primary_without_a_ready_fork_base() {
+        let (primary, holder, _a, b) = choose_parent_repository();
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
+
+        let not_ready = choose_parent_server(primary.path());
+        assert_eq!(
+            not_ready.state.choose_parent(&cut).await,
+            Some(not_ready.state.default_ref_id)
+        );
+        let mut config = not_ready.state.config.clone();
+        config.fork_base = None;
+        let off = ContextPlusServer::new(primary.path().to_path_buf(), config);
+        assert_eq!(
+            off.state.choose_parent(&cut).await,
+            Some(off.state.default_ref_id)
+        );
+
+        let cold = choose_parent_server(primary.path());
+        choose_parent_base(&cold, holder.path(), &b, true).await;
+        assert_eq!(
+            cold.state.choose_parent(&cut).await,
+            Some(cold.state.default_ref_id)
+        );
     }
 
     /// A checkout of `files` at a new directory registered as the fork base.

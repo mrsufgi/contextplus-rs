@@ -117,6 +117,33 @@ pub fn ensure_fork_base(config: &Config, primary_root: &Path) -> Result<Option<F
     }))
 }
 
+/// Whether the worktree at `root` differs from the fork base's `indexed`
+/// commit in fewer files than from the primary's HEAD; `Err` with the reason
+/// it cannot tell, such as a worktree of another repository.
+pub fn nearer_to_base(
+    root: &Path,
+    primary_root: &Path,
+    indexed: &str,
+) -> std::result::Result<bool, &'static str> {
+    let (Some(worktree), Some(primary)) = (
+        crate::core::git_worktree::git_dirs(root),
+        crate::core::git_worktree::git_dirs(primary_root),
+    ) else {
+        return Err("not_git");
+    };
+    if worktree.common_dir != primary.common_dir {
+        return Err("other_repository");
+    }
+    let head = resolve(root, "HEAD").ok_or("no_head")?;
+    let primary_head = resolve(primary_root, "HEAD").ok_or("no_head")?;
+    let changed = |from: &str| {
+        git(root, &["diff", "--no-renames", "--name-only", from, &head])
+            .map(|names| names.lines().filter(|name| !name.is_empty()).count())
+            .ok_or("git_failed")
+    };
+    Ok(changed(indexed)? < changed(&primary_head)?)
+}
+
 /// The commit `reference` names in the repository at `root`.
 pub(crate) fn resolve(root: &Path, reference: &str) -> Option<String> {
     git(

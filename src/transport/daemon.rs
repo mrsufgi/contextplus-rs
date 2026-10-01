@@ -871,7 +871,10 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         .unwrap_or_else(|_| reg.client_root.clone());
     let ref_id = RefId::for_canonical_path(&canonical_root);
 
-    let parent_ref_id = server.state.registration_parent(&canonical_root);
+    let parent_ref_id = match server.state.ref_index(ref_id).await {
+        Some(existing) => existing.parent_ref_id,
+        None => server.state.choose_parent(&canonical_root).await,
+    };
 
     let head_sha = reg.head_sha.clone();
     let client_root = reg.client_root.clone();
