@@ -200,6 +200,28 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn choose_parent_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next worktree attach of `root` after it chose a parent.
+    pub(crate) fn pause_after_choose_parent(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        choose_parent_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_choose_parent(root: &Path) {
+        let pause = choose_parent_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
     fn store_read_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))

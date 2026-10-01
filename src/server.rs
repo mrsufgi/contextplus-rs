@@ -5805,6 +5805,8 @@ impl ContextPlusServer {
         }
 
         let parent_ref_id = self.state.choose_parent(&canonical).await;
+        #[cfg(test)]
+        crate::server_adapters::test_seams::after_choose_parent(&canonical).await;
 
         // Optional: read HEAD from the worktree's git index. Tolerates non-git
         // dirs (returns None → stored as None on the ref).
@@ -5835,7 +5837,7 @@ impl ContextPlusServer {
         {
             let mcp_data = self.state.root_dir.join(".mcp_data");
             let model = self.state.config.document_cache_identity();
-            let parent_ref_opt = match parent_ref_id {
+            let parent_ref_opt = match ref_arc.parent_ref_id {
                 Some(pid) => self.state.ref_index(pid).await,
                 None => None,
             };
@@ -5871,7 +5873,8 @@ impl ContextPlusServer {
             "Worktree attached: {}\n  ref_id  = {}\n  parent  = {}\n  head    = {}\n  sessions= {}\n  warmup  = {}",
             ref_arc.canonical_root.display(),
             ref_id.0,
-            parent_ref_id
+            ref_arc
+                .parent_ref_id
                 .map(|p| p.0.to_string())
                 .unwrap_or_else(|| "<none (this IS the primary)>".to_string()),
             head_display,
@@ -8936,6 +8939,47 @@ mod tests {
             fork_base_state(&server, "advanced").await,
             (advanced.clone(), Some(advanced), true),
             "attaching a worktree did not advance the fork base"
+        );
+    }
+
+    /// An attach that loses the race to insert its worktree's ref writes the
+    /// CAS parent of the ref that won, not the parent it chose.
+    #[tokio::test]
+    async fn attach_worktree_chains_the_cas_to_the_attached_ref_parent() {
+        let (primary, holder, _a, b) = choose_parent_repository();
+        let server = choose_parent_server(primary.path());
+        let base = choose_parent_base(&server, holder.path(), &b, false).await;
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
+        server
+            .state
+            .fork_base_advancing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pause = crate::server_adapters::test_seams::pause_after_choose_parent(&cut);
+
+        let attach = {
+            let (server, cut) = (server.clone(), cut.clone());
+            tokio::spawn(async move { attached_worktree(&server, &cut).await })
+        };
+        pause.wait_until_entered().await;
+        let won = attach_identifier_ref(&server, &cut, Some(base)).await;
+        pause.resume();
+        attach.await.unwrap();
+
+        let base_hex = server
+            .state
+            .ref_index(base)
+            .await
+            .unwrap()
+            .cas_ref_id_hex
+            .clone();
+        let cas = crate::cache::cas::CasStore::new(
+            server.state.root_dir.join(".mcp_data"),
+            server.state.config.document_cache_identity(),
+        );
+        assert_eq!(
+            cas.read_parent(&won.cas_ref_id_hex).unwrap(),
+            Some(base_hex),
+            "the CAS chain names a parent the attached ref does not have"
         );
     }
 
