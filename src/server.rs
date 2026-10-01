@@ -15623,6 +15623,13 @@ mod tests {
         })
         .await
         .expect("the warmup never finished");
+        assert_eq!(
+            owner
+                .active_requests
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the warmup still holds its worktree in use"
+        );
         let generation = owner
             .cache_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -15636,6 +15643,18 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Acquire)
                     == generation,
             "the budget evicted a worktree whose warmup had just ended"
+        );
+        mark_ref_idle(&server.state, id);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            owner.project_cache.read().await.is_none()
+                && owner
+                    .cache_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != generation,
+            "the budget spared an idle worktree after its warmup ended"
         );
     }
 
