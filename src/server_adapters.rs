@@ -613,6 +613,10 @@ impl WalkAndIndexFn for RefWalkerIndexer {
     fn track_background_task(&self, task: &tokio::task::JoinHandle<()>) {
         self.ref_index.track_background_task(task);
     }
+
+    fn ref_id(&self) -> &str {
+        &self.ref_index.cas_ref_id_hex
+    }
 }
 
 impl CachedWalkerIndexer {
@@ -1188,6 +1192,8 @@ impl CachedWalkerIndexer {
         if queued > 0 {
             tracing::warn!(
                 queued,
+                ref_id = %ref_index.cas_ref_id_hex,
+                root = %ref_index.canonical_root.display(),
                 "semantic_code_search returning partial results; leftovers queued for background fill"
             );
         }

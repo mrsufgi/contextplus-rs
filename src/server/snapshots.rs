@@ -1141,8 +1141,9 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
         let cache = Arc::new(load_project_cache(root, config, None, false));
+        let owner = crate::ref_index::RefIndex::new(root.to_path_buf(), root.to_path_buf(), None);
         let (index, document_paths) =
-            build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content);
+            build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content, &owner);
         let cached = CachedLexicalIndex {
             index,
             document_paths,
@@ -1214,7 +1215,9 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         std::fs::write(tmp.path().join("src/lib.rs"), "pub fn shared() {}\n").unwrap();
         let cache = Arc::new(load_project_cache(tmp.path(), &config, None, false));
-        let (index, _) = build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content);
+        let owner = crate::ref_index::RefIndex::new(tmp.path().into(), tmp.path().into(), None);
+        let (index, _) =
+            build_lexical_index(["src/lib.rs"].into_iter(), &cache.file_content, &owner);
         assert_eq!(index.document_prior(0), (1.0, false));
         // A document classified by other code than the current: its path now
         // reads as a generated test file.
@@ -1305,8 +1308,9 @@ mod tests {
             .map(|entry| entry.relative_path.as_str())
             .collect();
         paths.sort_unstable();
+        let owner = crate::ref_index::RefIndex::new(tmp.path().into(), tmp.path().into(), None);
         let (mut index, mut document_paths) =
-            build_lexical_index(paths.into_iter(), &cache.file_content);
+            build_lexical_index(paths.into_iter(), &cache.file_content, &owner);
         let deleted: Vec<usize> = (0..document_paths.len()).filter(|i| i % 4 != 0).collect();
         for &i in &deleted {
             document_paths[i].clear();

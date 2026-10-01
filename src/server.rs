@@ -1765,9 +1765,10 @@ const LEXICAL_BUILD_BATCH: usize = 16;
 fn build_lexical_index<'a>(
     paths: impl Iterator<Item = &'a str>,
     files: &crate::core::walker::FileContents,
+    owner: &crate::ref_index::RefIndex,
 ) -> (crate::tools::lexical_search::LexicalIndex, Vec<String>) {
     use rayon::prelude::*;
-    let built = build_lexical_index_batched(paths, |batch| {
+    let built = build_lexical_index_batched(paths, owner, |batch| {
         STRUCTURAL_POOL.install(|| {
             batch
                 .par_iter()
@@ -1785,6 +1786,7 @@ fn build_lexical_index<'a>(
 /// held at once stay small next to the index being built.
 fn build_lexical_index_batched<'a>(
     paths: impl Iterator<Item = &'a str>,
+    owner: &crate::ref_index::RefIndex,
     count: impl Fn(&[&'a str]) -> Vec<crate::tools::lexical_search::DocumentTermCounts>,
 ) -> (crate::tools::lexical_search::LexicalIndex, Vec<String>) {
     let started = Instant::now();
@@ -1798,6 +1800,8 @@ fn build_lexical_index_batched<'a>(
     index.finish_build();
     tracing::info!(
         phase = "lexical_build",
+        ref_id = %owner.cas_ref_id_hex,
+        root = %owner.canonical_root.display(),
         elapsed_ms = started.elapsed().as_millis(),
         documents = paths.len(),
         "cold-start phase"
@@ -4522,6 +4526,7 @@ impl ContextPlusServer {
 
         let source = Arc::clone(project_cache);
         let parent_index = Arc::clone(&base);
+        let owner = Arc::clone(ref_index);
         let (index, document_paths, mask) = tokio::task::spawn_blocking(move || {
             let files = &source.file_content;
             let changed = |path: &str| files.shadows(path) || files.own().contains_key(path);
@@ -4556,6 +4561,7 @@ impl ContextPlusServer {
                     })
                     .map(|entry| entry.relative_path.as_str()),
                 files,
+                &owner,
             );
             let mask = BaseMask::new(&parent_index.index, masked);
             (index, document_paths, mask)
@@ -4709,6 +4715,7 @@ impl ContextPlusServer {
         tracing::debug!(generation, reason, "Rebuilding LexicalIndex");
 
         let cache_for_build = Arc::clone(project_cache);
+        let build_owner = Arc::clone(ref_index);
         // An index inherited from the parent ref answers for another tree,
         // so it is never served while this ref rebuilds.
         let stale = guard
@@ -4728,6 +4735,7 @@ impl ContextPlusServer {
                     .filter(|e| !e.is_directory)
                     .map(|e| e.relative_path.as_str()),
                 &cache_for_build.file_content,
+                &build_owner,
             )
         });
         if let Some(previous) = stale {
@@ -9797,11 +9805,12 @@ mod tests {
         let files = crate::core::walker::FileContents::from(files);
         let mut paths: Vec<&str> = files.keys().map(String::as_str).collect();
         paths.sort_unstable();
+        let owner = crate::ref_index::RefIndex::new(PathBuf::new(), PathBuf::new(), None);
 
         // Counted on this thread so the counting allocator sees every batch.
         let (((index, document_paths), retained), peak) = crate::alloc_probe::peak_bytes(|| {
             crate::alloc_probe::retained_bytes(|| {
-                build_lexical_index_batched(paths.iter().copied(), |batch| {
+                build_lexical_index_batched(paths.iter().copied(), &owner, |batch| {
                     batch
                         .iter()
                         .map(|path| lexical_term_counts(path, &files))
@@ -22942,6 +22951,42 @@ mod tests {
                 && forks[0].contains("parent_whole_root=true"),
             "{forks:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_fork_worktree_build_lines_name_the_worktree() {
+        let (_ollama, _primary, worktree, server, session) =
+            semantic_fork_servers(semantic_fork_rewrite_a_third).await;
+        semantic_fork_query(&server).await;
+        let owner = session.current_ref().await;
+        let named = format!(
+            "ref_id={} root={} ",
+            owner.cas_ref_id_hex,
+            worktree.path().canonicalize().unwrap().display()
+        );
+        let files = load_project_cache(worktree.path(), &server.state.config, None, false);
+
+        let (logs, capture) = crate::test_logs::captured_info_logs();
+        semantic_fork_query(&session).await;
+        build_lexical_index(
+            files
+                .file_entries
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .map(|entry| entry.relative_path.as_str()),
+            &files.file_content,
+            &owner,
+        );
+        drop(capture);
+        let logs = crate::test_logs::logs_as_string(&logs);
+        for phase in ["semantic_index_build", "lexical_build"] {
+            assert!(
+                logs.lines()
+                    .any(|line| line.contains(&format!("phase=\"{phase}\""))
+                        && line.contains(&named)),
+                "no {phase} line names the worktree:\n{logs}"
+            );
+        }
     }
 
     /// Replaces the primary's vector store with a fresh build, as after an eviction.

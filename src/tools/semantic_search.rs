@@ -2994,6 +2994,8 @@ pub async fn semantic_code_search(
             );
             tracing::info!(
                 phase = "semantic_index_build",
+                ref_id = %walk_and_index_fn.ref_id(),
+                root = %search_root.display(),
                 elapsed_ms = started.elapsed().as_millis(),
                 documents = idx.document_count(),
                 "cold-start phase"
@@ -3059,6 +3061,10 @@ pub trait WalkAndIndexFn: Send + Sync {
         })
     }
     fn track_background_task(&self, _task: &tokio::task::JoinHandle<()>) {}
+    /// The ref this walker indexes, for log lines.
+    fn ref_id(&self) -> &str {
+        ""
+    }
 }
 
 // ---------------------------------------------------------------------------
