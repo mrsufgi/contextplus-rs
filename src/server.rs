@@ -25349,6 +25349,84 @@ mod tests {
         );
     }
 
+    /// Refreshes the primary's entry with a new vector for one of its
+    /// documents, as a batch of its background fill does; that vector and
+    /// its vector generation.
+    async fn semantic_fork_fill_primary_vector(server: &ContextPlusServer) -> (Vec<f32>, u64) {
+        use crate::tools::semantic_search::CachedSearchIndex;
+
+        let primary = server.state.default_ref().unwrap();
+        let mut slot = primary.search_index_cache.write().await;
+        let entry = slot.as_mut().expect("a semantic index");
+        let at = entry
+            .index
+            .documents()
+            .iter()
+            .position(|doc| doc.path == "src/area_2/file_6.rs")
+            .unwrap();
+        let doc = &entry.index.documents()[at];
+        let mut vector = entry.index.vector_at(at).unwrap().to_vec();
+        vector[0] += 1.0;
+        let update = (doc.path.clone(), doc.source_hash.clone(), vector.clone());
+        let vector_generation = primary
+            .semantic_vector_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        CachedSearchIndex::refresh_vectors(
+            entry,
+            &primary.canonical_root,
+            vec![update],
+            vector_generation,
+        );
+        (vector, vector_generation)
+    }
+
+    /// A parent rebuild whose build overlaps a batch of the fill takes its
+    /// vectors into the entry it installs without walking the root again.
+    #[tokio::test]
+    async fn semantic_fork_parent_rebuild_takes_fill_vectors_queued_while_it_ran_without_a_walk() {
+        let (_ollama, _primary, _worktree, server, _session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_queue_primary_batch(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let walks = || {
+            primary
+                .semantic_walks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = walks();
+        let pause =
+            crate::server_adapters::test_seams::pause_before_stale_install(&primary.canonical_root);
+
+        let rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent");
+        pause.wait_until_entered().await;
+        let (vector, vector_generation) = semantic_fork_fill_primary_vector(&server).await;
+        pause.resume();
+        rebuild.await.unwrap();
+
+        assert_eq!(
+            walks() - before,
+            1,
+            "the rebuild walked the root again for a batch of the fill"
+        );
+        let after = semantic_fork_index(&server).await;
+        assert!(
+            after.is_settled(vector_generation) && after.forkable_at(&primary.canonical_root),
+            "the parent was left {:?}",
+            after.unforkable_clause(&primary.canonical_root)
+        );
+        let at = after
+            .index
+            .documents()
+            .iter()
+            .position(|doc| doc.path == "src/area_2/file_6.rs")
+            .unwrap();
+        assert_eq!(after.index.vector_at(at), Some(vector.as_slice()));
+    }
+
     /// A primary whose index of its whole root fell behind its tracker while
     /// no worktree was attached, and a worktree of it, not yet attached.
     async fn semantic_fork_parent_left_behind() -> (
