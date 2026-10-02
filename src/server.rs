@@ -9560,8 +9560,9 @@ mod tests {
         );
     }
 
-    /// After a restart, a worktree registered while the fork base registers
-    /// again is parented on it, at the head its index held before.
+    /// After a restart, the fork base registers again at the head its index
+    /// held before, ahead of the advance that indexes it, and a worktree
+    /// registered meanwhile is parented on it.
     #[tokio::test]
     async fn choose_parent_takes_the_fork_base_after_a_restart() {
         let (_ollama, primary, _bases, server) =
@@ -9599,16 +9600,21 @@ mod tests {
 
         let restarted =
             ContextPlusServer::new(primary.path().to_path_buf(), server.state.config.clone());
+        let resolve =
+            crate::server_adapters::test_seams::pause_after_fork_base_resolve(&base.canonical_root);
         let registration = crate::transport::daemon::start_fork_base(&restarted)
             .await
             .expect("a background registration");
-        let parent = restarted.state.choose_parent(&cut).await;
         registration.await.unwrap();
-        restarted
+        resolve.wait_until_entered().await;
+        let restored = restarted
             .state
-            .fork_base_advance_task()
-            .expect("an advance")
-            .await;
+            .fork_base_indexed_head
+            .lock()
+            .unwrap()
+            .clone();
+        let parent = choose_parent_released(&restarted, &cut, || resolve.resume()).await;
+        crate::server_adapters::test_seams::settle_fork_base(&restarted.state).await;
         let base = restarted
             .state
             .ref_index(*restarted.state.fork_base_ref_id.get().unwrap())
@@ -9617,6 +9623,11 @@ mod tests {
         let tracker = base.tracker_handle.lock().unwrap().take();
         tracker.expect("the fork base's tracker").stop().await;
 
+        assert_eq!(
+            restored,
+            Some(origin),
+            "the restarted fork base did not restore the head its index held"
+        );
         assert_eq!(
             parent,
             restarted.state.fork_base_ref_id.get().copied(),
