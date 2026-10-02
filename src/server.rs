@@ -8636,7 +8636,7 @@ mod tests {
         wait_until_reparsed(&build, &first_edit).await;
         std::fs::write(
             repo.path().join("src/ledger.rs"),
-            "pub fn open_account() {}\npub fn audit_account() {}\npub fn reconcile_account() {}\n",
+            "pub fn open_account() {}\npub fn reconcile_account() {}\n",
         )
         .unwrap();
         server
@@ -8652,7 +8652,10 @@ mod tests {
 
         server.current_ref().await.cancel_background_tasks();
 
-        for (query, name) in [(first, "audit_account"), (second, "reconcile_account")] {
+        for (query, name, other) in [
+            (first, "audit_account", "reconcile_account"),
+            (second, "reconcile_account", "audit_account"),
+        ] {
             let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
                 .await
                 .expect("the identifier query never answered")
@@ -8661,6 +8664,10 @@ mod tests {
             assert!(text.starts_with("Partial results"), "{text}");
             assert!(!text.contains("before the latest edits"), "{text}");
             assert!(text.contains(&format!("{name} - src/ledger.rs")), "{text}");
+            assert!(
+                !text.contains(&format!("{other} - src/ledger.rs")),
+                "{text}"
+            );
         }
         drop(held);
     }
