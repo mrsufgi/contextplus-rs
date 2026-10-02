@@ -9852,10 +9852,10 @@ mod tests {
         let fill = test_seams::pause_fill_start(&base.canonical_root);
         let waits = test_seams::pause_before_embeds_wait(&base.canonical_root);
         checkout.resume();
-        tokio::select! {
-            () = fill.wait_until_entered() => {}
-            () = waits.wait_until_entered() => {}
-        }
+        let waited = tokio::select! {
+            () = fill.wait_until_entered() => false,
+            () = waits.wait_until_entered() => true,
+        };
         fill.resume();
         waits.resume();
         tracker_embed.resume();
@@ -9865,6 +9865,7 @@ mod tests {
         }
         test_seams::settle_fork_base(&server.state).await;
 
+        assert!(waited, "the advance did not wait for the tracker's embed");
         let embedded = matching_embed_input_count(&ollama, "pub fn advanced_").await;
         assert_eq!(
             embedded, files,
