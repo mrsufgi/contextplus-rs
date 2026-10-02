@@ -158,8 +158,9 @@ pub(crate) struct IdentifierBuild {
     /// The parsed documents, without vectors, once parsing is done.
     parsed: tokio::sync::watch::Receiver<Option<Arc<IdentifierIndex>>>,
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
-    /// The documents as of the latest project cache a request asked for.
-    current: Arc<std::sync::Mutex<Option<CurrentIdentifierDocs>>>,
+    /// The documents as of each live project cache a request asked for, in
+    /// the order their reparses started.
+    current: Arc<std::sync::Mutex<Vec<CurrentIdentifierDocs>>>,
     /// The documents the latest finished reparse produced.
     latest: Arc<std::sync::Mutex<Option<ReparsedIdentifierDocs>>>,
     /// The ref whose background tasks reparse the documents.
@@ -268,36 +269,37 @@ impl IdentifierBuild {
     }
 
     /// The reparse of `docs` as of `cache`, started unless one is already,
-    /// after the reparse it replaces.
+    /// after the latest one started. The reparses of project caches that are
+    /// gone are dropped.
     fn reparse(
         &self,
         docs: &Arc<IdentifierIndex>,
         cache: &Arc<ProjectCache>,
     ) -> Option<tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>> {
-        let mut slot = self.current.lock().unwrap();
-        match slot.as_ref() {
-            Some((of, current)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)) => {
-                Some(current.clone())
-            }
-            _ => {
-                let source = self.source.upgrade()?;
-                let owner = self.owner.upgrade()?;
-                let previous = slot.take().map(|(_, current)| current);
-                let (sender, current) = tokio::sync::watch::channel(None);
-                let docs = Arc::clone(docs);
-                let edited = Arc::clone(cache);
-                let latest = Arc::clone(&self.latest);
-                owner.spawn_background_task(async move {
-                    if let Some(mut previous) = previous {
-                        let _ = previous.wait_for(Option::is_some).await;
-                    }
-                    let reparsed = Self::reparse_after_latest(&latest, docs, source, edited).await;
-                    sender.send_replace(Some(reparsed));
-                });
-                *slot = Some((Arc::downgrade(cache), current.clone()));
-                Some(current)
-            }
+        let mut reparses = self.current.lock().unwrap();
+        reparses.retain(|(of, _)| of.strong_count() > 0);
+        if let Some((_, current)) = reparses
+            .iter()
+            .find(|(of, _)| std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)))
+        {
+            return Some(current.clone());
         }
+        let source = self.source.upgrade()?;
+        let owner = self.owner.upgrade()?;
+        let previous = reparses.last().map(|(_, current)| current.clone());
+        let (sender, current) = tokio::sync::watch::channel(None);
+        let docs = Arc::clone(docs);
+        let edited = Arc::clone(cache);
+        let latest = Arc::clone(&self.latest);
+        owner.spawn_background_task(async move {
+            if let Some(mut previous) = previous {
+                let _ = previous.wait_for(Option::is_some).await;
+            }
+            let reparsed = Self::reparse_after_latest(&latest, docs, source, edited).await;
+            sender.send_replace(Some(reparsed));
+        });
+        reparses.push((Arc::downgrade(cache), current.clone()));
+        Some(current)
     }
 
     /// `reparsed` on a blocking thread, reusing the files the latest finished
@@ -8503,7 +8505,7 @@ mod tests {
         server
             .dispatch("explore", identifier_args("audit_account", "meaning"))
             .await;
-        let mut reparse = first.current.lock().unwrap().as_ref().unwrap().1.clone();
+        let mut reparse = first.current.lock().unwrap().last().unwrap().1.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
             reparse.wait_for(Option::is_some),
@@ -8552,20 +8554,7 @@ mod tests {
             })
         };
 
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            let mut reparse = loop {
-                let current = build.current.lock().unwrap().clone();
-                match current {
-                    Some((of, reparse)) if std::ptr::eq(of.as_ptr(), Arc::as_ptr(&edited)) => {
-                        break reparse;
-                    }
-                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-                }
-            };
-            reparse.wait_for(Option::is_some).await.unwrap();
-        })
-        .await
-        .expect("the query left the edited files unparsed while it waited on the build");
+        wait_until_reparsed(&build, &edited).await;
         assert!(!query.is_finished(), "the query answered before its budget");
         server.current_ref().await.cancel_background_tasks();
         let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
@@ -8577,6 +8566,82 @@ mod tests {
         assert!(text.starts_with("Partial results"), "{text}");
         assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
         assert!(!text.contains("close_account"), "{text}");
+        drop(held);
+    }
+
+    /// Waits until a request has parsed the files that differ in `cache`
+    /// again, as a meaning query does while it waits on `build`.
+    async fn wait_until_reparsed(build: &IdentifierBuild, cache: &Arc<ProjectCache>) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut reparse = loop {
+                let current = build
+                    .current
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(of, _)| std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)))
+                    .map(|(_, reparse)| reparse.clone());
+                match current {
+                    Some(reparse) => break reparse,
+                    None => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            };
+            reparse.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the query left the edited files unparsed while it waited on the build");
+    }
+
+    #[tokio::test]
+    async fn partial_identifier_answers_overlapping_an_edit_each_read_their_edits() {
+        let (repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let build = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let meaning_query = |name: &'static str| {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args(name, "meaning"))
+                    .await
+            })
+        };
+        let first_edit = server.ensure_project_cache().await.unwrap();
+        let first = meaning_query("audit_account");
+        wait_until_reparsed(&build, &first_edit).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\npub fn reconcile_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("second test edit")
+            .await;
+        let second_edit = server.ensure_project_cache().await.unwrap();
+        let second = meaning_query("reconcile_account");
+        wait_until_reparsed(&build, &second_edit).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "a query answered before its budget"
+        );
+
+        server.current_ref().await.cancel_background_tasks();
+
+        for (query, name) in [(first, "audit_account"), (second, "reconcile_account")] {
+            let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+                .await
+                .expect("the identifier query never answered")
+                .unwrap();
+            let text = text_of(&answered);
+            assert!(text.starts_with("Partial results"), "{text}");
+            assert!(!text.contains("before the latest edits"), "{text}");
+            assert!(text.contains(&format!("{name} - src/ledger.rs")), "{text}");
+        }
         drop(held);
     }
 
@@ -8765,7 +8830,7 @@ mod tests {
             .await;
         let edited = server.ensure_project_cache().await.unwrap();
         let (stalled, reparse) = tokio::sync::watch::channel(None);
-        *build.current.lock().unwrap() = Some((Arc::downgrade(&edited), reparse));
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&edited), reparse)];
         (repo, ollama, server, held, stalled)
     }
 
@@ -9047,7 +9112,7 @@ mod tests {
         let parsed = build.parsed.borrow().clone().unwrap();
         let first_edit = edit_depot(&repo, &server, 0).await;
         let (stalled, first) = tokio::sync::watch::channel(None);
-        *build.current.lock().unwrap() = Some((Arc::downgrade(&first_edit), first));
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
         let second_edit = edit_depot(&repo, &server, 1).await;
         let mut second = build.reparse(&parsed, &second_edit).unwrap();
 
@@ -9084,7 +9149,7 @@ mod tests {
         let edited = server.ensure_project_cache().await.unwrap();
 
         for _ in 0..200 {
-            *build.current.lock().unwrap() = None;
+            build.current.lock().unwrap().clear();
             let observed = Arc::clone(&edited);
             let holders = Arc::strong_count(&edited);
             let current = build.reparse(&parsed, &edited).unwrap();
