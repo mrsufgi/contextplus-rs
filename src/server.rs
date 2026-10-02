@@ -2929,6 +2929,9 @@ impl ContextPlusServer {
         if owner.search_index_cache.read().await.is_none() {
             return None;
         }
+        // The fork base's fill embeds what its re-embed left without a vector.
+        let fork_base = self.state.is_fork_base(&owner);
+        let mut unfilled = Vec::new();
         let mut docs = Vec::new();
         let mut vectors = Vec::new();
         let mut deleted = Vec::new();
@@ -2975,13 +2978,19 @@ impl ContextPlusServer {
                     entries,
                 )
             };
+            let hash = crate::core::embeddings::content_hash(&content);
             let vector = owner
                 .embedding_cache
                 .read()
                 .await
                 .get(path)
-                .filter(|entry| entry.hash == crate::core::parser::hash_content(&content))
+                .filter(|entry| entry.hash == hash)
                 .map(|entry| entry.vector.clone());
+            if fork_base && vector.is_none() {
+                let shape = self.state.config.embed_doc_shape;
+                let document = build_embedding_document(path, &content, shape);
+                unfilled.push((path.clone(), hash.clone(), document));
+            }
             docs.push(SearchDocument::new(
                 path.clone(),
                 header,
@@ -2989,7 +2998,7 @@ impl ContextPlusServer {
                 entries,
                 text,
             ));
-            docs.last_mut().unwrap().source_hash = crate::core::embeddings::content_hash(&content);
+            docs.last_mut().unwrap().source_hash = hash;
             vectors.push(vector);
         }
         let mut guard = owner.search_index_cache.write().await;
@@ -3004,6 +3013,9 @@ impl ContextPlusServer {
             );
         }
         drop(guard);
+        if !unfilled.is_empty() {
+            crate::server_adapters::queue_fill(&self.state, &owner, unfilled).await;
+        }
         crate::server_adapters::refresh_fork_parent(&self.state, &owner).await
     }
 
@@ -9262,6 +9274,44 @@ mod tests {
                     .any(|doc| doc.content.contains(&format!("{tag}_1")))
             });
         (head, indexed, holds)
+    }
+
+    /// An advance whose re-embed of the changed files fails leaves them to
+    /// the fork base's fill, so its index holds their vectors once settled.
+    #[tokio::test]
+    async fn fork_base_advance_fills_the_files_its_failed_reembed_left() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (ollama, primary, _bases, server) = fork_base_server(0).await;
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(body_string_contains("pub fn advanced_"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&ollama)
+            .await;
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+
+        server.advance_fork_base().expect("an advance").await;
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
+
+        let base = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        let entry = base.search_index_cache.read().await.clone().unwrap();
+        assert!(
+            entry.has_every_vector(),
+            "the fork base's index kept documents without vectors"
+        );
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true)
+        );
     }
 
     #[tokio::test]

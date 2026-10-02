@@ -1484,20 +1484,14 @@ impl CachedWalkerIndexer {
             fill.pending.insert(path.clone(), doc);
         }
         drop(cache);
-        if !fill.running && !fill.pending.is_empty() {
-            fill.running = true;
-            let owner = Arc::clone(ref_index);
-            let ollama = ollama.clone();
-            let config = config.clone();
-            let parent_vectors = parent_vectors.clone();
-            let state = Arc::clone(&self.state);
-            let task = tokio::spawn(async move {
-                run_fill(state, owner, ollama, config, parent_vectors).await;
-            });
-            ref_index.track_background_task(&task);
-            #[cfg(test)]
-            test_seams::fill_started(&ref_index.canonical_root, task);
-        }
+        start_fill(
+            &mut fill,
+            &self.state,
+            ref_index,
+            ollama,
+            config,
+            parent_vectors,
+        );
         drop(fill);
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(config.embed_budget_ms);
@@ -3560,6 +3554,72 @@ async fn save_vectors(
             result => tracing::warn!(?result, "Failed to persist background embeddings"),
         }
     }
+}
+
+/// Starts the background fill of `ref_index` over the documents pending in
+/// `fill`, its fill state, unless the fill runs.
+fn start_fill(
+    fill: &mut SemanticFill,
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+    ollama: &OllamaClient,
+    config: &Config,
+    parent_vectors: Option<Arc<FileVectors>>,
+) {
+    if fill.running || fill.pending.is_empty() {
+        return;
+    }
+    fill.running = true;
+    let owner = Arc::clone(ref_index);
+    let (state, ollama, config) = (Arc::clone(state), ollama.clone(), config.clone());
+    let task = tokio::spawn(async move {
+        run_fill(state, owner, ollama, config, parent_vectors).await;
+    });
+    ref_index.track_background_task(&task);
+    #[cfg(test)]
+    test_seams::fill_started(&ref_index.canonical_root, task);
+}
+
+/// Queues `documents`, each a path, its content hash and its embedding text,
+/// for the background fill of `ref_index` and starts the fill.
+pub(crate) async fn queue_fill(
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+    documents: Vec<(String, String, String)>,
+) {
+    let parent_vectors = match ref_index.parent_ref_id {
+        Some(parent_id) => state
+            .ref_index(parent_id)
+            .await
+            .map(|parent| Arc::clone(&parent.embedding_cache)),
+        None => None,
+    };
+    let mut fill = ref_index.semantic_fill.lock().await;
+    for (path, hash, text) in documents {
+        let doc = FillDocument {
+            path,
+            hash,
+            text,
+            owner: None,
+        };
+        if fill.failed(&doc)
+            || fill
+                .pending
+                .get(&doc.path)
+                .is_some_and(|held| held.hash == doc.hash)
+        {
+            continue;
+        }
+        fill.pending.insert(doc.path.clone(), doc);
+    }
+    start_fill(
+        &mut fill,
+        state,
+        ref_index,
+        &state.ollama,
+        &state.config,
+        parent_vectors,
+    );
 }
 
 async fn run_fill(
