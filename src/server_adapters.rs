@@ -628,6 +628,17 @@ pub(crate) mod test_seams {
         );
     }
 
+    /// Whether the background fill of `ref_index` runs.
+    pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
+        ref_index.semantic_fill.lock().await.running
+    }
+
+    /// Marks the background fill of `ref_index` running, with no task behind
+    /// it.
+    pub(crate) async fn mark_fill_running(ref_index: &crate::ref_index::RefIndex) {
+        ref_index.semantic_fill.lock().await.running = true;
+    }
+
     pub(crate) async fn pending_hash(
         ref_index: &crate::ref_index::RefIndex,
         path: &str,
@@ -3243,9 +3254,10 @@ fn parent_lag(parent: &crate::ref_index::RefIndex, base: &CachedSearchIndex) -> 
     )
 }
 
-/// Whether the background fill of `ref_index` runs.
-pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
-    ref_index.semantic_fill.lock().await.running
+/// The vectors the background fill of `ref_index` still owes while it runs.
+pub(crate) async fn fill_owed(ref_index: &crate::ref_index::RefIndex) -> Option<usize> {
+    let fill = ref_index.semantic_fill.lock().await;
+    fill.running.then(|| fill.pending.len())
 }
 
 /// Whether `entry`, the index of `ref_index`, holds the vectors its fill

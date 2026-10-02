@@ -924,12 +924,17 @@ impl SharedState {
 
     /// Waits for the fork base's advance task to exit and for its fill, the
     /// rebuild of its index or the batches queued on it to end, each of which
-    /// checks the fork base once more as it ends.
+    /// checks the fork base once more as it ends; at once while its fill owes
+    /// more than [`FORK_BASE_SETTLE_FILL_MAX`] vectors.
     async fn fork_base_settled(&self, base: &crate::ref_index::RefIndex) {
         loop {
             let mut exits = self.fork_base_advance_exits.subscribe();
             // Before the advance: a fill that ends has already checked the fork base.
-            let filling = crate::server_adapters::fill_running(base).await;
+            let owed = crate::server_adapters::fill_owed(base).await;
+            if owed.is_some_and(|owed| owed > FORK_BASE_SETTLE_FILL_MAX) {
+                return;
+            }
+            let filling = owed.is_some();
             let advance = self
                 .fork_base_advance
                 .lock()
@@ -1857,6 +1862,10 @@ const ADVANCE_EXITING: u8 = 2;
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The most vectors the fork base's running fill may owe for choosing a
+/// worktree's parent to wait for it.
+const FORK_BASE_SETTLE_FILL_MAX: usize = 8;
 
 /// How long choosing a worktree's parent waits for the fork base to settle
 /// before it judges the fork base as it stands.
@@ -9072,6 +9081,52 @@ mod tests {
         );
     }
 
+    /// A worktree registered while the fork base's fill owes more vectors
+    /// than the wait for it could see filled is parented on the primary
+    /// without waiting.
+    #[tokio::test(start_paused = true)]
+    async fn choose_parent_takes_the_primary_at_once_while_a_long_fill_runs() {
+        use crate::server_adapters::test_seams;
+        use crate::tools::semantic_search::{CachedSearchIndex, SearchDocument};
+
+        let (primary, holder, _a, b) = choose_parent_repository();
+        let server = choose_parent_server(primary.path());
+        let base_id = choose_parent_base(&server, holder.path(), &b, false).await;
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
+        let base = server.state.ref_index(base_id).await.unwrap();
+        let owed = FORK_BASE_SETTLE_FILL_MAX + 1;
+        let docs = (0..SEMANTIC_FORK_FILES)
+            .map(|i| {
+                SearchDocument::new(
+                    format!("f{i}.rs"),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    "x".into(),
+                )
+            })
+            .collect();
+        let vectors = (0..SEMANTIC_FORK_FILES)
+            .map(|i| (i >= owed).then(|| vec![1.0, 0.0, 0.0]))
+            .collect();
+        let filling = CachedSearchIndex::build(&base.canonical_root, docs, vectors, 0, 0, None);
+        *base.search_index_cache.write().await = Some(Arc::new(filling));
+        for i in 0..owed {
+            test_seams::seed_pending(&base, &format!("f{i}.rs"), format!("f{i}"), "x".into()).await;
+        }
+        test_seams::mark_fill_running(&base).await;
+
+        let started = tokio::time::Instant::now();
+        let parent = server.state.choose_parent(&cut).await;
+
+        assert_eq!(parent, Some(server.state.default_ref_id));
+        assert!(
+            started.elapsed() < FORK_BASE_SETTLE_TIMEOUT,
+            "the choice waited {:?} for a fill owing {owed} vectors",
+            started.elapsed()
+        );
+    }
+
     /// A worktree registered while an advance of the fork base outlasts the
     /// wait for it is parented on the fork base at the head its index holds,
     /// with git given its own time once the wait ends.
@@ -9443,17 +9498,12 @@ mod tests {
         );
     }
 
-    /// A worktree registered while the fork base's first vectors fill waits
-    /// for them and is parented on the fork base.
+    /// A worktree registered while the fork base's last few vectors fill
+    /// waits for them and is parented on the fork base.
     #[tokio::test]
     async fn choose_parent_takes_the_fork_base_once_the_fill_it_waits_for_drains() {
         let ollama = wiremock::MockServer::start().await;
         let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
-        lexdelta_git(
-            primary.path(),
-            &["update-ref", "refs/remotes/origin/main", "HEAD"],
-        );
-        let origin = choose_parent_rev(primary.path(), "origin/main");
         let bases = tempfile::tempdir().unwrap();
         let mut config = identifier_test_server(&ollama, primary.path())
             .await
@@ -9465,6 +9515,12 @@ mod tests {
         config.fork_base_min_advance_secs = 0;
         config.embed_budget_ms = 0;
         let server = ContextPlusServer::new(primary.path().to_path_buf(), config.clone());
+        semantic_fork_query(&server).await;
+        let primary_root = server.state.default_ref().unwrap().canonical_root.clone();
+        for task in crate::server_adapters::test_seams::take_fills(&primary_root) {
+            task.await.unwrap();
+        }
+        let origin = fork_base_move_origin_files(primary.path(), "upstream", 3);
         let root = primary.path().to_path_buf();
         let base = tokio::task::spawn_blocking(move || {
             crate::git::fork_base::ensure_fork_base(&config, &root)
@@ -21010,7 +21066,7 @@ mod tests {
     /// Waits for `ref_index`'s background fill to persist and stop.
     async fn fill_settled(ref_index: &Arc<crate::ref_index::RefIndex>) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while crate::server_adapters::fill_running(ref_index).await {
+            while crate::server_adapters::test_seams::fill_running(ref_index).await {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
@@ -22189,7 +22245,7 @@ mod tests {
                 .await
                 .contains_key("target.rs");
             let ref_index = server.current_ref().await;
-            let fill_finished = !crate::server_adapters::fill_running(&ref_index).await;
+            let fill_finished = !crate::server_adapters::test_seams::fill_running(&ref_index).await;
             if vector_ready && fill_finished {
                 break;
             }
@@ -22286,7 +22342,7 @@ mod tests {
         ollama.release_fill.add_permits(1);
         let ref_index = server.current_ref().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while crate::server_adapters::fill_running(&ref_index).await {
+            while crate::server_adapters::test_seams::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
             }
             assert_eq!(
@@ -22328,7 +22384,7 @@ mod tests {
         ollama.release_fill.add_permits(1);
         let ref_index = server.current_ref().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while crate::server_adapters::fill_running(&ref_index).await {
+            while crate::server_adapters::test_seams::fill_running(&ref_index).await {
                 tokio::task::yield_now().await;
             }
             assert_eq!(
@@ -27233,7 +27289,7 @@ mod tests {
     }
 
     async fn bench_fill_done(ref_index: &crate::ref_index::RefIndex) {
-        while crate::server_adapters::fill_running(ref_index).await {
+        while crate::server_adapters::test_seams::fill_running(ref_index).await {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
