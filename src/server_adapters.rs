@@ -2059,7 +2059,7 @@ impl CachedWalkerIndexer {
     /// Rebuilds the parent's index of its whole root from cached vectors when
     /// only its queued batches keep a worktree from forking it, as when they
     /// queued with no worktree attached, and waits for the rebuild, or for
-    /// the one already catching it up.
+    /// the one already catching it up, at most the embed budget.
     async fn catch_up_parent(&self, parent: &Arc<crate::ref_index::RefIndex>) {
         let queued = parent
             .search_index_cache
@@ -2072,17 +2072,22 @@ impl CachedWalkerIndexer {
         if !queued {
             return;
         }
-        match refresh_fork_parent(&self.state, parent).await {
-            Some(rebuild) => {
-                let _ = rebuild.await;
+        let rebuild = refresh_fork_parent(&self.state, parent).await;
+        let caught_up = async {
+            match rebuild {
+                Some(rebuild) => {
+                    let _ = rebuild.await;
+                }
+                None => {
+                    #[cfg(test)]
+                    test_seams::before_parent_rebuild_wait(&parent.canonical_root).await;
+                    crate::tools::semantic_search::stale_rebuild_ended(&parent.search_index_cache)
+                        .await;
+                }
             }
-            None => {
-                #[cfg(test)]
-                test_seams::before_parent_rebuild_wait(&parent.canonical_root).await;
-                crate::tools::semantic_search::stale_rebuild_ended(&parent.search_index_cache)
-                    .await;
-            }
-        }
+        };
+        let budget = std::time::Duration::from_millis(self.config.embed_budget_ms);
+        let _ = tokio::time::timeout(budget, caught_up).await;
     }
 
     /// Builds and installs the index of `parent`'s whole root unless it holds

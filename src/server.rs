@@ -24233,6 +24233,21 @@ mod tests {
     /// Above `ANN_THRESHOLD`, so the primary's index holds a vector store.
     const SEMANTIC_FORK_FILES: usize = 2_100;
 
+    /// [`identifier_test_server`] whose worktree walks wait for a parent's
+    /// catch-up however long a loaded runner takes.
+    async fn semantic_fork_server(
+        ollama: &wiremock::MockServer,
+        root: &std::path::Path,
+    ) -> ContextPlusServer {
+        let mut config = identifier_test_server(ollama, root)
+            .await
+            .state
+            .config
+            .clone();
+        config.embed_budget_ms = 600_000;
+        ContextPlusServer::new(root.to_path_buf(), config)
+    }
+
     async fn semantic_fork_servers(
         edit: fn(&std::path::Path),
     ) -> (
@@ -24248,7 +24263,7 @@ mod tests {
         lexdelta_corpus(primary.path(), SEMANTIC_FORK_FILES);
         lexdelta_corpus(worktree.path(), SEMANTIC_FORK_FILES);
         edit(worktree.path());
-        let server = identifier_test_server(&ollama, primary.path()).await;
+        let server = semantic_fork_server(&ollama, primary.path()).await;
         let session = attached_worktree(&server, worktree.path()).await;
         (ollama, primary, worktree, server, session)
     }
@@ -25481,7 +25496,7 @@ mod tests {
         lexdelta_corpus(primary.path(), SEMANTIC_FORK_FILES);
         lexdelta_corpus(worktree.path(), SEMANTIC_FORK_FILES);
         lexdelta_edit_worktree(worktree.path());
-        let server = identifier_test_server(&ollama, primary.path()).await;
+        let server = semantic_fork_server(&ollama, primary.path()).await;
         semantic_fork_query(&server).await;
         semantic_fork_queue_primary_batch(&server).await;
         (ollama, primary, worktree, server)
@@ -25561,6 +25576,50 @@ mod tests {
         }
 
         semantic_fork_assert_parent_caught_up(&server, &session).await;
+    }
+
+    /// A worktree's walk waits for its parent's catch-up no longer than its
+    /// embed budget, then builds its own index.
+    #[tokio::test]
+    async fn semantic_fork_walk_stops_waiting_for_a_parent_catch_up_past_its_budget() {
+        use crate::server_adapters::{RefWalkerIndexer, test_seams};
+        use crate::tools::semantic_search::{WalkAndIndexFn, WalkOutcome};
+
+        let (_ollama, _primary, worktree, server) = semantic_fork_parent_left_behind().await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let primary = server.state.default_ref().unwrap();
+        let install = test_seams::pause_before_stale_install(&primary.canonical_root);
+        let rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent");
+        install.wait_until_entered().await;
+        let mut config = server.state.config.clone();
+        config.embed_budget_ms = 0;
+        let owner = session.current_ref().await;
+        let walker = RefWalkerIndexer {
+            ref_index: Arc::clone(&owner),
+            walker: CachedWalkerIndexer {
+                config,
+                ollama: server.state.ollama.clone(),
+                state: Arc::clone(&server.state),
+            },
+        };
+
+        let walked = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            walker.walk_or_install(&owner.canonical_root),
+        )
+        .await;
+        install.resume();
+        rebuild.await.unwrap();
+        for task in test_seams::take_fills(&owner.canonical_root) {
+            task.await.unwrap();
+        }
+
+        assert!(
+            matches!(walked, Ok(Ok(WalkOutcome::Documents(..)))),
+            "the worktree's walk waited past its budget for its parent's catch-up"
+        );
     }
 
     #[tokio::test]
