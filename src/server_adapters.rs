@@ -2064,17 +2064,20 @@ impl CachedWalkerIndexer {
     /// Rebuilds the parent's index of its whole root from cached vectors when
     /// only its queued batches keep a worktree from forking it, as when they
     /// queued with no worktree attached, and waits for the rebuild, or for
-    /// the one already catching it up, at most the embed budget.
+    /// the one already running, at most the embed budget.
     async fn catch_up_parent(&self, parent: &Arc<crate::ref_index::RefIndex>) {
-        let queued = parent
+        let behind = parent
             .search_index_cache
             .read()
             .await
             .as_ref()
             .is_some_and(|entry| {
-                entry.unforkable_clause(&parent.canonical_root) == Some("batches_queued")
+                matches!(
+                    entry.unforkable_clause(&parent.canonical_root),
+                    Some("batches_queued" | "rebuild_in_progress")
+                )
             });
-        if !queued {
+        if !behind {
             return;
         }
         let rebuild = refresh_fork_parent(&self.state, parent).await;

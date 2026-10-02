@@ -24745,8 +24745,10 @@ mod tests {
         );
     }
 
+    /// A worktree's walk forks no primary index mid-rebuild: it waits for
+    /// the rebuild and forks the index once the rebuild ends.
     #[tokio::test]
-    async fn semantic_fork_skips_a_primary_mid_rebuild() {
+    async fn semantic_fork_waits_out_a_primary_mid_rebuild() {
         let (_ollama, _primary, worktree, server, session) =
             semantic_fork_servers(lexdelta_edit_worktree).await;
         semantic_fork_query(&server).await;
@@ -24754,17 +24756,40 @@ mod tests {
         entry
             .rebuild_in_progress
             .store(true, std::sync::atomic::Ordering::Release);
+        let primary = server.state.default_ref().unwrap();
+        let waits = crate::server_adapters::test_seams::pause_before_parent_rebuild_wait(
+            &primary.canonical_root,
+        );
 
-        let result = semantic_fork_query(&session).await;
+        let mut query = {
+            let session = session.clone();
+            tokio::spawn(async move { semantic_fork_query(&session).await })
+        };
+        let answered = tokio::select! {
+            answered = &mut query => Some(answered.unwrap()),
+            () = waits.wait_until_entered() => None,
+        };
+        assert!(
+            answered.is_none(),
+            "the worktree's walk did not wait for the primary's rebuild"
+        );
+        let owner = session.current_ref().await;
+        assert!(
+            owner.search_index_cache.read().await.is_none(),
+            "the worktree indexed its root while the primary was mid-rebuild"
+        );
         entry
             .rebuild_in_progress
             .store(false, std::sync::atomic::Ordering::Release);
+        waits.resume();
+        let result = query.await.unwrap();
+
         assert!(
-            !semantic_fork_index(&session)
+            semantic_fork_index(&session)
                 .await
                 .index
                 .shares_vector_store(&entry.index),
-            "the worktree forked a primary index mid-rebuild"
+            "the worktree did not fork the primary once its rebuild ended"
         );
         assert_eq!(
             result,
@@ -25734,6 +25759,56 @@ mod tests {
             query.await.unwrap();
         }
 
+        semantic_fork_assert_parent_caught_up(&server, &session).await;
+    }
+
+    /// A worktree's walk over a parent one tracker generation behind, whose
+    /// rebuild runs with no batch queued, waits for that rebuild and forks
+    /// the caught-up parent.
+    #[tokio::test]
+    async fn semantic_fork_walk_waits_for_a_parent_rebuild_with_no_batch_queued() {
+        use crate::server_adapters::test_seams;
+
+        let (_ollama, _primary, _worktree, server, session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        primary
+            .cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let install = test_seams::pause_before_stale_install(&primary.canonical_root);
+        let rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent");
+        install.wait_until_entered().await;
+        let waits = test_seams::pause_before_parent_rebuild_wait(&primary.canonical_root);
+
+        let mut query = {
+            let session = session.clone();
+            tokio::spawn(async move { semantic_fork_query(&session).await })
+        };
+        let waited = tokio::select! {
+            answered = &mut query => {
+                answered.unwrap();
+                false
+            }
+            () = waits.wait_until_entered() => true,
+        };
+        waits.resume();
+        install.resume();
+        rebuild.await.unwrap();
+        if waited {
+            query.await.unwrap();
+        }
+        let indexed = session.current_ref().await.canonical_root.clone();
+        for task in test_seams::take_fills(&indexed) {
+            task.await.unwrap();
+        }
+
+        assert!(
+            waited,
+            "the worktree's walk did not wait for its parent's rebuild"
+        );
         semantic_fork_assert_parent_caught_up(&server, &session).await;
     }
 
