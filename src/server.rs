@@ -1196,7 +1196,8 @@ impl SharedState {
     /// trigger is measured process memory; per-ref estimates only pick which
     /// idle worktrees to evict, least recently used first, down to 80% of the
     /// budget. The primary is never evicted: when it alone exceeds the budget
-    /// one warning names its heaviest structures.
+    /// one warning names its heaviest structures. The fork base is evicted
+    /// only over twice the budget; its next advance or fork rebuilds it.
     pub async fn enforce_memory_budget(&self) {
         let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
         let mut snapshots = Vec::with_capacity(refs.len());
@@ -1281,7 +1282,12 @@ impl SharedState {
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
                 let id = crate::ref_index::RefId::for_canonical_path(&refs[i].canonical_root);
-                if Arc::ptr_eq(&refs[i], &self.default_ref) || self.pinned(id) {
+                let spared = if self.fork_base_ref_id.get() == Some(&id) {
+                    !emergency
+                } else {
+                    self.pinned(id)
+                };
+                if Arc::ptr_eq(&refs[i], &self.default_ref) || spared {
                     return None;
                 }
                 let Some(&(tick, last_used)) = access.get(&id) else {
@@ -9689,6 +9695,20 @@ mod tests {
     /// base's index with only its own changes and shares its vector store.
     #[tokio::test]
     async fn fork_base_worktree_forks_the_fork_base_with_its_own_delta() {
+        fork_base_worktree_forks_with_its_own_delta(false).await;
+    }
+
+    /// A worktree forks the fork base whose caches an emergency budget pass
+    /// cleared, with only its own changes.
+    #[tokio::test]
+    async fn fork_base_worktree_forks_the_fork_base_an_emergency_cleared() {
+        fork_base_worktree_forks_with_its_own_delta(true).await;
+    }
+
+    /// Cuts a worktree from `origin/main`, far from the primary, once an
+    /// emergency budget pass cleared the fork base when `cleared`, and asserts
+    /// it forks the fork base's index with only its own changes.
+    async fn fork_base_worktree_forks_with_its_own_delta(cleared: bool) {
         let ollama = wiremock::MockServer::start().await;
         let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
         lexdelta_git(primary.path(), &["checkout", "-q", "-b", "upstream"]);
@@ -9738,6 +9758,17 @@ mod tests {
         );
         let base_id = *server.state.fork_base_ref_id.get().unwrap();
         let base = server.state.ref_index(base_id).await.unwrap();
+        if cleared {
+            mark_ref_idle_for(&server.state, base_id, std::time::Duration::from_secs(120));
+            *server.state.measured_resident_override.lock().unwrap() = Some(usize::MAX);
+            server.state.enforce_memory_budget().await;
+            *server.state.measured_resident_override.lock().unwrap() = None;
+            assert!(
+                base.search_index_cache.read().await.is_none()
+                    && base.embedding_cache.read().await.is_empty(),
+                "an emergency kept the fork base's caches"
+            );
+        }
         let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &upstream);
         std::fs::write(
             cut.join("src/area_1/file_1.rs"),
@@ -18722,18 +18753,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_budget_never_evicts_the_fork_base() {
-        for measured in [RESIDENCY_BUDGET / 2 * 3, RESIDENCY_BUDGET * 3] {
-            let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-            let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
-            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+    async fn memory_budget_keeps_the_fork_base_under_twice_the_budget() {
+        let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
+        *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET / 2 * 3);
 
-            server.state.enforce_memory_budget().await;
-            assert!(
-                !base.embedding_cache.read().await.is_empty(),
-                "a pass at {measured} bytes evicted the fork base"
-            );
-        }
+        server.state.enforce_memory_budget().await;
+        assert!(
+            !base.embedding_cache.read().await.is_empty(),
+            "a pass under twice the budget evicted the fork base"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_budget_emergency_evicts_the_fork_base() {
+        let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
+        *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET * 3);
+
+        server.state.enforce_memory_budget().await;
+        assert!(
+            base.embedding_cache.read().await.is_empty(),
+            "an emergency kept the fork base's caches"
+        );
+        assert!(
+            server
+                .state
+                .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+                .await
+                .is_some(),
+            "an emergency removed the fork base"
+        );
     }
 
     #[tokio::test]
