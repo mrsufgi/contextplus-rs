@@ -145,11 +145,32 @@ pub fn nearer_to_base(
 }
 
 /// Moves the fork base checkout at `dir` to `sha`, discarding any edits made
-/// in it; `Err` with the reason it could not.
+/// in it and the locks a git killed in it left; `Err` with the reason it
+/// could not.
 pub fn checkout(dir: &Path, sha: &str) -> std::result::Result<(), &'static str> {
+    remove_stale_locks(dir);
     git(dir, &["checkout", "--force", "--detach", "--quiet", sha])
         .map(drop)
         .ok_or("checkout_failed")
+}
+
+/// Removes the index and HEAD locks in the gitdir of the checkout at `dir`,
+/// which only a killed git leaves: the checkout's one writer is the daemon
+/// holding its lock.
+fn remove_stale_locks(dir: &Path) {
+    let Some(dirs) = crate::core::git_worktree::git_dirs(dir) else {
+        return;
+    };
+    for lock in ["index.lock", "HEAD.lock"] {
+        if std::fs::remove_file(dirs.gitdir.join(lock)).is_ok() {
+            tracing::info!(
+                phase = "fork_base",
+                lock,
+                dir = %dir.display(),
+                "removed a stale git lock"
+            );
+        }
+    }
 }
 
 /// The paths that differ between commits `from` and `to`, renames as a

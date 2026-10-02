@@ -9349,6 +9349,30 @@ mod tests {
         );
     }
 
+    /// An advance moves the checkout past the index lock a git killed in it
+    /// left.
+    #[tokio::test]
+    async fn fork_base_advance_moves_past_a_lock_a_killed_git_left() {
+        let (_ollama, primary, _bases, server) = fork_base_server(0).await;
+        server.advance_fork_base().expect("an advance").await;
+        let base = server
+            .state
+            .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+            .await
+            .unwrap();
+        let gitdir = crate::core::git_worktree::git_dirs(&base.canonical_root)
+            .unwrap()
+            .gitdir;
+        std::fs::write(gitdir.join("index.lock"), "").unwrap();
+
+        let advanced = fork_base_move_origin(primary.path(), "advanced");
+        server.advance_fork_base().unwrap().await;
+        assert_eq!(
+            fork_base_state(&server, "advanced").await,
+            (advanced.clone(), Some(advanced), true)
+        );
+    }
+
     #[tokio::test]
     async fn fork_base_advance_runs_one_task_at_a_time() {
         let (_ollama, _primary, _bases, server) = fork_base_server(0).await;
