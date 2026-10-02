@@ -868,9 +868,9 @@ impl SharedState {
             );
             Some(primary)
         };
-        let deadline = tokio::time::Instant::now() + CHOOSE_PARENT_TIMEOUT;
         let mut registering = self.fork_base_registering.subscribe();
-        let _ = tokio::time::timeout_at(deadline, registering.wait_for(|busy| !busy)).await;
+        let _ =
+            tokio::time::timeout(CHOOSE_PARENT_TIMEOUT, registering.wait_for(|busy| !busy)).await;
         let Some(base_id) = self.fork_base_ref_id.get().copied() else {
             return refused("base_not_ready");
         };
@@ -879,7 +879,7 @@ impl SharedState {
         };
         #[cfg(test)]
         crate::server_adapters::test_seams::before_fork_base_settles(canonical_root).await;
-        let _ = tokio::time::timeout_at(deadline, self.fork_base_settled(&base)).await;
+        let _ = tokio::time::timeout(FORK_BASE_SETTLE_TIMEOUT, self.fork_base_settled(&base)).await;
         let entry = base.search_index_cache.read().await.clone();
         let indexed = self.fork_base_indexed_head.lock().unwrap().clone();
         let Some(indexed) = indexed else {
@@ -898,8 +898,8 @@ impl SharedState {
             Some(_) => {}
         }
         let (root, primary_root) = (canonical_root.to_path_buf(), self.canonical_root.clone());
-        let nearer = tokio::time::timeout_at(
-            deadline,
+        let nearer = tokio::time::timeout(
+            CHOOSE_PARENT_TIMEOUT,
             tokio::task::spawn_blocking(move || {
                 crate::git::fork_base::nearer_to_base(&root, &primary_root, &indexed)
             }),
@@ -1850,13 +1850,20 @@ const ADVANCE_RETRIGGERED: u8 = 1;
 /// The advance task exits, so the next trigger starts another.
 const ADVANCE_EXITING: u8 = 2;
 
-/// How long choosing a worktree's parent may wait for the fork base to settle
-/// and run git on the registration path. Tests share loaded runners, so there
-/// it waits however long it takes.
+/// How long choosing a worktree's parent may wait for the fork base to
+/// register, and then run git, on the registration path. Tests share loaded
+/// runners, so there it waits however long it takes.
 #[cfg(not(test))]
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 const CHOOSE_PARENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long choosing a worktree's parent waits for the fork base to settle
+/// before it judges the fork base as it stands.
+#[cfg(not(test))]
+const FORK_BASE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const FORK_BASE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// How often an identifier build saves the vectors it has embedded so far; it
 /// saves the rest when it ends.
@@ -9062,6 +9069,40 @@ mod tests {
             server.state.choose_parent(&cut).await,
             Some(server.state.default_ref_id),
             "a worktree was parented on a fork base whose vectors are still filling"
+        );
+    }
+
+    /// A worktree registered while an advance of the fork base outlasts the
+    /// wait for it is parented on the fork base at the head its index holds,
+    /// with git given its own time once the wait ends.
+    #[tokio::test(start_paused = true)]
+    async fn choose_parent_takes_the_fork_base_while_an_advance_outlasts_the_wait() {
+        use futures::FutureExt;
+
+        let (primary, holder, _a, b) = choose_parent_repository();
+        let server = choose_parent_server(primary.path());
+        let base_id = choose_parent_base(&server, holder.path(), &b, false).await;
+        let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &b);
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = held.await;
+        });
+        let abort = task.abort_handle();
+        let advance = async move {
+            let _ = task.await;
+        }
+        .boxed()
+        .shared();
+        *server.state.fork_base_advance.lock().unwrap() = Some((abort, advance.clone()));
+
+        let parent = server.state.choose_parent(&cut).await;
+        release.send(()).unwrap();
+        advance.await;
+
+        assert_eq!(
+            parent,
+            Some(base_id),
+            "a worktree registered during a long advance was parented on the primary"
         );
     }
 
