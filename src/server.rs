@@ -9214,6 +9214,7 @@ mod tests {
         let holders = [Arc::strong_count(&source), Arc::strong_count(&second_edit)];
 
         let _second = build.reparse(&parsed, &second_edit).unwrap();
+        tokio::task::yield_now().await;
 
         assert_eq!(
             [Arc::strong_count(&source), Arc::strong_count(&second_edit)],
