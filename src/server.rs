@@ -25529,6 +25529,40 @@ mod tests {
         semantic_fork_assert_parent_caught_up(&server, &session).await;
     }
 
+    /// A worktree's walk over a parent whose catch-up another caller started
+    /// waits for that rebuild and forks the caught-up parent.
+    #[tokio::test]
+    async fn semantic_fork_walk_waits_for_a_parent_catch_up_already_running() {
+        use crate::server_adapters::test_seams;
+
+        let (_ollama, _primary, worktree, server) = semantic_fork_parent_left_behind().await;
+        let session = attached_worktree(&server, worktree.path()).await;
+        let primary = server.state.default_ref().unwrap();
+        let install = test_seams::pause_before_stale_install(&primary.canonical_root);
+        let rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent");
+        install.wait_until_entered().await;
+        let waits = test_seams::pause_before_parent_rebuild_wait(&primary.canonical_root);
+
+        let mut query = {
+            let session = session.clone();
+            tokio::spawn(async move { semantic_fork_query(&session).await })
+        };
+        let answered = tokio::select! {
+            answered = &mut query => Some(answered.unwrap()),
+            () = waits.wait_until_entered() => None,
+        };
+        waits.resume();
+        install.resume();
+        rebuild.await.unwrap();
+        if answered.is_none() {
+            query.await.unwrap();
+        }
+
+        semantic_fork_assert_parent_caught_up(&server, &session).await;
+    }
+
     #[tokio::test]
     async fn semantic_fork_parent_behind_without_a_child_is_left_alone() {
         let ollama = wiremock::MockServer::start().await;

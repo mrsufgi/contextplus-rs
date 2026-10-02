@@ -498,6 +498,30 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn parent_rebuild_wait_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next worktree catch-up of the parent rooted at `root`
+    /// before it waits for a rebuild of the parent another caller started.
+    pub(crate) fn pause_before_parent_rebuild_wait(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        parent_rebuild_wait_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_parent_rebuild_wait(root: &Path) {
+        let pause = parent_rebuild_wait_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn store_read_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -2034,7 +2058,8 @@ impl CachedWalkerIndexer {
 
     /// Rebuilds the parent's index of its whole root from cached vectors when
     /// only its queued batches keep a worktree from forking it, as when they
-    /// queued with no worktree attached, and waits for the rebuild.
+    /// queued with no worktree attached, and waits for the rebuild, or for
+    /// the one already catching it up.
     async fn catch_up_parent(&self, parent: &Arc<crate::ref_index::RefIndex>) {
         let queued = parent
             .search_index_cache
@@ -2047,8 +2072,16 @@ impl CachedWalkerIndexer {
         if !queued {
             return;
         }
-        if let Some(rebuild) = refresh_fork_parent(&self.state, parent).await {
-            let _ = rebuild.await;
+        match refresh_fork_parent(&self.state, parent).await {
+            Some(rebuild) => {
+                let _ = rebuild.await;
+            }
+            None => {
+                #[cfg(test)]
+                test_seams::before_parent_rebuild_wait(&parent.canonical_root).await;
+                crate::tools::semantic_search::stale_rebuild_ended(&parent.search_index_cache)
+                    .await;
+            }
         }
     }
 

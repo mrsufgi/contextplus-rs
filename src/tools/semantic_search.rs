@@ -1162,6 +1162,8 @@ pub struct CachedSearchIndex {
     /// Guards background rebuild: CAS false→true claims the spawn slot.
     /// Reset by the RAII `RebuildGuard` even on panic, preventing permanent lockout.
     pub(crate) rebuild_in_progress: std::sync::atomic::AtomicBool,
+    /// Notified when `RebuildGuard` resets `rebuild_in_progress`.
+    rebuild_ended: tokio::sync::Notify,
 }
 
 /// Maximum absolute doc-count delta that qualifies for a background (stale-serve) rebuild.
@@ -1179,6 +1181,7 @@ impl Drop for RebuildGuard {
         self.0
             .rebuild_in_progress
             .store(false, std::sync::atomic::Ordering::Release);
+        self.0.rebuild_ended.notify_waiters();
     }
 }
 
@@ -1195,6 +1198,7 @@ impl CachedSearchIndex {
             generation: std::sync::atomic::AtomicU64::new(generation),
             reuse_count: std::sync::atomic::AtomicU64::new(0),
             rebuild_in_progress: std::sync::atomic::AtomicBool::new(false),
+            rebuild_ended: tokio::sync::Notify::new(),
         }
     }
 
@@ -2657,6 +2661,25 @@ pub(crate) fn spawn_stale_rebuild(
     });
     walk_and_index_fn.track_background_task(&task);
     Some(task)
+}
+
+/// Waits until no rebuild of the entry in `lock` runs, following the entries
+/// the rebuilds install.
+pub(crate) async fn stale_rebuild_ended(lock: &RwLock<Option<Arc<CachedSearchIndex>>>) {
+    loop {
+        let Some(entry) = lock.read().await.clone() else {
+            return;
+        };
+        let mut ended = std::pin::pin!(entry.rebuild_ended.notified());
+        ended.as_mut().enable();
+        if !entry
+            .rebuild_in_progress
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        ended.await;
+    }
 }
 
 /// Run semantic code search. Caller provides the embedding function and file walker.
