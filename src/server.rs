@@ -25349,6 +25349,46 @@ mod tests {
         );
     }
 
+    /// A parent rebuild that installs with changed files queued at every
+    /// pass stops after `STALE_REBUILD_PASSES` passes.
+    #[tokio::test]
+    async fn semantic_fork_parent_rebuild_stops_after_its_passes() {
+        use crate::server_adapters::test_seams::pause_before_stale_install;
+
+        let (_ollama, _primary, _worktree, server, _session) =
+            semantic_fork_servers(lexdelta_edit_worktree).await;
+        semantic_fork_query(&server).await;
+        semantic_fork_queue_primary_batch(&server).await;
+        let primary = server.state.default_ref().unwrap();
+        let mut pause = pause_before_stale_install(&primary.canonical_root);
+
+        let mut rebuild = crate::server_adapters::refresh_fork_parent(&server.state, &primary)
+            .await
+            .expect("a rebuild of the parent");
+        for _ in 0..crate::tools::semantic_search::STALE_REBUILD_PASSES {
+            pause.wait_until_entered().await;
+            semantic_fork_queue_primary_batch(&server).await;
+            let held = std::mem::replace(
+                &mut pause,
+                pause_before_stale_install(&primary.canonical_root),
+            );
+            held.resume();
+        }
+        let again = tokio::select! {
+            ended = &mut rebuild => {
+                ended.unwrap();
+                false
+            }
+            () = pause.wait_until_entered() => true,
+        };
+        if again {
+            pause.resume();
+            rebuild.await.unwrap();
+        }
+
+        assert!(!again, "the rebuild ran past its passes");
+    }
+
     /// Refreshes the primary's entry with a new vector for one of its
     /// documents, as a batch of its background fill does; that vector and
     /// its vector generation.

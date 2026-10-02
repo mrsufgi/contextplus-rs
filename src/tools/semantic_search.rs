@@ -1168,6 +1168,8 @@ pub struct CachedSearchIndex {
 const BG_REBUILD_MAX_ABS_DELTA: usize = 200;
 /// Maximum fractional doc-count delta (5%) that qualifies for a background rebuild.
 const BG_REBUILD_MAX_FRAC: f64 = 0.05;
+/// Most walks one stale rebuild runs while changed files queue during them.
+pub(crate) const STALE_REBUILD_PASSES: usize = 3;
 
 /// RAII guard that resets `rebuild_in_progress` on the held `CachedSearchIndex`
 /// when dropped — even on panic — preventing permanent lockout of the fast path.
@@ -2518,8 +2520,9 @@ pub fn format_search_results_with_freshness(
 /// Rebuilds `stale`, the entry in `lock`, in the background from a walk of
 /// `root` and the batches queued on it from `generation` on, unless a rebuild
 /// of it already runs, and again while the entry it installs has batches of
-/// changed files queued during its build; the fill's vectors queued then go
-/// into that entry. The rebuild's task, when this call started it.
+/// changed files queued during its build, up to [`STALE_REBUILD_PASSES`]
+/// walks; the fill's vectors queued then go into that entry. The rebuild's
+/// task, when this call started it.
 pub(crate) fn spawn_stale_rebuild(
     stale: &Arc<CachedSearchIndex>,
     lock: &Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
@@ -2538,7 +2541,7 @@ pub(crate) fn spawn_stale_rebuild(
     let root = root.to_path_buf();
     let mut build_generation = generation;
     let task = tokio::spawn(async move {
-        loop {
+        for pass in 1.. {
             let _reset = RebuildGuard(Arc::clone(&previous));
             let vector_generation = walker.vector_generation(&root).await;
             let (docs, vectors) = match walker.walk_or_install(&root).await {
@@ -2640,6 +2643,7 @@ pub(crate) fn spawn_stale_rebuild(
             *guard = Some(Arc::clone(&installed));
             drop(guard);
             if installed.pending.lock().unwrap().batches.is_empty()
+                || pass == STALE_REBUILD_PASSES
                 || installed
                     .rebuild_in_progress
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
