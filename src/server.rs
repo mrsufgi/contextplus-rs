@@ -298,6 +298,8 @@ impl IdentifierBuild {
         let source = self.source.clone();
         let edited = Arc::downgrade(cache);
         let latest = Arc::clone(&self.latest);
+        #[cfg(test)]
+        let root = owner.root_dir.clone();
         owner.spawn_background_task(async move {
             if let Some(mut previous) = previous {
                 let _ = previous.wait_for(Option::is_some).await;
@@ -317,6 +319,8 @@ impl IdentifierBuild {
                 _ => None,
             };
             sender.send_replace(Some(reparsed));
+            #[cfg(test)]
+            crate::server_adapters::test_seams::after_reparse_publish(&root).await;
         });
         reparses.push((Arc::downgrade(cache), current.clone()));
         Some(current)
@@ -9174,31 +9178,25 @@ mod tests {
             .invalidate_project_cache_with_reason("test edit")
             .await;
         let edited = server.ensure_project_cache().await.unwrap();
+        let pause = crate::server_adapters::test_seams::pause_after_reparse_publish(
+            &server.current_ref().await.root_dir,
+        );
+        build.current.lock().unwrap().clear();
+        let holders = Arc::strong_count(&edited);
 
-        for _ in 0..200 {
-            build.current.lock().unwrap().clear();
-            let observed = Arc::clone(&edited);
-            let holders = Arc::strong_count(&edited);
-            let current = build.reparse(&parsed, &edited).unwrap();
-            let held_after = tokio::task::spawn_blocking(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                while current.borrow().is_none() {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the reparse never published"
-                    );
-                    std::hint::spin_loop();
-                }
-                Arc::strong_count(&observed)
-            })
-            .await
-            .unwrap();
+        let current = build.reparse(&parsed, &edited).unwrap();
+        pause.wait_until_entered().await;
+        let held_after = Arc::strong_count(&edited);
+        pause.resume();
 
-            assert_eq!(
-                held_after, holders,
-                "the reparse published while it held the edited project cache"
-            );
-        }
+        assert!(
+            matches!(*current.borrow(), Some(Some(_))),
+            "the reparse published no documents"
+        );
+        assert_eq!(
+            held_after, holders,
+            "the reparse published while it held the edited project cache"
+        );
         drop(held);
     }
 
