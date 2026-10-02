@@ -270,7 +270,9 @@ impl IdentifierBuild {
 
     /// The reparse of `docs` as of `cache`, started unless one is already,
     /// after the latest one started. The reparses of project caches that are
-    /// gone are dropped.
+    /// gone are dropped; one waiting on the reparse before it holds neither
+    /// project cache, and parses nothing once either is gone or the build has
+    /// ended.
     fn reparse(
         &self,
         docs: &Arc<IdentifierIndex>,
@@ -284,18 +286,36 @@ impl IdentifierBuild {
         {
             return Some(current.clone());
         }
-        let source = self.source.upgrade()?;
+        if self.source.strong_count() == 0 {
+            return None;
+        }
         let owner = self.owner.upgrade()?;
         let previous = reparses.last().map(|(_, current)| current.clone());
         let (sender, current) = tokio::sync::watch::channel(None);
+        let id = self.id;
+        let ref_index = self.owner.clone();
         let docs = Arc::clone(docs);
-        let edited = Arc::clone(cache);
+        let source = self.source.clone();
+        let edited = Arc::downgrade(cache);
         let latest = Arc::clone(&self.latest);
         owner.spawn_background_task(async move {
             if let Some(mut previous) = previous {
                 let _ = previous.wait_for(Option::is_some).await;
             }
-            let reparsed = Self::reparse_after_latest(&latest, docs, source, edited).await;
+            let running = ref_index.upgrade().is_some_and(|owner| {
+                owner
+                    .identifier_build
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|build| build.id == id && build.running())
+            });
+            let reparsed = match (source.upgrade(), edited.upgrade()) {
+                (Some(source), Some(edited)) if running => {
+                    Self::reparse_after_latest(&latest, docs, source, edited).await
+                }
+                _ => None,
+            };
             sender.send_replace(Some(reparsed));
         });
         reparses.push((Arc::downgrade(cache), current.clone()));
@@ -9173,6 +9193,90 @@ mod tests {
             );
         }
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_reparse_queued_behind_another_holds_neither_project_cache() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let source = build.source.upgrade().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let holders = [Arc::strong_count(&source), Arc::strong_count(&second_edit)];
+
+        let _second = build.reparse(&parsed, &second_edit).unwrap();
+
+        assert_eq!(
+            [Arc::strong_count(&source), Arc::strong_count(&second_edit)],
+            holders,
+            "the queued reparse holds a project cache"
+        );
+        drop(stalled);
+        drop(held);
+    }
+
+    /// Waits until the reparse `current` publishes, and returns its documents.
+    async fn published_reparse(
+        mut current: tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            current.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the queued reparse never published")
+        .unwrap()
+        .clone()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn a_queued_reparse_of_a_replaced_project_cache_parses_nothing() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let second = build.reparse(&parsed, &second_edit).unwrap();
+        drop(second_edit);
+        edit_depot(&repo, &server, 2).await;
+
+        drop(stalled);
+
+        let published = published_reparse(second).await;
+        assert!(
+            published.is_none() && build.latest.lock().unwrap().is_none(),
+            "the reparse parsed a project cache since replaced"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_queued_reparse_after_its_build_ends_parses_nothing() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let source = build.source.upgrade().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let second = build.reparse(&parsed, &second_edit).unwrap();
+        drop(held);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), build.clone().finished())
+            .await
+            .expect("the build never ended");
+
+        drop(stalled);
+
+        let published = published_reparse(second).await;
+        assert!(
+            published.is_none() && build.latest.lock().unwrap().is_none(),
+            "the reparse parsed after its build ended"
+        );
+        drop(source);
     }
 
     #[tokio::test]
