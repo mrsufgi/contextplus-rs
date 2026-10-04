@@ -2399,9 +2399,7 @@ impl SearchIndex {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-                    .then_with(|| {
-                        self.documents[a.0].path.cmp(&self.documents[b.0].path)
-                    })
+                    .then_with(|| self.documents[a.0].path.cmp(&self.documents[b.0].path))
             });
             scored.truncate(k);
         }
@@ -2410,9 +2408,7 @@ impl SearchIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
                 .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-                .then_with(|| {
-                    self.documents[a.0].path.cmp(&self.documents[b.0].path)
-                })
+                .then_with(|| self.documents[a.0].path.cmp(&self.documents[b.0].path))
         });
 
         scored

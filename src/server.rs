@@ -2353,23 +2353,17 @@ impl ContextPlusServer {
         if let Some((task, advance)) = slot.as_ref()
             && !task.is_finished()
             && {
-                let mut current = self
-                    .state
-                    .fork_base_advance_state
-                    .load(Ordering::Acquire);
+                let mut current = self.state.fork_base_advance_state.load(Ordering::Acquire);
                 loop {
                     if current == ADVANCE_EXITING {
                         break false;
                     }
-                    match self
-                        .state
-                        .fork_base_advance_state
-                        .compare_exchange_weak(
-                            current,
-                            ADVANCE_RETRIGGERED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
+                    match self.state.fork_base_advance_state.compare_exchange_weak(
+                        current,
+                        ADVANCE_RETRIGGERED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
                         Ok(_) => break true,
                         Err(updated) => current = updated,
                     }
@@ -2509,9 +2503,7 @@ impl ContextPlusServer {
                 "fork base checked"
             );
             let again = moved || {
-                let mut current = state
-                    .fork_base_advance_state
-                    .load(Ordering::Acquire);
+                let mut current = state.fork_base_advance_state.load(Ordering::Acquire);
                 loop {
                     let next = if current == ADVANCE_RETRIGGERED {
                         ADVANCE_RUNNING
