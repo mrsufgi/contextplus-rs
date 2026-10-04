@@ -1368,15 +1368,31 @@ mod tests {
 
     #[tokio::test]
     async fn start_fork_base_registers_an_existing_checkout_in_the_background() {
-        let (_ollama, _primary, _bases, server) = fork_base_daemon().await;
-        let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
-        let existing = tokio::task::spawn_blocking(move || {
-            crate::git::fork_base::ensure_fork_base(&config, &root)
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        drop(existing.expect("a fork base checkout"));
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
+        // Pre-create the checkout via git directly, without acquiring the fd
+        // lock file.  On macOS flock(LOCK_EX|LOCK_NB) can return EWOULDBLOCK
+        // for a brief window after an fd close; calling ensure_fork_base here
+        // and dropping the ForkBase would trigger that race, making the second
+        // ensure_fork_base inside start_fork_base return None.
+        let dir =
+            crate::git::fork_base::fork_base_dir(&server.state.config, primary.path()).unwrap();
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        let sha = fork_base_git(primary.path(), &["rev-parse", "refs/remotes/origin/main"]);
+        fork_base_git(
+            primary.path(),
+            &[
+                "worktree",
+                "add",
+                "-f",
+                "-f",
+                "--detach",
+                "--lock",
+                "--reason",
+                crate::git::fork_base::LOCK_REASON,
+                &dir.to_string_lossy(),
+                &sha,
+            ],
+        );
 
         let registration = start_fork_base(&server)
             .await
