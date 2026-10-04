@@ -185,6 +185,32 @@ pub fn walk_with_config(root_dir: &Path, config: &Config) -> Vec<FileEntry> {
     })
 }
 
+/// Whether a walk of `root_dir` enters its subdirectory `prefix`, and so
+/// finds under it every file a walk of `prefix` finds: a walk skips paths
+/// under hidden, gitignored or ignored directories, but not under the one it
+/// starts in.
+pub fn walk_enters(root_dir: &Path, prefix: &Path, ignore_dirs: &HashSet<String>) -> bool {
+    if prefix.components().any(|segment| {
+        let segment = segment.as_os_str().to_string_lossy();
+        segment.starts_with('.') || ignore_dirs.contains(segment.as_ref())
+    }) {
+        return false;
+    }
+    let target = root_dir.join(prefix);
+    let mut builder = WalkBuilder::new(root_dir);
+    builder.hidden(true);
+    builder.git_ignore(true);
+    builder.git_global(false);
+    builder.git_exclude(true);
+    builder.max_depth(Some(prefix.components().count()));
+    let on_the_way = target.clone();
+    builder.filter_entry(move |entry| on_the_way.starts_with(entry.path()));
+    builder
+        .build()
+        .flatten()
+        .any(|entry| entry.path() == target)
+}
+
 /// Group file entries by their parent directory.
 pub fn group_by_directory(
     entries: &[FileEntry],

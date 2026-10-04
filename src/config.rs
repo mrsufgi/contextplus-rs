@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Controls how the embedding tracker starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +208,16 @@ pub struct Config {
     /// background batches leave.
     /// Controlled by `CONTEXTPLUS_OLLAMA_MAX_CONCURRENT` (default: 4, clamped to [1, 64]).
     pub ollama_max_concurrent: usize,
+    /// The ref a fork base checkout tracks, such as `origin/main`; `None` turns
+    /// the fork base off. Controlled by `CONTEXTPLUS_FORK_BASE` (default: off).
+    pub fork_base: Option<String>,
+    /// The directory holding a fork base checkout per repository.
+    /// Controlled by `CONTEXTPLUS_FORK_BASE_DIR` (default:
+    /// `$XDG_CACHE_HOME/contextplus/fork-base`).
+    pub fork_base_dir: Option<PathBuf>,
+    /// The least time between two advances of the fork base.
+    /// Controlled by `CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS` (default: 1800).
+    pub fork_base_min_advance_secs: u64,
 }
 
 const DEFAULT_QUERY_BATCH_SIZE: usize = 1;
@@ -217,6 +227,7 @@ const DEFAULT_OLLAMA_MAX_CONCURRENT: usize = 4;
 /// while it builds, so this leaves room for several worktrees.
 const DEFAULT_RESIDENT_MEMORY_BUDGET_MB: usize = 4096;
 const DEFAULT_MEMORY_BUDGET_MIN_IDLE_SECS: u64 = 900;
+const DEFAULT_FORK_BASE_MIN_ADVANCE_SECS: u64 = 1800;
 const MIN_OLLAMA_MAX_CONCURRENT: usize = 1;
 const MAX_OLLAMA_MAX_CONCURRENT: usize = 64;
 
@@ -705,6 +716,22 @@ impl Config {
                 DEFAULT_OLLAMA_MAX_CONCURRENT,
             )
             .clamp(MIN_OLLAMA_MAX_CONCURRENT, MAX_OLLAMA_MAX_CONCURRENT),
+            fork_base: env_nonempty(env, "CONTEXTPLUS_FORK_BASE"),
+            fork_base_dir: env_nonempty(env, "CONTEXTPLUS_FORK_BASE_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    env_nonempty(env, "XDG_CACHE_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            env_nonempty(env, "HOME").map(|home| Path::new(&home).join(".cache"))
+                        })
+                        .map(|cache| cache.join("contextplus").join("fork-base"))
+                }),
+            fork_base_min_advance_secs: env_parse(
+                env,
+                "CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS",
+                DEFAULT_FORK_BASE_MIN_ADVANCE_SECS,
+            ),
         }
     }
 }
@@ -1616,5 +1643,41 @@ mod tests {
             "120".to_string(),
         )]);
         assert_eq!(Config::from_env_map(&env).memory_budget_min_idle_secs, 120);
+    }
+
+    #[test]
+    fn config_fork_base_reads_the_env_map() {
+        let unset = Config::from_env_map(&HashMap::from([(
+            "XDG_CACHE_HOME".to_string(),
+            "/cache".to_string(),
+        )]));
+        assert_eq!(unset.fork_base, None);
+        assert_eq!(
+            unset.fork_base_dir,
+            Some(PathBuf::from("/cache/contextplus/fork-base"))
+        );
+        assert_eq!(unset.fork_base_min_advance_secs, 1800);
+
+        let env = HashMap::from([
+            (
+                "CONTEXTPLUS_FORK_BASE".to_string(),
+                "origin/main".to_string(),
+            ),
+            (
+                "CONTEXTPLUS_FORK_BASE_DIR".to_string(),
+                "/bases".to_string(),
+            ),
+            (
+                "CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS".to_string(),
+                "60".to_string(),
+            ),
+        ]);
+        let config = Config::from_env_map(&env);
+        assert_eq!(config.fork_base.as_deref(), Some("origin/main"));
+        assert_eq!(config.fork_base_dir, Some(PathBuf::from("/bases")));
+        assert_eq!(config.fork_base_min_advance_secs, 60);
+
+        let empty = HashMap::from([("CONTEXTPLUS_FORK_BASE".to_string(), String::new())]);
+        assert_eq!(Config::from_env_map(&empty).fork_base, None);
     }
 }

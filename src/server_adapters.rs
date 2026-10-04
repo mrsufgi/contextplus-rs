@@ -96,6 +96,60 @@ pub(crate) mod test_seams {
         pause
     }
 
+    fn parent_refresh_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>
+    {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the task of a parent rebuild a refresh of the ref at `root` started.
+    pub(crate) fn parent_refreshed(root: &Path, task: tokio::task::JoinHandle<()>) {
+        parent_refresh_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(task);
+    }
+
+    /// The parent rebuilds refreshes of the ref at `root` started.
+    pub(crate) fn take_parent_refreshes(root: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+        parent_refresh_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
+    fn stale_rebuild_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>
+    {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the task of a whole-root rebuild a subdirectory search of the
+    /// ref at `root` started.
+    pub(crate) fn stale_rebuild_started(root: &Path, task: tokio::task::JoinHandle<()>) {
+        stale_rebuild_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(task);
+    }
+
+    /// The whole-root rebuilds subdirectory searches of the ref at `root`
+    /// started.
+    pub(crate) fn take_stale_rebuilds(root: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+        stale_rebuild_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn after_budget_clear(root: &Path) {
         let pause = budget_clear_slots().lock().unwrap().remove(root);
         if let Some(pause) = pause {
@@ -168,6 +222,300 @@ pub(crate) mod test_seams {
 
     pub(crate) async fn after_reparse_publish(root: &Path) {
         let pause = reparse_publish_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn choose_parent_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next worktree attach of `root` after it chose a parent.
+    pub(crate) fn pause_after_choose_parent(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        choose_parent_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_choose_parent(root: &Path) {
+        let pause = choose_parent_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn fork_base_settle_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses choosing the parent of the worktree at `root` before it waits
+    /// for the fork base to settle.
+    pub(crate) fn pause_before_fork_base_settles(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fork_base_settle_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_fork_base_settles(root: &Path) {
+        let pause = fork_base_settle_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn fork_base_resolve_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next advance pass of the fork base rooted at `root` after
+    /// it resolved the commit its ref names.
+    pub(crate) fn pause_after_fork_base_resolve(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fork_base_resolve_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_fork_base_resolve(root: &Path) {
+        let pause = fork_base_resolve_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn fork_base_checkout_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next advance pass of the fork base rooted at `root` after
+    /// it moved the checkout, before its index catches up.
+    pub(crate) fn pause_after_fork_base_checkout(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fork_base_checkout_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_fork_base_checkout(root: &Path) {
+        let pause = fork_base_checkout_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn reembed_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next re-embed of changed files of the ref at `root` before
+    /// it sends them to Ollama.
+    pub(crate) fn pause_before_reembed(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        reembed_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_reembed(root: &Path) {
+        let pause = reembed_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn embeds_wait_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next tracked refresh of the ref at `root` before it waits
+    /// for the changed files another re-embed is sending.
+    pub(crate) fn pause_before_embeds_wait(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        embeds_wait_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_embeds_wait(root: &Path) {
+        let pause = embeds_wait_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn fill_start_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next background fill of the ref at `root` before its first
+    /// batch.
+    pub(crate) fn pause_fill_start(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fill_start_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn fill_start(root: &Path) {
+        let pause = fill_start_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn fill_slots() -> &'static Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the task of a background fill of the ref at `root`.
+    pub(crate) fn fill_started(root: &Path, task: tokio::task::JoinHandle<()>) {
+        fill_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(task);
+    }
+
+    /// The background fills of the ref at `root` started.
+    pub(crate) fn take_fills(root: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+        fill_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
+    fn remote_ref_advance_slots()
+    -> &'static Mutex<BTreeMap<PathBuf, Vec<crate::server::ForkBaseAdvance>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<crate::server::ForkBaseAdvance>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the advance a move of a remote-tracking ref started for the fork
+    /// base at `root`.
+    pub(crate) fn remote_ref_advanced(root: &Path, advance: crate::server::ForkBaseAdvance) {
+        remote_ref_advance_slots()
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(advance);
+    }
+
+    /// The advances moves of remote-tracking refs started for the fork base
+    /// at `root`.
+    pub(crate) fn take_remote_ref_advances(root: &Path) -> Vec<crate::server::ForkBaseAdvance> {
+        remote_ref_advance_slots()
+            .lock()
+            .unwrap()
+            .remove(root)
+            .unwrap_or_default()
+    }
+
+    /// Waits out the fork base's fills, the parent rebuilds they started and
+    /// the advances they triggered, until none is left running.
+    pub(crate) async fn settle_fork_base(state: &crate::server::SharedState) {
+        let base_id = *state.fork_base_ref_id.get().expect("a fork base");
+        let root = state
+            .ref_index(base_id)
+            .await
+            .unwrap()
+            .canonical_root
+            .clone();
+        loop {
+            if let Some(advance) = state.fork_base_advance_task() {
+                advance.await;
+            }
+            let tasks: Vec<_> = take_fills(&root)
+                .into_iter()
+                .chain(take_parent_refreshes(&root))
+                .collect();
+            if tasks.is_empty() {
+                return;
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        }
+    }
+
+    fn stale_install_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next stale rebuild of `root` once built, before it installs.
+    pub(crate) fn pause_before_stale_install(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        stale_install_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_stale_install(root: &Path) {
+        let pause = stale_install_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
+    fn parent_rebuild_wait_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next worktree catch-up of the parent rooted at `root`
+    /// before it waits for a rebuild of the parent another caller started.
+    pub(crate) fn pause_before_parent_rebuild_wait(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        parent_rebuild_wait_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn before_parent_rebuild_wait(root: &Path) {
+        let pause = parent_rebuild_wait_slots().lock().unwrap().remove(root);
         if let Some(pause) = pause {
             pause.entered.add_permits(1);
             pause.resume.acquire().await.unwrap().forget();
@@ -280,6 +628,17 @@ pub(crate) mod test_seams {
         );
     }
 
+    /// Whether the background fill of `ref_index` runs.
+    pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
+        ref_index.semantic_fill.lock().await.running
+    }
+
+    /// Marks the background fill of `ref_index` running, with no task behind
+    /// it.
+    pub(crate) async fn mark_fill_running(ref_index: &crate::ref_index::RefIndex) {
+        ref_index.semantic_fill.lock().await.running = true;
+    }
+
     pub(crate) async fn pending_hash(
         ref_index: &crate::ref_index::RefIndex,
         path: &str,
@@ -291,10 +650,6 @@ pub(crate) mod test_seams {
             .pending
             .get(path)
             .map(|document| document.hash.clone())
-    }
-
-    pub(crate) async fn fill_running(ref_index: &crate::ref_index::RefIndex) -> bool {
-        ref_index.semantic_fill.lock().await.running
     }
 
     pub(crate) struct BlockingPause {
@@ -536,6 +891,36 @@ impl RefWalkerIndexer {
         current.then_some((entry, prefix))
     }
 
+    /// The ref's semantic entry of its whole root, current or not, when
+    /// `root` lies inside it, with `root`'s path inside it.
+    pub(crate) async fn whole_root_index(
+        &self,
+        root: &Path,
+    ) -> Option<(Arc<CachedSearchIndex>, std::path::PathBuf)> {
+        let entry = self.ref_index.search_index_cache.read().await.clone()?;
+        if entry.search_root() != self.ref_index.canonical_root {
+            return None;
+        }
+        let canonical = tokio::fs::canonicalize(root).await.ok()?;
+        let prefix = canonical
+            .strip_prefix(entry.search_root())
+            .ok()?
+            .to_path_buf();
+        Some((entry, prefix))
+    }
+
+    /// Whether an entry walked from `search_root` holds every file a walk of
+    /// its subdirectory `prefix` finds.
+    pub(crate) async fn walk_enters(&self, search_root: &Path, prefix: &Path) -> bool {
+        let (root, prefix) = (search_root.to_path_buf(), prefix.to_path_buf());
+        let ignore_dirs = self.walker.config.ignore_dirs.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::core::walker::walk_enters(&root, &prefix, &ignore_dirs)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Expires a worktree's semantic entry when its parent holds a forkable
     /// vector store the worktree has not forked or been refused, so a query of
     /// its whole `root` walks and re-forks.
@@ -613,6 +998,14 @@ impl WalkAndIndexFn for RefWalkerIndexer {
     fn track_background_task(&self, task: &tokio::task::JoinHandle<()>) {
         self.ref_index.track_background_task(task);
     }
+
+    fn ref_id(&self) -> &str {
+        &self.ref_index.cas_ref_id_hex
+    }
+
+    fn ref_root(&self) -> Option<&Path> {
+        Some(&self.ref_index.canonical_root)
+    }
 }
 
 impl CachedWalkerIndexer {
@@ -681,9 +1074,24 @@ impl CachedWalkerIndexer {
                 .and_then(|entry| entry.pending_vector_dimensions());
             let base =
                 base.filter(|base| replacement_dims.is_none_or(|dims| dims == base.index.dims()));
+            if let (Some(parent), None) = (&fork_parent, &base) {
+                let entry = parent.search_index_cache.read().await.clone();
+                let clause = match &entry {
+                    Some(entry) => entry
+                        .unforkable_clause(&parent.canonical_root)
+                        .unwrap_or("dimensions"),
+                    None => "no_index",
+                };
+                log_fork_refusal(
+                    &ref_index,
+                    parent,
+                    entry.as_ref().and_then(|entry| entry.index.vector_store()),
+                    ForkRefusal::not_forkable(clause),
+                );
+            }
             let mut walked = None;
             if let (Some(parent), Some(base)) = (&fork_parent, &base) {
-                match self.fork_documents(&root, parent, base).await {
+                match self.fork_documents(&root, &ref_index, parent, base).await {
                     Ok(forked) => {
                         return self
                             .fork_walk(
@@ -711,15 +1119,20 @@ impl CachedWalkerIndexer {
             if docs.is_empty() {
                 return Ok(WalkOutcome::Documents(docs, Vec::new()));
             }
-            if let (Some(parent), Some(base)) = (&fork_parent, &base)
-                && let Some(shared) = Shared::of(&base.index, &docs)
-            {
-                let forked = shared.forked(docs, content_hashes, embedding_texts);
-                return self
-                    .fork_walk(
-                        &root, &ref_index, parent, base, forked, walk_start, documents,
-                    )
-                    .await;
+            if let (Some(parent), Some(base)) = (&fork_parent, &base) {
+                match Shared::of(&base.index, &docs) {
+                    Ok(shared) => {
+                        let forked = shared.forked(docs, content_hashes, embedding_texts);
+                        return self
+                            .fork_walk(
+                                &root, &ref_index, parent, base, forked, walk_start, documents,
+                            )
+                            .await;
+                    }
+                    Err(refusal) => {
+                        log_fork_refusal(&ref_index, parent, base.index.vector_store(), refusal)
+                    }
+                }
             }
             let vectors = self
                 .walk_vectors(&root, &ref_index, &content_hashes, &embedding_texts, true)
@@ -913,13 +1326,22 @@ impl CachedWalkerIndexer {
             ancestor_id = ancestor.parent_ref_id;
         }
         // A fork's entry holds the vectors it took from a parent that has since
-        // moved off their content; they become this ref's own.
-        let unfound: Vec<usize> = uncached_indices
-            .iter()
-            .copied()
-            .filter(|&idx| vectors[idx].is_none())
-            .collect();
-        if !unfound.is_empty() {
+        // moved off their content; they become this ref's own. The fork base,
+        // no worktree of the primary, takes the primary's of identical files.
+        let fork_base = self.state.fork_base_ref_id.get()
+            == Some(&crate::ref_index::RefId::for_canonical_path(
+                &ref_index.canonical_root,
+            ));
+        let primary = fork_base.then(|| self.state.default_ref()).flatten();
+        for holder in std::iter::once(ref_index.as_ref()).chain(primary.as_deref()) {
+            let unfound: Vec<usize> = uncached_indices
+                .iter()
+                .copied()
+                .filter(|&idx| vectors[idx].is_none())
+                .collect();
+            if unfound.is_empty() {
+                break;
+            }
             let wanted: Vec<(&str, &str)> = unfound
                 .iter()
                 .map(|&idx| {
@@ -927,7 +1349,7 @@ impl CachedWalkerIndexer {
                     (path.as_str(), hash.as_str())
                 })
                 .collect();
-            for (idx, vector) in unfound.iter().zip(held_vectors(ref_index, &wanted).await) {
+            for (idx, vector) in unfound.iter().zip(held_vectors(holder, &wanted).await) {
                 if let Some((_, vector)) = vector {
                     vectors[*idx] = Some(vector.clone());
                     let hash = content_hashes[*idx].1.clone();
@@ -1053,24 +1475,23 @@ impl CachedWalkerIndexer {
                     continue;
                 }
                 doc.owner = None;
+            } else if ref_index.reembedding.lock().unwrap().get(path) == Some(hash) {
+                // Left to the re-embed sending it; the fill takes it if that fails.
+                doc.owner = None;
             } else {
                 pending.push((idx, doc.clone()));
             }
             fill.pending.insert(path.clone(), doc);
         }
         drop(cache);
-        if !fill.running && !fill.pending.is_empty() {
-            fill.running = true;
-            let owner = Arc::clone(ref_index);
-            let ollama = ollama.clone();
-            let config = config.clone();
-            let parent_vectors = parent_vectors.clone();
-            let state = Arc::clone(&self.state);
-            let task = tokio::spawn(async move {
-                run_fill(state, owner, ollama, config, parent_vectors).await;
-            });
-            ref_index.track_background_task(&task);
-        }
+        start_fill(
+            &mut fill,
+            &self.state,
+            ref_index,
+            ollama,
+            config,
+            parent_vectors,
+        );
         drop(fill);
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(config.embed_budget_ms);
@@ -1168,6 +1589,8 @@ impl CachedWalkerIndexer {
         if queued > 0 {
             tracing::warn!(
                 queued,
+                ref_id = %ref_index.cas_ref_id_hex,
+                root = %ref_index.canonical_root.display(),
                 "semantic_code_search returning partial results; leftovers queued for background fill"
             );
         }
@@ -1385,18 +1808,25 @@ impl CachedWalkerIndexer {
     async fn fork_documents(
         &self,
         root: &Path,
+        ref_index: &crate::ref_index::RefIndex,
         parent: &Arc<crate::ref_index::RefIndex>,
         base: &Arc<CachedSearchIndex>,
     ) -> std::result::Result<Forked, Option<WalkedFiles>> {
+        let refused = |refusal| {
+            log_fork_refusal(ref_index, parent, base.index.vector_store(), refusal);
+        };
         // The flat file cache the primary holds, however old: its clean blobs
         // and contents were recorded together. A walk never builds one.
-        let files = parent
+        let Some(files) = parent
             .project_cache
             .read()
             .await
             .clone()
             .filter(|cache| cache.file_content.base().is_none())
-            .ok_or(None)?;
+        else {
+            refused(ForkRefusal::reason("no_parent_cache"));
+            return Err(None);
+        };
         let started = std::time::Instant::now();
         let config = self.config.clone();
         let walk_root = root.to_path_buf();
@@ -1409,6 +1839,7 @@ impl CachedWalkerIndexer {
         );
         let max_size = self.config.max_embed_file_size;
         if files.file_content.base().is_none() {
+            refused(ForkRefusal::reason("flat_cache"));
             return Err(Some(
                 files
                     .file_entries
@@ -1470,20 +1901,24 @@ impl CachedWalkerIndexer {
         })
         .await
         .map_err(|_| None)?;
-        let Some(forked) = forked else {
-            // Refused: the standalone walk takes the contents at hand.
-            return Err(walked
-                .into_iter()
-                .map(|(path, walked)| match walked {
-                    Walked::Shared(_) => {
-                        let content = files.file_content.get(&path).cloned();
-                        Some((path, content))
-                    }
-                    Walked::Read(Some(content)) => Some((path, Some(content))),
-                    Walked::Skipped => Some((path, None)),
-                    Walked::Read(None) => None,
-                })
-                .collect());
+        let forked = match forked {
+            Ok(forked) => forked,
+            Err(refusal) => {
+                refused(refusal);
+                // Refused: the standalone walk takes the contents at hand.
+                return Err(walked
+                    .into_iter()
+                    .map(|(path, walked)| match walked {
+                        Walked::Shared(_) => {
+                            let content = files.file_content.get(&path).cloned();
+                            Some((path, content))
+                        }
+                        Walked::Read(Some(content)) => Some((path, Some(content))),
+                        Walked::Skipped => Some((path, None)),
+                        Walked::Read(None) => None,
+                    })
+                    .collect());
+            }
         };
         tracing::info!(
             phase = "semantic_walk",
@@ -1540,6 +1975,11 @@ impl CachedWalkerIndexer {
         let root = ref_index.canonical_root.clone();
         let (generation, vector_generation) = (start.generation, start.vector_generation);
         let (changed_count, deleted_count) = (changed.len(), deleted.len());
+        let threshold =
+            ForkRefusal::threshold(changed_count, deleted_count, base.index.document_count());
+        let store_of_base = base.index.vector_store().cloned();
+        let (lag, whole_root) = parent_lag(parent, &base);
+        let drift = self.fork_base_drift(ref_index, parent).await;
         let fork = tokio::task::spawn_blocking(move || {
             base.fork_delta(
                 &root,
@@ -1555,6 +1995,9 @@ impl CachedWalkerIndexer {
         .ok()
         .flatten();
         let Some(fork) = fork else {
+            if let Err(refusal) = threshold {
+                log_fork_refusal(ref_index, parent, store_of_base.as_ref(), refusal);
+            }
             record();
             return None;
         };
@@ -1566,6 +2009,7 @@ impl CachedWalkerIndexer {
         };
         if installed.is_some() {
             record();
+            ref_index.fork_refused.lock().unwrap().clear();
         }
         tracing::info!(
             phase = "semantic_fork",
@@ -1574,14 +2018,37 @@ impl CachedWalkerIndexer {
             installed = installed.is_some(),
             changed = changed_count,
             deleted = deleted_count,
+            parent_generation_lag = lag,
+            parent_whole_root = whole_root,
+            drift_files = drift,
             elapsed_ms = started.elapsed().as_millis(),
             "cold-start phase"
         );
         installed
     }
 
+    /// The files a worktree of the fork base differs in from the commit of
+    /// the fork base's index; `None` for a worktree of the primary.
+    async fn fork_base_drift(
+        &self,
+        ref_index: &crate::ref_index::RefIndex,
+        parent: &crate::ref_index::RefIndex,
+    ) -> Option<usize> {
+        let base = crate::ref_index::RefId::for_canonical_path(&parent.canonical_root);
+        if self.state.fork_base_ref_id.get() != Some(&base) {
+            return None;
+        }
+        let indexed = self.state.fork_base_indexed_head.lock().unwrap().clone()?;
+        let root = ref_index.canonical_root.clone();
+        tokio::task::spawn_blocking(move || crate::git::fork_base::drift_files(&root, &indexed))
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Builds the parent's index of its whole root when the parent holds none,
-    /// as after a restart, and installs it so a worktree can fork it.
+    /// as after a restart, or a scoped one, and installs it so a worktree can
+    /// fork it, catching up one its queued batches leave unforkable.
     async fn build_parent_index(
         &self,
         parent: &Arc<crate::ref_index::RefIndex>,
@@ -1590,9 +2057,60 @@ impl CachedWalkerIndexer {
         if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
             return;
         }
-        if parent.search_index_cache.read().await.is_some() {
+        self.build_whole_root_index(parent).await;
+        self.catch_up_parent(parent).await;
+    }
+
+    /// Rebuilds the parent's index of its whole root from cached vectors when
+    /// only its queued batches keep a worktree from forking it, as when they
+    /// queued with no worktree attached, and waits for the rebuild, or for
+    /// the one already running, at most the embed budget.
+    async fn catch_up_parent(&self, parent: &Arc<crate::ref_index::RefIndex>) {
+        let behind = parent
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|entry| {
+                matches!(
+                    entry.unforkable_clause(&parent.canonical_root),
+                    Some("batches_queued" | "rebuild_in_progress")
+                )
+            });
+        if !behind {
             return;
         }
+        let rebuild = refresh_fork_parent(&self.state, parent).await;
+        let caught_up = async {
+            match rebuild {
+                Some(rebuild) => {
+                    let _ = rebuild.await;
+                }
+                None => {
+                    #[cfg(test)]
+                    test_seams::before_parent_rebuild_wait(&parent.canonical_root).await;
+                    crate::tools::semantic_search::stale_rebuild_ended(&parent.search_index_cache)
+                        .await;
+                }
+            }
+        };
+        let budget = std::time::Duration::from_millis(self.config.embed_budget_ms);
+        let _ = tokio::time::timeout(budget, caught_up).await;
+    }
+
+    /// Builds and installs the index of `parent`'s whole root unless it holds
+    /// one.
+    pub(crate) async fn build_whole_root_index(&self, parent: &Arc<crate::ref_index::RefIndex>) {
+        let seen = {
+            let current = parent.search_index_cache.read().await;
+            if current
+                .as_ref()
+                .is_some_and(|entry| entry.search_root() == parent.canonical_root)
+            {
+                return;
+            }
+            current.as_ref().map(Arc::downgrade)
+        };
         let generation = parent
             .cache_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1631,7 +2149,7 @@ impl CachedWalkerIndexer {
         else {
             return;
         };
-        let installed = entry.install(&mut *parent.search_index_cache.write().await, None);
+        let installed = entry.install(&mut *parent.search_index_cache.write().await, seen.as_ref());
         tracing::info!(
             phase = "semantic_parent_index",
             ref_id = %parent.cas_ref_id_hex,
@@ -1674,6 +2192,8 @@ impl CachedWalkerIndexer {
         }
         let started = std::time::Instant::now();
         let (generation, vector_generation) = (start.generation, start.vector_generation);
+        let (lag, whole_root) = parent_lag(parent, &base);
+        let drift = self.fork_base_drift(ref_index, parent).await;
         let (docs, vectors, fork) = tokio::task::spawn_blocking(move || {
             let fork = base.fork(&root, &docs, &vectors, generation, vector_generation);
             (docs, vectors, fork)
@@ -1690,12 +2210,16 @@ impl CachedWalkerIndexer {
         );
         if installed {
             record();
+            ref_index.fork_refused.lock().unwrap().clear();
         }
         tracing::info!(
             phase = "semantic_fork",
             ref_id = %ref_index.cas_ref_id_hex,
             parent_ref_id = %parent.cas_ref_id_hex,
             installed,
+            parent_generation_lag = lag,
+            parent_whole_root = whole_root,
+            drift_files = drift,
             elapsed_ms = started.elapsed().as_millis(),
             "cold-start phase"
         );
@@ -1776,20 +2300,28 @@ impl CachedWalkerIndexer {
             .then(Default::default)
     }
 
-    /// The parent a worktree's warmup forks, its index built first from its
-    /// cached vectors when it holds none: the warmup makes no Ollama call.
+    /// The parent a worktree's warmup forks, its index of its whole root built
+    /// or caught up first from its cached vectors: the warmup makes no Ollama
+    /// call.
     async fn warmup_parent(
         &self,
         ref_index: &crate::ref_index::RefIndex,
     ) -> Option<Arc<crate::ref_index::RefIndex>> {
         let parent = self.state.ref_index(ref_index.parent_ref_id?).await?;
-        if parent.parent_ref_id.is_none()
-            && parent.canonical_root != ref_index.canonical_root
-            && parent.search_index_cache.read().await.is_none()
+        if parent.parent_ref_id.is_some() || parent.canonical_root == ref_index.canonical_root {
+            return Some(parent);
+        }
+        if parent
+            .search_index_cache
+            .read()
+            .await
+            .as_ref()
+            .is_none_or(|entry| entry.search_root() != parent.canonical_root)
             && let Some(files) = parent.project_cache.read().await.clone()
         {
             self.primary_warmup(&parent, &files).await;
         }
+        self.catch_up_parent(&parent).await;
         Some(parent)
     }
 
@@ -1852,7 +2384,7 @@ impl CachedWalkerIndexer {
                 })
                 .collect();
             let Forked { documents, deleted } =
-                Forked::of(&walked, &classify_base.index, doc_shape)?;
+                Forked::of(&walked, &classify_base.index, doc_shape).ok()?;
             let fingerprint =
                 IndexFingerprint::of(documents.iter().map(|document| match document {
                     ForkDocument::Shared(at) => &classify_base.index.documents()[*at],
@@ -2452,13 +2984,13 @@ struct Forked {
 }
 
 impl Forked {
-    /// The documents of the classified files `walked` over `base`; `None`
+    /// The documents of the classified files `walked` over `base`, refused
     /// when the worktree's own changes pass the promotion threshold.
     fn of(
         walked: &[(String, Walked)],
         base: &SearchIndex,
         doc_shape: crate::config::EmbedDocShape,
-    ) -> Option<Self> {
+    ) -> std::result::Result<Self, ForkRefusal> {
         use rayon::prelude::*;
         let held = positions_by_path(base);
         let parent_documents: HashMap<&str, &SearchDocument> = base
@@ -2503,10 +3035,8 @@ impl Forked {
             .iter()
             .filter(|document| matches!(document, ForkDocument::Own(_)))
             .count();
-        ((changed + deleted.len()) as f64
-            <= base.documents().len() as f64
-                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION)
-            .then_some(Self { documents, deleted })
+        ForkRefusal::threshold(changed, deleted.len(), base.documents().len())?;
+        Ok(Self { documents, deleted })
     }
 }
 
@@ -2520,8 +3050,8 @@ struct Shared {
 }
 
 impl Shared {
-    /// `None` when the walk's own changes pass the promotion threshold.
-    fn of(base: &SearchIndex, docs: &[SearchDocument]) -> Option<Self> {
+    /// Refused when the walk's own changes pass the promotion threshold.
+    fn of(base: &SearchIndex, docs: &[SearchDocument]) -> std::result::Result<Self, ForkRefusal> {
         let held: HashMap<&str, usize> = base
             .documents()
             .iter()
@@ -2549,10 +3079,8 @@ impl Shared {
             .map(|doc| doc.path.clone())
             .collect();
         let changed = positions.iter().filter(|at| at.is_none()).count();
-        ((changed + deleted.len()) as f64
-            <= base.documents().len() as f64
-                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION)
-            .then_some(Self { positions, deleted })
+        ForkRefusal::threshold(changed, deleted.len(), base.documents().len())?;
+        Ok(Self { positions, deleted })
     }
 
     /// The walked `docs`, with their content hashes and embedding texts, over
@@ -2578,6 +3106,164 @@ impl Shared {
             deleted: self.deleted,
         }
     }
+}
+
+/// Why a worktree's walk did not fork its parent's index.
+#[derive(Clone, Copy, Debug)]
+struct ForkRefusal {
+    reason: &'static str,
+    /// The clause of [`CachedSearchIndex::forkable_at`] the parent failed.
+    clause: Option<&'static str>,
+    changed: usize,
+    deleted: usize,
+    limit: usize,
+}
+
+/// The parent's vector store, reason and clause of a logged fork refusal.
+pub(crate) type ForkRefusalKey = (usize, &'static str, Option<&'static str>);
+
+impl ForkRefusal {
+    fn reason(reason: &'static str) -> Self {
+        Self {
+            reason,
+            clause: None,
+            changed: 0,
+            deleted: 0,
+            limit: 0,
+        }
+    }
+
+    fn not_forkable(clause: &'static str) -> Self {
+        Self {
+            clause: Some(clause),
+            ..Self::reason("not_forkable")
+        }
+    }
+
+    /// Refused when `changed` and `deleted` documents pass the promotion
+    /// threshold of a parent index of `documents`.
+    fn threshold(
+        changed: usize,
+        deleted: usize,
+        documents: usize,
+    ) -> std::result::Result<(), Self> {
+        let limit = documents as f64 * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION;
+        if (changed + deleted) as f64 <= limit {
+            return Ok(());
+        }
+        Err(Self {
+            changed,
+            deleted,
+            limit: limit as usize,
+            ..Self::reason("over_threshold")
+        })
+    }
+}
+
+/// Logs why `ref_index` did not fork `parent`'s index over `store`, once per
+/// store and refusal.
+fn log_fork_refusal(
+    ref_index: &crate::ref_index::RefIndex,
+    parent: &crate::ref_index::RefIndex,
+    store: Option<&Arc<crate::core::embeddings::VectorStore>>,
+    refusal: ForkRefusal,
+) {
+    let key = (
+        store.map_or(0, |store| Arc::as_ptr(store) as usize),
+        refusal.reason,
+        refusal.clause,
+    );
+    if !ref_index.fork_refused.lock().unwrap().insert(key) {
+        return;
+    }
+    tracing::info!(
+        phase = "semantic_fork_refused",
+        ref_id = %ref_index.cas_ref_id_hex,
+        root = %ref_index.canonical_root.display(),
+        parent_ref_id = %parent.cas_ref_id_hex,
+        reason = refusal.reason,
+        clause = refusal.clause.unwrap_or("none"),
+        changed = refusal.changed,
+        deleted = refusal.deleted,
+        limit = refusal.limit,
+        "cold-start phase"
+    );
+}
+
+/// Rebuilds the index of `ref_index`, a parent of attached worktrees, in the
+/// background from cached vectors when it is behind its tracker, so they
+/// fork it without waiting for its next query. The rebuild's task, when this
+/// call started it.
+pub(crate) async fn refresh_fork_parent(
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+    let fork_base = state.is_fork_base(ref_index);
+    if ref_index.parent_ref_id.is_some()
+        || !fork_base && state.attached_children(ref_index).await.is_empty()
+    {
+        return None;
+    }
+    let entry = ref_index.search_index_cache.read().await.clone()?;
+    let generation = ref_index.cache_generation.load(Ordering::Acquire);
+    if entry.search_root() != ref_index.canonical_root || !entry.is_behind(generation) {
+        return None;
+    }
+    // Vectors the cache lacks are left to the fill, not embedded by the walk.
+    let mut config = state.config.clone();
+    config.embed_budget_ms = 0;
+    let walker: Arc<dyn WalkAndIndexFn> = Arc::new(RefWalkerIndexer {
+        walker: CachedWalkerIndexer {
+            config,
+            ollama: state.ollama.clone(),
+            state: Arc::clone(state),
+        },
+        ref_index: Arc::clone(ref_index),
+    });
+    let rebuild = crate::tools::semantic_search::spawn_stale_rebuild(
+        &entry,
+        &ref_index.search_index_cache,
+        generation,
+        &walker,
+        &ref_index.canonical_root,
+    )?;
+    if !fork_base {
+        return Some(rebuild);
+    }
+    let state = Arc::clone(state);
+    Some(tokio::spawn(async move {
+        let _ = rebuild.await;
+        state.recheck_fork_base();
+    }))
+}
+
+/// The tracker generations `parent` moved since its entry `base` was built,
+/// and whether `base` indexes its whole root.
+fn parent_lag(parent: &crate::ref_index::RefIndex, base: &CachedSearchIndex) -> (u64, bool) {
+    use std::sync::atomic::Ordering;
+    (
+        parent
+            .cache_generation
+            .load(Ordering::Acquire)
+            .saturating_sub(base.generation.load(Ordering::Acquire)),
+        base.search_root() == parent.canonical_root,
+    )
+}
+
+/// The vectors the background fill of `ref_index` still owes while it runs.
+pub(crate) async fn fill_owed(ref_index: &crate::ref_index::RefIndex) -> Option<usize> {
+    let fill = ref_index.semantic_fill.lock().await;
+    fill.running.then(|| fill.pending.len())
+}
+
+/// Whether `entry`, the index of `ref_index`, holds the vectors its fill
+/// still owes: nothing queued to fill, or a vector for every document.
+pub(crate) async fn vectors_filled(
+    ref_index: &crate::ref_index::RefIndex,
+    entry: &CachedSearchIndex,
+) -> bool {
+    entry.has_every_vector() || ref_index.semantic_fill.lock().await.pending.is_empty()
 }
 
 /// The parent's semantic index when a worktree can fork it.
@@ -2642,6 +3328,14 @@ pub(crate) struct SemanticFill {
 }
 
 impl SemanticFill {
+    /// Drops the pending document of `path` at `hash`, which a re-embed
+    /// embedded.
+    pub(crate) fn embedded(&mut self, path: &str, hash: &str) {
+        if self.pending.get(path).is_some_and(|doc| doc.hash == hash) {
+            self.pending.remove(path);
+        }
+    }
+
     fn failed(&self, doc: &FillDocument) -> bool {
         self.failures
             .get(&doc.path)
@@ -2865,6 +3559,72 @@ async fn save_vectors(
     }
 }
 
+/// Starts the background fill of `ref_index` over the documents pending in
+/// `fill`, its fill state, unless the fill runs.
+fn start_fill(
+    fill: &mut SemanticFill,
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+    ollama: &OllamaClient,
+    config: &Config,
+    parent_vectors: Option<Arc<FileVectors>>,
+) {
+    if fill.running || fill.pending.is_empty() {
+        return;
+    }
+    fill.running = true;
+    let owner = Arc::clone(ref_index);
+    let (state, ollama, config) = (Arc::clone(state), ollama.clone(), config.clone());
+    let task = tokio::spawn(async move {
+        run_fill(state, owner, ollama, config, parent_vectors).await;
+    });
+    ref_index.track_background_task(&task);
+    #[cfg(test)]
+    test_seams::fill_started(&ref_index.canonical_root, task);
+}
+
+/// Queues `documents`, each a path, its content hash and its embedding text,
+/// for the background fill of `ref_index` and starts the fill.
+pub(crate) async fn queue_fill(
+    state: &Arc<SharedState>,
+    ref_index: &Arc<crate::ref_index::RefIndex>,
+    documents: Vec<(String, String, String)>,
+) {
+    let parent_vectors = match ref_index.parent_ref_id {
+        Some(parent_id) => state
+            .ref_index(parent_id)
+            .await
+            .map(|parent| Arc::clone(&parent.embedding_cache)),
+        None => None,
+    };
+    let mut fill = ref_index.semantic_fill.lock().await;
+    for (path, hash, text) in documents {
+        let doc = FillDocument {
+            path,
+            hash,
+            text,
+            owner: None,
+        };
+        if fill.failed(&doc)
+            || fill
+                .pending
+                .get(&doc.path)
+                .is_some_and(|held| held.hash == doc.hash)
+        {
+            continue;
+        }
+        fill.pending.insert(doc.path.clone(), doc);
+    }
+    start_fill(
+        &mut fill,
+        state,
+        ref_index,
+        &state.ollama,
+        &state.config,
+        parent_vectors,
+    );
+}
+
 async fn run_fill(
     state: Arc<SharedState>,
     ref_index: Arc<crate::ref_index::RefIndex>,
@@ -2873,15 +3633,19 @@ async fn run_fill(
     parent_vectors: Option<Arc<FileVectors>>,
 ) {
     let mut completed = 0usize;
+    #[cfg(test)]
+    test_seams::fill_start(&ref_index.canonical_root).await;
     loop {
         let batch: Vec<_> = {
             let fill = ref_index.semantic_fill.lock().await;
+            let reembedding = ref_index.reembedding.lock().unwrap();
             fill.pending
                 .values()
                 .filter(|doc| {
                     doc.owner
                         .as_ref()
                         .is_none_or(|owner| owner.upgrade().is_none())
+                        && reembedding.get(&doc.path) != Some(&doc.hash)
                 })
                 .take(8)
                 .cloned()
@@ -2895,6 +3659,10 @@ async fn run_fill(
             persist_fill(&state, &ref_index, &config, parent_vectors.as_deref()).await;
             let mut fill = ref_index.semantic_fill.lock().await;
             if fill.pending.is_empty() {
+                // Before the fill reads as ended, so a wait for the fork base sees the check.
+                if state.is_fork_base(&ref_index) {
+                    state.recheck_fork_base();
+                }
                 fill.running = false;
                 return;
             }
@@ -2926,6 +3694,7 @@ async fn run_fill(
             }
             let mut fill = ref_index.semantic_fill.lock().await;
             let mut ready = Vec::new();
+            let mut refreshed = false;
             match outcome {
                 Ok(Ok(vectors))
                     if vectors.len() == batch.len() && vectors.iter().all(|v| !v.is_empty()) =>
@@ -2973,6 +3742,7 @@ async fn run_fill(
                             vector_generation,
                         );
                     }
+                    refreshed = true;
                 }
                 result => {
                     for doc in &batch {
@@ -2998,6 +3768,13 @@ async fn run_fill(
                 }
             }
             drop(fill);
+            if refreshed {
+                let _refresh = refresh_fork_parent(&state, &ref_index).await;
+                #[cfg(test)]
+                if let Some(task) = _refresh {
+                    test_seams::parent_refreshed(&ref_index.canonical_root, task);
+                }
+            }
             if completed >= 64 {
                 persist_fill(&state, &ref_index, &config, parent_vectors.as_deref()).await;
                 completed = 0;

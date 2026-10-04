@@ -1162,12 +1162,16 @@ pub struct CachedSearchIndex {
     /// Guards background rebuild: CAS false→true claims the spawn slot.
     /// Reset by the RAII `RebuildGuard` even on panic, preventing permanent lockout.
     pub(crate) rebuild_in_progress: std::sync::atomic::AtomicBool,
+    /// Notified when `RebuildGuard` resets `rebuild_in_progress`.
+    rebuild_ended: tokio::sync::Notify,
 }
 
 /// Maximum absolute doc-count delta that qualifies for a background (stale-serve) rebuild.
 const BG_REBUILD_MAX_ABS_DELTA: usize = 200;
 /// Maximum fractional doc-count delta (5%) that qualifies for a background rebuild.
 const BG_REBUILD_MAX_FRAC: f64 = 0.05;
+/// Most walks one stale rebuild runs while changed files queue during them.
+pub(crate) const STALE_REBUILD_PASSES: usize = 3;
 
 /// RAII guard that resets `rebuild_in_progress` on the held `CachedSearchIndex`
 /// when dropped — even on panic — preventing permanent lockout of the fast path.
@@ -1177,6 +1181,7 @@ impl Drop for RebuildGuard {
         self.0
             .rebuild_in_progress
             .store(false, std::sync::atomic::Ordering::Release);
+        self.0.rebuild_ended.notify_waiters();
     }
 }
 
@@ -1193,6 +1198,7 @@ impl CachedSearchIndex {
             generation: std::sync::atomic::AtomicU64::new(generation),
             reuse_count: std::sync::atomic::AtomicU64::new(0),
             rebuild_in_progress: std::sync::atomic::AtomicBool::new(false),
+            rebuild_ended: tokio::sync::Notify::new(),
         }
     }
 
@@ -1243,15 +1249,35 @@ impl CachedSearchIndex {
             && self.pending.lock().unwrap().batches.is_empty()
     }
 
+    /// Whether this entry was built before the tracker's `generation` or has
+    /// batches queued.
+    pub(crate) fn is_behind(&self, generation: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Acquire) < generation
+            || !self.pending.lock().unwrap().batches.is_empty()
+    }
+
     /// A parent entry a worktree can fork: walked from its whole `root`, over
     /// a vector store worth sharing, with no queued batches or rebuild.
     pub(crate) fn forkable_at(&self, root: &Path) -> bool {
-        self.search_root == root
-            && self.index.ann_store.is_some()
-            && self.pending.lock().unwrap().batches.is_empty()
-            && !self
-                .rebuild_in_progress
-                .load(std::sync::atomic::Ordering::Acquire)
+        self.unforkable_clause(root).is_none()
+    }
+
+    /// The first clause of [`Self::forkable_at`] this entry fails at `root`.
+    pub(crate) fn unforkable_clause(&self, root: &Path) -> Option<&'static str> {
+        if self.search_root != root {
+            Some("scoped")
+        } else if self.index.ann_store.is_none() {
+            Some("no_ann_store")
+        } else if !self.pending.lock().unwrap().batches.is_empty() {
+            Some("batches_queued")
+        } else if self
+            .rebuild_in_progress
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Some("rebuild_in_progress")
+        } else {
+            None
+        }
     }
 
     #[cfg(test)]
@@ -1475,6 +1501,11 @@ impl CachedSearchIndex {
 
     pub(crate) fn has_vector_shape(&self) -> bool {
         self.index.dims != 0
+    }
+
+    /// Whether every document of this entry holds a vector.
+    pub(crate) fn has_every_vector(&self) -> bool {
+        self.index.has_vector.iter().all(|ready| *ready)
     }
 
     pub(crate) fn refresh_vectors(
@@ -2368,6 +2399,7 @@ impl SearchIndex {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| self.documents[a.0].path.cmp(&self.documents[b.0].path))
             });
             scored.truncate(k);
         }
@@ -2376,6 +2408,7 @@ impl SearchIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
                 .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| self.documents[a.0].path.cmp(&self.documents[b.0].path))
         });
 
         scored
@@ -2490,6 +2523,167 @@ pub fn format_search_results_with_freshness(
 // High-level entry point (to be wired with SharedState)
 // ---------------------------------------------------------------------------
 
+/// Rebuilds `stale`, the entry in `lock`, in the background from a walk of
+/// `root` and the batches queued on it from `generation` on, unless a rebuild
+/// of it already runs, and again while the entry it installs has batches of
+/// changed files queued during its build, up to [`STALE_REBUILD_PASSES`]
+/// walks; the fill's vectors queued then go into that entry. The rebuild's
+/// task, when this call started it.
+pub(crate) fn spawn_stale_rebuild(
+    stale: &Arc<CachedSearchIndex>,
+    lock: &Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
+    generation: u64,
+    walk_and_index_fn: &Arc<dyn WalkAndIndexFn>,
+    root: &Path,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+    stale
+        .rebuild_in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    let mut previous = Arc::clone(stale);
+    let lock = Arc::clone(lock);
+    let walker = Arc::clone(walk_and_index_fn);
+    let root = root.to_path_buf();
+    let mut build_generation = generation;
+    let task = tokio::spawn(async move {
+        for pass in 1.. {
+            let _reset = RebuildGuard(Arc::clone(&previous));
+            let vector_generation = walker.vector_generation(&root).await;
+            let (docs, vectors) = match walker.walk_or_install(&root).await {
+                // The walk replaced `previous` with an index of its own.
+                Ok(WalkOutcome::Installed(_)) => return,
+                Ok(WalkOutcome::Documents(docs, vectors)) => (docs, vectors),
+                Err(error) => {
+                    tracing::warn!(%error, "Background index refresh failed");
+                    return;
+                }
+            };
+            let base = Arc::clone(&previous);
+            let built = tokio::task::spawn_blocking(move || {
+                let pending = base.pending.lock().unwrap();
+                let mut snapshot: std::collections::BTreeMap<_, _> = docs
+                    .into_iter()
+                    .zip(vectors)
+                    .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
+                    .collect();
+                let mut ready_generation = build_generation;
+                let mut ready_vector_generation = vector_generation;
+                for RefreshBatch {
+                    docs,
+                    vectors,
+                    deleted,
+                    generation,
+                    vector_generation: batch_vector_generation,
+                } in &pending.batches
+                {
+                    if *generation < build_generation {
+                        continue;
+                    }
+                    for path in deleted {
+                        snapshot.remove(path);
+                    }
+                    for (doc, vector) in docs.iter().zip(vectors) {
+                        snapshot.insert(doc.path.clone(), (doc.clone(), vector.clone()));
+                    }
+                    ready_generation = ready_generation.max(*generation);
+                    ready_vector_generation =
+                        ready_vector_generation.max(batch_vector_generation.unwrap_or(0));
+                }
+                let consumed = pending.batches.len();
+                drop(pending);
+                let (docs, vectors) = snapshot.into_values().unzip();
+                let (changed, vectors, deleted) = base.index.delta_from(docs, vectors);
+                let mut index = base.index.clone();
+                index.apply_delta(changed, vectors, &deleted);
+                index.prepare_ann();
+                (index, ready_generation, ready_vector_generation, consumed)
+            })
+            .await;
+            let Ok((index, ready_generation, ready_vector_generation, consumed)) = built else {
+                return;
+            };
+            if index.dims != previous.index.dims && index.has_vector.iter().any(|ready| !ready) {
+                // A newer shape batch may have arrived after the walker snapshot.
+                return;
+            }
+            #[cfg(test)]
+            crate::server_adapters::test_seams::before_stale_install(&root).await;
+            let mut guard = lock.write().await;
+            if !guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
+                return;
+            }
+            let fp = index.fingerprint();
+            let mut entry = CachedSearchIndex::new(index, fp, ready_generation);
+            let leftover = previous.pending.lock().unwrap().batches[consumed..].to_vec();
+            entry.search_root = previous.search_root.clone();
+            entry.vector_generation = ready_vector_generation;
+            let mut installed = Arc::new(entry);
+            // Batches of the fill carry vectors alone, which need no walk.
+            let fill_generation = leftover
+                .iter()
+                .map(|batch| batch.vector_generation)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|generations| generations.into_iter().max());
+            if let Some(vector_generation) = fill_generation {
+                let search_root = installed.search_root.clone();
+                let updates = leftover
+                    .into_iter()
+                    .flat_map(|batch| batch.docs.into_iter().zip(batch.vectors))
+                    .filter_map(|(doc, vector)| Some((doc.path, doc.source_hash, vector?)))
+                    .collect();
+                CachedSearchIndex::refresh_vectors(
+                    &mut installed,
+                    &search_root,
+                    updates,
+                    vector_generation,
+                );
+            } else {
+                Arc::get_mut(&mut installed)
+                    .unwrap()
+                    .pending
+                    .get_mut()
+                    .unwrap()
+                    .batches = leftover;
+            }
+            *guard = Some(Arc::clone(&installed));
+            drop(guard);
+            if installed.pending.lock().unwrap().batches.is_empty()
+                || pass == STALE_REBUILD_PASSES
+                || installed
+                    .rebuild_in_progress
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return;
+            }
+            previous = installed;
+            build_generation = ready_generation;
+        }
+    });
+    walk_and_index_fn.track_background_task(&task);
+    Some(task)
+}
+
+/// Waits until no rebuild of the entry in `lock` runs, following the entries
+/// the rebuilds install.
+pub(crate) async fn stale_rebuild_ended(lock: &RwLock<Option<Arc<CachedSearchIndex>>>) {
+    loop {
+        let Some(entry) = lock.read().await.clone() else {
+            return;
+        };
+        let mut ended = std::pin::pin!(entry.rebuild_ended.notified());
+        ended.as_mut().enable();
+        if !entry
+            .rebuild_in_progress
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        ended.await;
+    }
+}
+
 /// Run semantic code search. Caller provides the embedding function and file walker.
 /// This is the main entry point that tool handlers should call.
 ///
@@ -2524,100 +2718,13 @@ pub(crate) async fn semantic_code_search_owned(
                 == std::fs::canonicalize(&options.root_dir)
                     .unwrap_or_else(|_| options.root_dir.clone())
         {
-            if stale
-                .rebuild_in_progress
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                let previous = Arc::clone(&stale);
-                let lock = Arc::clone(lock);
-                let walker = Arc::clone(&walk_and_index_fn);
-                let root = options.root_dir.clone();
-                let build_generation = generation.load(Ordering::Acquire);
-                let task = tokio::spawn(async move {
-                    let _reset = RebuildGuard(Arc::clone(&previous));
-                    let vector_generation = walker.vector_generation(&root).await;
-                    match walker.walk_or_install(&root).await {
-                        // The walk replaced `previous` with an index of its own.
-                        Ok(WalkOutcome::Installed(_)) => {}
-                        Ok(WalkOutcome::Documents(docs, vectors)) => {
-                            let base = Arc::clone(&previous);
-                            let built = tokio::task::spawn_blocking(move || {
-                                let pending = base.pending.lock().unwrap();
-                                let mut snapshot: std::collections::BTreeMap<_, _> = docs
-                                    .into_iter()
-                                    .zip(vectors)
-                                    .map(|(doc, vector)| (doc.path.clone(), (doc, vector)))
-                                    .collect();
-                                let mut ready_generation = build_generation;
-                                let mut ready_vector_generation = vector_generation;
-                                for RefreshBatch {
-                                    docs,
-                                    vectors,
-                                    deleted,
-                                    generation,
-                                    vector_generation: batch_vector_generation,
-                                } in &pending.batches
-                                {
-                                    if *generation < build_generation {
-                                        continue;
-                                    }
-                                    for path in deleted {
-                                        snapshot.remove(path);
-                                    }
-                                    for (doc, vector) in docs.iter().zip(vectors) {
-                                        snapshot.insert(
-                                            doc.path.clone(),
-                                            (doc.clone(), vector.clone()),
-                                        );
-                                    }
-                                    ready_generation = ready_generation.max(*generation);
-                                    ready_vector_generation = ready_vector_generation
-                                        .max(batch_vector_generation.unwrap_or(0));
-                                }
-                                let consumed = pending.batches.len();
-                                drop(pending);
-                                let (docs, vectors) = snapshot.into_values().unzip();
-                                let (changed, vectors, deleted) =
-                                    base.index.delta_from(docs, vectors);
-                                let mut index = base.index.clone();
-                                index.apply_delta(changed, vectors, &deleted);
-                                index.prepare_ann();
-                                (index, ready_generation, ready_vector_generation, consumed)
-                            })
-                            .await;
-                            if let Ok((
-                                index,
-                                ready_generation,
-                                ready_vector_generation,
-                                consumed,
-                            )) = built
-                            {
-                                if index.dims != previous.index.dims
-                                    && index.has_vector.iter().any(|ready| !ready)
-                                {
-                                    // A newer shape batch may have arrived after the walker snapshot.
-                                    return;
-                                }
-                                let mut guard = lock.write().await;
-                                if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &previous)) {
-                                    let fp = index.fingerprint();
-                                    let mut entry =
-                                        CachedSearchIndex::new(index, fp, ready_generation);
-                                    entry.pending.get_mut().unwrap().batches =
-                                        previous.pending.lock().unwrap().batches[consumed..]
-                                            .to_vec();
-                                    entry.search_root = previous.search_root.clone();
-                                    entry.vector_generation = ready_vector_generation;
-                                    *guard = Some(Arc::new(entry));
-                                }
-                            }
-                        }
-                        Err(error) => tracing::warn!(%error, "Background index refresh failed"),
-                    }
-                });
-                walk_and_index_fn.track_background_task(&task);
-            }
+            spawn_stale_rebuild(
+                &stale,
+                lock,
+                generation.load(Ordering::Acquire),
+                &walk_and_index_fn,
+                &options.root_dir,
+            );
             let query = sanitize_query(&options.query);
             let vectors = embed_fn.embed(&[query.to_string()]).await?;
             let vector = vectors
@@ -2641,6 +2748,60 @@ pub(crate) async fn semantic_code_search_owned(
         cache_generation,
     )
     .await
+}
+
+/// Answers `options`, whose root is at `prefix` in `entry`'s root, from
+/// `entry`'s documents under it, as an index of the root would.
+pub(crate) async fn search_entry_under(
+    entry: Arc<CachedSearchIndex>,
+    prefix: PathBuf,
+    options: SemanticSearchOptions,
+    embed_fn: &dyn EmbedFn,
+) -> Result<String> {
+    let query = sanitize_query(&options.query).into_owned();
+    if query.is_empty() {
+        return Ok("No matching files found for the given query.".to_string());
+    }
+    let query_vec = embed_fn
+        .embed(std::slice::from_ref(&query))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ContextPlusError::Ollama("Empty embedding response".into()))?;
+    let keep = result_path_filter(&options, prefix.clone());
+    let mut resolved = resolve_search_options(&options);
+    resolved.include_globs.clear();
+    resolved.exclude_globs.clear();
+    resolved.root_dir = entry.search_root.clone();
+    let documents = entry
+        .index
+        .documents()
+        .iter()
+        .filter(|doc| Path::new(&doc.path).starts_with(&prefix))
+        .count();
+    let root_dir = options.root_dir.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        let mut results = entry
+            .index
+            .search_where(&query, &query_vec, &resolved, Some(&keep));
+        for result in &mut results {
+            result.path = Path::new(&result.path)
+                .strip_prefix(&prefix)
+                .unwrap_or(Path::new(&result.path))
+                .to_string_lossy()
+                .into_owned();
+        }
+        fill_result_snippets(&root_dir, &mut results);
+        (query, results)
+    })
+    .await
+    .map_err(|err| ContextPlusError::Other(format!("Snippet task failed: {err}")))?;
+    let (query, results) = results;
+    Ok(format_search_results_with_freshness(
+        &query,
+        &results,
+        Some(documents),
+    ))
 }
 
 pub async fn semantic_code_search(
@@ -2981,6 +3142,8 @@ pub async fn semantic_code_search(
             );
             tracing::info!(
                 phase = "semantic_index_build",
+                ref_id = %walk_and_index_fn.ref_id(),
+                root = %search_root.display(),
                 elapsed_ms = started.elapsed().as_millis(),
                 documents = idx.document_count(),
                 "cold-start phase"
@@ -2990,7 +3153,15 @@ pub async fn semantic_code_search(
             entry.search_root = search_root;
             *entry.metadata.write().unwrap() = metadata;
             let arc = Arc::new(entry);
-            *guard = Some(Arc::clone(&arc));
+            // A scoped index answers this query but never replaces the
+            // ref's index of its whole root.
+            let ref_root = walk_and_index_fn.ref_root();
+            if !guard.as_ref().is_some_and(|current| {
+                ref_root == Some(current.search_root.as_path())
+                    && current.search_root != arc.search_root
+            }) {
+                *guard = Some(Arc::clone(&arc));
+            }
             arc
         }
     };
@@ -3046,6 +3217,14 @@ pub trait WalkAndIndexFn: Send + Sync {
         })
     }
     fn track_background_task(&self, _task: &tokio::task::JoinHandle<()>) {}
+    /// The ref this walker indexes, for log lines.
+    fn ref_id(&self) -> &str {
+        ""
+    }
+    /// The canonical root of the ref this walker indexes.
+    fn ref_root(&self) -> Option<&Path> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

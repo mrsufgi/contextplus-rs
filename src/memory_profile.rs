@@ -505,6 +505,7 @@ async fn teardown_report(session: &ProfileSession) {
     }
     released("identifier_vectors");
     *owner.search_index_cache.write().await = None;
+    *owner.scoped_search_index_cache.write().await = None;
     released("search_index");
     *owner.project_cache.write().await = None;
     released("project_cache");

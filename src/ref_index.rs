@@ -212,9 +212,19 @@ pub struct RefIndex {
     /// Already `Arc<RwLock<…>>` so background rebuild tasks can hold a clone.
     pub(crate) semantic_vector_generation: AtomicU64,
     pub(crate) semantic_fill: tokio::sync::Mutex<crate::server_adapters::SemanticFill>,
+    /// The content hash of each changed file a re-embed is sending to Ollama.
+    pub(crate) reembedding: std::sync::Mutex<HashMap<String, String>>,
+    /// Notified when a re-embed stops sending its changed files.
+    pub(crate) reembedding_released: tokio::sync::Notify,
     /// The parent's vector store this worktree last forked, or was refused a fork of.
     pub(crate) fork_base: std::sync::Mutex<std::sync::Weak<crate::core::embeddings::VectorStore>>,
+    /// The fork refusals logged since this worktree last forked.
+    pub(crate) fork_refused:
+        std::sync::Mutex<std::collections::HashSet<crate::server_adapters::ForkRefusalKey>>,
     pub search_index_cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
+    /// The index of a subdirectory searched while `search_index_cache` holds
+    /// the whole root's.
+    pub(crate) scoped_search_index_cache: Arc<RwLock<Option<Arc<CachedSearchIndex>>>>,
 
     /// Monotonic counter incremented by the embedding tracker on each file-change
     /// event batch. `semantic_code_search` compares this against
@@ -296,8 +306,12 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            reembedding: std::sync::Mutex::new(HashMap::new()),
+            reembedding_released: tokio::sync::Notify::new(),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
+            fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
+            scoped_search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
@@ -354,8 +368,12 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            reembedding: std::sync::Mutex::new(HashMap::new()),
+            reembedding_released: tokio::sync::Notify::new(),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
+            fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
+            scoped_search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),
@@ -414,8 +432,12 @@ impl RefIndex {
             lexical_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             semantic_vector_generation: AtomicU64::new(0),
             semantic_fill: tokio::sync::Mutex::new(Default::default()),
+            reembedding: std::sync::Mutex::new(HashMap::new()),
+            reembedding_released: tokio::sync::Notify::new(),
             fork_base: std::sync::Mutex::new(std::sync::Weak::new()),
+            fork_refused: std::sync::Mutex::new(Default::default()),
             search_index_cache: Arc::new(RwLock::new(None)),
+            scoped_search_index_cache: Arc::new(RwLock::new(None)),
             cache_generation: Arc::new(AtomicU64::new(0)),
             tracker_handle: Arc::new(std::sync::Mutex::new(None)),
             project_cache: Arc::new(RwLock::new(None)),

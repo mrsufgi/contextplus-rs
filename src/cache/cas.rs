@@ -212,6 +212,19 @@ fn parent_path(mcp_data: &Path, ref_id_hex: &str) -> PathBuf {
     ref_dir(mcp_data, ref_id_hex).join(PARENT_FILE)
 }
 
+/// The lock serializing this process's updates of the manifest at `path`.
+fn manifest_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    type Locks = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>;
+    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 // ---------------------------------------------------------------------------
 // CasStore
 // ---------------------------------------------------------------------------
@@ -518,9 +531,8 @@ impl CasStore {
     /// Atomically update the ref's manifest with new `(key, hash)` pairs.
     ///
     /// Loads the existing manifest, merges the new pairs (new entries win),
-    /// and saves atomically. Thread-safe only if no other writer is
-    /// concurrently modifying the same ref's manifest — callers must serialize
-    /// manifest writes per ref.
+    /// and saves atomically. Updates of one ref's manifest in this process
+    /// run one at a time, so none saves over another's pairs.
     pub fn update_manifest(
         &self,
         ref_id_hex: &str,
@@ -529,7 +541,13 @@ impl CasStore {
         if updates.is_empty() {
             return Ok(());
         }
+        let lock = manifest_lock(&manifest_path(&self.mcp_data, ref_id_hex));
+        let _serialized = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut manifest = self.load_manifest(ref_id_hex)?;
+        #[cfg(test)]
+        test_seams::after_manifest_update_load(&self.mcp_data);
         for (key, hash) in updates {
             manifest.upsert(key.clone(), hash.clone());
         }
@@ -687,6 +705,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 pub(crate) mod test_seams {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Mutex, OnceLock};
 
     fn manifest_load_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
@@ -715,6 +734,48 @@ pub(crate) mod test_seams {
             .unwrap()
             .remove(mcp_data)
             .unwrap_or_default()
+    }
+
+    pub(crate) struct ManifestUpdatePause {
+        entered: Receiver<()>,
+        resume: Sender<()>,
+    }
+
+    impl ManifestUpdatePause {
+        pub(crate) fn wait_until_entered(&self) {
+            self.entered.recv().unwrap();
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.send(()).unwrap();
+        }
+    }
+
+    type ManifestUpdateSlot = (Sender<()>, Receiver<()>);
+
+    fn manifest_update_slots() -> &'static Mutex<BTreeMap<PathBuf, ManifestUpdateSlot>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, ManifestUpdateSlot>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next manifest update in the CAS at `mcp_data` once it
+    /// loaded the manifest, before it saves it.
+    pub(crate) fn pause_after_manifest_update_load(mcp_data: &Path) -> ManifestUpdatePause {
+        let (entered_tx, entered) = channel();
+        let (resume, resume_rx) = channel();
+        manifest_update_slots()
+            .lock()
+            .unwrap()
+            .insert(mcp_data.to_path_buf(), (entered_tx, resume_rx));
+        ManifestUpdatePause { entered, resume }
+    }
+
+    pub(crate) fn after_manifest_update_load(mcp_data: &Path) {
+        let slot = manifest_update_slots().lock().unwrap().remove(mcp_data);
+        if let Some((entered, resume)) = slot {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
     }
 }
 
@@ -1113,5 +1174,38 @@ mod tests {
         let map = m.to_map();
         assert_eq!(map.get(&k1), Some(&h1));
         assert_eq!(map.get(&k2), Some(&h2));
+    }
+
+    #[test]
+    fn update_manifest_keeps_a_concurrent_update_of_the_same_ref() {
+        let tmp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(make_store(&tmp));
+        let ref_id = "concurrent_test";
+        let (k1, h1) = (ChunkKey::new("a.rs", 0), ChunkHash::of("a"));
+        let (k2, h2) = (ChunkKey::new("b.rs", 0), ChunkHash::of("b"));
+        let pause = test_seams::pause_after_manifest_update_load(store.mcp_data());
+
+        let first = {
+            let (store, update) = (store.clone(), [(k1.clone(), h1.clone())]);
+            std::thread::spawn(move || store.update_manifest(ref_id, &update).unwrap())
+        };
+        pause.wait_until_entered();
+        let (done, finished) = std::sync::mpsc::channel();
+        let second = {
+            let (store, update) = (store.clone(), [(k2.clone(), h2.clone())]);
+            std::thread::spawn(move || {
+                store.update_manifest(ref_id, &update).unwrap();
+                done.send(()).unwrap();
+            })
+        };
+        // Gives a second update that does not wait for the first the time to save.
+        let _ = finished.recv_timeout(std::time::Duration::from_millis(200));
+        pause.resume();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let map = store.load_manifest(ref_id).unwrap().to_map();
+        assert_eq!(map.get(&k1), Some(&h1), "the first update was lost");
+        assert_eq!(map.get(&k2), Some(&h2), "the second update was lost");
     }
 }

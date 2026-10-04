@@ -871,13 +871,9 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         .unwrap_or_else(|_| reg.client_root.clone());
     let ref_id = RefId::for_canonical_path(&canonical_root);
 
-    // Determine parent ref: find merge-base between client HEAD and primary.
-    // For now: if the client root differs from the primary root, the primary
-    // ref is the parent (CoW-fork). U6 will wire in proper merge-base lookup.
-    let parent_ref_id = if ref_id != server.state.default_ref_id {
-        Some(server.state.default_ref_id)
-    } else {
-        None
+    let parent_ref_id = match server.state.ref_index(ref_id).await {
+        Some(existing) => existing.parent_ref_id,
+        None => server.state.choose_parent(&canonical_root).await,
     };
 
     let head_sha = reg.head_sha.clone();
@@ -901,38 +897,9 @@ async fn serve_connection(server: ContextPlusServer, mut stream: UnixStream) {
         "ref attached"
     );
 
-    // ── Step 2b: initialize CAS on-disk layout for this ref ─────────────────
-    // For the primary ref this is a no-op (idempotent empty-manifest creation).
-    // For non-primary (worktree) refs this creates the ref directory and writes
-    // the parent pointer so chunk lookups can chain through the primary's
-    // manifest (U12 diff-only embedding).
-    {
-        let mcp_data = server.state.root_dir.join(paths::MCP_DATA_DIR);
-        let model = server.state.config.document_cache_identity();
-        let parent_ref_opt = match parent_ref_id {
-            Some(pid) => server.state.ref_index(pid).await,
-            None => None,
-        };
-        if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
-            tracing::warn!(ref_id = ref_id.0, "CAS fork_from failed (non-fatal): {e}");
-        }
-    }
-
-    // ── Step 2c: per-ref warmup (U18) ────────────────────────────────────────
-    // Fire-and-forget: errors inside `spawn_ref_warmup` are logged and never
-    // propagate here.  Idempotent — safe to call for every connection including
-    // reconnects from the same worktree root.
-    server.spawn_ref_warmup(ref_id);
-
-    // ── Step 2d: per-ref embedding tracker (U11) ─────────────────────────────
-    // Mirror the daemon's startup behaviour for the default ref so attached
-    // worktree refs also pick up live file changes in Eager mode. Lazy mode
-    // defers tracker startup until the first tool call on the session, which
-    // resolves to this ref via `session_ref_id` and calls
-    // `ensure_tracker_started` automatically.
-    if server.state.config.embed_tracker_mode == crate::config::TrackerMode::Eager {
-        server.ensure_tracker_started_for(ref_id).await;
-    }
+    prepare_ref(&server, ref_id, &ref_arc).await;
+    // A worktree cut from a fresh ref finds the fork base already moving to it.
+    let _advance = server.advance_fork_base();
 
     // ── Step 3: send session_ready ───────────────────────────────────────────
     let session_id = format!("{}-{}", ref_id.0, reg.client_pid);
@@ -1026,6 +993,144 @@ fn spawn_signal_listener(draining: Arc<AtomicBool>) {
     });
 }
 
+/// Sets up a ref just attached: its CAS layout, its warmup and, in eager
+/// mode, its tracker.
+async fn prepare_ref(server: &ContextPlusServer, ref_id: RefId, ref_arc: &RefIndex) {
+    // ── CAS on-disk layout ───────────────────────────────────────────────────
+    // For the primary ref this is a no-op (idempotent empty-manifest creation).
+    // For non-primary (worktree) refs this creates the ref directory and writes
+    // the parent pointer so chunk lookups can chain through the primary's
+    // manifest (U12 diff-only embedding).
+    {
+        let mcp_data = server.state.root_dir.join(paths::MCP_DATA_DIR);
+        let model = server.state.config.document_cache_identity();
+        let parent_ref_opt = match ref_arc.parent_ref_id {
+            Some(pid) => server.state.ref_index(pid).await,
+            None => None,
+        };
+        if let Err(e) = ref_arc.fork_from(&mcp_data, &model, parent_ref_opt.as_deref()) {
+            tracing::warn!(ref_id = ref_id.0, "CAS fork_from failed (non-fatal): {e}");
+        }
+    }
+
+    // ── Per-ref warmup (U18) ─────────────────────────────────────────────────
+    // Fire-and-forget: errors inside `spawn_ref_warmup` are logged and never
+    // propagate here.  Idempotent — safe to call for every connection including
+    // reconnects from the same worktree root.
+    server.spawn_ref_warmup(ref_id);
+
+    // ── Per-ref embedding tracker (U11) ──────────────────────────────────────
+    // Mirror the daemon's startup behaviour for the default ref so attached
+    // worktree refs also pick up live file changes in Eager mode. Lazy mode
+    // defers tracker startup until the first tool call on the session, which
+    // resolves to this ref via `session_ref_id` and calls
+    // `ensure_tracker_started` automatically.
+    if server.state.config.embed_tracker_mode == crate::config::TrackerMode::Eager {
+        server.ensure_tracker_started_for(ref_id).await;
+    }
+}
+
+/// Registers the fork base checkout as a parentless ref in the background,
+/// once created when missing. The background task, when one started.
+pub(crate) async fn start_fork_base(
+    server: &ContextPlusServer,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let config = &server.state.config;
+    config.fork_base.as_ref()?;
+    if config.embed_tracker_mode == crate::config::TrackerMode::Off {
+        // The base advances on its tracker's events.
+        tracing::info!(phase = "fork_base", reason = "tracker_off", "fork base off");
+        return None;
+    }
+    crate::git::fork_base::fork_base_dir(config, &server.state.root_dir)?;
+    server.state.fork_base_registering.send_replace(true);
+    let register = {
+        let server = server.clone();
+        async move {
+            let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
+            let base = tokio::task::spawn_blocking(move || {
+                crate::git::fork_base::ensure_fork_base(&config, &root)
+            })
+            .await;
+            match base {
+                Ok(Ok(Some(base))) => register_fork_base(&server, base).await,
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    phase = "fork_base",
+                    reason = "checkout_failed",
+                    %error,
+                    "fork base off"
+                ),
+                Err(error) => tracing::warn!(
+                    phase = "fork_base",
+                    reason = "checkout_failed",
+                    %error,
+                    "fork base off"
+                ),
+            }
+            server.state.fork_base_registering.send_replace(false);
+        }
+    };
+    Some(tokio::spawn(register))
+}
+
+/// Attaches the fork base checkout as a parentless ref with its own CAS
+/// manifest, warmup and tracker; off when its root is already a worktree's.
+pub(crate) async fn register_fork_base(
+    server: &ContextPlusServer,
+    base: crate::git::fork_base::ForkBase,
+) {
+    let canonical = base.dir.canonicalize().unwrap_or_else(|_| base.dir.clone());
+    let ref_id = RefId::for_canonical_path(&canonical);
+    let ref_arc = server
+        .state
+        .attach_ref(ref_id, || {
+            Arc::new(RefIndex::new_with_head(
+                base.dir.clone(),
+                canonical.clone(),
+                None,
+                base.head.clone(),
+            ))
+        })
+        .await;
+    if ref_arc.parent_ref_id.is_some() {
+        tracing::warn!(
+            phase = "fork_base",
+            reason = "registered_with_parent",
+            root = %canonical.display(),
+            "fork base off"
+        );
+        server.state.detach_ref(ref_id, Duration::ZERO).await;
+        return;
+    }
+    tracing::info!(
+        phase = "fork_base",
+        ref_id = %ref_arc.cas_ref_id_hex,
+        root = %canonical.display(),
+        head = %base.head,
+        "fork base registered"
+    );
+    let name = crate::server::cache_name("fork-base", &server.state.config);
+    let (dir, head) = (base.dir.clone(), base.head.clone());
+    let restored =
+        tokio::task::spawn_blocking(move || crate::git::fork_base::load_indexed_head(&dir, &name))
+            .await
+            .ok()
+            .flatten()
+            .filter(|indexed| *indexed == head);
+    if restored.is_some() {
+        *server.state.fork_base_indexed_head.lock().unwrap() = restored;
+    }
+    *server.state.fork_base.lock().unwrap() = Some(base);
+    let _ = server.state.fork_base_ref_id.set(ref_id);
+    // Registrations waiting on the fork base choose their parent from here.
+    server.state.fork_base_registering.send_replace(false);
+    prepare_ref(server, ref_id, &ref_arc).await;
+    server.ensure_tracker_started_for(ref_id).await;
+    // Indexes the checkout, and moves it first when its ref moved since.
+    let _advance = server.advance_fork_base();
+}
+
 /// Top-level entry called from `main`. Acquire lock → bind → write pid → run.
 /// Returns `Ok(false)` if another daemon is already running (caller falls
 /// back to client mode).
@@ -1057,6 +1162,7 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     if config.warmup_on_start {
         server.spawn_warmup_task(true);
     }
+    let _registering_fork_base = start_fork_base(&server).await;
 
     run(server, listener, socket_path, pid_path, idle_secs, lock).await?;
     Ok(true)
@@ -1152,6 +1258,241 @@ mod tests {
         assert_ne!(linked_id, inspection.state.default_ref_id);
 
         drop(refs);
+        drop(bridge_stream);
+        connection.abort();
+    }
+
+    fn fork_base_git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A repository with `refs/remotes/origin/main` at its one commit, and a
+    /// daemon server over it with the fork base on, embedding through a mock.
+    async fn fork_base_daemon() -> (
+        wiremock::MockServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ContextPlusServer,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, Request, ResponseTemplate};
+
+        let ollama = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = request
+                    .body_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| body["input"].as_array().map(Vec::len))
+                    .unwrap_or_default();
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "embeddings": vec![vec![1.0, 0.0, 0.0]; inputs] }),
+                )
+            })
+            .mount(&ollama)
+            .await;
+        let primary = tempfile::tempdir().unwrap();
+        fork_base_git(primary.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(primary.path().join("lib.rs"), "pub fn base() {}\n").unwrap();
+        std::fs::write(primary.path().join(".gitignore"), ".mcp_data/\n").unwrap();
+        fork_base_git(primary.path(), &["add", "-A"]);
+        fork_base_git(primary.path(), &["commit", "-qm", "base"]);
+        fork_base_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let bases = tempfile::tempdir().unwrap();
+        let config = Config::from_env_map(&env_map(&[
+            ("CONTEXTPLUS_FORK_BASE", "origin/main"),
+            ("CONTEXTPLUS_FORK_BASE_DIR", &bases.path().to_string_lossy()),
+            ("CONTEXTPLUS_EMBED_TRACKER", "lazy"),
+            ("CONTEXTPLUS_REF_WARMUP_MODE", "off"),
+            ("CONTEXTPLUS_WARMUP_ON_START", "false"),
+            ("OLLAMA_HOST", &ollama.uri()),
+        ]));
+        let server = daemon_server(primary.path(), config);
+        (ollama, primary, bases, server)
+    }
+
+    #[tokio::test]
+    async fn daemon_registers_a_parentless_fork_base() {
+        let (_ollama, _primary, bases, server) = fork_base_daemon().await;
+
+        if let Some(task) = start_fork_base(&server).await {
+            task.await.unwrap();
+        }
+        let base_id = *server
+            .state
+            .fork_base_ref_id
+            .get()
+            .expect("a fork base ref");
+        let base = server.state.ref_index(base_id).await.expect("registered");
+        server.advance_fork_base().expect("an advance").await;
+        assert!(
+            base.canonical_root
+                .starts_with(bases.path().canonicalize().unwrap())
+        );
+        assert_eq!(base.parent_ref_id, None);
+        assert!(
+            server
+                .state
+                .root_dir
+                .join(paths::MCP_DATA_DIR)
+                .join("refs")
+                .join(&base.cas_ref_id_hex)
+                .join("manifest.rkyv")
+                .exists(),
+            "the fork base has no CAS manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_fork_base_registers_an_existing_checkout_in_the_background() {
+        let (_ollama, _primary, _bases, server) = fork_base_daemon().await;
+        let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
+        let existing = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        drop(existing.expect("a fork base checkout"));
+
+        let registration = start_fork_base(&server)
+            .await
+            .expect("a background registration");
+        assert!(
+            server.state.fork_base_ref_id.get().is_none(),
+            "the fork base registered before the daemon took sessions"
+        );
+        registration.await.unwrap();
+        assert!(server.state.fork_base_ref_id.get().is_some());
+        server.advance_fork_base().expect("an advance").await;
+    }
+
+    #[tokio::test]
+    async fn sessions_and_attaches_on_the_fork_base_dir_get_no_parent() {
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
+        let dir =
+            crate::git::fork_base::fork_base_dir(&server.state.config, primary.path()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let ref_id = RefId::for_canonical_path(&dir);
+
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), dir.to_string_lossy().into_owned().into());
+        server.dispatch("attach_worktree", args).await;
+        let attached = server.state.ref_index(ref_id).await.expect("attached");
+        assert_eq!(attached.parent_ref_id, None);
+
+        let server = daemon_server(primary.path(), server.state.config.clone());
+        let inspection = server.clone();
+        let (mut bridge_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let connection = tokio::spawn(serve_connection(server, daemon_stream));
+        write_frame(
+            &mut bridge_stream,
+            &RegisterSession {
+                client_root: dir.clone(),
+                head_sha: "base-head".into(),
+                client_pid: 42,
+                search_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: SessionReady =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut bridge_stream))
+                .await
+                .expect("daemon did not register the session")
+                .unwrap();
+        assert!(matches!(ready, SessionReady::Ready { .. }));
+        let registered = inspection
+            .state
+            .ref_index(ref_id)
+            .await
+            .expect("registered");
+        assert_eq!(registered.parent_ref_id, None);
+        drop(bridge_stream);
+        connection.abort();
+    }
+
+    #[tokio::test]
+    async fn register_session_checks_the_fork_base_ref() {
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
+        if let Some(task) = start_fork_base(&server).await {
+            task.await.unwrap();
+        }
+        crate::server_adapters::test_seams::settle_fork_base(&server.state).await;
+        let checked = server.state.fork_base_advance_task().expect("an advance");
+        // Only the session's registration may see the moved ref.
+        let base_id = *server.state.fork_base_ref_id.get().unwrap();
+        let base = server.state.ref_index(base_id).await.unwrap();
+        let tracker = base.tracker_handle.lock().unwrap().take();
+        tracker.expect("the fork base's tracker").stop().await;
+        std::fs::write(primary.path().join("lib.rs"), "pub fn moved() {}\n").unwrap();
+        fork_base_git(primary.path(), &["commit", "-qam", "moved"]);
+        let moved = fork_base_git(primary.path(), &["rev-parse", "HEAD"]);
+        fork_base_git(
+            primary.path(),
+            &["update-ref", "refs/remotes/origin/main", &moved],
+        );
+        let worktree = tempfile::tempdir().unwrap();
+
+        let inspection = server.clone();
+        let (mut bridge_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let connection = tokio::spawn(serve_connection(server, daemon_stream));
+        write_frame(
+            &mut bridge_stream,
+            &RegisterSession {
+                client_root: worktree.path().to_path_buf(),
+                head_sha: "worktree-head".into(),
+                client_pid: 42,
+                search_config: None,
+            },
+        )
+        .await
+        .unwrap();
+        let ready: SessionReady =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut bridge_stream))
+                .await
+                .expect("daemon did not register the session")
+                .unwrap();
+        assert!(matches!(ready, SessionReady::Ready { .. }));
+        let advance = inspection
+            .state
+            .fork_base_advance_task()
+            .expect("an advance");
+        assert!(
+            !advance.ptr_eq(&checked),
+            "registering a session started no advance"
+        );
+        advance.await;
+        let base = inspection
+            .state
+            .fork_base
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|base| base.head.clone());
+        assert_eq!(
+            base,
+            Some(moved),
+            "registering a session did not advance the fork base"
+        );
         drop(bridge_stream);
         connection.abort();
     }
