@@ -150,6 +150,30 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn reparse_publish_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Pauses the next identifier reparse of the ref rooted at `root` after
+    /// it publishes its documents.
+    pub(crate) fn pause_after_reparse_publish(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        reparse_publish_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn after_reparse_publish(root: &Path) {
+        let pause = reparse_publish_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn store_read_slots() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1050,12 +1074,19 @@ impl CachedWalkerIndexer {
         drop(fill);
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(config.embed_budget_ms);
+        let delta = pending.len() <= config.embed_batch_size.max(1);
         for chunk in pending.chunks(config.embed_batch_size.max(1)) {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
             let texts: Vec<_> = chunk.iter().map(|(_, d)| d.text.clone()).collect();
-            match tokio::time::timeout_at(deadline, ollama.embed_documents(&texts)).await {
+            let embedded = tokio::time::timeout_at(deadline, ollama.embed_documents(&texts));
+            let embedded = if delta {
+                crate::core::embeddings::delta(embedded).await
+            } else {
+                embedded.await
+            };
+            match embedded {
                 Ok(Ok(result)) if result.len() == chunk.len() => {
                     let mut current = Vec::with_capacity(chunk.len());
                     for (_, doc) in chunk {

@@ -158,7 +158,26 @@ pub(crate) struct IdentifierBuild {
     /// The parsed documents, without vectors, once parsing is done.
     parsed: tokio::sync::watch::Receiver<Option<Arc<IdentifierIndex>>>,
     done: tokio::sync::watch::Receiver<IdentifierBuildResult>,
+    /// The documents as of each live project cache a request asked for, in
+    /// the order their reparses started.
+    current: Arc<std::sync::Mutex<Vec<CurrentIdentifierDocs>>>,
+    /// The documents the latest finished reparse produced.
+    latest: Arc<std::sync::Mutex<Option<ReparsedIdentifierDocs>>>,
+    /// The ref whose background tasks reparse the documents.
+    owner: std::sync::Weak<crate::ref_index::RefIndex>,
 }
+
+type CurrentIdentifierDocs = (
+    std::sync::Weak<ProjectCache>,
+    tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>,
+);
+
+/// A build's documents as of an edited project cache, with the content each
+/// file that differs from the build's project cache was parsed from.
+type ReparsedIdentifierDocs = (
+    Arc<IdentifierIndex>,
+    Arc<HashMap<String, Option<Arc<String>>>>,
+);
 
 impl IdentifierBuild {
     /// Whether the build indexes the project cache `cache`.
@@ -199,6 +218,199 @@ impl IdentifierBuild {
             Some(parsed) => Ok(parsed),
             None => self.finished().await,
         }
+    }
+
+    /// `finished`, parsing the documents again as of `cache` once the build
+    /// has parsed them, so a request that stops waiting finds them parsed.
+    async fn finished_reparsing(self, cache: &Arc<ProjectCache>) -> Result<Arc<IdentifierIndex>> {
+        let reparse = async {
+            if let Ok(docs) = self.clone().documents().await
+                && !self.built_from(cache)
+            {
+                self.reparse(&docs, cache);
+            }
+            std::future::pending().await
+        };
+        tokio::select! {
+            finished = self.clone().finished() => finished,
+            never = reparse => never,
+        }
+    }
+
+    /// `docs`, documents of this build, as of the project cache `cache`: each
+    /// file whose content differs from the build's project cache is parsed
+    /// again, once per project cache for every request of it. `None` once the
+    /// build's project cache is gone, or when more than
+    /// `FULL_REBUILD_CHANGE_FRACTION` of its files differ.
+    async fn documents_for(
+        &self,
+        docs: &Arc<IdentifierIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        if self.built_from(cache) {
+            return Some(Arc::clone(docs));
+        }
+        let mut current = self.reparse(docs, cache)?;
+        let reparsed = current.wait_for(Option::is_some).await.ok()?.clone();
+        reparsed.flatten()
+    }
+
+    /// `documents_for` without waiting: `None` too while the files that
+    /// differ are still being parsed again.
+    fn documents_for_now(
+        &self,
+        docs: &Arc<IdentifierIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        if self.built_from(cache) {
+            return Some(Arc::clone(docs));
+        }
+        self.reparse(docs, cache)?.borrow().clone().flatten()
+    }
+
+    /// The reparse of `docs` as of `cache`, started unless one is already,
+    /// after the latest one started. The reparses of project caches that are
+    /// gone are dropped; one waiting on the reparse before it holds neither
+    /// project cache, and parses nothing once either is gone or the build has
+    /// ended.
+    fn reparse(
+        &self,
+        docs: &Arc<IdentifierIndex>,
+        cache: &Arc<ProjectCache>,
+    ) -> Option<tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>> {
+        let mut reparses = self.current.lock().unwrap();
+        reparses.retain(|(of, _)| of.strong_count() > 0);
+        if let Some((_, current)) = reparses
+            .iter()
+            .find(|(of, _)| std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)))
+        {
+            return Some(current.clone());
+        }
+        if self.source.strong_count() == 0 {
+            return None;
+        }
+        let owner = self.owner.upgrade()?;
+        let previous = reparses.last().map(|(_, current)| current.clone());
+        let (sender, current) = tokio::sync::watch::channel(None);
+        let id = self.id;
+        let ref_index = self.owner.clone();
+        let docs = Arc::clone(docs);
+        let source = self.source.clone();
+        let edited = Arc::downgrade(cache);
+        let latest = Arc::clone(&self.latest);
+        #[cfg(test)]
+        let root = owner.root_dir.clone();
+        owner.spawn_background_task(async move {
+            if let Some(mut previous) = previous {
+                let _ = previous.wait_for(Option::is_some).await;
+            }
+            let running = ref_index.upgrade().is_some_and(|owner| {
+                owner
+                    .identifier_build
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|build| build.id == id && build.running())
+            });
+            let reparsed = match (source.upgrade(), edited.upgrade()) {
+                (Some(source), Some(edited)) if running => {
+                    Self::reparse_after_latest(&latest, docs, source, edited).await
+                }
+                _ => None,
+            };
+            sender.send_replace(Some(reparsed));
+            #[cfg(test)]
+            crate::server_adapters::test_seams::after_reparse_publish(&root).await;
+        });
+        reparses.push((Arc::downgrade(cache), current.clone()));
+        Some(current)
+    }
+
+    /// `reparsed` on a blocking thread, reusing the files the latest finished
+    /// reparse parsed, and recorded as the latest.
+    async fn reparse_after_latest(
+        latest: &std::sync::Mutex<Option<ReparsedIdentifierDocs>>,
+        docs: Arc<IdentifierIndex>,
+        source: Arc<ProjectCache>,
+        cache: Arc<ProjectCache>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        let previous = latest.lock().unwrap().clone();
+        let reparsed = tokio::task::spawn_blocking(move || {
+            Self::reparsed(&docs, &source, &cache, previous.as_ref())
+        })
+        .await
+        .ok()??;
+        let index = Arc::clone(&reparsed.0);
+        *latest.lock().unwrap() = Some(reparsed);
+        Some(index)
+    }
+
+    /// `docs`, parsed from `source`, with each file whose content differs in
+    /// `cache` parsed again, unless `previous` parsed the same content.
+    fn reparsed(
+        docs: &IdentifierIndex,
+        source: &ProjectCache,
+        cache: &ProjectCache,
+        previous: Option<&ReparsedIdentifierDocs>,
+    ) -> Option<ReparsedIdentifierDocs> {
+        use rayon::prelude::*;
+        let differing: std::collections::BTreeSet<&String> = cache
+            .file_content
+            .keys()
+            .chain(source.file_content.keys())
+            .filter(|path| cache.file_content.get(path) != source.file_content.get(path))
+            .collect();
+        if differing.len() as f64
+            > source.file_content.len() as f64
+                * crate::tools::semantic_search::FULL_REBUILD_CHANGE_FRACTION
+        {
+            return None;
+        }
+        let mut files = docs.docs.files.clone();
+        for path in &differing {
+            files.remove(*path);
+        }
+        let parsed_from: HashMap<String, Option<Arc<String>>> = differing
+            .iter()
+            .map(|path| ((*path).clone(), cache.file_content.get(path).cloned()))
+            .collect();
+        let mut unparsed = Vec::new();
+        for path in differing {
+            match previous.filter(|(_, from)| from.get(path) == parsed_from.get(path)) {
+                Some((index, _)) => {
+                    if let Some(file_docs) = index.docs.files.get(path) {
+                        files.insert(path.clone(), Arc::clone(file_docs));
+                    }
+                }
+                None => unparsed.push(path),
+            }
+        }
+        let parse = |path: &String| {
+            let content = cache.file_content.get(path)?;
+            let file_docs =
+                crate::tools::semantic_identifiers::identifier_docs_for_file(path, content)?;
+            Some((path.clone(), Arc::new(file_docs)))
+        };
+        // A few files parse here rather than queue behind unrelated work in
+        // the shared rayon pool.
+        const PARALLEL_THRESHOLD: usize = 64;
+        if unparsed.len() >= PARALLEL_THRESHOLD {
+            files.par_extend(unparsed.into_par_iter().filter_map(parse));
+        } else {
+            files.extend(unparsed.into_iter().filter_map(parse));
+        }
+        let index = Arc::new(IdentifierIndex {
+            docs: Segmented::from_files(files),
+            vectors: IdentifierVectorIndex::empty(),
+            dims: 0,
+            file_count: cache
+                .file_entries
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .count(),
+            built_at: Instant::now(),
+        });
+        Some((index, Arc::new(parsed_from)))
     }
 }
 
@@ -3607,6 +3819,9 @@ impl ContextPlusServer {
             source: Arc::downgrade(cache),
             parsed: parsed_receiver,
             done: receiver,
+            current: Arc::default(),
+            latest: Arc::default(),
+            owner: Arc::downgrade(ref_index),
         };
         let server = self.clone();
         let owner = Arc::clone(ref_index);
@@ -4948,10 +5163,12 @@ impl ContextPlusServer {
 
         // A build waits at most the embed budget; past it, the parsed
         // documents answer by keyword while the build keeps embedding. A
-        // keyword ranking needs only the parsed documents. A build of the
-        // tree before an edit answers only partially, and once it ends, a
-        // build of the current tree takes the rest of the budget; until that
-        // build parses, the ended build's index answers.
+        // keyword ranking needs only the parsed documents, with the files an
+        // edit changed since the build started parsed again within the budget;
+        // a ranking by meaning parses them while it waits on the build. A
+        // build of the tree before an edit answers only partially, and once
+        // it ends, a build of the current tree takes the rest of the budget;
+        // until that build parses, the ended build's index answers.
         const OUTDATED: &str = "identifiers reflect the tree before the latest edits";
         let budget = std::time::Duration::from_millis(self.state.config.embed_budget_ms);
         let started = tokio::time::Instant::now();
@@ -4966,7 +5183,7 @@ impl ContextPlusServer {
             let waited = if Self::ranks_identifiers_by_keyword(&args) {
                 tokio::time::timeout(remaining, build.clone().documents()).await
             } else {
-                tokio::time::timeout(remaining, build.clone().finished()).await
+                tokio::time::timeout(remaining, build.clone().finished_reparsing(&cache)).await
             };
             match waited {
                 Ok(Ok(index)) if build.built_from(&cache) => break (index, None),
@@ -4975,7 +5192,14 @@ impl ContextPlusServer {
                     cache = self.ensure_project_cache().await?;
                     lookup = self.identifier_index_or_build(&cache, true).await?;
                 }
-                Ok(Ok(index)) => break (index, Some(OUTDATED.to_string())),
+                Ok(Ok(index)) => {
+                    let remaining = budget.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(remaining, build.documents_for(&index, &cache)).await
+                    {
+                        Ok(Some(current)) => break (current, None),
+                        _ => break (index, Some(OUTDATED.to_string())),
+                    }
+                }
                 waited => {
                     let reason = match waited {
                         Ok(Err(error)) => format!("identifier embedding failed ({error})"),
@@ -4987,13 +5211,16 @@ impl ContextPlusServer {
                         Some(index) if build.parsed.borrow().is_none() => {
                             break (index, Some(OUTDATED.to_string()));
                         }
-                        _ => self.parsed_identifier_docs(&build).await,
+                        _ => self.parsed_identifier_docs(&build, &cache).await,
                     };
-                    let Some(index) = parsed else {
+                    let Some((index, stale)) = parsed else {
                         return Ok(Self::ok_text(format!(
                             "Partial results: {reason}, and no identifiers are parsed yet. Retry shortly."
                         )));
                     };
+                    if stale {
+                        break (index, Some(format!("{reason}, and {OUTDATED}")));
+                    }
                     break (index, Some(reason));
                 }
             }
@@ -5003,15 +5230,21 @@ impl ContextPlusServer {
     }
 
     /// The documents of a build that has not finished: its own once parsed,
-    /// else the index this ref already holds, unless that answers for the
-    /// parent's tree.
+    /// with the files that differ in `cache` parsed again once a request has
+    /// parsed them, else the index this ref already holds, unless that
+    /// answers for the parent's tree. Paired with whether they are the
+    /// build's documents of the tree before the edits in `cache`.
     async fn parsed_identifier_docs(
         &self,
         build: &IdentifierBuild,
-    ) -> Option<Arc<IdentifierIndex>> {
+        cache: &Arc<ProjectCache>,
+    ) -> Option<(Arc<IdentifierIndex>, bool)> {
         let parsed = build.parsed.borrow().clone();
-        if parsed.is_some() {
-            return parsed;
+        if let Some(parsed) = parsed {
+            return Some(match build.documents_for_now(&parsed, cache) {
+                Some(current) => (current, false),
+                None => (parsed, true),
+            });
         }
         let ref_index = self.current_ref().await;
         if ref_index
@@ -5020,7 +5253,8 @@ impl ContextPlusServer {
         {
             return None;
         }
-        ref_index.identifier_index.read().await.as_ref().cloned()
+        let index = ref_index.identifier_index.read().await.as_ref().cloned()?;
+        Some((index, false))
     }
 
     /// Whether identifier search `args` rank by keyword alone.
@@ -5147,15 +5381,13 @@ impl ContextPlusServer {
                 state: self.state.clone(),
             },
         };
-        let result = crate::core::embeddings::interactive(
-            crate::tools::semantic_navigate::semantic_navigate(
-                options,
-                &self.state.ollama,
-                &self.state.config,
-                &ref_index.embedding_cache,
-                &ref_index.root_dir,
-                Some(&indexer),
-            ),
+        let result = crate::tools::semantic_navigate::semantic_navigate(
+            options,
+            &self.state.ollama,
+            &self.state.config,
+            &ref_index.embedding_cache,
+            &ref_index.root_dir,
+            Some(&indexer),
         )
         .await?;
         Ok(Self::ok_text(result))
@@ -8110,6 +8342,19 @@ mod tests {
         "pub fn open_account() {}\npub fn close_account() {}\n",
     )];
 
+    /// `src/ledger.rs` among five other files.
+    const LEDGER_TREE: &[(&str, &str)] = &[
+        (
+            "src/ledger.rs",
+            "pub fn open_account() {}\npub fn close_account() {}\n",
+        ),
+        ("src/parcel.rs", "pub fn ship_parcel() {}\n"),
+        ("src/route.rs", "pub fn plan_route() {}\n"),
+        ("src/depot.rs", "pub fn stock_depot() {}\n"),
+        ("src/driver.rs", "pub fn assign_driver() {}\n"),
+        ("src/fleet.rs", "pub fn service_fleet() {}\n"),
+    ];
+
     #[tokio::test]
     async fn identifier_query_answers_by_keyword_within_the_budget_while_the_build_embeds() {
         let (_repo, _ollama, server) =
@@ -8263,6 +8508,174 @@ mod tests {
         drop(held);
     }
 
+    #[tokio::test]
+    async fn a_partial_identifier_answer_after_an_edit_reads_the_edited_files_once_parsed() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let first = started_identifier_build(&server).await;
+        wait_until_parsed(&first).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        server
+            .dispatch("explore", identifier_args("audit_account", "meaning"))
+            .await;
+        let mut reparse = first.current.lock().unwrap().last().unwrap().1.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            reparse.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the edited files were never parsed again")
+        .unwrap();
+
+        let answered = server
+            .dispatch("explore", identifier_args("audit_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+        assert!(!text.contains("close_account"), "{text}");
+        assert!(first.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_meaning_identifier_query_after_an_edit_parses_the_edited_files_while_it_waits() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let query = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args("audit_account", "meaning"))
+                    .await
+            })
+        };
+
+        wait_until_reparsed(&build, &edited).await;
+        assert!(!query.is_finished(), "the query answered before its budget");
+        server.current_ref().await.cancel_background_tasks();
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+            .await
+            .expect("the identifier query never answered")
+            .unwrap();
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+        assert!(!text.contains("close_account"), "{text}");
+        drop(held);
+    }
+
+    /// Waits until a request has parsed the files that differ in `cache`
+    /// again, as a meaning query does while it waits on `build`.
+    async fn wait_until_reparsed(build: &IdentifierBuild, cache: &Arc<ProjectCache>) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut reparse = loop {
+                let current = build
+                    .current
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(of, _)| std::ptr::eq(of.as_ptr(), Arc::as_ptr(cache)))
+                    .map(|(_, reparse)| reparse.clone());
+                match current {
+                    Some(reparse) => break reparse,
+                    None => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            };
+            reparse.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the query left the edited files unparsed while it waited on the build");
+    }
+
+    #[tokio::test]
+    async fn partial_identifier_answers_overlapping_an_edit_each_read_their_edits() {
+        let (repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let build = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let meaning_query = |name: &'static str| {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("explore", identifier_args(name, "meaning"))
+                    .await
+            })
+        };
+        let first_edit = server.ensure_project_cache().await.unwrap();
+        let first = meaning_query("audit_account");
+        wait_until_reparsed(&build, &first_edit).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn reconcile_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("second test edit")
+            .await;
+        let second_edit = server.ensure_project_cache().await.unwrap();
+        let second = meaning_query("reconcile_account");
+        wait_until_reparsed(&build, &second_edit).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "a query answered before its budget"
+        );
+
+        server.current_ref().await.cancel_background_tasks();
+
+        for (query, name, other) in [
+            (first, "audit_account", "reconcile_account"),
+            (second, "reconcile_account", "audit_account"),
+        ] {
+            let answered = tokio::time::timeout(std::time::Duration::from_secs(60), query)
+                .await
+                .expect("the identifier query never answered")
+                .unwrap();
+            let text = text_of(&answered);
+            assert!(text.starts_with("Partial results"), "{text}");
+            assert!(!text.contains("before the latest edits"), "{text}");
+            assert!(text.contains(&format!("{name} - src/ledger.rs")), "{text}");
+            assert!(
+                !text.contains(&format!("{other} - src/ledger.rs")),
+                "{text}"
+            );
+        }
+        drop(held);
+    }
+
     /// Waits until a request holds `cache` beyond its `holders`, as an
     /// identifier query does from just before it joins a build.
     async fn wait_until_held(cache: &Arc<ProjectCache>, holders: usize) {
@@ -8284,7 +8697,7 @@ mod tests {
         tokio::sync::OwnedSemaphorePermit,
     ) {
         let (repo, ollama, server) =
-            scripted_identifier_server(LEDGER_FILES, embeddings_for, |config| {
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
                 config.embed_budget_ms = 600_000;
                 config.query_embed_budget_ms = 600_000;
             })
@@ -8348,6 +8761,528 @@ mod tests {
                 "keywords:\n{by_keyword}\n\nmeaning:\n{by_meaning}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_after_an_edit_parses_the_edited_files_again() {
+        let (_repo, _ollama, server, held) = identifier_build_outdated_by_an_edit().await;
+        let running = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("audit_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("audit_account - src/ledger.rs"), "{text}");
+        let after = server
+            .current_ref()
+            .await
+            .identifier_build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|build| build.id);
+        assert_eq!(after, running, "the query started a second build");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_after_edits_to_most_of_the_tree_is_outdated() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 600_000;
+                config.query_embed_budget_ms = 600_000;
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        for (path, source) in &LEDGER_TREE[..3] {
+            std::fs::write(
+                repo.path().join(path),
+                format!("{source}pub fn audit_account() {{}}\n"),
+            )
+            .unwrap();
+        }
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("audit_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        assert!(build.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    /// An identifier server whose cold build has parsed `src/ledger.rs` and
+    /// holds every embed permit, after an edit that adds `audit_account`
+    /// whose reparse runs until the returned sender is dropped.
+    async fn identifier_build_with_a_stalled_reparse() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::watch::Sender<Option<Option<Arc<IdentifierIndex>>>>,
+    ) {
+        let (repo, ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let (stalled, reparse) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&edited), reparse)];
+        (repo, ollama, server, held, stalled)
+    }
+
+    #[tokio::test]
+    async fn a_keyword_identifier_query_answers_within_the_budget_while_its_reparse_runs() {
+        let (_repo, _ollama, server, held, stalled) =
+            identifier_build_with_a_stalled_reparse().await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the reparse");
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_partial_identifier_answer_does_not_wait_for_its_reparse() {
+        let (_repo, _ollama, server, held, stalled) =
+            identifier_build_with_a_stalled_reparse().await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.dispatch("explore", identifier_args("open_account", "meaning")),
+        )
+        .await
+        .expect("the partial answer waited for the reparse");
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("open_account - src/ledger.rs"), "{text}");
+        drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_partial_identifier_answer_from_documents_before_an_edit_says_so() {
+        let (_repo, _ollama, server, held, stalled) =
+            identifier_build_with_a_stalled_reparse().await;
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_partial_identifier_answer_after_edits_to_most_of_the_tree_says_so() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |config| {
+                config.embed_budget_ms = 0
+            })
+            .await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        for (path, source) in &LEDGER_TREE[..3] {
+            std::fs::write(
+                repo.path().join(path),
+                format!("{source}pub fn audit_account() {{}}\n"),
+            )
+            .unwrap();
+        }
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let parsed = build.parsed.borrow().clone().unwrap();
+        assert!(build.documents_for(&parsed, &edited).await.is_none());
+
+        let answered = server
+            .dispatch("explore", identifier_args("open_account", "meaning"))
+            .await;
+
+        let text = text_of(&answered);
+        assert!(text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("before the latest edits"), "{text}");
+        assert!(build.running(), "the build ended before the query answered");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_reparse_of_a_few_edited_files_never_waits_on_the_rayon_pool() {
+        const CHILD: &str = "CONTEXTPLUS_REPARSE_RAYON_SATURATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate saturation from other tests that legitimately use the global pool.
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "server::tests::a_reparse_of_a_few_edited_files_never_waits_on_the_rayon_pool",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RAYON_NUM_THREADS", "2")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let source = build.source.upgrade().unwrap();
+        let parsed = build.parsed.borrow().clone().unwrap();
+        edit_depot(&repo, &server, 0).await;
+        let edited = edit_depot(&repo, &server, 1).await;
+        let gate = Arc::new(std::sync::RwLock::new(()));
+        let closed = gate.write().unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        {
+            let gate = Arc::clone(&gate);
+            rayon::spawn_broadcast(move |_| {
+                let _ = entered_tx.send(());
+                drop(gate.read());
+            });
+        }
+        for _ in 0..rayon::current_num_threads() {
+            entered
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a rayon worker never took the blocking job");
+        }
+
+        let (reparsed_tx, reparsed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = reparsed_tx.send(IdentifierBuild::reparsed(&parsed, &source, &edited, None));
+        });
+        let reparsed = reparsed.recv_timeout(std::time::Duration::from_secs(60));
+        drop(closed);
+
+        let (reparsed, _) = reparsed
+            .expect("the reparse queued behind unrelated rayon work")
+            .unwrap();
+        let names: Vec<String> = reparsed.docs.iter().map(|doc| doc.name.clone()).collect();
+        assert!(names.contains(&"audit_0".to_string()), "{names:?}");
+        assert!(names.contains(&"audit_1".to_string()), "{names:?}");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn requests_against_one_build_after_an_edit_share_one_reparse() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let edit = |name: &str| {
+            std::fs::write(
+                repo.path().join("src/ledger.rs"),
+                format!("pub fn open_account() {{}}\npub fn {name}() {{}}\n"),
+            )
+            .unwrap();
+        };
+        edit("audit_account");
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+
+        let (first, concurrent) = tokio::join!(
+            build.documents_for(&parsed, &edited),
+            build.documents_for(&parsed, &edited)
+        );
+        let repeated = build.documents_for(&parsed, &edited).await;
+        edit("freeze_account");
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited_again = server.ensure_project_cache().await.unwrap();
+        let newer = build.documents_for(&parsed, &edited_again).await.unwrap();
+
+        let first = first.unwrap();
+        assert!(Arc::ptr_eq(&first, &concurrent.unwrap()));
+        assert!(Arc::ptr_eq(&first, &repeated.unwrap()));
+        let names = |index: &IdentifierIndex| -> Vec<String> {
+            index.docs.iter().map(|doc| doc.name.clone()).collect()
+        };
+        assert!(names(&first).contains(&"audit_account".to_string()));
+        assert!(names(&newer).contains(&"freeze_account".to_string()));
+        assert!(
+            build.running(),
+            "the build ended before the requests answered"
+        );
+        drop(held);
+    }
+
+    /// An identifier server of twenty `src/depot_{i}.rs` files whose cold
+    /// build has parsed them and holds every embed permit.
+    async fn parsed_depot_build() -> (
+        tempfile::TempDir,
+        wiremock::MockServer,
+        ContextPlusServer,
+        tokio::sync::OwnedSemaphorePermit,
+        IdentifierBuild,
+    ) {
+        let tree: Vec<(String, String)> = (0..20)
+            .map(|i| {
+                (
+                    format!("src/depot_{i}.rs"),
+                    format!("pub fn stock_{i}() {{}}\n"),
+                )
+            })
+            .collect();
+        let tree: Vec<(&str, &str)> = tree
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let (repo, ollama, server) =
+            scripted_identifier_server(&tree, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        (repo, ollama, server, held, build)
+    }
+
+    /// Adds `audit_{i}` to `src/depot_{i}.rs` and returns the edited tree.
+    async fn edit_depot(
+        repo: &tempfile::TempDir,
+        server: &ContextPlusServer,
+        i: usize,
+    ) -> Arc<ProjectCache> {
+        std::fs::write(
+            repo.path().join(format!("src/depot_{i}.rs")),
+            format!("pub fn stock_{i}() {{}}\npub fn audit_{i}() {{}}\n"),
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        server.ensure_project_cache().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reparse_after_a_further_edit_reuses_the_files_the_last_one_parsed() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let first = build.documents_for(&parsed, &first_edit).await.unwrap();
+        let second_edit = edit_depot(&repo, &server, 1).await;
+
+        let second = build.documents_for(&parsed, &second_edit).await.unwrap();
+
+        let names: Vec<String> = second.docs.iter().map(|doc| doc.name.clone()).collect();
+        assert!(names.contains(&"audit_0".to_string()), "{names:?}");
+        assert!(names.contains(&"audit_1".to_string()), "{names:?}");
+        assert!(
+            Arc::ptr_eq(
+                &first.docs.files["src/depot_0.rs"],
+                &second.docs.files["src/depot_0.rs"]
+            ),
+            "the second reparse parsed src/depot_0.rs again"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_reparse_stops_with_the_ref_background_tasks() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let mut second = build.reparse(&parsed, &second_edit).unwrap();
+
+        server.current_ref().await.cancel_background_tasks();
+
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            second.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the cancelled reparse neither published nor stopped")
+        .map(|reparsed| reparsed.clone());
+        assert!(published.is_err(), "the reparse outlived its ref's tasks");
+        drop(stalled);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_published_reparse_no_longer_holds_the_edited_project_cache() {
+        let (repo, _ollama, server) =
+            scripted_identifier_server(LEDGER_TREE, embeddings_for, |_| {}).await;
+        let held = hold_embeds(&server).await;
+        let build = started_identifier_build(&server).await;
+        wait_until_parsed(&build).await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        std::fs::write(
+            repo.path().join("src/ledger.rs"),
+            "pub fn open_account() {}\npub fn audit_account() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let edited = server.ensure_project_cache().await.unwrap();
+        let pause = crate::server_adapters::test_seams::pause_after_reparse_publish(
+            &server.current_ref().await.root_dir,
+        );
+        build.current.lock().unwrap().clear();
+        let holders = Arc::strong_count(&edited);
+
+        let current = build.reparse(&parsed, &edited).unwrap();
+        pause.wait_until_entered().await;
+        let held_after = Arc::strong_count(&edited);
+        pause.resume();
+
+        assert!(
+            matches!(*current.borrow(), Some(Some(_))),
+            "the reparse published no documents"
+        );
+        assert_eq!(
+            held_after, holders,
+            "the reparse published while it held the edited project cache"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_reparse_queued_behind_another_holds_neither_project_cache() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let source = build.source.upgrade().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let holders = [Arc::strong_count(&source), Arc::strong_count(&second_edit)];
+
+        let _second = build.reparse(&parsed, &second_edit).unwrap();
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            [Arc::strong_count(&source), Arc::strong_count(&second_edit)],
+            holders,
+            "the queued reparse holds a project cache"
+        );
+        drop(stalled);
+        drop(held);
+    }
+
+    /// Waits until the reparse `current` publishes, and returns its documents.
+    async fn published_reparse(
+        mut current: tokio::sync::watch::Receiver<Option<Option<Arc<IdentifierIndex>>>>,
+    ) -> Option<Arc<IdentifierIndex>> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            current.wait_for(Option::is_some),
+        )
+        .await
+        .expect("the queued reparse never published")
+        .unwrap()
+        .clone()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn a_queued_reparse_of_a_replaced_project_cache_parses_nothing() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let second = build.reparse(&parsed, &second_edit).unwrap();
+        drop(second_edit);
+        edit_depot(&repo, &server, 2).await;
+
+        drop(stalled);
+
+        let published = published_reparse(second).await;
+        assert!(
+            published.is_none() && build.latest.lock().unwrap().is_none(),
+            "the reparse parsed a project cache since replaced"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_queued_reparse_after_its_build_ends_parses_nothing() {
+        let (repo, _ollama, server, held, build) = parsed_depot_build().await;
+        let parsed = build.parsed.borrow().clone().unwrap();
+        let source = build.source.upgrade().unwrap();
+        let first_edit = edit_depot(&repo, &server, 0).await;
+        let (stalled, first) = tokio::sync::watch::channel(None);
+        *build.current.lock().unwrap() = vec![(Arc::downgrade(&first_edit), first)];
+        let second_edit = edit_depot(&repo, &server, 1).await;
+        let second = build.reparse(&parsed, &second_edit).unwrap();
+        drop(held);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(60), build.clone().finished())
+            .await
+            .expect("the build never ended");
+
+        drop(stalled);
+
+        let published = published_reparse(second).await;
+        assert!(
+            published.is_none() && build.latest.lock().unwrap().is_none(),
+            "the reparse parsed after its build ended"
+        );
+        drop(source);
     }
 
     #[tokio::test]
@@ -8495,6 +9430,7 @@ mod tests {
         let held = hold_embeds(&server).await;
         let build = started_identifier_build(&server).await;
         wait_until_parsed(&build).await;
+        let cache = server.ensure_project_cache().await.unwrap();
         let mut keyword_args = serde_json::Map::new();
         keyword_args.insert("semantic_weight".into(), json!(0.0));
         keyword_args.insert("keyword_weight".into(), json!(1.0));
@@ -8503,8 +9439,12 @@ mod tests {
                 keyword_args,
                 server.resolve_root(&serde_json::Map::new()).await,
                 "open_account".into(),
-                &server.ensure_project_cache().await.unwrap(),
-                &server.parsed_identifier_docs(&build).await.unwrap(),
+                &cache,
+                &server
+                    .parsed_identifier_docs(&build, &cache)
+                    .await
+                    .unwrap()
+                    .0,
                 Some("held".into()),
             )
             .await
@@ -14765,6 +15705,50 @@ mod tests {
         );
     }
 
+    /// A keyword query of a worktree edited while its build waits on the
+    /// primary's build parses the edited files again.
+    #[tokio::test]
+    async fn a_keyword_identifier_query_of_an_edited_worktree_waiting_on_its_primary_is_current() {
+        let ollama = wiremock::MockServer::start().await;
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        for dir in [primary.path(), worktree.path()] {
+            for name in ["same_a", "same_b", "same_c", "same_d", "same_e"] {
+                std::fs::write(
+                    dir.join(format!("{name}.rs")),
+                    format!("fn {name}() {{}}\n"),
+                )
+                .unwrap();
+            }
+        }
+        std::fs::write(primary.path().join("differs.rs"), "fn old_name() {}\n").unwrap();
+        std::fs::write(worktree.path().join("differs.rs"), "fn new_name() {}\n").unwrap();
+        let server = identifier_test_server(&ollama, primary.path()).await;
+        let worktree_server = attached_worktree(&server, worktree.path()).await;
+        let held = hold_embeds(&server).await;
+        let primary_build = started_identifier_build(&server).await;
+        wait_until_parsed(&primary_build).await;
+        let worktree_build = started_identifier_build(&worktree_server).await;
+        wait_until_parsed(&worktree_build).await;
+        std::fs::write(worktree.path().join("differs.rs"), "fn edited_name() {}\n").unwrap();
+        worktree_server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            worktree_server.dispatch("explore", identifier_args("edited_name", "keywords")),
+        )
+        .await
+        .expect("the keyword query waited for the build's vectors");
+
+        let text = text_of(&answered);
+        assert!(!text.starts_with("Partial results"), "{text}");
+        assert!(text.contains("edited_name - differs.rs"), "{text}");
+        assert!(worktree_build.running(), "the worktree build ended early");
+        drop(held);
+    }
+
     /// Every field of an identifier index's documents, in index order.
     fn identifier_documents(index: &IdentifierIndex) -> Vec<String> {
         let sorted = |tokens: &std::collections::HashSet<String>| {
@@ -16480,6 +17464,219 @@ mod tests {
         for embed in embeds {
             embed.abort();
         }
+    }
+
+    /// A server whose embedder answers at once, except requests with a
+    /// `SLOW` input, which it never answers within a test.
+    async fn slow_marker_server(
+        files: &[(&str, &str)],
+        max_concurrent: usize,
+    ) -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .respond_with(|request: &Request| {
+                let inputs = embed_request_inputs(request);
+                let response = embeddings_for(&inputs);
+                if inputs.iter().any(|input| input.contains("SLOW")) {
+                    response.set_delay(std::time::Duration::from_secs(3600))
+                } else {
+                    response
+                }
+            })
+            .mount(&ollama)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        for &(path, source) in files {
+            let full_path = root.path().join(path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(full_path, source).unwrap();
+        }
+        let mut config = semantic_fill_config(&ollama.uri(), 600_000, 60_000);
+        config.ollama_max_concurrent = max_concurrent;
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+        (root, ollama, server)
+    }
+
+    /// A `slow_marker_server` of two permits over a corpus larger than one
+    /// embed batch, whose `src/navigate.rs` embeds never answer.
+    async fn slow_navigate_corpus_server()
+    -> (tempfile::TempDir, wiremock::MockServer, ContextPlusServer) {
+        let corpus: Vec<(String, String)> = (0..32)
+            .map(|i| {
+                (
+                    format!("src/routes/route_{i}.rs"),
+                    format!("pub fn route_{i}() {{}}\n"),
+                )
+            })
+            .chain([(
+                "src/navigate.rs".to_string(),
+                "pub fn navigate_corpus() { /* SLOW */ }\n".to_string(),
+            )])
+            .collect();
+        let corpus: Vec<(&str, &str)> = corpus
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        slow_marker_server(&corpus, 2).await
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_navigate_embeds_its_corpus_beside_a_batch() {
+        let (_root, ollama, server) = slow_navigate_corpus_server().await;
+        let navigate = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("semantic_navigate", serde_json::Map::new())
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "navigate_corpus")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate never embedded its corpus");
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind navigate's corpus and a background batch");
+
+        assert!(query.is_ok(), "{query:?}");
+        navigate.abort();
+    }
+
+    #[tokio::test]
+    async fn a_query_embed_proceeds_while_a_navigate_query_embeds_its_corpus_beside_a_batch() {
+        let (_root, ollama, server) = slow_navigate_corpus_server().await;
+        let navigate = {
+            let server = server.clone();
+            let mut args = serde_json::Map::new();
+            args.insert("query".into(), json!("route"));
+            tokio::spawn(async move { server.dispatch("semantic_navigate", args).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "navigate_corpus")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate never embedded its corpus");
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server.state.ollama.embed_query("needle"),
+        )
+        .await
+        .expect("the query embed queued behind navigate's corpus and a background batch");
+
+        assert!(query.is_ok(), "{query:?}");
+        navigate.abort();
+        server.current_ref().await.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn a_navigate_query_embeds_its_fresh_files_beside_a_background_batch() {
+        let (_root, ollama, server) =
+            slow_marker_server(&[("src/fresh.rs", "pub fn fresh_needle() {}\n")], 2).await;
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+        let navigate = {
+            let server = server.clone();
+            let mut args = serde_json::Map::new();
+            args.insert("query".into(), json!("fresh needle"));
+            tokio::spawn(async move { server.dispatch("semantic_navigate", args).await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "fresh_needle")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate's fresh files queued behind a background batch");
+
+        navigate.abort();
+        server.current_ref().await.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn navigate_embeds_a_file_edited_since_its_cache_beside_a_background_batch() {
+        let (root, ollama, server) = slow_marker_server(
+            &[
+                ("src/edited.rs", "pub fn before_edit() {}\n"),
+                ("src/steady.rs", "pub fn steady_file() {}\n"),
+            ],
+            2,
+        )
+        .await;
+        let warmed = server
+            .dispatch("semantic_navigate", serde_json::Map::new())
+            .await;
+        assert!(
+            !matching_embed_request_batches(&ollama, "steady_file")
+                .await
+                .is_empty(),
+            "{}",
+            text_of(&warmed)
+        );
+        std::fs::write(
+            root.path().join("src/edited.rs"),
+            "pub fn edited_needle() {}\n",
+        )
+        .unwrap();
+        server
+            .invalidate_project_cache_with_reason("test edit")
+            .await;
+        let texts = vec!["SLOW background batch".to_string()];
+        let mut batch = std::pin::pin!(server.state.ollama.embed_documents(&texts));
+        assert!(futures::poll!(&mut batch).is_pending());
+        let navigate = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .dispatch("semantic_navigate", serde_json::Map::new())
+                    .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while matching_embed_request_batches(&ollama, "edited_needle")
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("navigate's edited file queued behind a background batch");
+
+        navigate.abort();
+        server.current_ref().await.cancel_background_tasks();
     }
 
     // -----------------------------------------------------------------------

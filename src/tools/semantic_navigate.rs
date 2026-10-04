@@ -507,7 +507,10 @@ pub async fn semantic_navigate(
                 results
             }
             None => {
-                let (docs, vectors) = indexer.walk_candidates(&root, eligible).await?;
+                let (docs, vectors) = crate::core::embeddings::interactive_delta(
+                    indexer.walk_candidates(&root, eligible),
+                )
+                .await?;
                 let mut index = SearchIndex::new();
                 index.index_with_vectors(docs, vectors);
                 let query_vector = ollama.embed_query(query).await?;
@@ -1048,12 +1051,19 @@ async fn resolve_embeddings(
     // passed by the caller — don't wrap it again with cache_name()
     let embed_cache_name = embed_model.to_string();
     let chunk_size = ollama.batch_size();
+    // A delta that fits one batch embeds in the interactive lane; a corpus
+    // takes the batch lane.
+    let interactive = uncached_indices.len() <= chunk_size;
 
     for chunk_start in (0..uncached_indices.len()).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(uncached_indices.len());
         let chunk_texts = &uncached_texts[chunk_start..chunk_end];
 
-        let mut chunk_vectors = ollama.embed_documents(chunk_texts).await?;
+        let mut chunk_vectors = if interactive {
+            crate::core::embeddings::interactive(ollama.embed_documents(chunk_texts)).await?
+        } else {
+            ollama.embed_documents(chunk_texts).await?
+        };
 
         // Store this chunk's vectors in cache, then drop lock BEFORE disk I/O.
         // Empty vectors (failed Ollama batches, time-box partials) are skipped

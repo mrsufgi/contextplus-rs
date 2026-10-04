@@ -212,6 +212,7 @@ enum EmbedLane {
 
 tokio::task_local! {
     static INTERACTIVE: ();
+    static INTERACTIVE_DELTA: ();
 }
 
 /// Runs `request` with its document embeds in the interactive lane, so they
@@ -219,6 +220,22 @@ tokio::task_local! {
 /// Tasks it spawns are not covered.
 pub async fn interactive<F: std::future::Future>(request: F) -> F::Output {
     INTERACTIVE.scope((), request).await
+}
+
+/// Runs `request` with only the embeds it runs through [`delta`] in the
+/// interactive lane, so a corpus it embeds stays behind the batch cap.
+pub async fn interactive_delta<F: std::future::Future>(request: F) -> F::Output {
+    INTERACTIVE_DELTA.scope((), request).await
+}
+
+/// Runs `embed`, of a delta that fits one batch, in the interactive lane
+/// when its request runs in [`interactive_delta`].
+pub async fn delta<F: std::future::Future>(embed: F) -> F::Output {
+    if INTERACTIVE_DELTA.try_with(|_| ()).is_ok() {
+        interactive(embed).await
+    } else {
+        embed.await
+    }
 }
 
 #[derive(Clone)]
