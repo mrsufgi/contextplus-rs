@@ -382,6 +382,12 @@ const SEARCH_CONFIG_KEYS: &[&str] = &[
     "CONTEXTPLUS_HNSW_MIN_VECTORS",
     "CONTEXTPLUS_REF_WARMUP_MODE",
     "CONTEXTPLUS_OLLAMA_MAX_CONCURRENT",
+    "CONTEXTPLUS_FORK_BASE",
+    "CONTEXTPLUS_FORK_BASE_DIR",
+    "CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS",
+    "CONTEXTPLUS_MEMORY_BUDGET_MB",
+    "CONTEXTPLUS_MEMORY_MIN_IDLE_SECS",
+    "CONTEXTPLUS_QUERY_EMBED_BUDGET_MS",
 ];
 
 fn matching_server(document: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -2227,5 +2233,35 @@ mod tests {
             AcquireOutcome::AlreadyRunning => {} // expected arm
             AcquireOutcome::Acquired(_) => panic!("should have been AlreadyRunning"),
         }
+    }
+
+    #[test]
+    fn mcp_json_fork_base_overrides_missing_env() {
+        let contents = serde_json::json!({
+            "mcpServers": {
+                "contextplus": {
+                    "command": "/opt/contextplus-rs",
+                    "env": {
+                        "CONTEXTPLUS_FORK_BASE": "origin/main",
+                        "CONTEXTPLUS_FORK_BASE_DIR": "/bases",
+                        "CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS": "120"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &HashMap::new()).unwrap();
+
+        assert_eq!(
+            resolved.config.fork_base.as_deref(),
+            Some("origin/main"),
+            "fork_base should be read from .mcp.json when absent from env"
+        );
+        assert_eq!(
+            resolved.config.fork_base_dir,
+            Some(std::path::PathBuf::from("/bases")),
+        );
+        assert_eq!(resolved.config.fork_base_min_advance_secs, 120);
     }
 }
