@@ -2352,13 +2352,29 @@ impl ContextPlusServer {
         let mut slot = self.state.fork_base_advance.lock().unwrap();
         if let Some((task, advance)) = slot.as_ref()
             && !task.is_finished()
-            && self
-                .state
-                .fork_base_advance_state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                    (state != ADVANCE_EXITING).then_some(ADVANCE_RETRIGGERED)
-                })
-                .is_ok()
+            && {
+                let mut current = self
+                    .state
+                    .fork_base_advance_state
+                    .load(Ordering::Acquire);
+                loop {
+                    if current == ADVANCE_EXITING {
+                        break false;
+                    }
+                    match self
+                        .state
+                        .fork_base_advance_state
+                        .compare_exchange_weak(
+                            current,
+                            ADVANCE_RETRIGGERED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                        Ok(_) => break true,
+                        Err(updated) => current = updated,
+                    }
+                }
+            }
         {
             return Some(advance.clone());
         }
@@ -2492,18 +2508,27 @@ impl ContextPlusServer {
                 indexed,
                 "fork base checked"
             );
-            let again = moved
-                || state.fork_base_advance_state.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |state| {
-                        Some(if state == ADVANCE_RETRIGGERED {
-                            ADVANCE_RUNNING
-                        } else {
-                            ADVANCE_EXITING
-                        })
-                    },
-                ) == Ok(ADVANCE_RETRIGGERED);
+            let again = moved || {
+                let mut current = state
+                    .fork_base_advance_state
+                    .load(Ordering::Acquire);
+                loop {
+                    let next = if current == ADVANCE_RETRIGGERED {
+                        ADVANCE_RUNNING
+                    } else {
+                        ADVANCE_EXITING
+                    };
+                    match state.fork_base_advance_state.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(prev) => break prev == ADVANCE_RETRIGGERED,
+                        Err(updated) => current = updated,
+                    }
+                }
+            };
             if !again {
                 return;
             }
