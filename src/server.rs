@@ -3242,7 +3242,7 @@ impl ContextPlusServer {
     fn spawn_shallow_warmup_task(&self, ref_id: crate::ref_index::RefId) {
         let state = Arc::clone(&self.state);
         let server = self.clone();
-        tokio::spawn(async move {
+        let _task = tokio::spawn(async move {
             // --- Idempotency guard ---
             {
                 let mut inflight = state.warmup_in_flight.lock().await;
@@ -3407,6 +3407,8 @@ impl ContextPlusServer {
                 "ref_warmup shallow: complete (no embed calls)"
             );
         });
+        #[cfg(test)]
+        crate::server_adapters::test_seams::warmup_started(ref_id.0, _task);
     }
 
     /// Spawn the full warmup background task for `ref_id`.
@@ -3423,7 +3425,7 @@ impl ContextPlusServer {
     fn spawn_full_warmup_task(&self, ref_id: crate::ref_index::RefId) {
         let state = Arc::clone(&self.state);
         let server = self.clone();
-        tokio::spawn(async move {
+        let _task = tokio::spawn(async move {
             // --- Idempotency guard ---
             {
                 let mut inflight = state.warmup_in_flight.lock().await;
@@ -3575,6 +3577,8 @@ impl ContextPlusServer {
                 "ref_warmup full: complete"
             );
         });
+        #[cfg(test)]
+        crate::server_adapters::test_seams::warmup_started(ref_id.0, _task);
     }
 
     /// Fetch instructions content (cached after first successful fetch).
@@ -17969,19 +17973,19 @@ mod tests {
     /// index it installs.
     async fn identifier_shallow_warmup(server: &ContextPlusServer) -> Arc<IdentifierIndex> {
         let owner = server.current_ref().await;
-        server.spawn_shallow_warmup_task(crate::ref_index::RefId::for_canonical_path(
-            &owner.canonical_root,
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if let Some(index) = owner.identifier_index.read().await.as_ref() {
-                    return Arc::clone(index);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the shallow warmup installed no identifier index")
+        let ref_id = crate::ref_index::RefId::for_canonical_path(&owner.canonical_root);
+        server.spawn_shallow_warmup_task(ref_id);
+        // Await the warmup task directly rather than polling with a wall-clock
+        // timeout; on slow CI the 10 s limit fires before the task finishes.
+        for task in crate::server_adapters::test_seams::take_warmups(ref_id.0) {
+            task.await.expect("warmup task panicked");
+        }
+        owner
+            .identifier_index
+            .read()
+            .await
+            .clone()
+            .expect("the shallow warmup installed no identifier index")
     }
 
     /// A worktree's shallow warmup over a primary with an identifier index
