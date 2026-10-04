@@ -420,6 +420,33 @@ pub(crate) mod test_seams {
             .unwrap_or_default()
     }
 
+    fn warmup_slots() -> &'static Mutex<BTreeMap<u64, Vec<tokio::task::JoinHandle<()>>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<u64, Vec<tokio::task::JoinHandle<()>>>>> =
+            OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Keeps the JoinHandle of a background shallow- or full-warmup task for
+    /// `ref_id` so tests can await it deterministically instead of using a
+    /// wall-clock timeout.
+    pub(crate) fn warmup_started(ref_id: u64, task: tokio::task::JoinHandle<()>) {
+        warmup_slots()
+            .lock()
+            .unwrap()
+            .entry(ref_id)
+            .or_default()
+            .push(task);
+    }
+
+    /// All warmup tasks for `ref_id` started since the last call.
+    pub(crate) fn take_warmups(ref_id: u64) -> Vec<tokio::task::JoinHandle<()>> {
+        warmup_slots()
+            .lock()
+            .unwrap()
+            .remove(&ref_id)
+            .unwrap_or_default()
+    }
+
     fn remote_ref_advance_slots()
     -> &'static Mutex<BTreeMap<PathBuf, Vec<crate::server::ForkBaseAdvance>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<crate::server::ForkBaseAdvance>>>> =

@@ -382,6 +382,12 @@ const SEARCH_CONFIG_KEYS: &[&str] = &[
     "CONTEXTPLUS_HNSW_MIN_VECTORS",
     "CONTEXTPLUS_REF_WARMUP_MODE",
     "CONTEXTPLUS_OLLAMA_MAX_CONCURRENT",
+    "CONTEXTPLUS_FORK_BASE",
+    "CONTEXTPLUS_FORK_BASE_DIR",
+    "CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS",
+    "CONTEXTPLUS_MEMORY_BUDGET_MB",
+    "CONTEXTPLUS_MEMORY_MIN_IDLE_SECS",
+    "CONTEXTPLUS_QUERY_EMBED_BUDGET_MS",
 ];
 
 fn matching_server(document: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -1362,15 +1368,31 @@ mod tests {
 
     #[tokio::test]
     async fn start_fork_base_registers_an_existing_checkout_in_the_background() {
-        let (_ollama, _primary, _bases, server) = fork_base_daemon().await;
-        let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
-        let existing = tokio::task::spawn_blocking(move || {
-            crate::git::fork_base::ensure_fork_base(&config, &root)
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        drop(existing.expect("a fork base checkout"));
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
+        // Pre-create the checkout via git directly, without acquiring the fd
+        // lock file.  On macOS flock(LOCK_EX|LOCK_NB) can return EWOULDBLOCK
+        // for a brief window after an fd close; calling ensure_fork_base here
+        // and dropping the ForkBase would trigger that race, making the second
+        // ensure_fork_base inside start_fork_base return None.
+        let dir =
+            crate::git::fork_base::fork_base_dir(&server.state.config, primary.path()).unwrap();
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        let sha = fork_base_git(primary.path(), &["rev-parse", "refs/remotes/origin/main"]);
+        fork_base_git(
+            primary.path(),
+            &[
+                "worktree",
+                "add",
+                "-f",
+                "-f",
+                "--detach",
+                "--lock",
+                "--reason",
+                crate::git::fork_base::LOCK_REASON,
+                &dir.to_string_lossy(),
+                &sha,
+            ],
+        );
 
         let registration = start_fork_base(&server)
             .await
@@ -2227,5 +2249,35 @@ mod tests {
             AcquireOutcome::AlreadyRunning => {} // expected arm
             AcquireOutcome::Acquired(_) => panic!("should have been AlreadyRunning"),
         }
+    }
+
+    #[test]
+    fn mcp_json_fork_base_overrides_missing_env() {
+        let contents = serde_json::json!({
+            "mcpServers": {
+                "contextplus": {
+                    "command": "/opt/contextplus-rs",
+                    "env": {
+                        "CONTEXTPLUS_FORK_BASE": "origin/main",
+                        "CONTEXTPLUS_FORK_BASE_DIR": "/bases",
+                        "CONTEXTPLUS_FORK_BASE_MIN_ADVANCE_SECS": "120"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let resolved = resolve_daemon_config_contents(Some(&contents), &HashMap::new()).unwrap();
+
+        assert_eq!(
+            resolved.config.fork_base.as_deref(),
+            Some("origin/main"),
+            "fork_base should be read from .mcp.json when absent from env"
+        );
+        assert_eq!(
+            resolved.config.fork_base_dir,
+            Some(std::path::PathBuf::from("/bases")),
+        );
+        assert_eq!(resolved.config.fork_base_min_advance_secs, 120);
     }
 }
