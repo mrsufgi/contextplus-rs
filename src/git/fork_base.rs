@@ -244,6 +244,32 @@ fn remove_other_checkouts(primary_root: &Path, dir: &Path) {
         } else if line.strip_prefix("locked ").map(str::trim) == Some(LOCK_REASON)
             && let Some(path) = path.take().filter(|path| *path != canonical && path != dir)
         {
+            // A live daemon holds a write fd-lock on the checkout's sibling
+            // `.lock` file. Try to acquire it; skip the removal if it is held.
+            let lock_path = path.with_extension("lock");
+            let live = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .ok()
+                .and_then(|f| {
+                    let mut lock = fd_lock::RwLock::new(f);
+                    match lock.try_write() {
+                        Ok(_guard) => None,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Some(()),
+                        Err(_) => None,
+                    }
+                })
+                .is_some();
+            if live {
+                tracing::info!(
+                    phase = "fork_base",
+                    path = %path.display(),
+                    "skipped removing a fork base held by another daemon"
+                );
+                continue;
+            }
             let removed = git(
                 primary_root,
                 &["worktree", "remove", "-f", "-f", &path.to_string_lossy()],
@@ -466,6 +492,20 @@ mod tests {
             .map(|(path, _)| path)
             .collect();
         assert_eq!(listed, vec![base.dir.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn remove_other_checkouts_skips_a_live_fork_base() {
+        let (primary, _) = repository();
+        let live_bases = tempfile::tempdir().unwrap();
+        let live = ensure_fork_base(&config(live_bases.path()), primary.path())
+            .unwrap()
+            .expect("the live fork base");
+        let new_bases = tempfile::tempdir().unwrap();
+        ensure_fork_base(&config(new_bases.path()), primary.path())
+            .unwrap()
+            .expect("the new fork base");
+        assert!(live.dir.exists(), "a live fork base was removed");
     }
 
     #[test]
