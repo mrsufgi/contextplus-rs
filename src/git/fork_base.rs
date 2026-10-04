@@ -83,6 +83,11 @@ pub fn ensure_fork_base(config: &Config, primary_root: &Path) -> Result<Option<F
         if !ours {
             return refused("foreign_checkout");
         }
+        // A checkout a crash interrupted holds part of the tree it moved to.
+        let at = resolve(&dir, "HEAD").unwrap_or_else(|| sha.clone());
+        if checkout(&dir, &at).is_err() {
+            return refused("checkout_failed");
+        }
     } else {
         let target = dir.to_string_lossy();
         // Twice forced: a registration left locked by a removed checkout
@@ -382,15 +387,13 @@ mod tests {
         assert!(held.dir.exists());
     }
 
-    #[test]
-    fn fork_base_repairs_a_locked_registration_with_no_checkout() {
-        let (primary, sha) = repository();
-        let bases = tempfile::tempdir().unwrap();
-        let config = config(bases.path());
-        let dir = fork_base_dir(&config, primary.path()).unwrap();
-        std::fs::create_dir_all(bases.path()).unwrap();
+    /// The fork base checkout of `primary` at `sha`, added by git alone so no
+    /// lock of a dropped [`ForkBase`] can outlive it in a spawned child.
+    fn locked_checkout(primary: &Path, config: &Config, sha: &str) -> PathBuf {
+        let dir = fork_base_dir(config, primary).unwrap();
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
         git(
-            primary.path(),
+            primary,
             &[
                 "worktree",
                 "add",
@@ -400,9 +403,18 @@ mod tests {
                 "--reason",
                 LOCK_REASON,
                 &dir.to_string_lossy(),
-                &sha,
+                sha,
             ],
         );
+        dir
+    }
+
+    #[test]
+    fn fork_base_repairs_a_locked_registration_with_no_checkout() {
+        let (primary, sha) = repository();
+        let bases = tempfile::tempdir().unwrap();
+        let config = config(bases.path());
+        let dir = locked_checkout(primary.path(), &config, &sha);
         std::fs::remove_dir_all(&dir).unwrap();
 
         let base = ensure_fork_base(&config, primary.path())
@@ -410,6 +422,28 @@ mod tests {
             .expect("a repaired fork base");
         assert_eq!(base.dir, dir);
         assert_eq!(git(&base.dir, &["rev-parse", "HEAD"]), sha);
+    }
+
+    #[test]
+    fn fork_base_restores_a_checkout_a_crash_left_partial() {
+        let (primary, sha) = repository();
+        let bases = tempfile::tempdir().unwrap();
+        let config = config(bases.path());
+        let dir = locked_checkout(primary.path(), &config, &sha);
+        std::fs::write(dir.join("lib.rs"), "pub fn half").unwrap();
+
+        let base = ensure_fork_base(&config, primary.path())
+            .unwrap()
+            .expect("a restored fork base");
+        assert_eq!(base.head, sha);
+        assert_eq!(
+            git(
+                &base.dir,
+                &["status", "--porcelain", "--untracked-files=no"]
+            ),
+            "",
+            "the fork base kept a partial tree"
+        );
     }
 
     #[test]
