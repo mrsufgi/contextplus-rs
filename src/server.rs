@@ -1197,9 +1197,10 @@ impl SharedState {
     /// Keeps the process within `resident_memory_budget_bytes` of RAM. The
     /// trigger is measured process memory; per-ref estimates only pick which
     /// idle worktrees to evict, least recently used first, down to 80% of the
-    /// budget. The primary is never evicted: when it alone exceeds the budget
-    /// one warning names its heaviest structures. The fork base is evicted
-    /// only over twice the budget; its next advance or fork rebuilds it.
+    /// budget. The primary and the fork base are pinned for the daemon's
+    /// lifetime and are never evicted, even during an emergency pass.  When
+    /// the primary alone exceeds the budget one warning names its heaviest
+    /// structures.
     pub async fn enforce_memory_budget(&self) {
         let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
         let mut snapshots = Vec::with_capacity(refs.len());
@@ -1313,11 +1314,7 @@ impl SharedState {
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
                 let id = crate::ref_index::RefId::for_canonical_path(&refs[i].canonical_root);
-                let spared = if self.fork_base_ref_id.get() == Some(&id) {
-                    !emergency
-                } else {
-                    self.pinned(id)
-                };
+                let spared = self.pinned(id);
                 if Arc::ptr_eq(&refs[i], &self.default_ref) || spared {
                     return None;
                 }
@@ -1531,12 +1528,13 @@ fn process_resident_bytes() -> Option<usize> {
 const MEMORY_RETAINED_FREE_TRIM_BYTES: usize = 256 * 1024 * 1024;
 
 /// Minimum unique bytes a candidate must hold before eviction is attempted.
-/// Evicting a ref that contributes zero unique bytes frees nothing and still
-/// forces a full cache rebuild on next access.  A fork whose every Arc is
-/// shared with its parent shows `unique_estimated_mib = 0`; the old
-/// `holds_unique_bytes` check passed it (the overlay Arc was unique, but
-/// empty) while contributing nothing to the freed total.
-const EVICTION_MIN_UNIQUE_BYTES: usize = 1;
+/// Evicting a ref that frees fewer than this threshold costs a full re-warm
+/// while returning nothing meaningful.  The log field `unique_estimated_mib`
+/// uses integer MiB rounding; any value below 1 MiB rounds to zero, which is
+/// the observable symptom of spurious near-zero evictions.  Setting the floor
+/// to 1 MiB suppresses those evictions while leaving refs with real resident
+/// content (at least one MiB of unique embeddings or vectors) eligible.
+const EVICTION_MIN_UNIQUE_BYTES: usize = 1024 * 1024;
 
 /// Walks every arena under its lock, so it runs off the async runtime.
 async fn sample_allocator_in_use() -> Option<usize> {
@@ -9799,16 +9797,16 @@ mod tests {
         fork_base_worktree_forks_with_its_own_delta(false).await;
     }
 
-    /// A worktree forks the fork base whose caches an emergency budget pass
-    /// cleared, with only its own changes.
+    /// A worktree forks the fork base with only its own changes even after an
+    /// emergency budget pass; the fork base is pinned and must not be evicted.
     #[tokio::test]
-    async fn fork_base_worktree_forks_the_fork_base_an_emergency_cleared() {
+    async fn fork_base_worktree_forks_even_after_emergency_budget_pass() {
         fork_base_worktree_forks_with_its_own_delta(true).await;
     }
 
     /// Cuts a worktree from `origin/main`, far from the primary, once an
-    /// emergency budget pass cleared the fork base when `cleared`, and asserts
-    /// it forks the fork base's index with only its own changes.
+    /// emergency budget pass ran when `cleared`, and asserts it forks the fork
+    /// base's index with only its own changes (fork base stays pinned).
     async fn fork_base_worktree_forks_with_its_own_delta(cleared: bool) {
         let ollama = wiremock::MockServer::start().await;
         let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
@@ -9865,9 +9863,8 @@ mod tests {
             server.state.enforce_memory_budget().await;
             *server.state.measured_resident_override.lock().unwrap() = None;
             assert!(
-                base.search_index_cache.read().await.is_none()
-                    && base.embedding_cache.read().await.is_empty(),
-                "an emergency kept the fork base's caches"
+                !base.embedding_cache.read().await.is_empty(),
+                "an emergency evicted the fork base's caches; the fork base must be pinned"
             );
         }
         let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &upstream);
@@ -17275,7 +17272,8 @@ mod tests {
             .identifier_vectors
             .set(Arc::new(RwLock::new(HashMap::from([(
                 "worktree-only-vector".to_string(),
-                Arc::from(vec![0.5_f32; 4096]),
+                // 1 MiB of identifier vectors — enough to cross EVICTION_MIN_UNIQUE_BYTES.
+                Arc::from(vec![0.5_f32; 256 * 1024]),
             )]))))
             .unwrap();
         let attached = server.state.attach_ref(ref_id, || Arc::clone(&owner)).await;
@@ -17331,7 +17329,9 @@ mod tests {
         use crate::ref_index::{RefId, RefIndex};
 
         let mut config = Config::from_env();
-        config.resident_memory_budget_bytes = 11 * 1024;
+        // 11 × unit keeps proportions from the old test: budget sits between
+        // 2× and 3× a single ref's content, so one eviction suffices.
+        config.resident_memory_budget_bytes = 11 * 256 * 1024;
         config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
@@ -17367,7 +17367,8 @@ mod tests {
                 format!("{name}.rs"),
                 CacheEntry {
                     hash: format!("{name}-hash"),
-                    vector: vec![0.5; 1024],
+                    // 1 MiB per ref so each crosses EVICTION_MIN_UNIQUE_BYTES.
+                    vector: vec![0.5; 256 * 1024],
                 },
             );
         }
@@ -17419,7 +17420,8 @@ mod tests {
             "serving.rs".to_string(),
             CacheEntry {
                 hash: "serving-hash".to_string(),
-                vector: vec![0.5; 4096],
+                // 1 MiB so the ref crosses EVICTION_MIN_UNIQUE_BYTES once released.
+                vector: vec![0.5; 256 * 1024],
             },
         );
 
@@ -17446,7 +17448,7 @@ mod tests {
         use crate::ref_index::{RefId, RefIndex};
 
         let mut config = Config::from_env();
-        config.resident_memory_budget_bytes = 10 * 1024;
+        config.resident_memory_budget_bytes = 10 * 256 * 1024;
         config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
@@ -17488,14 +17490,15 @@ mod tests {
             "unique.rs".to_string(),
             CacheEntry {
                 hash: "unique-hash".to_string(),
-                vector: vec![0.5; 1024],
+                // 1 MiB so the ref crosses EVICTION_MIN_UNIQUE_BYTES.
+                vector: vec![0.5; 256 * 1024],
             },
         );
         server.state.touch_ref(shared_id);
         server.state.touch_ref(unique_id);
         mark_ref_idle(&server.state, shared_id);
         mark_ref_idle(&server.state, unique_id);
-        *server.state.measured_resident_override.lock().unwrap() = Some(20 * 1024);
+        *server.state.measured_resident_override.lock().unwrap() = Some(20 * 256 * 1024);
 
         server.state.enforce_memory_budget().await;
 
@@ -18366,6 +18369,17 @@ mod tests {
         .await
         .expect("the background identifier rebuild never sent its embed request");
 
+        // Push unique bytes past EVICTION_MIN_UNIQUE_BYTES so the budget pass
+        // considers this ref eligible (the identifier build above emits only
+        // small 2-dim mock vectors, not enough by themselves).
+        owner.embedding_cache.write().await.insert(
+            "budget_trigger.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "bt".to_string(),
+                vector: vec![0.5f32; 256 * 1024],
+            },
+        );
+
         mark_ref_idle(&server.state, worktree_id);
         server.state.enforce_memory_budget().await;
         assert!(owner.project_cache.read().await.is_none());
@@ -18479,7 +18493,8 @@ mod tests {
             format!("{name}.rs"),
             CacheEntry {
                 hash: format!("{name}-hash"),
-                vector: vec![0.5; 4096],
+                // 1 MiB of vectors — enough to cross EVICTION_MIN_UNIQUE_BYTES.
+                vector: vec![0.5; 256 * 1024],
             },
         );
         (id, owner)
@@ -18721,7 +18736,8 @@ mod tests {
             "resident.rs".to_string(),
             crate::core::embeddings::CacheEntry {
                 hash: "resident-hash".to_string(),
-                vector: vec![0.5; 4096],
+                // 1 MiB so the ref crosses EVICTION_MIN_UNIQUE_BYTES after warmup.
+                vector: vec![0.5; 256 * 1024],
             },
         );
         let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(&owner.root_dir);
@@ -18867,15 +18883,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_budget_emergency_evicts_the_fork_base() {
+    async fn memory_budget_emergency_does_not_evict_the_fork_base() {
         let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
         *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET * 3);
 
         server.state.enforce_memory_budget().await;
         assert!(
-            base.embedding_cache.read().await.is_empty(),
-            "an emergency kept the fork base's caches"
+            !base.embedding_cache.read().await.is_empty(),
+            "emergency evicted the fork base; it must stay pinned"
         );
         assert!(
             server
@@ -18883,7 +18899,33 @@ mod tests {
                 .ref_index(*server.state.fork_base_ref_id.get().unwrap())
                 .await
                 .is_some(),
-            "an emergency removed the fork base"
+            "emergency removed the fork base from the registry"
+        );
+    }
+
+    // Fix 2b: the fork base is pinned for the daemon's lifetime and must never
+    // be evicted — not even during an emergency pass.  #136 design: "pin the
+    // fork base and never parent it".
+    #[tokio::test]
+    async fn memory_budget_emergency_never_evicts_the_fork_base() {
+        let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
+        // Emergency: 3× budget.
+        *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET * 3);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            !base.embedding_cache.read().await.is_empty(),
+            "emergency evicted the fork base; it must be pinned for the daemon's lifetime"
+        );
+        assert!(
+            server
+                .state
+                .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+                .await
+                .is_some(),
+            "emergency removed the fork base from the registry"
         );
     }
 
@@ -18933,6 +18975,61 @@ mod tests {
             fork.embedding_cache.read().await.is_empty(),
             "cache state changed unexpectedly"
         );
+    }
+
+    // Fix 2a: a non-fork worktree whose unique bytes are all below
+    // EVICTION_MIN_UNIQUE_BYTES must not be evicted in either a normal or an
+    // emergency pass.  A worktree that shares heavy inherited caches (same Arc
+    // pointer as primary) and contributes only a tiny delta (<< 1 MiB) frees
+    // nothing useful when evicted and still forces a re-warm.
+    #[tokio::test]
+    async fn memory_budget_skips_near_zero_unique_worktree_normal_and_emergency() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 0;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        // Attach a worktree whose only unique content is a single tiny vector
+        // (well below EVICTION_MIN_UNIQUE_BYTES after the fix).  The parent_ref_id
+        // is set so that it inherits the primary's identifier_index Arc; the only
+        // unique components are its own (empty) overlay Arcs and the small
+        // embedding entry.
+        let path = PathBuf::from("/tmp/cptest-near-zero-unique-wt");
+        let id = RefId::for_canonical_path(&path);
+        let owner = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        owner.embedding_cache.write().await.insert(
+            "tiny.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "t".to_string(),
+                // A single f32 — well under 1 MiB of unique bytes.
+                vector: vec![0.5f32; 1],
+            },
+        );
+        mark_ref_idle_for(&server.state, id, std::time::Duration::ZERO);
+
+        // Normal pass (2× budget) and emergency pass (3× budget) must both skip it.
+        for measured in [RESIDENCY_BUDGET * 2, RESIDENCY_BUDGET * 3] {
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+            let (logs, _capture) = crate::test_logs::captured_info_logs();
+            server.state.enforce_memory_budget().await;
+            let logs = crate::test_logs::logs_as_string(&logs);
+            assert!(
+                !logs.contains("ref caches evicted for memory budget"),
+                "evicted a near-zero-unique worktree at measured={measured}: {logs}"
+            );
+        }
     }
 
     // Fix 3: the fork base's exclusive bytes must not count toward the
@@ -19312,7 +19409,10 @@ mod tests {
     #[tokio::test]
     async fn review_r3_memory_budget_evicts_down_to_low_watermark() {
         let mut config = Config::from_env();
-        config.resident_memory_budget_bytes = 40_000;
+        // Budget chosen so low_watermark (80 % of budget) lands between one
+        // and two ref-units (≈ 1 MiB each).  That stops the pass after
+        // evicting two of the three idle refs.
+        config.resident_memory_budget_bytes = 5 * 1024 * 1024 / 2;
         config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
