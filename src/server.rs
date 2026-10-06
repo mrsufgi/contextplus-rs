@@ -746,6 +746,8 @@ pub struct SharedState {
     #[cfg(test)]
     pub(crate) measured_resident_override: std::sync::Mutex<Option<usize>>,
     #[cfg(test)]
+    pub(crate) sampled_in_use_override: std::sync::Mutex<Option<usize>>,
+    #[cfg(test)]
     free_memory_checks: std::sync::atomic::AtomicUsize,
 }
 
@@ -1224,7 +1226,28 @@ impl SharedState {
             .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
         let budget = self.config.resident_memory_budget_bytes;
         let measured = self.measured_resident_bytes(estimated);
-        let emergency = measured > budget.saturating_mul(2);
+
+        // Bytes held exclusively by the fork base.  The base is pinned and can
+        // never be evicted under normal conditions, so its contribution to RSS
+        // should not count toward the emergency threshold — it cannot be
+        // reclaimed without an emergency pass.
+        let fork_base_id = self.fork_base_ref_id.get().copied();
+        let pinned_exclusive: usize = fork_base_id.map_or(0, |fb_id| {
+            refs.iter()
+                .enumerate()
+                .find(|(_, r)| {
+                    crate::ref_index::RefId::for_canonical_path(&r.canonical_root) == fb_id
+                })
+                .map_or(0, |(fi, _)| {
+                    components[fi]
+                        .iter()
+                        .filter(|(ptr, _, _)| holders[ptr].1 == 1)
+                        .map(|(ptr, _, _)| holders[ptr].0)
+                        .sum()
+                })
+        });
+        let evictable_measured = measured.saturating_sub(pinned_exclusive);
+        let emergency = evictable_measured > budget.saturating_mul(2);
         if !emergency
             && self
                 .budget_emergency
@@ -1273,11 +1296,19 @@ impl SharedState {
                 min_idle.as_secs()
             );
         }
-        let in_use_before = if self.trim_due() {
-            sample_allocator_in_use().await
-        } else {
-            None
+        // Always sample allocator in-use when over budget so that the retained-
+        // free trim path can fire even when no evictions occurred.
+        #[cfg(test)]
+        let in_use_before = {
+            let ovr = *self.sampled_in_use_override.lock().unwrap();
+            if ovr.is_some() {
+                ovr
+            } else {
+                sample_allocator_in_use().await
+            }
         };
+        #[cfg(not(test))]
+        let in_use_before = sample_allocator_in_use().await;
         let access = self.ref_access.lock().unwrap().clone();
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
@@ -1306,8 +1337,17 @@ impl SharedState {
                 break;
             }
             let owner = &refs[i];
-            let holds_unique_bytes = components[i].iter().any(|(ptr, _, _)| holders[ptr].1 == 1);
-            if !holds_unique_bytes
+            // Pre-compute unique bytes so we can skip candidates that would
+            // free nothing.  A fork whose every Arc pointer is shared with its
+            // parent has unique_estimated == 0: the overlay Arc is unique in
+            // the pointer sense but carries 0 bytes.  Evicting such a ref
+            // writes nothing to the freed total and still forces a re-warm.
+            let unique_estimated: usize = components[i]
+                .iter()
+                .filter(|(ptr, _, _)| holders[ptr].1 == 1)
+                .map(|(ptr, _, _)| holders[ptr].0)
+                .sum();
+            if unique_estimated < EVICTION_MIN_UNIQUE_BYTES
                 || owner
                     .active_requests
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -1349,7 +1389,12 @@ impl SharedState {
                 "ref caches evicted for memory budget"
             );
         }
-        if evicted > 0 || self.trim_due() {
+        // Trim if we evicted something, if the periodic trim is due, or if the
+        // allocator is holding more freed memory than the threshold even though
+        // nothing was evicted (e.g. all candidates had 0 unique bytes).
+        let retained_free = in_use_before.map_or(0, |in_use| measured.saturating_sub(in_use));
+        let trim_threshold = MEMORY_RETAINED_FREE_TRIM_BYTES.max(budget / 8);
+        if evicted > 0 || self.trim_due() || retained_free > trim_threshold {
             self.trim_free_memory().await;
         }
         let estimated_after = holders
@@ -1370,6 +1415,7 @@ impl SharedState {
                 in_use_sampled = in_use.is_some(),
                 in_use_before_mib = in_use.map_or(0, |(before, _)| mib(before)),
                 in_use_after_mib = in_use.map_or(0, |(_, after)| mib(after)),
+                pinned_exclusive_mib = mib(pinned_exclusive),
                 budget_mib = mib(budget),
                 min_idle_secs = min_idle.as_secs(),
                 emergency,
@@ -1483,6 +1529,14 @@ fn process_resident_bytes() -> Option<usize> {
 /// Freed memory the allocator may keep before it is returned to the OS while
 /// the process is under budget.
 const MEMORY_RETAINED_FREE_TRIM_BYTES: usize = 256 * 1024 * 1024;
+
+/// Minimum unique bytes a candidate must hold before eviction is attempted.
+/// Evicting a ref that contributes zero unique bytes frees nothing and still
+/// forces a full cache rebuild on next access.  A fork whose every Arc is
+/// shared with its parent shows `unique_estimated_mib = 0`; the old
+/// `holds_unique_bytes` check passed it (the overlay Arc was unique, but
+/// empty) while contributing nothing to the freed total.
+const EVICTION_MIN_UNIQUE_BYTES: usize = 1;
 
 /// Walks every arena under its lock, so it runs off the async runtime.
 async fn sample_allocator_in_use() -> Option<usize> {
@@ -2842,6 +2896,8 @@ impl ContextPlusServer {
             fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sampled_in_use_override: std::sync::Mutex::new(None),
             #[cfg(test)]
             free_memory_checks: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -18831,6 +18887,109 @@ mod tests {
         );
     }
 
+    // Fix 1: eviction must skip candidates whose unique estimated bytes are
+    // below EVICTION_MIN_UNIQUE_BYTES.  A forked worktree sharing all of its
+    // parent's Arcs has unique_estimated == 0 (each unique Arc carries 0
+    // bytes); evicting it frees nothing and forces a re-warm.
+    #[tokio::test]
+    async fn memory_budget_skips_zero_unique_byte_candidates() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 0;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        // Attach a worktree with EMPTY caches — all unique Arc pointers carry
+        // 0 bytes.  unique_estimated will be 0 < EVICTION_MIN_UNIQUE_BYTES.
+        let empty_path = PathBuf::from("/tmp/cptest-zero-unique-fork");
+        let id = RefId::for_canonical_path(&empty_path);
+        let fork = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(
+                    empty_path.clone(),
+                    empty_path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        // Mark idle immediately so it is a candidate.
+        mark_ref_idle_for(&server.state, id, std::time::Duration::ZERO);
+        // Pretend we are well over budget.
+        *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET * 2);
+
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        server.state.enforce_memory_budget().await;
+        let logs = crate::test_logs::logs_as_string(&logs);
+
+        assert!(
+            !logs.contains("ref caches evicted for memory budget"),
+            "a zero-unique-byte fork was evicted: {logs}"
+        );
+        // The ref's embedding cache must still be intact (empty, not cleared).
+        assert!(
+            fork.embedding_cache.read().await.is_empty(),
+            "cache state changed unexpectedly"
+        );
+    }
+
+    // Fix 3: the fork base's exclusive bytes must not count toward the
+    // emergency threshold so that the pinned base alone cannot drive emergency
+    // mode and force eviction of unrelated idle worktrees.
+    #[tokio::test]
+    async fn memory_budget_fork_base_exclusive_bytes_do_not_trigger_emergency() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        // budget = 1 MiB; emergency at 2 MiB of evictable memory.
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 900;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        // Set up a fork base with its own embedding data (~1 MiB).
+        let base_root = tempfile::tempdir().unwrap();
+        let canonical = base_root.path().canonicalize().unwrap();
+        let base_id = RefId::for_canonical_path(&canonical);
+        let base = server
+            .state
+            .attach_ref(base_id, || {
+                Arc::new(RefIndex::new(canonical.clone(), canonical.clone(), None))
+            })
+            .await;
+        {
+            let mut cache = base.embedding_cache.write().await;
+            for i in 0..64u32 {
+                cache.insert(
+                    format!("base-{i}.rs"),
+                    crate::core::embeddings::CacheEntry {
+                        hash: format!("h{i}"),
+                        vector: vec![0.5f32; 4096],
+                    },
+                );
+            }
+        }
+        server.state.fork_base_ref_id.set(base_id).unwrap();
+        mark_ref_idle_for(&server.state, base_id, std::time::Duration::from_secs(120));
+
+        // measured = 1.9x budget < 2x budget.  Without the fix this would not
+        // be an emergency.  We verify that the fork base's exclusive bytes are
+        // NOT counted toward the emergency check (so emergency stays false and
+        // the pass does NOT log the emergency warning).
+        *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET / 10 * 19); // 1.9× budget
+
+        let (logs, _capture) = crate::test_logs::captured_info_logs();
+        server.state.enforce_memory_budget().await;
+        let logs = crate::test_logs::logs_as_string(&logs);
+
+        assert!(
+            !logs.contains("Resident memory is over twice CONTEXTPLUS_MEMORY_BUDGET_MB"),
+            "fork-base-exclusive bytes counted toward emergency threshold: {logs}"
+        );
+    }
+
     #[tokio::test]
     async fn detach_worktree_refuses_the_fork_base() {
         let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -19058,6 +19217,44 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the allocator was walked again within the trim interval"
+        );
+    }
+
+    // Fix 2: when over budget and no ref is evicted but the allocator holds
+    // a large retained-free block, the pass must still call trim_allocator so
+    // that freed memory is returned to the OS.
+    //
+    // The test verifies that `last_budget_trim` advances even when
+    // `trim_due() = false` (rate limit not elapsed) and `evicted = 0`, as
+    // long as `retained_free > threshold`.  Uses `sampled_in_use_override` so
+    // the result is deterministic under concurrent test threads.
+    #[tokio::test]
+    async fn over_budget_trims_when_retained_free_is_large_without_evictions() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 9999; // no evictions
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        // Inject a small in_use value and a large measured value so that
+        // retained_free = measured - in_use >> threshold.  Using the seam
+        // avoids any race with other tests touching the real allocator.
+        let threshold = MEMORY_RETAINED_FREE_TRIM_BYTES.max(1024 / 8);
+        let fake_in_use: usize = 1024;
+        *server.state.sampled_in_use_override.lock().unwrap() = Some(fake_in_use);
+        *server.state.measured_resident_override.lock().unwrap() =
+            Some(fake_in_use.saturating_add(threshold + 1));
+
+        // Disable trim_due so retained-free is the only trigger.
+        *server.state.last_budget_trim.lock().unwrap() = Some(Instant::now());
+        let before = *server.state.last_budget_trim.lock().unwrap();
+
+        server.state.enforce_memory_budget().await;
+
+        let after = *server.state.last_budget_trim.lock().unwrap();
+        assert!(
+            after > before,
+            "trim_allocator was not called when retained free > threshold with no evictions"
         );
     }
 

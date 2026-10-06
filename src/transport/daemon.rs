@@ -1060,7 +1060,21 @@ pub(crate) async fn start_fork_base(
             .await;
             match base {
                 Ok(Ok(Some(base))) => register_fork_base(&server, base).await,
-                Ok(Ok(None)) => {}
+                Ok(Ok(None)) => {
+                    // The checkout's lock file is held by another daemon (e.g.
+                    // a daemon that is restarting).  Spawn a background retry
+                    // loop instead of giving up for the daemon's lifetime.
+                    tracing::info!(
+                        phase = "fork_base",
+                        reason = "lock_retry_scheduled",
+                        "fork base lock held; will retry"
+                    );
+                    tokio::spawn(retry_fork_base_lock(server));
+                    // The retry task owns `registering`; return without
+                    // clearing it so waiting worktrees are held until the
+                    // retry either succeeds or exhausts.
+                    return;
+                }
                 Ok(Err(error)) => tracing::warn!(
                     phase = "fork_base",
                     reason = "checkout_failed",
@@ -1078,6 +1092,72 @@ pub(crate) async fn start_fork_base(
         }
     };
     Some(tokio::spawn(register))
+}
+
+/// Retries acquiring the fork-base checkout lock when it was held on the first
+/// attempt.  Runs as a detached background task; clears `fork_base_registering`
+/// when it either succeeds or exhausts its attempts.
+async fn retry_fork_base_lock(server: ContextPlusServer) {
+    for attempt in 0..FORK_BASE_LOCK_MAX_RETRIES {
+        // In production: sleep between attempts.  In tests: the seam fires
+        // immediately once the test calls `pause.resume()`, avoiding sleeps.
+        #[cfg(not(test))]
+        tokio::time::sleep(FORK_BASE_LOCK_RETRY_INTERVAL).await;
+        #[cfg(test)]
+        crate::server_adapters::test_seams::before_fork_base_retry(&server.state.root_dir).await;
+
+        if server.state.fork_base_ref_id.get().is_some() {
+            // Another code path registered the base already (e.g. a tracker
+            // event fired first).
+            server.state.fork_base_registering.send_replace(false);
+            return;
+        }
+        let (config, root) = (server.state.config.clone(), server.state.root_dir.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            crate::git::fork_base::ensure_fork_base(&config, &root)
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(base))) => {
+                register_fork_base(&server, base).await;
+                // register_fork_base sets fork_base_registering = false.
+                return;
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    phase = "fork_base",
+                    attempt,
+                    "fork base lock retry: still locked"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    phase = "fork_base",
+                    reason = "checkout_failed",
+                    %error,
+                    "fork base lock retry failed"
+                );
+                server.state.fork_base_registering.send_replace(false);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    phase = "fork_base",
+                    reason = "task_panicked",
+                    %error,
+                    "fork base lock retry task panicked"
+                );
+                server.state.fork_base_registering.send_replace(false);
+                return;
+            }
+        }
+    }
+    tracing::info!(
+        phase = "fork_base",
+        reason = "lock_retry_exhausted",
+        "fork base off"
+    );
+    server.state.fork_base_registering.send_replace(false);
 }
 
 /// Attaches the fork base checkout as a parentless ref with its own CAS
@@ -1145,6 +1225,29 @@ fn daemon_server(root_dir: &Path, config: Config) -> ContextPlusServer {
     ContextPlusServer::new(primary_root, config)
 }
 
+/// Sets the glibc malloc arena limit on Linux/glibc targets.  `n == 0`
+/// leaves the default.  Runs synchronously at daemon start; ignored elsewhere.
+fn apply_malloc_arena_max(n: i32) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if n > 0 {
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, n);
+        }
+        tracing::debug!(malloc_arena_max = n, "set glibc malloc arena limit");
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = n;
+}
+
+/// How long the fork-base lock-retry loop waits between attempts in
+/// production.  Tests substitute the `before_fork_base_retry` seam instead.
+#[cfg(not(test))]
+const FORK_BASE_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum number of lock retries before the daemon gives up acquiring the
+/// fork base (~4 minutes at 30 s per attempt).
+const FORK_BASE_LOCK_MAX_RETRIES: u32 = 8;
+
 pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     let lock = match acquire_lock(&root_dir)? {
         AcquireOutcome::Acquired(l) => l,
@@ -1152,6 +1255,12 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     };
 
     let config = resolve_daemon_startup_config(&root_dir, &crate::config::env_snapshot()).config;
+
+    // Limit glibc malloc arenas so that per-arena freed memory does not
+    // inflate RSS.  Tokio creates one OS thread per CPU; without a cap glibc
+    // creates up to 8 × nproc arenas, each holding freed memory independently.
+    apply_malloc_arena_max(config.malloc_arena_max);
+
     let listener = bind_listener(&root_dir)?;
     write_pid_file(&root_dir);
 
@@ -1404,6 +1513,66 @@ mod tests {
         registration.await.unwrap();
         assert!(server.state.fork_base_ref_id.get().is_some());
         server.advance_fork_base().expect("an advance").await;
+    }
+
+    // Fix 4: start_fork_base must retry in the background when the checkout
+    // lock is held by another process.  The test holds the lock during the
+    // first attempt, then releases it and uses the seam to trigger the retry
+    // immediately (no 30 s sleep).
+    #[tokio::test]
+    async fn start_fork_base_retries_when_lock_is_held() {
+        let (_ollama, primary, _bases, server) = fork_base_daemon().await;
+        let config = &server.state.config;
+        let lock_path = crate::git::fork_base::fork_base_dir(config, primary.path())
+            .unwrap()
+            .with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+
+        // Hold the lock file exclusively so `ensure_fork_base` gets WouldBlock.
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let mut fd_lock = fd_lock::RwLock::new(lock_file);
+        let guard = fd_lock.try_write().expect("lock not yet held");
+
+        // Register the seam so the retry loop fires immediately instead of
+        // sleeping.
+        let pause = crate::server_adapters::test_seams::pause_before_fork_base_retry(
+            &server.state.root_dir,
+        );
+
+        // Kick off start_fork_base — it will see WouldBlock and spawn the
+        // retry task.
+        let initial = start_fork_base(&server).await;
+        if let Some(task) = initial {
+            task.await.unwrap();
+        }
+        assert!(
+            server.state.fork_base_ref_id.get().is_none(),
+            "fork base registered despite lock being held"
+        );
+
+        // Wait until the retry loop is blocked on the seam, then release the
+        // lock and trigger the retry.
+        pause.wait_until_entered().await;
+        drop(guard); // release the write lock
+        pause.resume();
+
+        // Give the retry task time to complete.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if server.state.fork_base_ref_id.get().is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fork base was not registered after lock was released"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

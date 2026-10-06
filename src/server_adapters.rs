@@ -323,6 +323,35 @@ pub(crate) mod test_seams {
         }
     }
 
+    fn fork_base_retry_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
+        static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Replaces the 30 s sleep in the fork-base lock-retry loop for the
+    /// daemon rooted at `root`.  The test calls `pause.resume()` to trigger
+    /// the next attempt immediately without any wall-clock delay.
+    pub(crate) fn pause_before_fork_base_retry(root: &Path) -> Arc<AsyncPause> {
+        let pause = Arc::new(AsyncPause::new());
+        fork_base_retry_slots()
+            .lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Arc::clone(&pause));
+        pause
+    }
+
+    /// Called by the retry loop.  If a test registered a pause via
+    /// `pause_before_fork_base_retry`, it blocks here until the test calls
+    /// `pause.resume()`; otherwise it returns immediately (tests that do not
+    /// register a pause skip the retry delay entirely).
+    pub(crate) async fn before_fork_base_retry(root: &Path) {
+        let pause = fork_base_retry_slots().lock().unwrap().remove(root);
+        if let Some(pause) = pause {
+            pause.entered.add_permits(1);
+            pause.resume.acquire().await.unwrap().forget();
+        }
+    }
+
     fn reembed_slots() -> &'static Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>> {
         static SLOTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AsyncPause>>>> = OnceLock::new();
         SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
