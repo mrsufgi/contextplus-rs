@@ -9797,16 +9797,16 @@ mod tests {
         fork_base_worktree_forks_with_its_own_delta(false).await;
     }
 
-    /// A worktree forks the fork base whose caches an emergency budget pass
-    /// cleared, with only its own changes.
+    /// A worktree forks the fork base with only its own changes even after an
+    /// emergency budget pass; the fork base is pinned and must not be evicted.
     #[tokio::test]
-    async fn fork_base_worktree_forks_the_fork_base_an_emergency_cleared() {
+    async fn fork_base_worktree_forks_even_after_emergency_budget_pass() {
         fork_base_worktree_forks_with_its_own_delta(true).await;
     }
 
     /// Cuts a worktree from `origin/main`, far from the primary, once an
-    /// emergency budget pass cleared the fork base when `cleared`, and asserts
-    /// it forks the fork base's index with only its own changes.
+    /// emergency budget pass ran when `cleared`, and asserts it forks the fork
+    /// base's index with only its own changes (fork base stays pinned).
     async fn fork_base_worktree_forks_with_its_own_delta(cleared: bool) {
         let ollama = wiremock::MockServer::start().await;
         let (primary, holder, _worktree) = lexdelta_git_primary(SEMANTIC_FORK_FILES);
@@ -9863,9 +9863,8 @@ mod tests {
             server.state.enforce_memory_budget().await;
             *server.state.measured_resident_override.lock().unwrap() = None;
             assert!(
-                base.search_index_cache.read().await.is_none()
-                    && base.embedding_cache.read().await.is_empty(),
-                "an emergency kept the fork base's caches"
+                !base.embedding_cache.read().await.is_empty(),
+                "an emergency evicted the fork base's caches; the fork base must be pinned"
             );
         }
         let cut = choose_parent_worktree(primary.path(), holder.path(), "cut", &upstream);
