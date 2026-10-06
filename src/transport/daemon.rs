@@ -1145,6 +1145,29 @@ fn daemon_server(root_dir: &Path, config: Config) -> ContextPlusServer {
     ContextPlusServer::new(primary_root, config)
 }
 
+/// Sets the glibc malloc arena limit on Linux/glibc targets.  `n == 0`
+/// leaves the default.  Runs synchronously at daemon start; ignored elsewhere.
+fn apply_malloc_arena_max(n: i32) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if n > 0 {
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, n);
+        }
+        tracing::debug!(malloc_arena_max = n, "set glibc malloc arena limit");
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = n;
+}
+
+/// How long the fork-base lock-retry loop waits between attempts in
+/// production.  Tests substitute the `before_fork_base_retry` seam instead.
+#[cfg(not(test))]
+const FORK_BASE_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum number of lock retries before the daemon gives up acquiring the
+/// fork base (~4 minutes at 30 s per attempt).
+const FORK_BASE_LOCK_MAX_RETRIES: u32 = 8;
+
 pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     let lock = match acquire_lock(&root_dir)? {
         AcquireOutcome::Acquired(l) => l,
@@ -1152,6 +1175,12 @@ pub async fn run_if_owner(root_dir: PathBuf, _config: Config) -> Result<bool> {
     };
 
     let config = resolve_daemon_startup_config(&root_dir, &crate::config::env_snapshot()).config;
+
+    // Limit glibc malloc arenas so that per-arena freed memory does not
+    // inflate RSS.  Tokio creates one OS thread per CPU; without a cap glibc
+    // creates up to 8 × nproc arenas, each holding freed memory independently.
+    apply_malloc_arena_max(config.malloc_arena_max);
+
     let listener = bind_listener(&root_dir)?;
     write_pid_file(&root_dir);
 

@@ -170,6 +170,12 @@ pub struct Config {
     /// How long a worktree goes unused before the memory budget may evict it.
     /// Controlled by `CONTEXTPLUS_MEMORY_MIN_IDLE_SECS` (default: 900).
     pub memory_budget_min_idle_secs: u64,
+    /// glibc arena limit passed to `mallopt(M_ARENA_MAX, …)` at daemon start.
+    /// Many Tokio threads each create their own glibc arena; bounding the
+    /// count reduces per-arena free-memory fragmentation.  0 = leave the
+    /// glibc default (8 × nproc).
+    /// Controlled by `CONTEXTPLUS_MALLOC_ARENA_MAX` (default: 4).
+    pub malloc_arena_max: i32,
     pub max_embed_file_size: usize,
     pub embed_num_gpu: Option<i32>,
     pub embed_main_gpu: Option<i32>,
@@ -645,6 +651,7 @@ impl Config {
                 "CONTEXTPLUS_MEMORY_MIN_IDLE_SECS",
                 DEFAULT_MEMORY_BUDGET_MIN_IDLE_SECS,
             ),
+            malloc_arena_max: env_parse(env, "CONTEXTPLUS_MALLOC_ARENA_MAX", 4),
             max_embed_file_size: env_parse(
                 env,
                 "CONTEXTPLUS_MAX_EMBED_FILE_SIZE",

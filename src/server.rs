@@ -746,6 +746,8 @@ pub struct SharedState {
     #[cfg(test)]
     pub(crate) measured_resident_override: std::sync::Mutex<Option<usize>>,
     #[cfg(test)]
+    pub(crate) sampled_in_use_override: std::sync::Mutex<Option<usize>>,
+    #[cfg(test)]
     free_memory_checks: std::sync::atomic::AtomicUsize,
 }
 
@@ -1294,11 +1296,19 @@ impl SharedState {
                 min_idle.as_secs()
             );
         }
-        let in_use_before = if self.trim_due() {
-            sample_allocator_in_use().await
-        } else {
-            None
+        // Always sample allocator in-use when over budget so that the retained-
+        // free trim path can fire even when no evictions occurred.
+        #[cfg(test)]
+        let in_use_before = {
+            let ovr = *self.sampled_in_use_override.lock().unwrap();
+            if ovr.is_some() {
+                ovr
+            } else {
+                sample_allocator_in_use().await
+            }
         };
+        #[cfg(not(test))]
+        let in_use_before = sample_allocator_in_use().await;
         let access = self.ref_access.lock().unwrap().clone();
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
@@ -1379,7 +1389,12 @@ impl SharedState {
                 "ref caches evicted for memory budget"
             );
         }
-        if evicted > 0 || self.trim_due() {
+        // Trim if we evicted something, if the periodic trim is due, or if the
+        // allocator is holding more freed memory than the threshold even though
+        // nothing was evicted (e.g. all candidates had 0 unique bytes).
+        let retained_free = in_use_before.map_or(0, |in_use| measured.saturating_sub(in_use));
+        let trim_threshold = MEMORY_RETAINED_FREE_TRIM_BYTES.max(budget / 8);
+        if evicted > 0 || self.trim_due() || retained_free > trim_threshold {
             self.trim_free_memory().await;
         }
         let estimated_after = holders
@@ -2881,6 +2896,8 @@ impl ContextPlusServer {
             fork_base: std::sync::Mutex::new(None),
             #[cfg(test)]
             measured_resident_override: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sampled_in_use_override: std::sync::Mutex::new(None),
             #[cfg(test)]
             free_memory_checks: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -19200,6 +19217,44 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the allocator was walked again within the trim interval"
+        );
+    }
+
+    // Fix 2: when over budget and no ref is evicted but the allocator holds
+    // a large retained-free block, the pass must still call trim_allocator so
+    // that freed memory is returned to the OS.
+    //
+    // The test verifies that `last_budget_trim` advances even when
+    // `trim_due() = false` (rate limit not elapsed) and `evicted = 0`, as
+    // long as `retained_free > threshold`.  Uses `sampled_in_use_override` so
+    // the result is deterministic under concurrent test threads.
+    #[tokio::test]
+    async fn over_budget_trims_when_retained_free_is_large_without_evictions() {
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = 1024;
+        config.memory_budget_min_idle_secs = 9999; // no evictions
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        // Inject a small in_use value and a large measured value so that
+        // retained_free = measured - in_use >> threshold.  Using the seam
+        // avoids any race with other tests touching the real allocator.
+        let threshold = MEMORY_RETAINED_FREE_TRIM_BYTES.max(1024 / 8);
+        let fake_in_use: usize = 1024;
+        *server.state.sampled_in_use_override.lock().unwrap() = Some(fake_in_use);
+        *server.state.measured_resident_override.lock().unwrap() =
+            Some(fake_in_use.saturating_add(threshold + 1));
+
+        // Disable trim_due so retained-free is the only trigger.
+        *server.state.last_budget_trim.lock().unwrap() = Some(Instant::now());
+        let before = *server.state.last_budget_trim.lock().unwrap();
+
+        server.state.enforce_memory_budget().await;
+
+        let after = *server.state.last_budget_trim.lock().unwrap();
+        assert!(
+            after > before,
+            "trim_allocator was not called when retained free > threshold with no evictions"
         );
     }
 
