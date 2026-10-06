@@ -1224,7 +1224,28 @@ impl SharedState {
             .fold(0usize, |total, (bytes, _)| total.saturating_add(*bytes));
         let budget = self.config.resident_memory_budget_bytes;
         let measured = self.measured_resident_bytes(estimated);
-        let emergency = measured > budget.saturating_mul(2);
+
+        // Bytes held exclusively by the fork base.  The base is pinned and can
+        // never be evicted under normal conditions, so its contribution to RSS
+        // should not count toward the emergency threshold — it cannot be
+        // reclaimed without an emergency pass.
+        let fork_base_id = self.fork_base_ref_id.get().copied();
+        let pinned_exclusive: usize = fork_base_id.map_or(0, |fb_id| {
+            refs.iter()
+                .enumerate()
+                .find(|(_, r)| {
+                    crate::ref_index::RefId::for_canonical_path(&r.canonical_root) == fb_id
+                })
+                .map_or(0, |(fi, _)| {
+                    components[fi]
+                        .iter()
+                        .filter(|(ptr, _, _)| holders[ptr].1 == 1)
+                        .map(|(ptr, _, _)| holders[ptr].0)
+                        .sum()
+                })
+        });
+        let evictable_measured = measured.saturating_sub(pinned_exclusive);
+        let emergency = evictable_measured > budget.saturating_mul(2);
         if !emergency
             && self
                 .budget_emergency
@@ -1379,6 +1400,7 @@ impl SharedState {
                 in_use_sampled = in_use.is_some(),
                 in_use_before_mib = in_use.map_or(0, |(before, _)| mib(before)),
                 in_use_after_mib = in_use.map_or(0, |(_, after)| mib(after)),
+                pinned_exclusive_mib = mib(pinned_exclusive),
                 budget_mib = mib(budget),
                 min_idle_secs = min_idle.as_secs(),
                 emergency,
