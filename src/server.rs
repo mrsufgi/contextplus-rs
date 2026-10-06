@@ -1531,12 +1531,13 @@ fn process_resident_bytes() -> Option<usize> {
 const MEMORY_RETAINED_FREE_TRIM_BYTES: usize = 256 * 1024 * 1024;
 
 /// Minimum unique bytes a candidate must hold before eviction is attempted.
-/// Evicting a ref that contributes zero unique bytes frees nothing and still
-/// forces a full cache rebuild on next access.  A fork whose every Arc is
-/// shared with its parent shows `unique_estimated_mib = 0`; the old
-/// `holds_unique_bytes` check passed it (the overlay Arc was unique, but
-/// empty) while contributing nothing to the freed total.
-const EVICTION_MIN_UNIQUE_BYTES: usize = 1;
+/// Evicting a ref that frees fewer than this threshold costs a full re-warm
+/// while returning nothing meaningful.  The log field `unique_estimated_mib`
+/// uses integer MiB rounding; any value below 1 MiB rounds to zero, which is
+/// the observable symptom of spurious near-zero evictions.  Setting the floor
+/// to 1 MiB suppresses those evictions while leaving refs with real resident
+/// content (at least one MiB of unique embeddings or vectors) eligible.
+const EVICTION_MIN_UNIQUE_BYTES: usize = 1024 * 1024;
 
 /// Walks every arena under its lock, so it runs off the async runtime.
 async fn sample_allocator_in_use() -> Option<usize> {
@@ -17275,7 +17276,8 @@ mod tests {
             .identifier_vectors
             .set(Arc::new(RwLock::new(HashMap::from([(
                 "worktree-only-vector".to_string(),
-                Arc::from(vec![0.5_f32; 4096]),
+                // 1 MiB of identifier vectors — enough to cross EVICTION_MIN_UNIQUE_BYTES.
+                Arc::from(vec![0.5_f32; 256 * 1024]),
             )]))))
             .unwrap();
         let attached = server.state.attach_ref(ref_id, || Arc::clone(&owner)).await;
@@ -17331,7 +17333,9 @@ mod tests {
         use crate::ref_index::{RefId, RefIndex};
 
         let mut config = Config::from_env();
-        config.resident_memory_budget_bytes = 11 * 1024;
+        // 11 × unit keeps proportions from the old test: budget sits between
+        // 2× and 3× a single ref's content, so one eviction suffices.
+        config.resident_memory_budget_bytes = 11 * 256 * 1024;
         config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
@@ -17367,7 +17371,8 @@ mod tests {
                 format!("{name}.rs"),
                 CacheEntry {
                     hash: format!("{name}-hash"),
-                    vector: vec![0.5; 1024],
+                    // 1 MiB per ref so each crosses EVICTION_MIN_UNIQUE_BYTES.
+                    vector: vec![0.5; 256 * 1024],
                 },
             );
         }
@@ -17419,7 +17424,8 @@ mod tests {
             "serving.rs".to_string(),
             CacheEntry {
                 hash: "serving-hash".to_string(),
-                vector: vec![0.5; 4096],
+                // 1 MiB so the ref crosses EVICTION_MIN_UNIQUE_BYTES once released.
+                vector: vec![0.5; 256 * 1024],
             },
         );
 
@@ -17446,7 +17452,7 @@ mod tests {
         use crate::ref_index::{RefId, RefIndex};
 
         let mut config = Config::from_env();
-        config.resident_memory_budget_bytes = 10 * 1024;
+        config.resident_memory_budget_bytes = 10 * 256 * 1024;
         config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
@@ -17488,14 +17494,15 @@ mod tests {
             "unique.rs".to_string(),
             CacheEntry {
                 hash: "unique-hash".to_string(),
-                vector: vec![0.5; 1024],
+                // 1 MiB so the ref crosses EVICTION_MIN_UNIQUE_BYTES.
+                vector: vec![0.5; 256 * 1024],
             },
         );
         server.state.touch_ref(shared_id);
         server.state.touch_ref(unique_id);
         mark_ref_idle(&server.state, shared_id);
         mark_ref_idle(&server.state, unique_id);
-        *server.state.measured_resident_override.lock().unwrap() = Some(20 * 1024);
+        *server.state.measured_resident_override.lock().unwrap() = Some(20 * 256 * 1024);
 
         server.state.enforce_memory_budget().await;
 
@@ -18366,6 +18373,17 @@ mod tests {
         .await
         .expect("the background identifier rebuild never sent its embed request");
 
+        // Push unique bytes past EVICTION_MIN_UNIQUE_BYTES so the budget pass
+        // considers this ref eligible (the identifier build above emits only
+        // small 2-dim mock vectors, not enough by themselves).
+        owner.embedding_cache.write().await.insert(
+            "budget_trigger.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "bt".to_string(),
+                vector: vec![0.5f32; 256 * 1024],
+            },
+        );
+
         mark_ref_idle(&server.state, worktree_id);
         server.state.enforce_memory_budget().await;
         assert!(owner.project_cache.read().await.is_none());
@@ -18479,7 +18497,8 @@ mod tests {
             format!("{name}.rs"),
             CacheEntry {
                 hash: format!("{name}-hash"),
-                vector: vec![0.5; 4096],
+                // 1 MiB of vectors — enough to cross EVICTION_MIN_UNIQUE_BYTES.
+                vector: vec![0.5; 256 * 1024],
             },
         );
         (id, owner)
@@ -18721,7 +18740,8 @@ mod tests {
             "resident.rs".to_string(),
             crate::core::embeddings::CacheEntry {
                 hash: "resident-hash".to_string(),
-                vector: vec![0.5; 4096],
+                // 1 MiB so the ref crosses EVICTION_MIN_UNIQUE_BYTES after warmup.
+                vector: vec![0.5; 256 * 1024],
             },
         );
         let pause = crate::server_adapters::test_seams::pause_after_cache_snapshot(&owner.root_dir);
@@ -19393,7 +19413,10 @@ mod tests {
     #[tokio::test]
     async fn review_r3_memory_budget_evicts_down_to_low_watermark() {
         let mut config = Config::from_env();
-        config.resident_memory_budget_bytes = 40_000;
+        // Budget chosen so low_watermark (80 % of budget) lands between one
+        // and two ref-units (≈ 1 MiB each).  That stops the pass after
+        // evicting two of the three idle refs.
+        config.resident_memory_budget_bytes = 5 * 1024 * 1024 / 2;
         config.memory_budget_min_idle_secs = 60;
         let root = tempfile::tempdir().unwrap();
         let server = ContextPlusServer::new(root.path().to_path_buf(), config);
