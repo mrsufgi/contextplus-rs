@@ -1197,9 +1197,10 @@ impl SharedState {
     /// Keeps the process within `resident_memory_budget_bytes` of RAM. The
     /// trigger is measured process memory; per-ref estimates only pick which
     /// idle worktrees to evict, least recently used first, down to 80% of the
-    /// budget. The primary is never evicted: when it alone exceeds the budget
-    /// one warning names its heaviest structures. The fork base is evicted
-    /// only over twice the budget; its next advance or fork rebuilds it.
+    /// budget. The primary and the fork base are pinned for the daemon's
+    /// lifetime and are never evicted, even during an emergency pass.  When
+    /// the primary alone exceeds the budget one warning names its heaviest
+    /// structures.
     pub async fn enforce_memory_budget(&self) {
         let refs: Vec<_> = self.refs.read().await.values().cloned().collect();
         let mut snapshots = Vec::with_capacity(refs.len());
@@ -1313,11 +1314,7 @@ impl SharedState {
         let mut candidates: Vec<_> = (0..refs.len())
             .filter_map(|i| {
                 let id = crate::ref_index::RefId::for_canonical_path(&refs[i].canonical_root);
-                let spared = if self.fork_base_ref_id.get() == Some(&id) {
-                    !emergency
-                } else {
-                    self.pinned(id)
-                };
+                let spared = self.pinned(id);
                 if Arc::ptr_eq(&refs[i], &self.default_ref) || spared {
                     return None;
                 }
@@ -18887,15 +18884,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_budget_emergency_evicts_the_fork_base() {
+    async fn memory_budget_emergency_does_not_evict_the_fork_base() {
         let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
         *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET * 3);
 
         server.state.enforce_memory_budget().await;
         assert!(
-            base.embedding_cache.read().await.is_empty(),
-            "an emergency kept the fork base's caches"
+            !base.embedding_cache.read().await.is_empty(),
+            "emergency evicted the fork base; it must stay pinned"
         );
         assert!(
             server
@@ -18903,7 +18900,7 @@ mod tests {
                 .ref_index(*server.state.fork_base_ref_id.get().unwrap())
                 .await
                 .is_some(),
-            "an emergency removed the fork base"
+            "emergency removed the fork base from the registry"
         );
     }
 
