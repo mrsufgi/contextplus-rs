@@ -18887,6 +18887,32 @@ mod tests {
         );
     }
 
+    // Fix 2b: the fork base is pinned for the daemon's lifetime and must never
+    // be evicted — not even during an emergency pass.  #136 design: "pin the
+    // fork base and never parent it".
+    #[tokio::test]
+    async fn memory_budget_emergency_never_evicts_the_fork_base() {
+        let (root, base_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (server, base) = fork_base_budget_server(root.path(), base_root.path()).await;
+        // Emergency: 3× budget.
+        *server.state.measured_resident_override.lock().unwrap() = Some(RESIDENCY_BUDGET * 3);
+
+        server.state.enforce_memory_budget().await;
+
+        assert!(
+            !base.embedding_cache.read().await.is_empty(),
+            "emergency evicted the fork base; it must be pinned for the daemon's lifetime"
+        );
+        assert!(
+            server
+                .state
+                .ref_index(*server.state.fork_base_ref_id.get().unwrap())
+                .await
+                .is_some(),
+            "emergency removed the fork base from the registry"
+        );
+    }
+
     // Fix 1: eviction must skip candidates whose unique estimated bytes are
     // below EVICTION_MIN_UNIQUE_BYTES.  A forked worktree sharing all of its
     // parent's Arcs has unique_estimated == 0 (each unique Arc carries 0
@@ -18933,6 +18959,61 @@ mod tests {
             fork.embedding_cache.read().await.is_empty(),
             "cache state changed unexpectedly"
         );
+    }
+
+    // Fix 2a: a non-fork worktree whose unique bytes are all below
+    // EVICTION_MIN_UNIQUE_BYTES must not be evicted in either a normal or an
+    // emergency pass.  A worktree that shares heavy inherited caches (same Arc
+    // pointer as primary) and contributes only a tiny delta (<< 1 MiB) frees
+    // nothing useful when evicted and still forces a re-warm.
+    #[tokio::test]
+    async fn memory_budget_skips_near_zero_unique_worktree_normal_and_emergency() {
+        use crate::ref_index::{RefId, RefIndex};
+
+        let mut config = Config::from_env();
+        config.resident_memory_budget_bytes = RESIDENCY_BUDGET;
+        config.memory_budget_min_idle_secs = 0;
+        let root = tempfile::tempdir().unwrap();
+        let server = ContextPlusServer::new(root.path().to_path_buf(), config);
+
+        // Attach a worktree whose only unique content is a single tiny vector
+        // (well below EVICTION_MIN_UNIQUE_BYTES after the fix).  The parent_ref_id
+        // is set so that it inherits the primary's identifier_index Arc; the only
+        // unique components are its own (empty) overlay Arcs and the small
+        // embedding entry.
+        let path = PathBuf::from("/tmp/cptest-near-zero-unique-wt");
+        let id = RefId::for_canonical_path(&path);
+        let owner = server
+            .state
+            .attach_ref(id, || {
+                Arc::new(RefIndex::new(
+                    path.clone(),
+                    path,
+                    Some(server.state.default_ref_id),
+                ))
+            })
+            .await;
+        owner.embedding_cache.write().await.insert(
+            "tiny.rs".to_string(),
+            crate::core::embeddings::CacheEntry {
+                hash: "t".to_string(),
+                // A single f32 — well under 1 MiB of unique bytes.
+                vector: vec![0.5f32; 1],
+            },
+        );
+        mark_ref_idle_for(&server.state, id, std::time::Duration::ZERO);
+
+        // Normal pass (2× budget) and emergency pass (3× budget) must both skip it.
+        for measured in [RESIDENCY_BUDGET * 2, RESIDENCY_BUDGET * 3] {
+            *server.state.measured_resident_override.lock().unwrap() = Some(measured);
+            let (logs, _capture) = crate::test_logs::captured_info_logs();
+            server.state.enforce_memory_budget().await;
+            let logs = crate::test_logs::logs_as_string(&logs);
+            assert!(
+                !logs.contains("ref caches evicted for memory budget"),
+                "evicted a near-zero-unique worktree at measured={measured}: {logs}"
+            );
+        }
     }
 
     // Fix 3: the fork base's exclusive bytes must not count toward the
