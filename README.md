@@ -4,9 +4,45 @@ High-performance [MCP](https://modelcontextprotocol.io/) server for semantic cod
 
 ## Why Rust?
 
-### Cold Start Benchmark (fresh process per call)
+### Server Latency (~9.7K-file monorepo)
 
-Measured against the workspace (~2800 source files), each call spawns a fresh process:
+Measured on a ~9.7K-file TypeScript/Go monorepo with a warm embedding cache, release build, Intel Core Ultra 7 265 (20 CPUs), Linux. Cold start = first call from a fresh process (three runs, median reported). Warm = median of 20 consecutive calls to the same running server.
+
+**Cold start** (process boot + cache load included):
+
+| Phase | Median |
+|-------|--------|
+| Server initialize | 126 ms |
+| `explore` first call | 551 ms |
+| `impact cycles` first call | 1,144 ms |
+| `impact dead` first call | 1,814 ms |
+
+Second-call speedup from the running server: `explore` 551 ms → 7 ms (79×); `impact dead` 1,814 ms → 43 ms (42×).
+
+**Warm per-call latency** (subsequent calls, same process):
+
+| Tool | Median |
+|------|--------|
+| `explore` files (semantic) | 5.6 ms |
+| `explore` files (keywords) | 0.9 ms |
+| `explore` files (scoped) | 4.2 ms |
+| `explore` identifiers (semantic) | 39 ms |
+| `explore` identifiers (keywords) | 80 ms |
+| `explore` clusters | 92 ms |
+| `outline` file | 0.9 ms |
+| `outline` dir (small) | 2.2 ms |
+| `outline` dir (large, depth 1) | 13.5 ms |
+| `impact` symbol | 73 ms |
+| `impact` cycles | 10 ms |
+| `impact` dead | 51 ms |
+| `check` embeddings | 69 ms |
+| `worktrees` list | 0.3 ms |
+
+Memory stays flat across repeated calls: 20 back-to-back `outline` directory calls hold at 700–750 MiB of process memory (RSS + swap), where the previous glibc-malloc build climbed from 835 to 1,002 MiB.
+
+### Historical Comparison (cold-process methodology)
+
+The rows below were collected with a different methodology: each call spawns a fresh process. They are retained as a rough Rust-vs-TypeScript baseline.
 
 | Tool | Rust | TypeScript | Grep | Rust vs TS |
 |------|------|-----------|------|------------|
@@ -52,11 +88,12 @@ MCP tools return ranked, structured results. Grep returns raw lines.
 Rust eliminates all overhead via:
 - **Zero-copy cache** with `rkyv` + `memmap2` (no deserialization)
 - **SIMD cosine similarity** via `simsimd` (AVX-512/AVX2 auto-dispatch)
-- **Native tree-sitter** (compiled in, no WASM VM) — 15 languages + regex fallback
+- **Native tree-sitter** (compiled in, no WASM VM) — 16 languages + regex fallback
 - **Disk-persistent embedding cache** with content-hash staleness detection
 - **Adaptive embedding retry** with exponential backoff and cancellation tokens
 - **Automatic chunking** for oversized embedding inputs (chunk → embed → merge)
 - **Process lifecycle management** — idle timeout, parent PID orphan detection, SIGTERM/SIGHUP handling
+- **jemalloc** allocator with background purge via `tikv-jemallocator`
 
 ## Install
 
@@ -285,7 +322,7 @@ src/
   error.rs                   # ContextPlusError enum (thiserror)
   core/
     embeddings.rs            # OllamaClient + adaptive retry + chunking + cancellation
-    tree_sitter.rs           # Native multi-lang parser (15 languages)
+    tree_sitter.rs           # Native multi-lang parser (16 languages)
     parser.rs                # Code symbol extraction + regex fallback for unsupported langs
     walker.rs                # gitignore-aware file walker (ignore crate)
     embedding_tracker.rs     # File watcher with lazy/eager/off modes
@@ -312,8 +349,9 @@ Unsupported file types fall back to regex-based symbol extraction.
 | `rmcp` | MCP SDK with stdio transport |
 | `simsimd` | SIMD-accelerated cosine distance |
 | `rkyv` + `memmap2` | Zero-copy cache persistence |
-| `tree-sitter` | Native code parsing (15 languages) |
+| `tree-sitter` | Native code parsing (16 languages) |
 | `nalgebra` | Spectral clustering (eigendecomposition) |
+| `tikv-jemallocator` | jemalloc allocator with background purge |
 | `notify` | File system watching |
 | `ignore` | gitignore-aware file walking |
 
@@ -325,58 +363,126 @@ Nine Criterion benchmark suites cover the critical hot paths — no Ollama depen
 
 How fast the embedding cache loads from disk. This was the #1 bottleneck in TS (1,109ms raw, 115ms with VectorStore optimization).
 
-| Operation | 1K vectors | 5K vectors | 30K vectors |
-|-----------|-----------|-----------|------------|
-| rkyv read | 0.36 ms | 2.8 ms | 181 ms |
-| rkyv mmap | 0.63 ms | 3.1 ms | 103 ms |
-| to_store (HashMap build) | 0.16 ms | 0.97 ms | 91 ms |
+| Operation | 1K×1024 | 5K×1024 | 30K×1024 |
+|-----------|---------|---------|----------|
+| rkyv read | 401 µs | 2.41 ms | 18.2 ms |
+| rkyv mmap | 219 µs | 903 µs | 7.75 ms |
+| to_store (HashMap build) | 219 µs | 823 µs | 7.00 ms |
 
-At 5K vectors (typical project size), total load is **~4ms**. At 30K vectors, mmap beats read by 43%.
+At 5K vectors (typical project size), mmap + store build totals **~1.7ms**. mmap beats read by 57% at 30K.
 
 ### Cosine Similarity (simsimd SIMD vs scalar)
 
-| Operation | 1K×1024 | 5K×1024 | 30K×1024 | SIMD speedup |
-|-----------|---------|---------|----------|-------------|
-| simsimd scan | 68 µs | 404 µs | **4.1 ms** | — |
-| naive scan | 663 µs | 3.4 ms | 20 ms | **~5x** |
-| Single pair (1024-dim) | 0.08 µs | — | — | **8x** vs naive |
+Single pair:
 
-30K-vector scan in 4.1ms — well under the 20ms target.
+| Dims | simsimd | naive | Speedup |
+|------|---------|-------|---------|
+| 128 | 11.5 ns | 72.2 ns | 6.3x |
+| 512 | 40.4 ns | 281 ns | 7.0x |
+| 1024 | 90.3 ns | 562 ns | 6.2x |
 
-### Tree-sitter Parse (native, 15 languages)
+Full corpus scan (1024-dim vectors):
 
-| Language | Parse time |
-|----------|-----------|
-| TypeScript | 113 µs |
-| TSX | 143 µs |
-| JavaScript | 102 µs |
-| Python | 141 µs |
-| Rust | 171 µs |
-| Go | 100 µs |
-| Java | 96 µs |
-| C | 98 µs |
-| C++ | 91 µs |
-| Bash | ~83 µs |
-| **All 15 combined** | **~2.1 ms** |
+| Operation | 1K vectors | 5K vectors | 30K vectors |
+|-----------|-----------|-----------|------------|
+| simsimd scan | 90.9 µs | 627 µs | **4.60 ms** |
+| naive scan | 570 µs | 3.12 ms | 20.3 ms |
+| SIMD speedup | 6.3x | 5.0x | **4.4x** |
 
-All 15 languages parsed in **~2.1ms total** — vs 50-200ms for WASM in TS.
+30K-vector scan in **4.6ms** — well under the 20ms target.
+
+### Tree-sitter Parse (native, 16 languages)
+
+Bench covers 10 of the 16 supported languages; the remaining 6 (Ruby, PHP, C#, Kotlin, HTML, CSS) are not benchmarked.
+
+| Language | Median |
+|----------|--------|
+| TypeScript | 95.7 µs |
+| TSX | 111 µs |
+| JavaScript | 80.6 µs |
+| Python | 96.0 µs |
+| Rust | 137 µs |
+| Go | 73.4 µs |
+| Java | 78.2 µs |
+| C | 82.8 µs |
+| C++ | 76.8 µs |
+| Bash | 64.7 µs |
+| **All 10 combined** | **1.20 ms** |
+
+10 languages parsed sequentially in **1.2ms** — vs 50-200ms for WASM in TS.
 
 ### Warm Search Pipeline
 
-End-to-end: disk load → VectorStore build → find_nearest(top_5) → format results.
+End-to-end: disk load → `SearchIndex` build → `search()` hybrid scorer (brute-force for ≤50K files, which is the production path for every normal-sized repo).
 
 | Scenario | 1K files | 5K files | 30K files |
 |----------|---------|---------|----------|
-| Full pipeline (mmap + search) | 0.9 ms | 5.3 ms | 224 ms |
-| Warm search only (in-memory) | **78 µs** | **418 µs** | **4.3 ms** |
-| Hash-check staleness (no-op) | 23 µs | 131 µs | 975 µs |
+| Warm search only (in-memory) | 285 µs | 1.87 ms | **6.42 ms** |
+| Full pipeline (mmap + index + search) | 2.07 ms | 21.8 ms | 148 ms |
+| Hash-check staleness (all fresh) | 15.1 µs | 83.0 µs | 676 µs |
 
-Warm search on 30K files: **4.3ms**. Hash-check (no-op refresh): **<1ms**.
+Warm search on 30K files: **6.4ms**. Hash-check (no-op refresh): **<1ms**.
+
+### Blast Radius
+
+Import reachability scan across the symbol-to-file dependency graph.
+
+| Scenario | 500 files / 100 lines | 2K files / 100 lines | 2K files / 200 lines |
+|----------|-----------------------|----------------------|----------------------|
+| No context | 737 µs | 2.81 ms | 5.69 ms |
+| With context | 751 µs | 2.81 ms | 5.68 ms |
+| Special chars | 744 µs | — | — |
+
+Context inclusion adds negligible overhead. 2K-file scan in **~2.8ms**.
+
+### Context Tree
+
+Directory tree with optional symbol resolution and depth limiting.
+
+| Scenario | 500 files | 2K files | 5K files |
+|----------|-----------|---------|---------|
+| No symbols | 124 µs | 913 µs | 2.88 ms |
+| With symbols | 490 µs | 2.13 ms | 6.01 ms |
+| Depth limit 2 | 75.0 µs | 347 µs | 919 µs |
+
+Depth limiting cuts 5K-file time from 2.9ms to **919µs** (3.1x).
+
+### Spectral Clustering
+
+K-means over the eigenvector embedding of the similarity graph (nalgebra eigendecomposition).
+
+| Scenario | 50 items | 200 items | 500 items |
+|----------|---------|---------|---------|
+| 64-dim vectors | 162 µs | 299 µs | 1.49 ms |
+| 768-dim vectors | 211 µs | 495 µs | — |
+
+### Identifier Score
+
+Ranking identifiers by semantic relevance against a query vector.
+
+| Operation | 1K ids | 5K ids | 10K ids | 114K ids |
+|-----------|--------|--------|---------|---------|
+| top-5 | 83.6 µs | 201 µs | 418 µs | 5.40 ms |
+| top-20 | 86.4 µs | 203 µs | 365 µs | 5.94 ms |
+| keywords | 85.0 µs | 199 µs | 345 µs | 5.70 ms |
+| filtered kinds | 74.8 µs | 143 µs | 193 µs | 3.08 ms |
+
+114K-identifier scan (large monorepo) in **~5-6ms**.
+
+### Walker
+
+gitignore-aware directory traversal (ignore crate).
+
+| Scenario | Median |
+|----------|--------|
+| Small tree (100 files, depth 1) | 99.3 µs |
+| Medium tree (500 files, depth 1) | 363 µs |
+| Medium tree (500 files, depth 2) | 229 µs |
 
 ## Development
 
 ```bash
-cargo test                  # 1050+ tests
+cargo test                  # 1835+ tests
 cargo bench                 # 9 Criterion benchmark suites
 cargo clippy --all-targets  # Lint
 cargo fmt --check           # Format check
