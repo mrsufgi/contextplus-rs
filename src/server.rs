@@ -6693,6 +6693,8 @@ impl ContextPlusServer {
                         .collect();
 
                     STRUCTURAL_POOL.install(|| {
+                        use crate::tools::dead_code_find::merge_file_tokens_into_presence;
+
                         // Parse symbols in parallel.
                         let symbols: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
                             file_entries
@@ -6706,25 +6708,16 @@ impl ContextPlusServer {
                                 .collect();
 
                         // Build presence index in parallel: each thread folds its
-                        // files into a partial map, then the partial maps are merged.
+                        // files into a partial presence map (with per-file dedup via
+                        // merge_file_tokens_into_presence), then partial maps are
+                        // merged. The reduce is safe: each file is processed by
+                        // exactly one thread, so any token in two partial maps must
+                        // come from two different files → Multiple is correct.
                         let presence: DeadCodePresence = file_entries
                             .par_iter()
                             .fold(DeadCodePresence::new, |mut acc, (rel_path, content)| {
                                 let path = PathBuf::from(rel_path.as_str());
-                                for tok in content
-                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                                    .filter(|t: &&str| !t.is_empty())
-                                {
-                                    let tok = tok.to_string();
-                                    match acc.entry(tok) {
-                                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                                            *e.get_mut() = TokenPresence::Multiple;
-                                        }
-                                        std::collections::hash_map::Entry::Vacant(e) => {
-                                            e.insert(TokenPresence::Unique(path.clone()));
-                                        }
-                                    }
-                                }
+                                merge_file_tokens_into_presence(&mut acc, &path, content.as_str());
                                 acc
                             })
                             .reduce(DeadCodePresence::new, |mut a, b| {
@@ -16222,6 +16215,71 @@ mod tests {
         assert!(
             text.contains("No dead-symbol candidates"),
             "empty project should yield no candidates, got: {text}"
+        );
+    }
+
+    /// A symbol that is defined and also called within its own file only must
+    /// still be reported as a dead-code candidate: it has no external users.
+    /// Regression for the fold-based presence builder: a token appearing twice
+    /// in the same file must not be promoted to `Multiple`.
+    #[tokio::test]
+    async fn find_dead_symbol_referenced_only_in_own_file_is_dead() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // self.ts: defines and calls `selfOnly` in the same file.
+        std::fs::write(
+            sub.join("self.ts"),
+            "export function selfOnly() { return 1; }\nconst r = selfOnly();\n",
+        )
+        .unwrap();
+        // other.ts: unrelated content — does not mention selfOnly.
+        std::fs::write(sub.join("other.ts"), "export function otherFn() {}\n").unwrap();
+
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let result = server
+            .dispatch("find_dead_code", serde_json::Map::new())
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("selfOnly"),
+            "selfOnly is referenced only in its own file and must be reported dead; got: {text}"
+        );
+    }
+
+    /// A symbol referenced in another file must NOT be reported dead.
+    #[tokio::test]
+    async fn find_dead_symbol_referenced_in_other_file_is_live() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("def.ts"),
+            "export function sharedFn() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join("user.ts"),
+            "import { sharedFn } from './def';\nconst x = sharedFn();\n",
+        )
+        .unwrap();
+
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let result = server
+            .dispatch("find_dead_code", serde_json::Map::new())
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            !text.contains("sharedFn"),
+            "sharedFn is referenced in another file and must not be reported dead; got: {text}"
         );
     }
 

@@ -93,10 +93,49 @@ pub enum TokenPresence {
 /// or to [`TokenPresence::Unique`] with a path other than the defining file.
 pub type DeadCodePresence = HashMap<String, TokenPresence>;
 
+/// Tokenize `content` and merge into `presence` with per-file deduplication.
+///
+/// A token that appears more than once in this file is treated as appearing
+/// once. In the occupied cases:
+/// - `Unique(same_path)` — same file already saw this token; stay `Unique`.
+/// - `Unique(other_path)` or `Multiple` — token is in multiple files; set `Multiple`.
+///
+/// This is the production tokenization function. All callers (server fold and
+/// [`build_dead_code_presence`]) route through here so the tested code is the
+/// same as the running code.
+pub fn merge_file_tokens_into_presence(
+    presence: &mut DeadCodePresence,
+    path: &Path,
+    content: &str,
+) {
+    // Collect to a per-file HashSet to deduplicate tokens within this file.
+    let deduped: HashSet<&str> = content
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    for tok in deduped {
+        match presence.entry(tok.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if !matches!(e.get(), TokenPresence::Unique(p) if p == path) {
+                    *e.get_mut() = TokenPresence::Multiple;
+                }
+                // TokenPresence::Unique(same path) → no-op: intra-file dedup already handled.
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(TokenPresence::Unique(path.to_path_buf()));
+            }
+        }
+    }
+}
+
 /// Build a [`DeadCodePresence`] index from a map of per-file token sets.
 ///
 /// Accepts any iterator over `(file_path, tokens_in_that_file)` pairs — a
 /// `HashMap<PathBuf, HashSet<String>>` satisfies the bound directly.
+///
+/// Delegates to [`merge_file_tokens_into_presence`] so tests exercise the same
+/// core logic as the server fold path.
 pub fn build_dead_code_presence<I, T>(tokens_by_file: I) -> DeadCodePresence
 where
     I: IntoIterator<Item = (PathBuf, T)>,
@@ -104,16 +143,11 @@ where
 {
     let mut presence = DeadCodePresence::new();
     for (path, tokens) in tokens_by_file {
-        for tok in tokens {
-            match presence.entry(tok) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    *e.get_mut() = TokenPresence::Multiple;
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(TokenPresence::Unique(path.clone()));
-                }
-            }
-        }
+        // Join the (already-identifier-safe) tokens with spaces so the
+        // production tokenizer can re-split them. Identifier tokens contain
+        // only alphanumeric + '_', so a space join is lossless.
+        let content: String = tokens.into_iter().collect::<Vec<_>>().join(" ");
+        merge_file_tokens_into_presence(&mut presence, &path, &content);
     }
     presence
 }
