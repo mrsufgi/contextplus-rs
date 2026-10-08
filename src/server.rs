@@ -6701,9 +6701,23 @@ impl ContextPlusServer {
         use crate::tools::dependency_loop_detect::{find_cycles, format_cycles};
 
         let cache = self.ensure_project_cache().await?;
-        let root = self.current_ref().await.root_dir.clone();
+        let ref_index = self.current_ref().await;
+        let root = ref_index.root_dir.clone();
 
-        let formatted = tokio::task::spawn_blocking(move || {
+        let cache_gen = ref_index
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached_forward = {
+            let guard = ref_index.cycles_forward_graph.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|(g, _)| *g == cache_gen)
+                .map(|(_, arc)| Arc::clone(arc))
+        };
+
+        let forward = if let Some(forward) = cached_forward {
+            forward
+        } else {
             let all_abs_paths: Vec<PathBuf> = cache
                 .file_content
                 .keys()
@@ -6712,17 +6726,28 @@ impl ContextPlusServer {
 
             // build_reverse_graph gives reverse edges (imported -> {importers}).
             // Invert to forward graph (importer -> {imported}) for cycle detection.
-            let reverse = build_reverse_graph(&all_abs_paths);
-            let mut forward: HashMap<PathBuf, std::collections::HashSet<PathBuf>> = HashMap::new();
+            let reverse = tokio::task::spawn_blocking(move || build_reverse_graph(&all_abs_paths))
+                .await
+                .map_err(|e| {
+                    ContextPlusError::Other(format!(
+                        "detect_dependency_loops spawn_blocking failed: {e}"
+                    ))
+                })?;
+
+            let mut fwd: crate::ref_index::ForwardGraph = HashMap::new();
             for (imported, importers) in &reverse {
                 for importer in importers {
-                    forward
-                        .entry(importer.clone())
+                    fwd.entry(importer.clone())
                         .or_default()
                         .insert(imported.clone());
                 }
             }
+            let arc = Arc::new(fwd);
+            *ref_index.cycles_forward_graph.lock().unwrap() = Some((cache_gen, Arc::clone(&arc)));
+            arc
+        };
 
+        let formatted = tokio::task::spawn_blocking(move || {
             let cycles = find_cycles(&forward);
             format_cycles(&cycles)
         })
@@ -16087,6 +16112,39 @@ mod tests {
             text.contains("No import cycles"),
             "empty project should have no cycles, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn impact_cycles_call_caches_forward_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..10usize {
+            std::fs::write(sub.join(format!("mod_{i}.ts")), "export const x = 1;\n").unwrap();
+        }
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let ref_index = server.current_ref().await;
+
+        let mut baseline: Option<(Vec<ResidentComponent>, usize)> = None;
+        for call in 1..=5 {
+            let result = server
+                .dispatch("detect_dependency_loops", serde_json::Map::new())
+                .await;
+            assert_eq!(result.is_error, Some(false), "call {call}");
+            drop(result);
+
+            let has_cache = ref_index.cycles_forward_graph.lock().unwrap().is_some();
+            assert!(has_cache, "forward graph must be cached after call {call}");
+
+            let components = ResidentSnapshot::capture(&ref_index).await.measure();
+            let access_len = server.state.ref_access.lock().unwrap().len();
+            let snap = (components, access_len);
+            if let Some(first) = &baseline {
+                assert_eq!(&snap, first, "shared state grew after call {call}");
+            } else {
+                baseline = Some(snap);
+            }
+        }
     }
 
     #[tokio::test]
