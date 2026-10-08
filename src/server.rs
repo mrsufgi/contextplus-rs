@@ -1557,13 +1557,26 @@ async fn sample_allocator_in_use() -> Option<usize> {
 
 /// Bytes the allocator has handed out and not had back.
 fn allocator_in_use_bytes() -> Option<usize> {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(not(test), not(target_env = "msvc")))]
     {
-        let info = unsafe { libc::mallinfo2() };
-        Some(info.uordblks + info.hblkhd)
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::mib().ok()?.advance().ok()?;
+        stats::allocated::mib().ok()?.read().ok()
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    None
+    #[cfg(all(not(test), target_env = "msvc"))]
+    {
+        None
+    }
+    #[cfg(test)]
+    {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let info = unsafe { libc::mallinfo2() };
+            Some(info.uordblks + info.hblkhd)
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        None
+    }
 }
 
 fn interval_elapsed(last: &std::sync::Mutex<Option<Instant>>) -> bool {
@@ -1588,7 +1601,7 @@ fn trim_retained_free_memory(measured: usize, threshold: usize) -> bool {
 
 /// Returns memory the allocator holds free to the OS.
 async fn release_free_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(not(test))]
     let _ = tokio::task::spawn_blocking(trim_allocator).await;
 }
 
@@ -1603,7 +1616,27 @@ thread_local! {
 fn trim_allocator() {
     #[cfg(test)]
     ALLOCATOR_TRIMS.with(|trims| trims.set(trims.get() + 1));
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(not(test), not(target_env = "msvc")))]
+    unsafe {
+        unsafe extern "C" {
+            #[link_name = "_rjem_mallctl"]
+            fn mallctl(
+                name: *const libc::c_char,
+                oldp: *mut libc::c_void,
+                oldlenp: *mut usize,
+                newp: *mut libc::c_void,
+                newlen: usize,
+            ) -> libc::c_int;
+        }
+        let _ = mallctl(
+            c"arena.4294967295.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+    #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
     }
