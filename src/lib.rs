@@ -13,6 +13,16 @@ pub mod server_helpers;
 pub mod tools;
 pub mod transport;
 
+#[cfg(all(not(test), not(target_env = "msvc")))]
+use tikv_jemallocator::Jemalloc;
+#[cfg(all(not(test), not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+#[cfg(all(not(test), not(target_env = "msvc")))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static _RJEM_MALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
 #[cfg(test)]
 mod alloc_probe;
 #[cfg(test)]

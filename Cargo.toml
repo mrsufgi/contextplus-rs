@@ -19,6 +19,9 @@ name = "contextplus-rs"
 path = "src/main.rs"
 
 [dependencies]
+tikv-jemallocator = "0.7.0"
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
+
 # MCP SDK (v1.1.0 — stable, #[tool] macros, stdio transport)
 rmcp = { version = "1", features = ["server", "transport-io"] }
 
