@@ -69,8 +69,11 @@ use crate::tools::semantic_search::CachedSearchIndex;
 
 pub(crate) type ForwardGraph = HashMap<PathBuf, HashSet<PathBuf>>;
 pub(crate) type DeadCodeSymbols = HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>>;
-pub(crate) type DeadCodeTokens = HashMap<PathBuf, HashSet<String>>;
-pub(crate) type DeadCodeCacheEntry = (u64, Arc<DeadCodeSymbols>, Arc<DeadCodeTokens>);
+pub(crate) type DeadCodeCacheEntry = (
+    u64,
+    Arc<DeadCodeSymbols>,
+    Arc<crate::tools::dead_code_find::DeadCodePresence>,
+);
 
 /// Stable identifier for a ref (worktree + HEAD).
 ///

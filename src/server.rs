@@ -2163,16 +2163,23 @@ fn cycles_forward_graph_bytes(graph: &crate::ref_index::ForwardGraph) -> usize {
 }
 
 fn dead_code_cache_bytes(entry: &crate::ref_index::DeadCodeCacheEntry) -> usize {
-    let (_, symbols, tokens) = entry;
+    use crate::tools::dead_code_find::TokenPresence;
+    let (_, symbols, presence) = entry;
     let sym_bytes: usize = symbols
         .iter()
         .map(|(k, v)| 64 + k.capacity() + v.len() * 128)
         .sum();
-    let tok_bytes: usize = tokens
+    let presence_bytes: usize = presence
         .iter()
-        .map(|(k, v)| 64 + k.capacity() + v.iter().map(|s| 64 + s.capacity()).sum::<usize>())
+        .map(|(k, v)| {
+            64 + k.capacity()
+                + match v {
+                    TokenPresence::Multiple => 8,
+                    TokenPresence::Unique(p) => 64 + p.capacity(),
+                }
+        })
         .sum();
-    sym_bytes + tok_bytes
+    sym_bytes + presence_bytes
 }
 
 /// O(1) estimate: vectors of one map share a width.
@@ -6665,28 +6672,78 @@ impl ContextPlusServer {
             guard
                 .as_ref()
                 .filter(|(g, _, _)| *g == cache_gen)
-                .map(|(_, syms, toks)| (Arc::clone(syms), Arc::clone(toks)))
+                .map(|(_, syms, presence)| (Arc::clone(syms), Arc::clone(presence)))
         };
 
-        let (symbols_arc, tokens_arc) = if let Some(cached) = cached_dead {
+        let (symbols_arc, presence_arc) = if let Some(cached) = cached_dead {
             cached
         } else {
-            let (syms, toks) = tokio::task::spawn_blocking({
+            let (syms, presence) = tokio::task::spawn_blocking({
                 let cache = Arc::clone(&cache);
                 move || {
-                    let symbols = build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
-                    let mut tokens: crate::ref_index::DeadCodeTokens =
-                        HashMap::with_capacity(cache.file_content.len());
-                    for (rel_path, content) in &cache.file_content {
-                        let token_set: std::collections::HashSet<String> = content
-                            .as_str()
-                            .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .filter(|t| !t.is_empty())
-                            .map(|t| t.to_string())
-                            .collect();
-                        tokens.insert(PathBuf::from(rel_path), token_set);
-                    }
-                    (symbols, tokens)
+                    use crate::core::structural_pool::STRUCTURAL_POOL;
+                    use crate::tools::dead_code_find::{DeadCodePresence, TokenPresence};
+                    use rayon::prelude::*;
+
+                    // Collect once so both parallel passes can iterate.
+                    let file_entries: Vec<(String, std::sync::Arc<String>)> = cache
+                        .file_content
+                        .iter()
+                        .map(|(rel, content)| (rel.clone(), std::sync::Arc::clone(content)))
+                        .collect();
+
+                    STRUCTURAL_POOL.install(|| {
+                        // Parse symbols in parallel.
+                        let symbols: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
+                            file_entries
+                                .par_iter()
+                                .filter_map(|(rel_path, content)| {
+                                    let ext = rel_path.rsplit('.').next().unwrap_or("");
+                                    parse_with_tree_sitter(content.as_str(), ext)
+                                        .ok()
+                                        .map(|syms| (PathBuf::from(rel_path.as_str()), syms))
+                                })
+                                .collect();
+
+                        // Build presence index in parallel: each thread folds its
+                        // files into a partial map, then the partial maps are merged.
+                        let presence: DeadCodePresence = file_entries
+                            .par_iter()
+                            .fold(DeadCodePresence::new, |mut acc, (rel_path, content)| {
+                                let path = PathBuf::from(rel_path.as_str());
+                                for tok in content
+                                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                    .filter(|t: &&str| !t.is_empty())
+                                {
+                                    let tok = tok.to_string();
+                                    match acc.entry(tok) {
+                                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                                            *e.get_mut() = TokenPresence::Multiple;
+                                        }
+                                        std::collections::hash_map::Entry::Vacant(e) => {
+                                            e.insert(TokenPresence::Unique(path.clone()));
+                                        }
+                                    }
+                                }
+                                acc
+                            })
+                            .reduce(DeadCodePresence::new, |mut a, b| {
+                                for (tok, pres) in b {
+                                    match a.entry(tok) {
+                                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                                            // Both chunks saw this token → multiple files.
+                                            *e.get_mut() = TokenPresence::Multiple;
+                                        }
+                                        std::collections::hash_map::Entry::Vacant(e) => {
+                                            e.insert(pres);
+                                        }
+                                    }
+                                }
+                                a
+                            });
+
+                        (symbols, presence)
+                    })
                 }
             })
             .await
@@ -6694,10 +6751,10 @@ impl ContextPlusServer {
                 ContextPlusError::Other(format!("find_dead_code spawn_blocking failed: {e}"))
             })?;
             let syms_arc = Arc::new(syms);
-            let toks_arc = Arc::new(toks);
+            let presence_arc = Arc::new(presence);
             *ref_index.dead_code_cache.lock().unwrap() =
-                Some((cache_gen, Arc::clone(&syms_arc), Arc::clone(&toks_arc)));
-            (syms_arc, toks_arc)
+                Some((cache_gen, Arc::clone(&syms_arc), Arc::clone(&presence_arc)));
+            (syms_arc, presence_arc)
         };
 
         let formatted = tokio::task::spawn_blocking(move || {
@@ -6713,7 +6770,7 @@ impl ContextPlusServer {
                 opts.max_results = max;
             }
 
-            let dead = find_dead_symbols(&symbols_arc, &tokens_arc, &opts);
+            let dead = find_dead_symbols(&symbols_arc, &presence_arc, &opts);
             format_dead_symbols(&dead, &scanned_root, files_scanned)
         })
         .await
@@ -16169,7 +16226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn impact_dead_call_caches_symbol_and_token_tables() {
+    async fn impact_dead_call_caches_symbol_and_presence_tables() {
         let root = tempfile::tempdir().unwrap();
         let sub = root.path().join("src");
         std::fs::create_dir_all(&sub).unwrap();
