@@ -1461,7 +1461,7 @@ impl SharedState {
         *self.last_budget_trim.lock().unwrap() = Some(Instant::now());
     }
 
-    /// Bytes of RAM the process holds. Tests share one process, so there the
+    /// Bytes of RAM plus swap the process holds. Tests share one process, so there the
     /// estimate stands in unless a test sets a measurement.
     fn measured_resident_bytes(&self, estimated: usize) -> usize {
         #[cfg(test)]
@@ -1514,13 +1514,24 @@ const MEMORY_BUDGET_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// returned to the OS at most this often.
 const MEMORY_BUDGET_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Resident set size of this process, from `/proc/self/statm`.
+fn parse_proc_status_memory(text: &str) -> Option<usize> {
+    let mut rss = None;
+    let mut swap = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            rss = Some(value.split_whitespace().next()?.parse::<usize>().ok()?);
+        } else if let Some(value) = line.strip_prefix("VmSwap:") {
+            swap = Some(value.split_whitespace().next()?.parse::<usize>().ok()?);
+        }
+    }
+    Some(rss?.saturating_add(swap.unwrap_or(0)).saturating_mul(1024))
+}
+
+/// Resident and swapped bytes of this process, from `/proc/self/status`.
 #[cfg(any(not(test), target_os = "linux"))]
 fn process_resident_bytes() -> Option<usize> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
-    let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-    Some(pages.saturating_mul(page_size))
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_proc_status_memory(&status)
 }
 
 /// Freed memory the allocator may keep before it is returned to the OS while
@@ -19250,6 +19261,27 @@ mod tests {
                 assert_eq!(log_field(line, "emergency"), Some(emergency), "{logs}");
             }
         }
+    }
+
+    #[test]
+    fn parse_proc_status_memory_includes_swap() {
+        assert_eq!(
+            parse_proc_status_memory("VmRSS:\t1000 kB\nVmSwap:\t500 kB\n"),
+            Some(1_536_000)
+        );
+    }
+
+    #[test]
+    fn parse_proc_status_memory_without_swap_returns_rss() {
+        assert_eq!(
+            parse_proc_status_memory("VmRSS:\t1000 kB\n"),
+            Some(1_024_000)
+        );
+    }
+
+    #[test]
+    fn parse_proc_status_memory_without_rss_returns_none() {
+        assert_eq!(parse_proc_status_memory("VmSwap:\t500 kB\n"), None);
     }
 
     #[cfg(target_os = "linux")]
