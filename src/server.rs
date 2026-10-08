@@ -1696,6 +1696,26 @@ impl ResidentSnapshot {
             file_outline_bytes(&owner.file_outlines.lock().unwrap()),
             "outlines",
         ));
+        components.push((
+            &owner.cycles_forward_graph as *const _ as usize,
+            owner
+                .cycles_forward_graph
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |(_, g)| cycles_forward_graph_bytes(g)),
+            "cycles_forward_graph",
+        ));
+        components.push((
+            &owner.dead_code_cache as *const _ as usize,
+            owner
+                .dead_code_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, dead_code_cache_bytes),
+            "dead_code_cache",
+        ));
         // One statement per lock so no guard is held while the next is awaited.
         let identifier_index = owner.identifier_index.read().await.clone();
         let search_index = owner.search_index_cache.read().await.clone();
@@ -2135,6 +2155,26 @@ fn file_outline_bytes(outlines: &HashMap<String, FileOutline>) -> usize {
         .sum()
 }
 
+fn cycles_forward_graph_bytes(graph: &crate::ref_index::ForwardGraph) -> usize {
+    graph
+        .iter()
+        .map(|(k, v)| 64 + k.capacity() + v.iter().map(|p| 64 + p.capacity()).sum::<usize>())
+        .sum()
+}
+
+fn dead_code_cache_bytes(entry: &crate::ref_index::DeadCodeCacheEntry) -> usize {
+    let (_, symbols, tokens) = entry;
+    let sym_bytes: usize = symbols
+        .iter()
+        .map(|(k, v)| 64 + k.capacity() + v.len() * 128)
+        .sum();
+    let tok_bytes: usize = tokens
+        .iter()
+        .map(|(k, v)| 64 + k.capacity() + v.iter().map(|s| 64 + s.capacity()).sum::<usize>())
+        .sum();
+    sym_bytes + tok_bytes
+}
+
 /// O(1) estimate: vectors of one map share a width.
 fn identifier_vector_bytes(vectors: &IdentifierVectors) -> usize {
     vectors.values().next().map_or(0, |vector| {
@@ -2360,6 +2400,8 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
     // Background rebuilds and fills would refill what is cleared here.
     owner.cancel_background_tasks();
     std::mem::take(&mut *owner.file_outlines.lock().unwrap());
+    *owner.cycles_forward_graph.lock().unwrap() = None;
+    *owner.dead_code_cache.lock().unwrap() = None;
     owner
         .cache_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -16162,6 +16204,15 @@ mod tests {
                 assert_eq!(&snap, first, "shared state grew after call {call}");
             } else {
                 baseline = Some(snap);
+                let first = baseline.as_ref().unwrap();
+                let has_dead = first
+                    .0
+                    .iter()
+                    .any(|(_, b, n)| *n == "dead_code_cache" && *b > 0);
+                assert!(
+                    has_dead,
+                    "dead_code_cache component must be non-zero in baseline"
+                );
             }
         }
     }
@@ -16221,7 +16272,14 @@ mod tests {
         let sub = root.path().join("src");
         std::fs::create_dir_all(&sub).unwrap();
         for i in 0..10usize {
-            std::fs::write(sub.join(format!("mod_{i}.ts")), "export const x = 1;\n").unwrap();
+            std::fs::write(
+                sub.join(format!("mod_{i}.ts")),
+                format!(
+                    "import {{ x as other }} from './mod_{}';\nexport const x = 1;\n",
+                    (i + 1) % 10
+                ),
+            )
+            .unwrap();
         }
         let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
         let ref_index = server.current_ref().await;
@@ -16244,8 +16302,92 @@ mod tests {
                 assert_eq!(&snap, first, "shared state grew after call {call}");
             } else {
                 baseline = Some(snap);
+                let first = baseline.as_ref().unwrap();
+                let has_cycles = first
+                    .0
+                    .iter()
+                    .any(|(_, b, n)| *n == "cycles_forward_graph" && *b > 0);
+                assert!(
+                    has_cycles,
+                    "cycles_forward_graph component must be non-zero in baseline"
+                );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn impact_caches_counted_and_evicted_by_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..5usize {
+            std::fs::write(
+                sub.join(format!("m{i}.ts")),
+                format!(
+                    "import {{ x as other }} from './m{}';\nexport const x = 1;\n",
+                    (i + 1) % 5
+                ),
+            )
+            .unwrap();
+        }
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let ref_index = server.current_ref().await;
+
+        let _ = server
+            .dispatch("detect_dependency_loops", serde_json::Map::new())
+            .await;
+        let _ = server
+            .dispatch("find_dead_code", serde_json::Map::new())
+            .await;
+
+        let components = ResidentSnapshot::capture(&ref_index).await.measure();
+        let cycles_bytes = components
+            .iter()
+            .find(|(_, _, name)| *name == "cycles_forward_graph")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        let dead_bytes = components
+            .iter()
+            .find(|(_, _, name)| *name == "dead_code_cache")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        assert!(
+            cycles_bytes > 0,
+            "cycles_forward_graph must be non-zero after populate"
+        );
+        assert!(
+            dead_bytes > 0,
+            "dead_code_cache must be non-zero after populate"
+        );
+
+        let id_cache_name = ref_index.cas_ref_id_hex.clone();
+        clear_ref_heavy_caches(&ref_index, &id_cache_name).await;
+
+        assert!(
+            ref_index.cycles_forward_graph.lock().unwrap().is_none(),
+            "cycles_forward_graph must be None after clear"
+        );
+        assert!(
+            ref_index.dead_code_cache.lock().unwrap().is_none(),
+            "dead_code_cache must be None after clear"
+        );
+
+        let components_after = ResidentSnapshot::capture(&ref_index).await.measure();
+        let cycles_after = components_after
+            .iter()
+            .find(|(_, _, name)| *name == "cycles_forward_graph")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        let dead_after = components_after
+            .iter()
+            .find(|(_, _, name)| *name == "dead_code_cache")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        assert_eq!(
+            cycles_after, 0,
+            "cycles_forward_graph bytes must be 0 after clear"
+        );
+        assert_eq!(dead_after, 0, "dead_code_cache bytes must be 0 after clear");
     }
 
     #[tokio::test]
