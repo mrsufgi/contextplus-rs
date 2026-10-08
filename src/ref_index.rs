@@ -68,6 +68,9 @@ use crate::server::{
 use crate::tools::semantic_search::CachedSearchIndex;
 
 pub(crate) type ForwardGraph = HashMap<PathBuf, HashSet<PathBuf>>;
+pub(crate) type DeadCodeSymbols = HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>>;
+pub(crate) type DeadCodeTokens = HashMap<PathBuf, HashSet<String>>;
+pub(crate) type DeadCodeCacheEntry = (u64, Arc<DeadCodeSymbols>, Arc<DeadCodeTokens>);
 
 /// Stable identifier for a ref (worktree + HEAD).
 ///
@@ -268,6 +271,10 @@ pub struct RefIndex {
     /// `(generation, Arc<forward_graph>)` so callers can read the graph
     /// without holding the lock during cycle detection.
     pub(crate) cycles_forward_graph: std::sync::Mutex<Option<(u64, Arc<ForwardGraph>)>>,
+
+    /// Cached whole-project symbol and token tables for dead-code detection.
+    /// Invalidated when `cache_generation` changes.
+    pub(crate) dead_code_cache: std::sync::Mutex<Option<DeadCodeCacheEntry>>,
 }
 
 impl RefIndex {
@@ -327,6 +334,7 @@ impl RefIndex {
             snapshots: SnapshotState::default(),
             file_outlines: std::sync::Mutex::new(HashMap::new()),
             cycles_forward_graph: std::sync::Mutex::new(None),
+            dead_code_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -390,6 +398,7 @@ impl RefIndex {
             snapshots: SnapshotState::default(),
             file_outlines: std::sync::Mutex::new(HashMap::new()),
             cycles_forward_graph: std::sync::Mutex::new(None),
+            dead_code_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -455,6 +464,7 @@ impl RefIndex {
             snapshots: SnapshotState::default(),
             file_outlines: std::sync::Mutex::new(HashMap::new()),
             cycles_forward_graph: std::sync::Mutex::new(None),
+            dead_code_cache: std::sync::Mutex::new(None),
         }
     }
 

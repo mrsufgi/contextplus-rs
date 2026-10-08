@@ -6582,23 +6582,51 @@ impl ContextPlusServer {
         // truncated-to-zero result set that looks like "no dead code found".
         let max_results = Self::get_usize(&args, "max_results").filter(|&n| n > 0);
 
+        let cache_gen = ref_index
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached_dead = {
+            let guard = ref_index.dead_code_cache.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|(g, _, _)| *g == cache_gen)
+                .map(|(_, syms, toks)| (Arc::clone(syms), Arc::clone(toks)))
+        };
+
+        let (symbols_arc, tokens_arc) = if let Some(cached) = cached_dead {
+            cached
+        } else {
+            let (syms, toks) = tokio::task::spawn_blocking({
+                let cache = Arc::clone(&cache);
+                move || {
+                    let symbols = build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
+                    let mut tokens: crate::ref_index::DeadCodeTokens =
+                        HashMap::with_capacity(cache.file_content.len());
+                    for (rel_path, content) in &cache.file_content {
+                        let token_set: std::collections::HashSet<String> = content
+                            .as_str()
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .filter(|t| !t.is_empty())
+                            .map(|t| t.to_string())
+                            .collect();
+                        tokens.insert(PathBuf::from(rel_path), token_set);
+                    }
+                    (symbols, tokens)
+                }
+            })
+            .await
+            .map_err(|e| {
+                ContextPlusError::Other(format!("find_dead_code spawn_blocking failed: {e}"))
+            })?;
+            let syms_arc = Arc::new(syms);
+            let toks_arc = Arc::new(toks);
+            *ref_index.dead_code_cache.lock().unwrap() =
+                Some((cache_gen, Arc::clone(&syms_arc), Arc::clone(&toks_arc)));
+            (syms_arc, toks_arc)
+        };
+
         let formatted = tokio::task::spawn_blocking(move || {
             let files_scanned = cache.file_content.len();
-            let symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
-                build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
-            let mut tokens_by_file: HashMap<PathBuf, std::collections::HashSet<String>> =
-                HashMap::new();
-
-            for (rel_path, content) in &cache.file_content {
-                let tokens: std::collections::HashSet<String> = content
-                    .as_str()
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|t| !t.is_empty())
-                    .map(|t| t.to_string())
-                    .collect();
-                tokens_by_file.insert(PathBuf::from(rel_path), tokens);
-            }
-
             let mut opts = DeadCodeOptions::default();
             if let Some(kinds) = ignore_kinds {
                 opts.ignore_kinds = kinds;
@@ -6610,7 +6638,7 @@ impl ContextPlusServer {
                 opts.max_results = max;
             }
 
-            let dead = find_dead_symbols(&symbols_by_file, &tokens_by_file, &opts);
+            let dead = find_dead_symbols(&symbols_arc, &tokens_arc, &opts);
             format_dead_symbols(&dead, &scanned_root, files_scanned)
         })
         .await
@@ -16063,6 +16091,46 @@ mod tests {
             text.contains("No dead-symbol candidates"),
             "empty project should yield no candidates, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn impact_dead_call_caches_symbol_and_token_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..10usize {
+            std::fs::write(
+                sub.join(format!("mod_{i}.rs")),
+                format!("pub fn func_{i}() {{}}\npub struct S{i};\n"),
+            )
+            .unwrap();
+        }
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let ref_index = server.current_ref().await;
+
+        let mut baseline: Option<(Vec<ResidentComponent>, usize)> = None;
+        for call in 1..=5 {
+            let result = server
+                .dispatch("find_dead_code", serde_json::Map::new())
+                .await;
+            assert_eq!(result.is_error, Some(false), "call {call}");
+            drop(result);
+
+            let has_cache = ref_index.dead_code_cache.lock().unwrap().is_some();
+            assert!(
+                has_cache,
+                "dead code cache must be populated after call {call}"
+            );
+
+            let components = ResidentSnapshot::capture(&ref_index).await.measure();
+            let access_len = server.state.ref_access.lock().unwrap().len();
+            let snap = (components, access_len);
+            if let Some(first) = &baseline {
+                assert_eq!(&snap, first, "shared state grew after call {call}");
+            } else {
+                baseline = Some(snap);
+            }
+        }
     }
 
     #[tokio::test]
