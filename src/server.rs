@@ -1461,7 +1461,7 @@ impl SharedState {
         *self.last_budget_trim.lock().unwrap() = Some(Instant::now());
     }
 
-    /// Bytes of RAM the process holds. Tests share one process, so there the
+    /// Bytes of RAM plus swap the process holds. Tests share one process, so there the
     /// estimate stands in unless a test sets a measurement.
     fn measured_resident_bytes(&self, estimated: usize) -> usize {
         #[cfg(test)]
@@ -1514,13 +1514,24 @@ const MEMORY_BUDGET_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// returned to the OS at most this often.
 const MEMORY_BUDGET_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Resident set size of this process, from `/proc/self/statm`.
+fn parse_proc_status_memory(text: &str) -> Option<usize> {
+    let mut rss = None;
+    let mut swap = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            rss = Some(value.split_whitespace().next()?.parse::<usize>().ok()?);
+        } else if let Some(value) = line.strip_prefix("VmSwap:") {
+            swap = Some(value.split_whitespace().next()?.parse::<usize>().ok()?);
+        }
+    }
+    Some(rss?.saturating_add(swap.unwrap_or(0)).saturating_mul(1024))
+}
+
+/// Resident and swapped bytes of this process, from `/proc/self/status`.
 #[cfg(any(not(test), target_os = "linux"))]
 fn process_resident_bytes() -> Option<usize> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
-    let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-    Some(pages.saturating_mul(page_size))
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_proc_status_memory(&status)
 }
 
 /// Freed memory the allocator may keep before it is returned to the OS while
@@ -1546,13 +1557,26 @@ async fn sample_allocator_in_use() -> Option<usize> {
 
 /// Bytes the allocator has handed out and not had back.
 fn allocator_in_use_bytes() -> Option<usize> {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(not(test), not(target_env = "msvc")))]
     {
-        let info = unsafe { libc::mallinfo2() };
-        Some(info.uordblks + info.hblkhd)
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::mib().ok()?.advance().ok()?;
+        stats::allocated::mib().ok()?.read().ok()
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    None
+    #[cfg(all(not(test), target_env = "msvc"))]
+    {
+        None
+    }
+    #[cfg(test)]
+    {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let info = unsafe { libc::mallinfo2() };
+            Some(info.uordblks + info.hblkhd)
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        None
+    }
 }
 
 fn interval_elapsed(last: &std::sync::Mutex<Option<Instant>>) -> bool {
@@ -1577,7 +1601,7 @@ fn trim_retained_free_memory(measured: usize, threshold: usize) -> bool {
 
 /// Returns memory the allocator holds free to the OS.
 async fn release_free_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(not(test))]
     let _ = tokio::task::spawn_blocking(trim_allocator).await;
 }
 
@@ -1592,7 +1616,27 @@ thread_local! {
 fn trim_allocator() {
     #[cfg(test)]
     ALLOCATOR_TRIMS.with(|trims| trims.set(trims.get() + 1));
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(not(test), not(target_env = "msvc")))]
+    unsafe {
+        unsafe extern "C" {
+            #[link_name = "_rjem_mallctl"]
+            fn mallctl(
+                name: *const libc::c_char,
+                oldp: *mut libc::c_void,
+                oldlenp: *mut usize,
+                newp: *mut libc::c_void,
+                newlen: usize,
+            ) -> libc::c_int;
+        }
+        let _ = mallctl(
+            c"arena.4294967295.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+    #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
     }
@@ -1651,6 +1695,26 @@ impl ResidentSnapshot {
             &owner.file_outlines as *const _ as usize,
             file_outline_bytes(&owner.file_outlines.lock().unwrap()),
             "outlines",
+        ));
+        components.push((
+            &owner.cycles_forward_graph as *const _ as usize,
+            owner
+                .cycles_forward_graph
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |(_, g)| cycles_forward_graph_bytes(g)),
+            "cycles_forward_graph",
+        ));
+        components.push((
+            &owner.dead_code_cache as *const _ as usize,
+            owner
+                .dead_code_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, dead_code_cache_bytes),
+            "dead_code_cache",
         ));
         // One statement per lock so no guard is held while the next is awaited.
         let identifier_index = owner.identifier_index.read().await.clone();
@@ -2091,6 +2155,33 @@ fn file_outline_bytes(outlines: &HashMap<String, FileOutline>) -> usize {
         .sum()
 }
 
+fn cycles_forward_graph_bytes(graph: &crate::ref_index::ForwardGraph) -> usize {
+    graph
+        .iter()
+        .map(|(k, v)| 64 + k.capacity() + v.iter().map(|p| 64 + p.capacity()).sum::<usize>())
+        .sum()
+}
+
+fn dead_code_cache_bytes(entry: &crate::ref_index::DeadCodeCacheEntry) -> usize {
+    use crate::tools::dead_code_find::TokenPresence;
+    let (_, symbols, presence) = entry;
+    let sym_bytes: usize = symbols
+        .iter()
+        .map(|(k, v)| 64 + k.capacity() + v.len() * 128)
+        .sum();
+    let presence_bytes: usize = presence
+        .iter()
+        .map(|(k, v)| {
+            64 + k.capacity()
+                + match v {
+                    TokenPresence::Multiple => 8,
+                    TokenPresence::Unique(p) => 64 + p.capacity(),
+                }
+        })
+        .sum();
+    sym_bytes + presence_bytes
+}
+
 /// O(1) estimate: vectors of one map share a width.
 fn identifier_vector_bytes(vectors: &IdentifierVectors) -> usize {
     vectors.values().next().map_or(0, |vector| {
@@ -2316,6 +2407,8 @@ async fn clear_ref_heavy_caches(owner: &crate::ref_index::RefIndex, id_cache_nam
     // Background rebuilds and fills would refill what is cleared here.
     owner.cancel_background_tasks();
     std::mem::take(&mut *owner.file_outlines.lock().unwrap());
+    *owner.cycles_forward_graph.lock().unwrap() = None;
+    *owner.dead_code_cache.lock().unwrap() = None;
     owner
         .cache_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -6571,23 +6664,94 @@ impl ContextPlusServer {
         // truncated-to-zero result set that looks like "no dead code found".
         let max_results = Self::get_usize(&args, "max_results").filter(|&n| n > 0);
 
+        let cache_gen = ref_index
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached_dead = {
+            let guard = ref_index.dead_code_cache.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|(g, _, _)| *g == cache_gen)
+                .map(|(_, syms, presence)| (Arc::clone(syms), Arc::clone(presence)))
+        };
+
+        let (symbols_arc, presence_arc) = if let Some(cached) = cached_dead {
+            cached
+        } else {
+            let (syms, presence) = tokio::task::spawn_blocking({
+                let cache = Arc::clone(&cache);
+                move || {
+                    use crate::core::structural_pool::STRUCTURAL_POOL;
+                    use crate::tools::dead_code_find::{DeadCodePresence, TokenPresence};
+                    use rayon::prelude::*;
+
+                    // Collect once so both parallel passes can iterate.
+                    let file_entries: Vec<(String, std::sync::Arc<String>)> = cache
+                        .file_content
+                        .iter()
+                        .map(|(rel, content)| (rel.clone(), std::sync::Arc::clone(content)))
+                        .collect();
+
+                    STRUCTURAL_POOL.install(|| {
+                        use crate::tools::dead_code_find::merge_file_tokens_into_presence;
+
+                        // Parse symbols in parallel.
+                        let symbols: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
+                            file_entries
+                                .par_iter()
+                                .filter_map(|(rel_path, content)| {
+                                    let ext = rel_path.rsplit('.').next().unwrap_or("");
+                                    parse_with_tree_sitter(content.as_str(), ext)
+                                        .ok()
+                                        .map(|syms| (PathBuf::from(rel_path.as_str()), syms))
+                                })
+                                .collect();
+
+                        // Build presence index in parallel: each thread folds its
+                        // files into a partial presence map (with per-file dedup via
+                        // merge_file_tokens_into_presence), then partial maps are
+                        // merged. The reduce is safe: each file is processed by
+                        // exactly one thread, so any token in two partial maps must
+                        // come from two different files → Multiple is correct.
+                        let presence: DeadCodePresence = file_entries
+                            .par_iter()
+                            .fold(DeadCodePresence::new, |mut acc, (rel_path, content)| {
+                                let path = PathBuf::from(rel_path.as_str());
+                                merge_file_tokens_into_presence(&mut acc, &path, content.as_str());
+                                acc
+                            })
+                            .reduce(DeadCodePresence::new, |mut a, b| {
+                                for (tok, pres) in b {
+                                    match a.entry(tok) {
+                                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                                            // Both chunks saw this token → multiple files.
+                                            *e.get_mut() = TokenPresence::Multiple;
+                                        }
+                                        std::collections::hash_map::Entry::Vacant(e) => {
+                                            e.insert(pres);
+                                        }
+                                    }
+                                }
+                                a
+                            });
+
+                        (symbols, presence)
+                    })
+                }
+            })
+            .await
+            .map_err(|e| {
+                ContextPlusError::Other(format!("find_dead_code spawn_blocking failed: {e}"))
+            })?;
+            let syms_arc = Arc::new(syms);
+            let presence_arc = Arc::new(presence);
+            *ref_index.dead_code_cache.lock().unwrap() =
+                Some((cache_gen, Arc::clone(&syms_arc), Arc::clone(&presence_arc)));
+            (syms_arc, presence_arc)
+        };
+
         let formatted = tokio::task::spawn_blocking(move || {
             let files_scanned = cache.file_content.len();
-            let symbols_by_file: HashMap<PathBuf, Vec<crate::core::parser::CodeSymbol>> =
-                build_symbols_by_file(&cache, |rel| PathBuf::from(rel));
-            let mut tokens_by_file: HashMap<PathBuf, std::collections::HashSet<String>> =
-                HashMap::new();
-
-            for (rel_path, content) in &cache.file_content {
-                let tokens: std::collections::HashSet<String> = content
-                    .as_str()
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|t| !t.is_empty())
-                    .map(|t| t.to_string())
-                    .collect();
-                tokens_by_file.insert(PathBuf::from(rel_path), tokens);
-            }
-
             let mut opts = DeadCodeOptions::default();
             if let Some(kinds) = ignore_kinds {
                 opts.ignore_kinds = kinds;
@@ -6599,7 +6763,7 @@ impl ContextPlusServer {
                 opts.max_results = max;
             }
 
-            let dead = find_dead_symbols(&symbols_by_file, &tokens_by_file, &opts);
+            let dead = find_dead_symbols(&symbols_arc, &presence_arc, &opts);
             format_dead_symbols(&dead, &scanned_root, files_scanned)
         })
         .await
@@ -6690,9 +6854,23 @@ impl ContextPlusServer {
         use crate::tools::dependency_loop_detect::{find_cycles, format_cycles};
 
         let cache = self.ensure_project_cache().await?;
-        let root = self.current_ref().await.root_dir.clone();
+        let ref_index = self.current_ref().await;
+        let root = ref_index.root_dir.clone();
 
-        let formatted = tokio::task::spawn_blocking(move || {
+        let cache_gen = ref_index
+            .cache_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached_forward = {
+            let guard = ref_index.cycles_forward_graph.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|(g, _)| *g == cache_gen)
+                .map(|(_, arc)| Arc::clone(arc))
+        };
+
+        let forward = if let Some(forward) = cached_forward {
+            forward
+        } else {
             let all_abs_paths: Vec<PathBuf> = cache
                 .file_content
                 .keys()
@@ -6701,17 +6879,28 @@ impl ContextPlusServer {
 
             // build_reverse_graph gives reverse edges (imported -> {importers}).
             // Invert to forward graph (importer -> {imported}) for cycle detection.
-            let reverse = build_reverse_graph(&all_abs_paths);
-            let mut forward: HashMap<PathBuf, std::collections::HashSet<PathBuf>> = HashMap::new();
+            let reverse = tokio::task::spawn_blocking(move || build_reverse_graph(&all_abs_paths))
+                .await
+                .map_err(|e| {
+                    ContextPlusError::Other(format!(
+                        "detect_dependency_loops spawn_blocking failed: {e}"
+                    ))
+                })?;
+
+            let mut fwd: crate::ref_index::ForwardGraph = HashMap::new();
             for (imported, importers) in &reverse {
                 for importer in importers {
-                    forward
-                        .entry(importer.clone())
+                    fwd.entry(importer.clone())
                         .or_default()
                         .insert(imported.clone());
                 }
             }
+            let arc = Arc::new(fwd);
+            *ref_index.cycles_forward_graph.lock().unwrap() = Some((cache_gen, Arc::clone(&arc)));
+            arc
+        };
 
+        let formatted = tokio::task::spawn_blocking(move || {
             let cycles = find_cycles(&forward);
             format_cycles(&cycles)
         })
@@ -16029,6 +16218,120 @@ mod tests {
         );
     }
 
+    /// A symbol that is defined and also called within its own file only must
+    /// still be reported as a dead-code candidate: it has no external users.
+    /// Regression for the fold-based presence builder: a token appearing twice
+    /// in the same file must not be promoted to `Multiple`.
+    #[tokio::test]
+    async fn find_dead_symbol_referenced_only_in_own_file_is_dead() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // self.ts: defines and calls `selfOnly` in the same file.
+        std::fs::write(
+            sub.join("self.ts"),
+            "export function selfOnly() { return 1; }\nconst r = selfOnly();\n",
+        )
+        .unwrap();
+        // other.ts: unrelated content — does not mention selfOnly.
+        std::fs::write(sub.join("other.ts"), "export function otherFn() {}\n").unwrap();
+
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let result = server
+            .dispatch("find_dead_code", serde_json::Map::new())
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("selfOnly"),
+            "selfOnly is referenced only in its own file and must be reported dead; got: {text}"
+        );
+    }
+
+    /// A symbol referenced in another file must NOT be reported dead.
+    #[tokio::test]
+    async fn find_dead_symbol_referenced_in_other_file_is_live() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("def.ts"),
+            "export function sharedFn() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join("user.ts"),
+            "import { sharedFn } from './def';\nconst x = sharedFn();\n",
+        )
+        .unwrap();
+
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let result = server
+            .dispatch("find_dead_code", serde_json::Map::new())
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let text = match &result.content[0].raw {
+            RawContent::Text(t) => t.text.as_str(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            !text.contains("sharedFn"),
+            "sharedFn is referenced in another file and must not be reported dead; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn impact_dead_call_caches_symbol_and_presence_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..10usize {
+            std::fs::write(
+                sub.join(format!("mod_{i}.rs")),
+                format!("pub fn func_{i}() {{}}\npub struct S{i};\n"),
+            )
+            .unwrap();
+        }
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let ref_index = server.current_ref().await;
+
+        let mut baseline: Option<(Vec<ResidentComponent>, usize)> = None;
+        for call in 1..=5 {
+            let result = server
+                .dispatch("find_dead_code", serde_json::Map::new())
+                .await;
+            assert_eq!(result.is_error, Some(false), "call {call}");
+            drop(result);
+
+            let has_cache = ref_index.dead_code_cache.lock().unwrap().is_some();
+            assert!(
+                has_cache,
+                "dead code cache must be populated after call {call}"
+            );
+
+            let components = ResidentSnapshot::capture(&ref_index).await.measure();
+            let access_len = server.state.ref_access.lock().unwrap().len();
+            let snap = (components, access_len);
+            if let Some(first) = &baseline {
+                assert_eq!(&snap, first, "shared state grew after call {call}");
+            } else {
+                baseline = Some(snap);
+                let first = baseline.as_ref().unwrap();
+                let has_dead = first
+                    .0
+                    .iter()
+                    .any(|(_, b, n)| *n == "dead_code_cache" && *b > 0);
+                assert!(
+                    has_dead,
+                    "dead_code_cache component must be non-zero in baseline"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_review_pr_diff_missing_diff_returns_error() {
         let server = test_server();
@@ -16076,6 +16379,130 @@ mod tests {
             text.contains("No import cycles"),
             "empty project should have no cycles, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn impact_cycles_call_caches_forward_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..10usize {
+            std::fs::write(
+                sub.join(format!("mod_{i}.ts")),
+                format!(
+                    "import {{ x as other }} from './mod_{}';\nexport const x = 1;\n",
+                    (i + 1) % 10
+                ),
+            )
+            .unwrap();
+        }
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let ref_index = server.current_ref().await;
+
+        let mut baseline: Option<(Vec<ResidentComponent>, usize)> = None;
+        for call in 1..=5 {
+            let result = server
+                .dispatch("detect_dependency_loops", serde_json::Map::new())
+                .await;
+            assert_eq!(result.is_error, Some(false), "call {call}");
+            drop(result);
+
+            let has_cache = ref_index.cycles_forward_graph.lock().unwrap().is_some();
+            assert!(has_cache, "forward graph must be cached after call {call}");
+
+            let components = ResidentSnapshot::capture(&ref_index).await.measure();
+            let access_len = server.state.ref_access.lock().unwrap().len();
+            let snap = (components, access_len);
+            if let Some(first) = &baseline {
+                assert_eq!(&snap, first, "shared state grew after call {call}");
+            } else {
+                baseline = Some(snap);
+                let first = baseline.as_ref().unwrap();
+                let has_cycles = first
+                    .0
+                    .iter()
+                    .any(|(_, b, n)| *n == "cycles_forward_graph" && *b > 0);
+                assert!(
+                    has_cycles,
+                    "cycles_forward_graph component must be non-zero in baseline"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn impact_caches_counted_and_evicted_by_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..5usize {
+            std::fs::write(
+                sub.join(format!("m{i}.ts")),
+                format!(
+                    "import {{ x as other }} from './m{}';\nexport const x = 1;\n",
+                    (i + 1) % 5
+                ),
+            )
+            .unwrap();
+        }
+        let server = server_with_root_and_ttl(root.path().to_path_buf(), 60);
+        let ref_index = server.current_ref().await;
+
+        let _ = server
+            .dispatch("detect_dependency_loops", serde_json::Map::new())
+            .await;
+        let _ = server
+            .dispatch("find_dead_code", serde_json::Map::new())
+            .await;
+
+        let components = ResidentSnapshot::capture(&ref_index).await.measure();
+        let cycles_bytes = components
+            .iter()
+            .find(|(_, _, name)| *name == "cycles_forward_graph")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        let dead_bytes = components
+            .iter()
+            .find(|(_, _, name)| *name == "dead_code_cache")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        assert!(
+            cycles_bytes > 0,
+            "cycles_forward_graph must be non-zero after populate"
+        );
+        assert!(
+            dead_bytes > 0,
+            "dead_code_cache must be non-zero after populate"
+        );
+
+        let id_cache_name = ref_index.cas_ref_id_hex.clone();
+        clear_ref_heavy_caches(&ref_index, &id_cache_name).await;
+
+        assert!(
+            ref_index.cycles_forward_graph.lock().unwrap().is_none(),
+            "cycles_forward_graph must be None after clear"
+        );
+        assert!(
+            ref_index.dead_code_cache.lock().unwrap().is_none(),
+            "dead_code_cache must be None after clear"
+        );
+
+        let components_after = ResidentSnapshot::capture(&ref_index).await.measure();
+        let cycles_after = components_after
+            .iter()
+            .find(|(_, _, name)| *name == "cycles_forward_graph")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        let dead_after = components_after
+            .iter()
+            .find(|(_, _, name)| *name == "dead_code_cache")
+            .map(|(_, b, _)| *b)
+            .unwrap_or(0);
+        assert_eq!(
+            cycles_after, 0,
+            "cycles_forward_graph bytes must be 0 after clear"
+        );
+        assert_eq!(dead_after, 0, "dead_code_cache bytes must be 0 after clear");
     }
 
     #[tokio::test]
@@ -19250,6 +19677,27 @@ mod tests {
                 assert_eq!(log_field(line, "emergency"), Some(emergency), "{logs}");
             }
         }
+    }
+
+    #[test]
+    fn parse_proc_status_memory_includes_swap() {
+        assert_eq!(
+            parse_proc_status_memory("VmRSS:\t1000 kB\nVmSwap:\t500 kB\n"),
+            Some(1_536_000)
+        );
+    }
+
+    #[test]
+    fn parse_proc_status_memory_without_swap_returns_rss() {
+        assert_eq!(
+            parse_proc_status_memory("VmRSS:\t1000 kB\n"),
+            Some(1_024_000)
+        );
+    }
+
+    #[test]
+    fn parse_proc_status_memory_without_rss_returns_none() {
+        assert_eq!(parse_proc_status_memory("VmSwap:\t500 kB\n"), None);
     }
 
     #[cfg(target_os = "linux")]

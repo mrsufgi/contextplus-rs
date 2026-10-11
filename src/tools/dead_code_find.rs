@@ -76,30 +76,96 @@ impl Default for DeadCodeOptions {
     }
 }
 
-/// Find potentially dead symbols. See module docs for the heuristic.
-pub fn find_dead_symbols(
-    symbols_by_file: &HashMap<PathBuf, Vec<CodeSymbol>>,
-    tokens_by_file: &HashMap<PathBuf, HashSet<String>>,
-    opts: &DeadCodeOptions,
-) -> Vec<DeadSymbol> {
-    // Build a `(token → set of files that mention it)` reverse map so we
-    // can quickly check whether an identifier appears outside its defining
-    // file. The value is the set of *files* that reference the token, not
-    // a count of references — `files_referencing` reflects that.
-    let mut files_referencing: HashMap<&str, HashSet<&Path>> = HashMap::new();
-    for (path, tokens) in tokens_by_file {
-        for tok in tokens {
-            files_referencing
-                .entry(tok.as_str())
-                .or_default()
-                .insert(path.as_path());
+/// Whether a token appears in one file only or in two or more files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenPresence {
+    /// The token appears in exactly one indexed file.
+    Unique(PathBuf),
+    /// The token appears in two or more indexed files.
+    Multiple,
+}
+
+/// Compact cross-file token-presence index.
+///
+/// For each token, stores whether it appears in a single file (and which one)
+/// or in two or more files. This is all that [`find_dead_symbols`] needs: a
+/// symbol is used elsewhere when its name maps to [`TokenPresence::Multiple`]
+/// or to [`TokenPresence::Unique`] with a path other than the defining file.
+pub type DeadCodePresence = HashMap<String, TokenPresence>;
+
+/// Tokenize `content` and merge into `presence` with per-file deduplication.
+///
+/// A token that appears more than once in this file is treated as appearing
+/// once. In the occupied cases:
+/// - `Unique(same_path)` — same file already saw this token; stay `Unique`.
+/// - `Unique(other_path)` or `Multiple` — token is in multiple files; set `Multiple`.
+///
+/// This is the production tokenization function. All callers (server fold and
+/// [`build_dead_code_presence`]) route through here so the tested code is the
+/// same as the running code.
+pub fn merge_file_tokens_into_presence(
+    presence: &mut DeadCodePresence,
+    path: &Path,
+    content: &str,
+) {
+    // Collect to a per-file HashSet to deduplicate tokens within this file.
+    let deduped: HashSet<&str> = content
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    for tok in deduped {
+        match presence.entry(tok.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if !matches!(e.get(), TokenPresence::Unique(p) if p == path) {
+                    *e.get_mut() = TokenPresence::Multiple;
+                }
+                // TokenPresence::Unique(same path) → no-op: intra-file dedup already handled.
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(TokenPresence::Unique(path.to_path_buf()));
+            }
         }
     }
+}
 
+/// Build a [`DeadCodePresence`] index from a map of per-file token sets.
+///
+/// Accepts any iterator over `(file_path, tokens_in_that_file)` pairs — a
+/// `HashMap<PathBuf, HashSet<String>>` satisfies the bound directly.
+///
+/// Delegates to [`merge_file_tokens_into_presence`] so tests exercise the same
+/// core logic as the server fold path.
+pub fn build_dead_code_presence<I, T>(tokens_by_file: I) -> DeadCodePresence
+where
+    I: IntoIterator<Item = (PathBuf, T)>,
+    T: IntoIterator<Item = String>,
+{
+    let mut presence = DeadCodePresence::new();
+    for (path, tokens) in tokens_by_file {
+        // Join the (already-identifier-safe) tokens with spaces so the
+        // production tokenizer can re-split them. Identifier tokens contain
+        // only alphanumeric + '_', so a space join is lossless.
+        let content: String = tokens.into_iter().collect::<Vec<_>>().join(" ");
+        merge_file_tokens_into_presence(&mut presence, &path, &content);
+    }
+    presence
+}
+
+/// Find potentially dead symbols. See module docs for the heuristic.
+///
+/// Accepts a prebuilt [`DeadCodePresence`] index instead of raw per-file token
+/// sets so the caller can cache it and avoid rebuilding a reverse map on every
+/// call.
+pub fn find_dead_symbols(
+    symbols_by_file: &HashMap<PathBuf, Vec<CodeSymbol>>,
+    presence: &DeadCodePresence,
+    opts: &DeadCodeOptions,
+) -> Vec<DeadSymbol> {
     let mut out = Vec::new();
     for (path, symbols) in symbols_by_file {
         for sym in symbols {
-            collect_dead(path, sym, &files_referencing, opts, &mut out);
+            collect_dead(path, sym, presence, opts, &mut out);
         }
     }
 
@@ -112,7 +178,7 @@ pub fn find_dead_symbols(
 fn collect_dead(
     path: &Path,
     sym: &CodeSymbol,
-    files_referencing: &HashMap<&str, HashSet<&Path>>,
+    presence: &DeadCodePresence,
     opts: &DeadCodeOptions,
     out: &mut Vec<DeadSymbol>,
 ) {
@@ -121,10 +187,11 @@ fn collect_dead(
     let skip = opts.ignore_kinds.contains(&kind_lc) || opts.ignore_names.contains(&name_lc);
 
     if !skip && !sym.name.is_empty() {
-        let users = files_referencing.get(sym.name.as_str());
-        let used_elsewhere = users
-            .map(|set| set.iter().any(|p| *p != path))
-            .unwrap_or(false);
+        let used_elsewhere = match presence.get(sym.name.as_str()) {
+            None => false,
+            Some(TokenPresence::Multiple) => true,
+            Some(TokenPresence::Unique(p)) => p.as_path() != path,
+        };
         if !used_elsewhere {
             out.push(DeadSymbol {
                 path: path.to_path_buf(),
@@ -136,7 +203,7 @@ fn collect_dead(
     }
 
     for child in &sym.children {
-        collect_dead(path, child, files_referencing, opts, out);
+        collect_dead(path, child, presence, opts, out);
     }
 }
 
@@ -229,7 +296,8 @@ mod tests {
             (path_a.clone(), HashSet::from(["orphan".to_string()])),
             (path_b.clone(), HashSet::from(["unrelated".to_string()])),
         ]);
-        let dead = find_dead_symbols(&symbols, &tokens, &options_no_filters());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &options_no_filters());
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].name, "orphan");
     }
@@ -243,7 +311,8 @@ mod tests {
             (path_a.clone(), HashSet::from(["used".to_string()])),
             (path_b.clone(), HashSet::from(["used".to_string()])),
         ]);
-        let dead = find_dead_symbols(&symbols, &tokens, &options_no_filters());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &options_no_filters());
         assert!(dead.is_empty());
     }
 
@@ -258,7 +327,8 @@ mod tests {
             path_a.clone(),
             HashSet::from(["MyTrait".to_string(), "foo".to_string()]),
         )]);
-        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &DeadCodeOptions::default());
         assert_eq!(dead.len(), 1, "trait should be skipped, foo flagged");
         assert_eq!(dead[0].name, "foo");
     }
@@ -268,7 +338,8 @@ mod tests {
         let path_a = PathBuf::from("a.rs");
         let symbols = HashMap::from([(path_a.clone(), vec![sym("main", "function", 1)])]);
         let tokens = HashMap::from([(path_a.clone(), HashSet::from(["main".to_string()]))]);
-        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &DeadCodeOptions::default());
         assert!(dead.is_empty());
     }
 
@@ -290,7 +361,8 @@ mod tests {
             ),
             (path_b.clone(), HashSet::from(["Parent".to_string()])),
         ]);
-        let dead = find_dead_symbols(&symbols, &tokens, &options_no_filters());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &options_no_filters());
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].name, "dead_method");
     }
@@ -298,8 +370,8 @@ mod tests {
     #[test]
     fn empty_inputs_return_empty() {
         let symbols: HashMap<PathBuf, Vec<CodeSymbol>> = HashMap::new();
-        let tokens: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-        assert!(find_dead_symbols(&symbols, &tokens, &options_no_filters()).is_empty());
+        let presence = DeadCodePresence::new();
+        assert!(find_dead_symbols(&symbols, &presence, &options_no_filters()).is_empty());
     }
 
     #[test]
@@ -315,9 +387,10 @@ mod tests {
             path_a.clone(),
             (0..10).map(|i| format!("dead_{i}")).collect::<HashSet<_>>(),
         )]);
+        let presence = build_dead_code_presence(tokens);
         let mut opts = options_no_filters();
         opts.max_results = 3;
-        let dead = find_dead_symbols(&symbols, &tokens, &opts);
+        let dead = find_dead_symbols(&symbols, &presence, &opts);
         assert_eq!(dead.len(), 3);
     }
 
@@ -339,12 +412,53 @@ mod tests {
             ),
             (path_b.clone(), HashSet::from(["z1".to_string()])),
         ]);
-        let dead = find_dead_symbols(&symbols, &tokens, &options_no_filters());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &options_no_filters());
         assert_eq!(dead[0].path, path_a);
         assert_eq!(dead[0].line, 5);
         assert_eq!(dead[1].path, path_a);
         assert_eq!(dead[1].line, 20);
         assert_eq!(dead[2].path, path_b);
+    }
+
+    #[test]
+    fn equivalence_three_scenarios_match_expected_results() {
+        // Verifies that the presence-based detector matches the expected results
+        // for the three key scenarios: dead symbol (only in own file), live
+        // symbol (referenced in one other file), live symbol (in two+ files).
+        let path_a = PathBuf::from("a.rs");
+        let path_b = PathBuf::from("b.rs");
+        let path_c = PathBuf::from("c.rs");
+
+        let symbols = HashMap::from([(
+            path_a.clone(),
+            vec![
+                sym("used_in_two", "function", 1),
+                sym("used_in_one", "function", 5),
+                sym("orphan", "function", 10),
+            ],
+        )]);
+        let tokens = HashMap::from([
+            (
+                path_a.clone(),
+                HashSet::from([
+                    "used_in_two".to_string(),
+                    "used_in_one".to_string(),
+                    "orphan".to_string(),
+                ]),
+            ),
+            (
+                path_b.clone(),
+                HashSet::from(["used_in_two".to_string(), "used_in_one".to_string()]),
+            ),
+            (path_c.clone(), HashSet::from(["used_in_two".to_string()])),
+        ]);
+
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &options_no_filters());
+
+        assert_eq!(dead.len(), 1, "only 'orphan' should be dead; got: {dead:?}");
+        assert_eq!(dead[0].name, "orphan");
     }
 
     #[test]
@@ -404,9 +518,9 @@ export function startApp() {
             .filter(|t| !t.is_empty())
             .map(|t| t.to_string())
             .collect();
-        let tokens_by_file = HashMap::from([(path.clone(), tokens)]);
+        let presence = build_dead_code_presence(HashMap::from([(path.clone(), tokens)]));
 
-        let dead = find_dead_symbols(&symbols_by_file, &tokens_by_file, &options_no_filters());
+        let dead = find_dead_symbols(&symbols_by_file, &presence, &options_no_filters());
         let dead_names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -454,7 +568,8 @@ export function startApp() {
             (rs_path.clone(), HashSet::from(["unused_fn".to_string()])),
         ]);
 
-        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &DeadCodeOptions::default());
 
         // HTML pseudo-kind symbols must not appear (filtered by ignore_kinds).
         for d in &dead {
@@ -483,7 +598,8 @@ export function startApp() {
             HashSet::from(["body".to_string(), "real_fn".to_string()]),
         )]);
 
-        let dead = find_dead_symbols(&symbols, &tokens, &DeadCodeOptions::default());
+        let presence = build_dead_code_presence(tokens);
+        let dead = find_dead_symbols(&symbols, &presence, &DeadCodeOptions::default());
         // "body" has kind "element" → skipped; "real_fn" has no external users → flagged.
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].name, "real_fn");
